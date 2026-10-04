@@ -1,0 +1,7154 @@
+{
+  "base_head": "dee2ba2a5e5051258b83f027433392eaf6a35a8a",
+  "head": "47bd736357dc890e74987f97953d9039a273df77",
+  "method": "same physical 100-workspace fixture + idle actual160x50PTY client; alternating base/head within each round, 3x60s per variant; no API polling during measured interval; readonly thread snapshots at boundaries; percent of one core",
+  "binary_sha256": {
+    "master-release": "96bacde4b1e494ce7c7583e6b6c264c1869ac150048cfb47a1716633f02eff1a",
+    "head-release": "cc5d43181c7eb5c64af9b73a5d905710cdeef61d737ca80ed12d7703e0397963"
+  },
+  "median_cpu_percent_one_core": {
+    "master-release": 8.648160195301488,
+    "head-release": 8.33105092640352
+  },
+  "head_relative_percent": -3.666783012070607,
+  "runs": {
+    "master-release": [
+      {
+        "variant": "master-release",
+        "round": 1,
+        "server_pid": 2707668,
+        "client_pid": 2708441,
+        "workspaces": 100,
+        "attached_client_output_bytes": 27650,
+        "elapsed_s": 60.01582450495334,
+        "cpu_ticks": 514,
+        "server_cpu_percent_one_core": 8.564407874752725,
+        "server_fds": 316,
+        "thread_groups_ticks": {
+          "main": 15,
+          "herdr": 14,
+          "tokio-rt-worker": 429,
+          "ctrl-c": 0,
+          "herdr-pty-1": 0,
+          "herdr-pty-2": 0,
+          "herdr-pty-3": 0,
+          "herdr-pty-4": 0,
+          "herdr-pty-5": 0,
+          "herdr-pty-6": 0,
+          "herdr-pty-7": 0,
+          "herdr-pty-8": 0,
+          "herdr-pty-9": 0,
+          "herdr-pty-10": 0,
+          "herdr-pty-11": 0,
+          "herdr-pty-12": 0,
+          "herdr-pty-13": 0,
+          "herdr-pty-14": 0,
+          "herdr-pty-15": 0,
+          "herdr-pty-16": 0,
+          "herdr-pty-17": 0,
+          "herdr-pty-18": 0,
+          "herdr-pty-19": 0,
+          "herdr-pty-20": 0,
+          "herdr-pty-21": 0,
+          "herdr-pty-22": 0,
+          "herdr-pty-23": 0,
+          "herdr-pty-24": 0,
+          "herdr-pty-25": 0,
+          "herdr-pty-26": 0,
+          "herdr-pty-27": 0,
+          "herdr-pty-28": 0,
+          "herdr-pty-29": 0,
+          "herdr-pty-30": 0,
+          "herdr-pty-31": 0,
+          "herdr-pty-32": 0,
+          "herdr-pty-33": 0,
+          "herdr-pty-34": 0,
+          "herdr-pty-35": 0,
+          "herdr-pty-36": 0,
+          "herdr-pty-37": 0,
+          "herdr-pty-38": 0,
+          "herdr-pty-39": 0,
+          "herdr-pty-40": 0,
+          "herdr-pty-41": 0,
+          "herdr-pty-42": 0,
+          "herdr-pty-43": 0,
+          "herdr-pty-44": 0,
+          "herdr-pty-45": 0,
+          "herdr-pty-46": 0,
+          "herdr-pty-47": 0,
+          "herdr-pty-48": 0,
+          "herdr-pty-49": 0,
+          "herdr-pty-50": 0,
+          "herdr-pty-51": 0,
+          "herdr-pty-52": 0,
+          "herdr-pty-53": 0,
+          "herdr-pty-54": 0,
+          "herdr-pty-55": 0,
+          "herdr-pty-56": 0,
+          "herdr-pty-57": 0,
+          "herdr-pty-58": 0,
+          "herdr-pty-59": 0,
+          "herdr-pty-60": 0,
+          "herdr-pty-61": 0,
+          "herdr-pty-62": 0,
+          "herdr-pty-63": 0,
+          "herdr-pty-64": 0,
+          "herdr-pty-65": 0,
+          "herdr-pty-66": 0,
+          "herdr-pty-67": 0,
+          "herdr-pty-68": 0,
+          "herdr-pty-69": 0,
+          "herdr-pty-70": 0,
+          "herdr-pty-71": 0,
+          "herdr-pty-72": 0,
+          "herdr-pty-73": 0,
+          "herdr-pty-74": 0,
+          "herdr-pty-75": 0,
+          "herdr-pty-76": 0,
+          "herdr-pty-77": 0,
+          "herdr-pty-78": 0,
+          "herdr-pty-79": 0,
+          "herdr-pty-80": 0,
+          "herdr-pty-81": 0,
+          "herdr-pty-82": 0,
+          "herdr-pty-83": 0,
+          "herdr-pty-84": 0,
+          "herdr-pty-85": 0,
+          "herdr-pty-86": 0,
+          "herdr-pty-87": 0,
+          "herdr-pty-88": 0,
+          "herdr-pty-89": 0,
+          "herdr-pty-90": 0,
+          "herdr-pty-91": 0,
+          "herdr-pty-92": 0,
+          "herdr-pty-93": 0,
+          "herdr-pty-94": 0,
+          "herdr-pty-95": 0,
+          "herdr-pty-96": 0,
+          "herdr-pty-97": 0,
+          "herdr-pty-98": 0,
+          "herdr-pty-99": 0,
+          "herdr-pty-100": 0
+        },
+        "thread_rows": [
+          {
+            "tid": 2707673,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 83
+          },
+          {
+            "tid": 2707677,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 79
+          },
+          {
+            "tid": 2707676,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 73
+          },
+          {
+            "tid": 2707675,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 70
+          },
+          {
+            "tid": 2707671,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 67
+          },
+          {
+            "tid": 2707674,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 35
+          },
+          {
+            "tid": 2707672,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 17
+          },
+          {
+            "tid": 2707668,
+            "name": "herdr",
+            "cpu_ticks": 15
+          },
+          {
+            "tid": 2707670,
+            "name": "herdr",
+            "cpu_ticks": 14
+          },
+          {
+            "tid": 2707678,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 5
+          },
+          {
+            "tid": 2707698,
+            "name": "ctrl-c",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707699,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707707,
+            "name": "herdr-pty-1",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707722,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707724,
+            "name": "herdr-pty-2",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707739,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707740,
+            "name": "herdr-pty-3",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707745,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707746,
+            "name": "herdr-pty-4",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707757,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707758,
+            "name": "herdr-pty-5",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707762,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707763,
+            "name": "herdr-pty-6",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707766,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707767,
+            "name": "herdr-pty-7",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707770,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707771,
+            "name": "herdr-pty-8",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707774,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707775,
+            "name": "herdr-pty-9",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707779,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707780,
+            "name": "herdr-pty-10",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707785,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707786,
+            "name": "herdr-pty-11",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707789,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707790,
+            "name": "herdr-pty-12",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707795,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707796,
+            "name": "herdr-pty-13",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707810,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707811,
+            "name": "herdr-pty-14",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707819,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707820,
+            "name": "herdr-pty-15",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707823,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707824,
+            "name": "herdr-pty-16",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707828,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707829,
+            "name": "herdr-pty-17",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707833,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707834,
+            "name": "herdr-pty-18",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707837,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707838,
+            "name": "herdr-pty-19",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707847,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707848,
+            "name": "herdr-pty-20",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707851,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707852,
+            "name": "herdr-pty-21",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707859,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707860,
+            "name": "herdr-pty-22",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707864,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707865,
+            "name": "herdr-pty-23",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707868,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707869,
+            "name": "herdr-pty-24",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707873,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707874,
+            "name": "herdr-pty-25",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707877,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707878,
+            "name": "herdr-pty-26",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707883,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707884,
+            "name": "herdr-pty-27",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707888,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707889,
+            "name": "herdr-pty-28",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707898,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707899,
+            "name": "herdr-pty-29",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707904,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707905,
+            "name": "herdr-pty-30",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707909,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707910,
+            "name": "herdr-pty-31",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707915,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707916,
+            "name": "herdr-pty-32",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707920,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707921,
+            "name": "herdr-pty-33",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707924,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707925,
+            "name": "herdr-pty-34",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707928,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707929,
+            "name": "herdr-pty-35",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707939,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707940,
+            "name": "herdr-pty-36",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707946,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707947,
+            "name": "herdr-pty-37",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707950,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707951,
+            "name": "herdr-pty-38",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707954,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707955,
+            "name": "herdr-pty-39",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707959,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707960,
+            "name": "herdr-pty-40",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707963,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707964,
+            "name": "herdr-pty-41",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707970,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707972,
+            "name": "herdr-pty-42",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707975,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707976,
+            "name": "herdr-pty-43",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707990,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2707992,
+            "name": "herdr-pty-44",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708008,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708009,
+            "name": "herdr-pty-45",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708012,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708021,
+            "name": "herdr-pty-46",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708022,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708026,
+            "name": "herdr-pty-47",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708027,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708046,
+            "name": "herdr-pty-48",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708049,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708060,
+            "name": "herdr-pty-49",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708061,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708065,
+            "name": "herdr-pty-50",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708071,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708076,
+            "name": "herdr-pty-51",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708077,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708082,
+            "name": "herdr-pty-52",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708083,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708095,
+            "name": "herdr-pty-53",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708102,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708111,
+            "name": "herdr-pty-54",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708116,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708120,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708121,
+            "name": "herdr-pty-55",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708125,
+            "name": "herdr-pty-56",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708127,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708132,
+            "name": "herdr-pty-57",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708133,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708137,
+            "name": "herdr-pty-58",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708138,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708146,
+            "name": "herdr-pty-59",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708151,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708152,
+            "name": "herdr-pty-60",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708153,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708157,
+            "name": "herdr-pty-61",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708161,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708162,
+            "name": "herdr-pty-62",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708167,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708171,
+            "name": "herdr-pty-63",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708176,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708177,
+            "name": "herdr-pty-64",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708179,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708183,
+            "name": "herdr-pty-65",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708184,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708194,
+            "name": "herdr-pty-66",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708195,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708200,
+            "name": "herdr-pty-67",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708201,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708209,
+            "name": "herdr-pty-68",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708214,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708215,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708216,
+            "name": "herdr-pty-69",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708220,
+            "name": "herdr-pty-70",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708221,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708225,
+            "name": "herdr-pty-71",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708227,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708229,
+            "name": "herdr-pty-72",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708231,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708234,
+            "name": "herdr-pty-73",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708236,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708239,
+            "name": "herdr-pty-74",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708246,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708249,
+            "name": "herdr-pty-75",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708250,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708256,
+            "name": "herdr-pty-76",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708257,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708261,
+            "name": "herdr-pty-77",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708265,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708266,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708267,
+            "name": "herdr-pty-78",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708271,
+            "name": "herdr-pty-79",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708274,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708279,
+            "name": "herdr-pty-80",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708282,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708283,
+            "name": "herdr-pty-81",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708285,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708294,
+            "name": "herdr-pty-82",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708295,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708299,
+            "name": "herdr-pty-83",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708300,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708306,
+            "name": "herdr-pty-84",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708307,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708317,
+            "name": "herdr-pty-85",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708319,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708322,
+            "name": "herdr-pty-86",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708323,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708327,
+            "name": "herdr-pty-87",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708329,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708340,
+            "name": "herdr-pty-88",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708349,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708353,
+            "name": "herdr-pty-89",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708355,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708358,
+            "name": "herdr-pty-90",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708359,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708364,
+            "name": "herdr-pty-91",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708366,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708374,
+            "name": "herdr-pty-92",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708375,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708379,
+            "name": "herdr-pty-93",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708382,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708383,
+            "name": "herdr-pty-94",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708384,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708388,
+            "name": "herdr-pty-95",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708394,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708395,
+            "name": "herdr-pty-96",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708401,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708404,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708406,
+            "name": "herdr-pty-97",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708410,
+            "name": "herdr-pty-98",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708411,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708414,
+            "name": "herdr-pty-99",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708415,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708434,
+            "name": "herdr-pty-100",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708445,
+            "name": "herdr",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2708446,
+            "name": "herdr",
+            "cpu_ticks": 0
+          }
+        ],
+        "thread_snapshot_total_ticks": 458
+      },
+      {
+        "variant": "master-release",
+        "round": 2,
+        "server_pid": 2753140,
+        "client_pid": 2753812,
+        "workspaces": 100,
+        "attached_client_output_bytes": 27650,
+        "elapsed_s": 60.019377121003345,
+        "cpu_ticks": 542,
+        "server_cpu_percent_one_core": 9.03041694197008,
+        "server_fds": 316,
+        "thread_groups_ticks": {
+          "main": 16,
+          "herdr": 14,
+          "tokio-rt-worker": 453,
+          "ctrl-c": 0,
+          "herdr-pty-1": 0,
+          "herdr-pty-2": 0,
+          "herdr-pty-3": 0,
+          "herdr-pty-4": 0,
+          "herdr-pty-5": 0,
+          "herdr-pty-6": 0,
+          "herdr-pty-7": 0,
+          "herdr-pty-8": 0,
+          "herdr-pty-9": 0,
+          "herdr-pty-10": 0,
+          "herdr-pty-11": 0,
+          "herdr-pty-12": 0,
+          "herdr-pty-13": 0,
+          "herdr-pty-14": 0,
+          "herdr-pty-15": 0,
+          "herdr-pty-16": 0,
+          "herdr-pty-17": 0,
+          "herdr-pty-18": 0,
+          "herdr-pty-19": 0,
+          "herdr-pty-20": 0,
+          "herdr-pty-21": 0,
+          "herdr-pty-22": 0,
+          "herdr-pty-23": 0,
+          "herdr-pty-24": 0,
+          "herdr-pty-25": 0,
+          "herdr-pty-26": 0,
+          "herdr-pty-27": 0,
+          "herdr-pty-28": 0,
+          "herdr-pty-29": 0,
+          "herdr-pty-30": 0,
+          "herdr-pty-31": 0,
+          "herdr-pty-32": 0,
+          "herdr-pty-33": 0,
+          "herdr-pty-34": 0,
+          "herdr-pty-35": 0,
+          "herdr-pty-36": 0,
+          "herdr-pty-37": 0,
+          "herdr-pty-38": 0,
+          "herdr-pty-39": 0,
+          "herdr-pty-40": 0,
+          "herdr-pty-41": 0,
+          "herdr-pty-42": 0,
+          "herdr-pty-43": 0,
+          "herdr-pty-44": 0,
+          "herdr-pty-45": 0,
+          "herdr-pty-46": 0,
+          "herdr-pty-47": 0,
+          "herdr-pty-48": 0,
+          "herdr-pty-49": 0,
+          "herdr-pty-50": 0,
+          "herdr-pty-51": 0,
+          "herdr-pty-52": 0,
+          "herdr-pty-53": 0,
+          "herdr-pty-54": 0,
+          "herdr-pty-55": 0,
+          "herdr-pty-56": 0,
+          "herdr-pty-57": 0,
+          "herdr-pty-58": 0,
+          "herdr-pty-59": 0,
+          "herdr-pty-60": 0,
+          "herdr-pty-61": 0,
+          "herdr-pty-62": 0,
+          "herdr-pty-63": 0,
+          "herdr-pty-64": 0,
+          "herdr-pty-65": 0,
+          "herdr-pty-66": 0,
+          "herdr-pty-67": 0,
+          "herdr-pty-68": 0,
+          "herdr-pty-69": 0,
+          "herdr-pty-70": 0,
+          "herdr-pty-71": 0,
+          "herdr-pty-72": 0,
+          "herdr-pty-73": 0,
+          "herdr-pty-74": 0,
+          "herdr-pty-75": 0,
+          "herdr-pty-76": 0,
+          "herdr-pty-77": 0,
+          "herdr-pty-78": 0,
+          "herdr-pty-79": 0,
+          "herdr-pty-80": 0,
+          "herdr-pty-81": 0,
+          "herdr-pty-82": 0,
+          "herdr-pty-83": 0,
+          "herdr-pty-84": 0,
+          "herdr-pty-85": 0,
+          "herdr-pty-86": 0,
+          "herdr-pty-87": 0,
+          "herdr-pty-88": 0,
+          "herdr-pty-89": 0,
+          "herdr-pty-90": 0,
+          "herdr-pty-91": 0,
+          "herdr-pty-92": 0,
+          "herdr-pty-93": 0,
+          "herdr-pty-94": 0,
+          "herdr-pty-95": 0,
+          "herdr-pty-96": 0,
+          "herdr-pty-97": 0,
+          "herdr-pty-98": 0,
+          "herdr-pty-99": 0,
+          "herdr-pty-100": 0
+        },
+        "thread_rows": [
+          {
+            "tid": 2753146,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 94
+          },
+          {
+            "tid": 2753148,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 91
+          },
+          {
+            "tid": 2753151,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 90
+          },
+          {
+            "tid": 2753152,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 86
+          },
+          {
+            "tid": 2753149,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 68
+          },
+          {
+            "tid": 2753150,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 24
+          },
+          {
+            "tid": 2753140,
+            "name": "herdr",
+            "cpu_ticks": 16
+          },
+          {
+            "tid": 2753144,
+            "name": "herdr",
+            "cpu_ticks": 14
+          },
+          {
+            "tid": 2753145,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753147,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753159,
+            "name": "ctrl-c",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753160,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753171,
+            "name": "herdr-pty-1",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753181,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753182,
+            "name": "herdr-pty-2",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753201,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753202,
+            "name": "herdr-pty-3",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753205,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753206,
+            "name": "herdr-pty-4",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753210,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753211,
+            "name": "herdr-pty-5",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753214,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753215,
+            "name": "herdr-pty-6",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753220,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753221,
+            "name": "herdr-pty-7",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753226,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753227,
+            "name": "herdr-pty-8",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753233,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753234,
+            "name": "herdr-pty-9",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753241,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753242,
+            "name": "herdr-pty-10",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753248,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753249,
+            "name": "herdr-pty-11",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753255,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753256,
+            "name": "herdr-pty-12",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753275,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753276,
+            "name": "herdr-pty-13",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753290,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753291,
+            "name": "herdr-pty-14",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753304,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753305,
+            "name": "herdr-pty-15",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753321,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753322,
+            "name": "herdr-pty-16",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753332,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753333,
+            "name": "herdr-pty-17",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753339,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753340,
+            "name": "herdr-pty-18",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753343,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753344,
+            "name": "herdr-pty-19",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753349,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753350,
+            "name": "herdr-pty-20",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753353,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753354,
+            "name": "herdr-pty-21",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753357,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753358,
+            "name": "herdr-pty-22",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753361,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753362,
+            "name": "herdr-pty-23",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753365,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753366,
+            "name": "herdr-pty-24",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753371,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753372,
+            "name": "herdr-pty-25",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753375,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753376,
+            "name": "herdr-pty-26",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753379,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753380,
+            "name": "herdr-pty-27",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753383,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753384,
+            "name": "herdr-pty-28",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753387,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753388,
+            "name": "herdr-pty-29",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753393,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753394,
+            "name": "herdr-pty-30",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753397,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753398,
+            "name": "herdr-pty-31",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753401,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753402,
+            "name": "herdr-pty-32",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753405,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753406,
+            "name": "herdr-pty-33",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753410,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753411,
+            "name": "herdr-pty-34",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753415,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753416,
+            "name": "herdr-pty-35",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753420,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753421,
+            "name": "herdr-pty-36",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753424,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753425,
+            "name": "herdr-pty-37",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753431,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753432,
+            "name": "herdr-pty-38",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753435,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753436,
+            "name": "herdr-pty-39",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753440,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753441,
+            "name": "herdr-pty-40",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753444,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753445,
+            "name": "herdr-pty-41",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753449,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753450,
+            "name": "herdr-pty-42",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753455,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753456,
+            "name": "herdr-pty-43",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753460,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753461,
+            "name": "herdr-pty-44",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753464,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753465,
+            "name": "herdr-pty-45",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753466,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753470,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753471,
+            "name": "herdr-pty-46",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753475,
+            "name": "herdr-pty-47",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753477,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753480,
+            "name": "herdr-pty-48",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753481,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753484,
+            "name": "herdr-pty-49",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753488,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753489,
+            "name": "herdr-pty-50",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753490,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753515,
+            "name": "herdr-pty-51",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753516,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753521,
+            "name": "herdr-pty-52",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753527,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753528,
+            "name": "herdr-pty-53",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753529,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753532,
+            "name": "herdr-pty-54",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753533,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753536,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753537,
+            "name": "herdr-pty-55",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753540,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753541,
+            "name": "herdr-pty-56",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753544,
+            "name": "herdr-pty-57",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753546,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753558,
+            "name": "herdr-pty-58",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753561,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753562,
+            "name": "herdr-pty-59",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753563,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753567,
+            "name": "herdr-pty-60",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753568,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753571,
+            "name": "herdr-pty-61",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753575,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753576,
+            "name": "herdr-pty-62",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753577,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753582,
+            "name": "herdr-pty-63",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753583,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753586,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753587,
+            "name": "herdr-pty-64",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753590,
+            "name": "herdr-pty-65",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753591,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753594,
+            "name": "herdr-pty-66",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753597,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753598,
+            "name": "herdr-pty-67",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753599,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753604,
+            "name": "herdr-pty-68",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753605,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753608,
+            "name": "herdr-pty-69",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753611,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753613,
+            "name": "herdr-pty-70",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753615,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753617,
+            "name": "herdr-pty-71",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753618,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753623,
+            "name": "herdr-pty-72",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753624,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753627,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753629,
+            "name": "herdr-pty-73",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753634,
+            "name": "herdr-pty-74",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753635,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753638,
+            "name": "herdr-pty-75",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753644,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753645,
+            "name": "herdr-pty-76",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753646,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753652,
+            "name": "herdr-pty-77",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753653,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753659,
+            "name": "herdr-pty-78",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753660,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753668,
+            "name": "herdr-pty-79",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753669,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753673,
+            "name": "herdr-pty-80",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753674,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753677,
+            "name": "herdr-pty-81",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753678,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753685,
+            "name": "herdr-pty-82",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753689,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753690,
+            "name": "herdr-pty-83",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753691,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753692,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753699,
+            "name": "herdr-pty-84",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753704,
+            "name": "herdr-pty-85",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753712,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753715,
+            "name": "herdr-pty-86",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753719,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753722,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753728,
+            "name": "herdr-pty-87",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753732,
+            "name": "herdr-pty-88",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753739,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753740,
+            "name": "herdr-pty-89",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753741,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753742,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753744,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753748,
+            "name": "herdr-pty-90",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753754,
+            "name": "herdr-pty-91",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753758,
+            "name": "herdr-pty-92",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753759,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753763,
+            "name": "herdr-pty-93",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753768,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753769,
+            "name": "herdr-pty-94",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753770,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753776,
+            "name": "herdr-pty-95",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753777,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753781,
+            "name": "herdr-pty-96",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753782,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753788,
+            "name": "herdr-pty-97",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753789,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753794,
+            "name": "herdr-pty-98",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753795,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753803,
+            "name": "herdr-pty-99",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753805,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753807,
+            "name": "herdr-pty-100",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753820,
+            "name": "herdr",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2753821,
+            "name": "herdr",
+            "cpu_ticks": 0
+          }
+        ],
+        "thread_snapshot_total_ticks": 483
+      },
+      {
+        "variant": "master-release",
+        "round": 3,
+        "server_pid": 2784768,
+        "client_pid": 2785430,
+        "workspaces": 100,
+        "attached_client_output_bytes": 27650,
+        "elapsed_s": 60.01276436599437,
+        "cpu_ticks": 519,
+        "server_cpu_percent_one_core": 8.648160195301488,
+        "server_fds": 316,
+        "thread_groups_ticks": {
+          "main": 15,
+          "herdr": 13,
+          "tokio-rt-worker": 438,
+          "ctrl-c": 0,
+          "herdr-pty-1": 0,
+          "herdr-pty-2": 0,
+          "herdr-pty-3": 0,
+          "herdr-pty-4": 0,
+          "herdr-pty-5": 0,
+          "herdr-pty-6": 0,
+          "herdr-pty-7": 0,
+          "herdr-pty-8": 0,
+          "herdr-pty-9": 0,
+          "herdr-pty-10": 0,
+          "herdr-pty-11": 0,
+          "herdr-pty-12": 0,
+          "herdr-pty-13": 0,
+          "herdr-pty-14": 0,
+          "herdr-pty-15": 0,
+          "herdr-pty-16": 0,
+          "herdr-pty-17": 0,
+          "herdr-pty-18": 0,
+          "herdr-pty-19": 0,
+          "herdr-pty-20": 0,
+          "herdr-pty-21": 0,
+          "herdr-pty-22": 0,
+          "herdr-pty-23": 0,
+          "herdr-pty-24": 0,
+          "herdr-pty-25": 0,
+          "herdr-pty-26": 0,
+          "herdr-pty-27": 0,
+          "herdr-pty-28": 0,
+          "herdr-pty-29": 0,
+          "herdr-pty-30": 0,
+          "herdr-pty-31": 0,
+          "herdr-pty-32": 0,
+          "herdr-pty-33": 0,
+          "herdr-pty-34": 0,
+          "herdr-pty-35": 0,
+          "herdr-pty-36": 0,
+          "herdr-pty-37": 0,
+          "herdr-pty-38": 0,
+          "herdr-pty-39": 0,
+          "herdr-pty-40": 0,
+          "herdr-pty-41": 0,
+          "herdr-pty-42": 0,
+          "herdr-pty-43": 0,
+          "herdr-pty-44": 0,
+          "herdr-pty-45": 0,
+          "herdr-pty-46": 0,
+          "herdr-pty-47": 0,
+          "herdr-pty-48": 0,
+          "herdr-pty-49": 0,
+          "herdr-pty-50": 0,
+          "herdr-pty-51": 0,
+          "herdr-pty-52": 0,
+          "herdr-pty-53": 0,
+          "herdr-pty-54": 0,
+          "herdr-pty-55": 0,
+          "herdr-pty-56": 0,
+          "herdr-pty-57": 0,
+          "herdr-pty-58": 0,
+          "herdr-pty-59": 0,
+          "herdr-pty-60": 0,
+          "herdr-pty-61": 0,
+          "herdr-pty-62": 0,
+          "herdr-pty-63": 0,
+          "herdr-pty-64": 0,
+          "herdr-pty-65": 0,
+          "herdr-pty-66": 0,
+          "herdr-pty-67": 0,
+          "herdr-pty-68": 0,
+          "herdr-pty-69": 0,
+          "herdr-pty-70": 0,
+          "herdr-pty-71": 0,
+          "herdr-pty-72": 0,
+          "herdr-pty-73": 0,
+          "herdr-pty-74": 0,
+          "herdr-pty-75": 0,
+          "herdr-pty-76": 0,
+          "herdr-pty-77": 0,
+          "herdr-pty-78": 0,
+          "herdr-pty-79": 0,
+          "herdr-pty-80": 0,
+          "herdr-pty-81": 0,
+          "herdr-pty-82": 0,
+          "herdr-pty-83": 0,
+          "herdr-pty-84": 0,
+          "herdr-pty-85": 0,
+          "herdr-pty-86": 0,
+          "herdr-pty-87": 0,
+          "herdr-pty-88": 0,
+          "herdr-pty-89": 0,
+          "herdr-pty-90": 0,
+          "herdr-pty-91": 0,
+          "herdr-pty-92": 0,
+          "herdr-pty-93": 0,
+          "herdr-pty-94": 0,
+          "herdr-pty-95": 0,
+          "herdr-pty-96": 0,
+          "herdr-pty-97": 0,
+          "herdr-pty-98": 0,
+          "herdr-pty-99": 0,
+          "herdr-pty-100": 0
+        },
+        "thread_rows": [
+          {
+            "tid": 2784773,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 88
+          },
+          {
+            "tid": 2784771,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 85
+          },
+          {
+            "tid": 2784775,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 82
+          },
+          {
+            "tid": 2784776,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 63
+          },
+          {
+            "tid": 2784772,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 38
+          },
+          {
+            "tid": 2784777,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 33
+          },
+          {
+            "tid": 2784778,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 30
+          },
+          {
+            "tid": 2784774,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 19
+          },
+          {
+            "tid": 2784768,
+            "name": "herdr",
+            "cpu_ticks": 15
+          },
+          {
+            "tid": 2784770,
+            "name": "herdr",
+            "cpu_ticks": 13
+          },
+          {
+            "tid": 2784782,
+            "name": "ctrl-c",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2784784,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2784793,
+            "name": "herdr-pty-1",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2784796,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2784797,
+            "name": "herdr-pty-2",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2784807,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2784808,
+            "name": "herdr-pty-3",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2784811,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2784812,
+            "name": "herdr-pty-4",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2784816,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2784817,
+            "name": "herdr-pty-5",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2784821,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2784822,
+            "name": "herdr-pty-6",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2784827,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2784828,
+            "name": "herdr-pty-7",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2784833,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2784834,
+            "name": "herdr-pty-8",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2784838,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2784839,
+            "name": "herdr-pty-9",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2784844,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2784845,
+            "name": "herdr-pty-10",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2784849,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2784850,
+            "name": "herdr-pty-11",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2784853,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2784854,
+            "name": "herdr-pty-12",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2784859,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2784860,
+            "name": "herdr-pty-13",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2784864,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2784865,
+            "name": "herdr-pty-14",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2784899,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2784900,
+            "name": "herdr-pty-15",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2784920,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2784921,
+            "name": "herdr-pty-16",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2784933,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2784934,
+            "name": "herdr-pty-17",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2784938,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2784939,
+            "name": "herdr-pty-18",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2784943,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2784944,
+            "name": "herdr-pty-19",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2784950,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2784951,
+            "name": "herdr-pty-20",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2784956,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2784957,
+            "name": "herdr-pty-21",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2784966,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2784967,
+            "name": "herdr-pty-22",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2784970,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2784971,
+            "name": "herdr-pty-23",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2784975,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2784976,
+            "name": "herdr-pty-24",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2784980,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2784981,
+            "name": "herdr-pty-25",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2784986,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2784987,
+            "name": "herdr-pty-26",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2784991,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2784992,
+            "name": "herdr-pty-27",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2784996,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2784997,
+            "name": "herdr-pty-28",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785001,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785002,
+            "name": "herdr-pty-29",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785006,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785007,
+            "name": "herdr-pty-30",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785011,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785012,
+            "name": "herdr-pty-31",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785016,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785017,
+            "name": "herdr-pty-32",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785020,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785021,
+            "name": "herdr-pty-33",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785025,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785026,
+            "name": "herdr-pty-34",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785029,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785030,
+            "name": "herdr-pty-35",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785040,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785041,
+            "name": "herdr-pty-36",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785047,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785048,
+            "name": "herdr-pty-37",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785052,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785053,
+            "name": "herdr-pty-38",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785056,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785057,
+            "name": "herdr-pty-39",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785072,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785073,
+            "name": "herdr-pty-40",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785100,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785101,
+            "name": "herdr-pty-41",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785116,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785117,
+            "name": "herdr-pty-42",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785128,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785129,
+            "name": "herdr-pty-43",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785135,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785136,
+            "name": "herdr-pty-44",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785139,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785140,
+            "name": "herdr-pty-45",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785143,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785144,
+            "name": "herdr-pty-46",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785145,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785149,
+            "name": "herdr-pty-47",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785150,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785156,
+            "name": "herdr-pty-48",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785157,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785161,
+            "name": "herdr-pty-49",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785162,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785165,
+            "name": "herdr-pty-50",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785169,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785170,
+            "name": "herdr-pty-51",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785171,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785177,
+            "name": "herdr-pty-52",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785178,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785182,
+            "name": "herdr-pty-53",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785183,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785187,
+            "name": "herdr-pty-54",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785188,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785191,
+            "name": "herdr-pty-55",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785192,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785195,
+            "name": "herdr-pty-56",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785196,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785202,
+            "name": "herdr-pty-57",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785203,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785206,
+            "name": "herdr-pty-58",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785207,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785210,
+            "name": "herdr-pty-59",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785211,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785214,
+            "name": "herdr-pty-60",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785219,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785220,
+            "name": "herdr-pty-61",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785224,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785225,
+            "name": "herdr-pty-62",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785226,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785232,
+            "name": "herdr-pty-63",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785233,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785236,
+            "name": "herdr-pty-64",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785237,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785242,
+            "name": "herdr-pty-65",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785243,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785248,
+            "name": "herdr-pty-66",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785249,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785258,
+            "name": "herdr-pty-67",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785261,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785262,
+            "name": "herdr-pty-68",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785263,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785267,
+            "name": "herdr-pty-69",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785271,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785272,
+            "name": "herdr-pty-70",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785273,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785278,
+            "name": "herdr-pty-71",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785279,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785283,
+            "name": "herdr-pty-72",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785284,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785287,
+            "name": "herdr-pty-73",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785290,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785293,
+            "name": "herdr-pty-74",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785294,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785298,
+            "name": "herdr-pty-75",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785299,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785304,
+            "name": "herdr-pty-76",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785305,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785308,
+            "name": "herdr-pty-77",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785309,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785312,
+            "name": "herdr-pty-78",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785315,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785319,
+            "name": "herdr-pty-79",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785320,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785324,
+            "name": "herdr-pty-80",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785328,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785329,
+            "name": "herdr-pty-81",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785332,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785333,
+            "name": "herdr-pty-82",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785335,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785338,
+            "name": "herdr-pty-83",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785340,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785348,
+            "name": "herdr-pty-84",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785349,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785353,
+            "name": "herdr-pty-85",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785354,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785358,
+            "name": "herdr-pty-86",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785359,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785363,
+            "name": "herdr-pty-87",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785364,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785368,
+            "name": "herdr-pty-88",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785369,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785372,
+            "name": "herdr-pty-89",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785373,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785377,
+            "name": "herdr-pty-90",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785378,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785383,
+            "name": "herdr-pty-91",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785384,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785389,
+            "name": "herdr-pty-92",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785390,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785394,
+            "name": "herdr-pty-93",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785395,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785399,
+            "name": "herdr-pty-94",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785401,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785404,
+            "name": "herdr-pty-95",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785405,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785409,
+            "name": "herdr-pty-96",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785411,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785414,
+            "name": "herdr-pty-97",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785415,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785418,
+            "name": "herdr-pty-98",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785421,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785422,
+            "name": "herdr-pty-99",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785423,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785426,
+            "name": "herdr-pty-100",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785432,
+            "name": "herdr",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2785433,
+            "name": "herdr",
+            "cpu_ticks": 0
+          }
+        ],
+        "thread_snapshot_total_ticks": 466
+      }
+    ],
+    "head-release": [
+      {
+        "variant": "head-release",
+        "round": 1,
+        "server_pid": 2728857,
+        "client_pid": 2729660,
+        "workspaces": 100,
+        "attached_client_output_bytes": 27650,
+        "elapsed_s": 60.01643783203326,
+        "cpu_ticks": 500,
+        "server_cpu_percent_one_core": 8.33105092640352,
+        "server_fds": 320,
+        "thread_groups_ticks": {
+          "main": 4,
+          "herdr-final-rel": 14,
+          "tokio-rt-worker": 459,
+          "ctrl-c": 0,
+          "herdr-pty-1": 0,
+          "herdr-pty-2": 0,
+          "herdr-pty-3": 0,
+          "herdr-pty-4": 0,
+          "herdr-pty-5": 0,
+          "herdr-pty-6": 0,
+          "herdr-pty-7": 0,
+          "herdr-pty-8": 0,
+          "herdr-pty-9": 0,
+          "herdr-pty-10": 0,
+          "herdr-pty-11": 0,
+          "herdr-pty-12": 0,
+          "herdr-pty-13": 0,
+          "herdr-pty-14": 0,
+          "herdr-pty-15": 0,
+          "herdr-pty-16": 0,
+          "herdr-pty-17": 0,
+          "herdr-pty-18": 0,
+          "herdr-pty-19": 0,
+          "herdr-pty-20": 0,
+          "herdr-pty-21": 0,
+          "herdr-pty-22": 0,
+          "herdr-pty-23": 0,
+          "herdr-pty-24": 0,
+          "herdr-pty-25": 0,
+          "herdr-pty-26": 0,
+          "herdr-pty-27": 0,
+          "herdr-pty-28": 0,
+          "herdr-pty-29": 0,
+          "herdr-pty-30": 0,
+          "herdr-pty-31": 0,
+          "herdr-pty-32": 0,
+          "herdr-pty-33": 0,
+          "herdr-pty-34": 0,
+          "herdr-pty-35": 0,
+          "herdr-pty-36": 0,
+          "herdr-pty-37": 0,
+          "herdr-pty-38": 0,
+          "herdr-pty-39": 0,
+          "herdr-pty-40": 0,
+          "herdr-pty-41": 0,
+          "herdr-pty-42": 0,
+          "herdr-pty-43": 0,
+          "herdr-pty-44": 0,
+          "herdr-pty-45": 0,
+          "herdr-pty-46": 0,
+          "herdr-pty-47": 0,
+          "herdr-pty-48": 0,
+          "herdr-pty-49": 0,
+          "herdr-pty-50": 0,
+          "herdr-pty-51": 0,
+          "herdr-pty-52": 0,
+          "herdr-pty-53": 0,
+          "herdr-pty-54": 0,
+          "herdr-pty-55": 0,
+          "herdr-pty-56": 0,
+          "herdr-pty-57": 0,
+          "herdr-pty-58": 0,
+          "herdr-pty-59": 0,
+          "herdr-pty-60": 0,
+          "herdr-pty-61": 0,
+          "herdr-pty-62": 0,
+          "herdr-pty-63": 0,
+          "herdr-pty-64": 0,
+          "herdr-pty-65": 0,
+          "herdr-pty-66": 0,
+          "herdr-pty-67": 0,
+          "herdr-pty-68": 0,
+          "herdr-pty-69": 0,
+          "herdr-pty-70": 0,
+          "herdr-pty-71": 0,
+          "herdr-pty-72": 0,
+          "herdr-pty-73": 0,
+          "herdr-pty-74": 0,
+          "herdr-pty-75": 0,
+          "herdr-pty-76": 0,
+          "herdr-pty-77": 0,
+          "herdr-pty-78": 0,
+          "herdr-pty-79": 0,
+          "herdr-pty-80": 0,
+          "herdr-pty-81": 0,
+          "herdr-pty-82": 0,
+          "herdr-pty-83": 0,
+          "herdr-pty-84": 0,
+          "herdr-pty-85": 0,
+          "herdr-pty-86": 0,
+          "herdr-pty-87": 0,
+          "herdr-pty-88": 0,
+          "herdr-pty-89": 0,
+          "herdr-pty-90": 0,
+          "herdr-pty-91": 0,
+          "herdr-pty-92": 0,
+          "herdr-pty-93": 0,
+          "herdr-pty-94": 0,
+          "herdr-pty-95": 0,
+          "herdr-pty-96": 0,
+          "herdr-pty-97": 0,
+          "herdr-pty-98": 0,
+          "herdr-pty-99": 0,
+          "herdr-pty-100": 0,
+          "notify-rs inoti": 5
+        },
+        "thread_rows": [
+          {
+            "tid": 2728867,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 86
+          },
+          {
+            "tid": 2728866,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 82
+          },
+          {
+            "tid": 2728863,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 79
+          },
+          {
+            "tid": 2728864,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 75
+          },
+          {
+            "tid": 2728862,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 54
+          },
+          {
+            "tid": 2728861,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 37
+          },
+          {
+            "tid": 2728865,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 35
+          },
+          {
+            "tid": 2728858,
+            "name": "herdr-final-rel",
+            "cpu_ticks": 14
+          },
+          {
+            "tid": 2728860,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 11
+          },
+          {
+            "tid": 2729716,
+            "name": "notify-rs inoti",
+            "cpu_ticks": 5
+          },
+          {
+            "tid": 2728857,
+            "name": "herdr-final-rel",
+            "cpu_ticks": 4
+          },
+          {
+            "tid": 2728873,
+            "name": "ctrl-c",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2728876,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2728886,
+            "name": "herdr-pty-1",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2728890,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2728891,
+            "name": "herdr-pty-2",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2728894,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2728895,
+            "name": "herdr-pty-3",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2728902,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2728903,
+            "name": "herdr-pty-4",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2728908,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2728909,
+            "name": "herdr-pty-5",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2728914,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2728915,
+            "name": "herdr-pty-6",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2728919,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2728920,
+            "name": "herdr-pty-7",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2728926,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2728927,
+            "name": "herdr-pty-8",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2728930,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2728931,
+            "name": "herdr-pty-9",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2728935,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2728936,
+            "name": "herdr-pty-10",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2728943,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2728944,
+            "name": "herdr-pty-11",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2728948,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2728949,
+            "name": "herdr-pty-12",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2728957,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2728958,
+            "name": "herdr-pty-13",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2728964,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2728965,
+            "name": "herdr-pty-14",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2728974,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2728975,
+            "name": "herdr-pty-15",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2728980,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2728981,
+            "name": "herdr-pty-16",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2728985,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2728986,
+            "name": "herdr-pty-17",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2728990,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2728991,
+            "name": "herdr-pty-18",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2728998,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2728999,
+            "name": "herdr-pty-19",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729003,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729004,
+            "name": "herdr-pty-20",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729009,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729010,
+            "name": "herdr-pty-21",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729017,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729018,
+            "name": "herdr-pty-22",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729028,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729029,
+            "name": "herdr-pty-23",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729038,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729039,
+            "name": "herdr-pty-24",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729052,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729053,
+            "name": "herdr-pty-25",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729060,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729061,
+            "name": "herdr-pty-26",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729071,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729072,
+            "name": "herdr-pty-27",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729085,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729086,
+            "name": "herdr-pty-28",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729097,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729098,
+            "name": "herdr-pty-29",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729105,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729106,
+            "name": "herdr-pty-30",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729111,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729112,
+            "name": "herdr-pty-31",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729122,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729123,
+            "name": "herdr-pty-32",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729126,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729127,
+            "name": "herdr-pty-33",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729131,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729132,
+            "name": "herdr-pty-34",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729151,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729153,
+            "name": "herdr-pty-35",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729174,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729175,
+            "name": "herdr-pty-36",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729183,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729184,
+            "name": "herdr-pty-37",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729214,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729215,
+            "name": "herdr-pty-38",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729225,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729226,
+            "name": "herdr-pty-39",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729231,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729232,
+            "name": "herdr-pty-40",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729235,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729236,
+            "name": "herdr-pty-41",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729243,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729244,
+            "name": "herdr-pty-42",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729249,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729250,
+            "name": "herdr-pty-43",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729256,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729258,
+            "name": "herdr-pty-44",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729259,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729262,
+            "name": "herdr-pty-45",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729264,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729268,
+            "name": "herdr-pty-46",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729269,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729273,
+            "name": "herdr-pty-47",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729274,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729280,
+            "name": "herdr-pty-48",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729281,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729286,
+            "name": "herdr-pty-49",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729287,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729293,
+            "name": "herdr-pty-50",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729294,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729297,
+            "name": "herdr-pty-51",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729299,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729303,
+            "name": "herdr-pty-52",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729305,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729308,
+            "name": "herdr-pty-53",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729310,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729316,
+            "name": "herdr-pty-54",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729317,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729323,
+            "name": "herdr-pty-55",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729324,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729328,
+            "name": "herdr-pty-56",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729329,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729333,
+            "name": "herdr-pty-57",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729334,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729338,
+            "name": "herdr-pty-58",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729348,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729349,
+            "name": "herdr-pty-59",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729353,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729354,
+            "name": "herdr-pty-60",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729357,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729360,
+            "name": "herdr-pty-61",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729364,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729365,
+            "name": "herdr-pty-62",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729366,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729371,
+            "name": "herdr-pty-63",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729372,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729377,
+            "name": "herdr-pty-64",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729378,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729382,
+            "name": "herdr-pty-65",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729385,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729389,
+            "name": "herdr-pty-66",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729391,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729396,
+            "name": "herdr-pty-67",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729397,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729403,
+            "name": "herdr-pty-68",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729404,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729412,
+            "name": "herdr-pty-69",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729413,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729417,
+            "name": "herdr-pty-70",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729418,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729422,
+            "name": "herdr-pty-71",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729423,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729429,
+            "name": "herdr-pty-72",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729433,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729435,
+            "name": "herdr-pty-73",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729436,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729440,
+            "name": "herdr-pty-74",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729443,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729449,
+            "name": "herdr-pty-75",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729450,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729456,
+            "name": "herdr-pty-76",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729457,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729463,
+            "name": "herdr-pty-77",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729466,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729474,
+            "name": "herdr-pty-78",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729480,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729481,
+            "name": "herdr-pty-79",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729482,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729485,
+            "name": "herdr-pty-80",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729487,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729490,
+            "name": "herdr-pty-81",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729491,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729498,
+            "name": "herdr-pty-82",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729499,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729502,
+            "name": "herdr-pty-83",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729505,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729509,
+            "name": "herdr-pty-84",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729510,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729514,
+            "name": "herdr-pty-85",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729516,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729524,
+            "name": "herdr-pty-86",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729525,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729530,
+            "name": "herdr-pty-87",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729532,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729535,
+            "name": "herdr-pty-88",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729536,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729544,
+            "name": "herdr-pty-89",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729549,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729556,
+            "name": "herdr-pty-90",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729557,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729560,
+            "name": "herdr-pty-91",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729562,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729567,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729568,
+            "name": "herdr-pty-92",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729586,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729587,
+            "name": "herdr-pty-93",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729591,
+            "name": "herdr-pty-94",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729592,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729597,
+            "name": "herdr-pty-95",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729599,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729602,
+            "name": "herdr-pty-96",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729607,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729610,
+            "name": "herdr-pty-97",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729611,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729623,
+            "name": "herdr-pty-98",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729631,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729645,
+            "name": "herdr-pty-99",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729646,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729656,
+            "name": "herdr-pty-100",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729663,
+            "name": "herdr-final-rel",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2729664,
+            "name": "herdr-final-rel",
+            "cpu_ticks": 0
+          }
+        ],
+        "thread_snapshot_total_ticks": 482
+      },
+      {
+        "variant": "head-release",
+        "round": 2,
+        "server_pid": 2768591,
+        "client_pid": 2769597,
+        "workspaces": 100,
+        "attached_client_output_bytes": 27650,
+        "elapsed_s": 60.02044854697306,
+        "cpu_ticks": 503,
+        "server_cpu_percent_one_core": 8.380477190308623,
+        "server_fds": 320,
+        "thread_groups_ticks": {
+          "main": 4,
+          "herdr-final-rel": 16,
+          "tokio-rt-worker": 460,
+          "ctrl-c": 0,
+          "herdr-pty-1": 0,
+          "herdr-pty-2": 0,
+          "herdr-pty-3": 0,
+          "herdr-pty-4": 0,
+          "herdr-pty-5": 0,
+          "herdr-pty-6": 0,
+          "herdr-pty-7": 0,
+          "herdr-pty-8": 0,
+          "herdr-pty-9": 0,
+          "herdr-pty-10": 0,
+          "herdr-pty-11": 0,
+          "herdr-pty-12": 0,
+          "herdr-pty-13": 0,
+          "herdr-pty-14": 0,
+          "herdr-pty-15": 0,
+          "herdr-pty-16": 0,
+          "herdr-pty-17": 0,
+          "herdr-pty-18": 0,
+          "herdr-pty-19": 0,
+          "herdr-pty-20": 0,
+          "herdr-pty-21": 0,
+          "herdr-pty-22": 0,
+          "herdr-pty-23": 0,
+          "herdr-pty-24": 0,
+          "herdr-pty-25": 0,
+          "herdr-pty-26": 0,
+          "herdr-pty-27": 0,
+          "herdr-pty-28": 0,
+          "herdr-pty-29": 0,
+          "herdr-pty-30": 0,
+          "herdr-pty-31": 0,
+          "herdr-pty-32": 0,
+          "herdr-pty-33": 0,
+          "herdr-pty-34": 0,
+          "herdr-pty-35": 0,
+          "herdr-pty-36": 0,
+          "herdr-pty-37": 0,
+          "herdr-pty-38": 0,
+          "herdr-pty-39": 0,
+          "herdr-pty-40": 0,
+          "herdr-pty-41": 0,
+          "herdr-pty-42": 0,
+          "herdr-pty-43": 0,
+          "herdr-pty-44": 0,
+          "herdr-pty-45": 0,
+          "herdr-pty-46": 0,
+          "herdr-pty-47": 0,
+          "herdr-pty-48": 0,
+          "herdr-pty-49": 0,
+          "herdr-pty-50": 0,
+          "herdr-pty-51": 0,
+          "herdr-pty-52": 0,
+          "herdr-pty-53": 0,
+          "herdr-pty-54": 0,
+          "herdr-pty-55": 0,
+          "herdr-pty-56": 0,
+          "herdr-pty-57": 0,
+          "herdr-pty-58": 0,
+          "herdr-pty-59": 0,
+          "herdr-pty-60": 0,
+          "herdr-pty-61": 0,
+          "herdr-pty-62": 0,
+          "herdr-pty-63": 0,
+          "herdr-pty-64": 0,
+          "herdr-pty-65": 0,
+          "herdr-pty-66": 0,
+          "herdr-pty-67": 0,
+          "herdr-pty-68": 0,
+          "herdr-pty-69": 0,
+          "herdr-pty-70": 0,
+          "herdr-pty-71": 0,
+          "herdr-pty-72": 0,
+          "herdr-pty-73": 0,
+          "herdr-pty-74": 0,
+          "herdr-pty-75": 0,
+          "herdr-pty-76": 0,
+          "herdr-pty-77": 0,
+          "herdr-pty-78": 0,
+          "herdr-pty-79": 0,
+          "herdr-pty-80": 0,
+          "herdr-pty-81": 0,
+          "herdr-pty-82": 0,
+          "herdr-pty-83": 0,
+          "herdr-pty-84": 0,
+          "herdr-pty-85": 0,
+          "herdr-pty-86": 0,
+          "herdr-pty-87": 0,
+          "herdr-pty-88": 0,
+          "herdr-pty-89": 0,
+          "herdr-pty-90": 0,
+          "herdr-pty-91": 0,
+          "herdr-pty-92": 0,
+          "herdr-pty-93": 0,
+          "herdr-pty-94": 0,
+          "herdr-pty-95": 0,
+          "herdr-pty-96": 0,
+          "herdr-pty-97": 0,
+          "herdr-pty-98": 0,
+          "herdr-pty-99": 0,
+          "herdr-pty-100": 0,
+          "notify-rs inoti": 3
+        },
+        "thread_rows": [
+          {
+            "tid": 2768600,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 105
+          },
+          {
+            "tid": 2768596,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 100
+          },
+          {
+            "tid": 2768598,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 93
+          },
+          {
+            "tid": 2768595,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 84
+          },
+          {
+            "tid": 2768599,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 61
+          },
+          {
+            "tid": 2768597,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 17
+          },
+          {
+            "tid": 2768592,
+            "name": "herdr-final-rel",
+            "cpu_ticks": 16
+          },
+          {
+            "tid": 2768591,
+            "name": "herdr-final-rel",
+            "cpu_ticks": 4
+          },
+          {
+            "tid": 2769614,
+            "name": "notify-rs inoti",
+            "cpu_ticks": 3
+          },
+          {
+            "tid": 2768594,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2768601,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2768618,
+            "name": "ctrl-c",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2768619,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2768639,
+            "name": "herdr-pty-1",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2768644,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2768645,
+            "name": "herdr-pty-2",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2768651,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2768652,
+            "name": "herdr-pty-3",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2768659,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2768660,
+            "name": "herdr-pty-4",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2768666,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2768668,
+            "name": "herdr-pty-5",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2768676,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2768677,
+            "name": "herdr-pty-6",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2768683,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2768684,
+            "name": "herdr-pty-7",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2768691,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2768692,
+            "name": "herdr-pty-8",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2768700,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2768701,
+            "name": "herdr-pty-9",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2768710,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2768711,
+            "name": "herdr-pty-10",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2768720,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2768721,
+            "name": "herdr-pty-11",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2768740,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2768741,
+            "name": "herdr-pty-12",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2768762,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2768763,
+            "name": "herdr-pty-13",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2768783,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2768784,
+            "name": "herdr-pty-14",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2768821,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2768822,
+            "name": "herdr-pty-15",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2768836,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2768837,
+            "name": "herdr-pty-16",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2768844,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2768845,
+            "name": "herdr-pty-17",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2768853,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2768854,
+            "name": "herdr-pty-18",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2768862,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2768863,
+            "name": "herdr-pty-19",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2768869,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2768870,
+            "name": "herdr-pty-20",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2768877,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2768878,
+            "name": "herdr-pty-21",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2768884,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2768885,
+            "name": "herdr-pty-22",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2768890,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2768891,
+            "name": "herdr-pty-23",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2768897,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2768898,
+            "name": "herdr-pty-24",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2768904,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2768905,
+            "name": "herdr-pty-25",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2768912,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2768913,
+            "name": "herdr-pty-26",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2768920,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2768921,
+            "name": "herdr-pty-27",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2768928,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2768929,
+            "name": "herdr-pty-28",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2768935,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2768936,
+            "name": "herdr-pty-29",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2768944,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2768945,
+            "name": "herdr-pty-30",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2768952,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2768953,
+            "name": "herdr-pty-31",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2768959,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2768960,
+            "name": "herdr-pty-32",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2768966,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2768967,
+            "name": "herdr-pty-33",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2768973,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2768974,
+            "name": "herdr-pty-34",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2768982,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2768983,
+            "name": "herdr-pty-35",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2768996,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2768997,
+            "name": "herdr-pty-36",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769003,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769004,
+            "name": "herdr-pty-37",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769014,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769015,
+            "name": "herdr-pty-38",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769019,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769020,
+            "name": "herdr-pty-39",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769025,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769026,
+            "name": "herdr-pty-40",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769031,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769032,
+            "name": "herdr-pty-41",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769037,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769038,
+            "name": "herdr-pty-42",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769042,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769043,
+            "name": "herdr-pty-43",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769047,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769048,
+            "name": "herdr-pty-44",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769051,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769052,
+            "name": "herdr-pty-45",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769059,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769060,
+            "name": "herdr-pty-46",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769064,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769065,
+            "name": "herdr-pty-47",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769066,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769071,
+            "name": "herdr-pty-48",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769072,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769088,
+            "name": "herdr-pty-49",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769089,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769115,
+            "name": "herdr-pty-50",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769120,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769136,
+            "name": "herdr-pty-51",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769138,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769149,
+            "name": "herdr-pty-52",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769150,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769154,
+            "name": "herdr-pty-53",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769158,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769166,
+            "name": "herdr-pty-54",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769172,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769173,
+            "name": "herdr-pty-55",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769174,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769178,
+            "name": "herdr-pty-56",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769182,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769198,
+            "name": "herdr-pty-57",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769201,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769223,
+            "name": "herdr-pty-58",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769229,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769249,
+            "name": "herdr-pty-59",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769252,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769269,
+            "name": "herdr-pty-60",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769271,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769276,
+            "name": "herdr-pty-61",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769277,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769282,
+            "name": "herdr-pty-62",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769289,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769290,
+            "name": "herdr-pty-63",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769294,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769303,
+            "name": "herdr-pty-64",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769307,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769316,
+            "name": "herdr-pty-65",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769318,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769324,
+            "name": "herdr-pty-66",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769330,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769334,
+            "name": "herdr-pty-67",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769336,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769339,
+            "name": "herdr-pty-68",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769340,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769344,
+            "name": "herdr-pty-69",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769347,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769351,
+            "name": "herdr-pty-70",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769353,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769356,
+            "name": "herdr-pty-71",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769357,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769360,
+            "name": "herdr-pty-72",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769364,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769367,
+            "name": "herdr-pty-73",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769368,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769372,
+            "name": "herdr-pty-74",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769380,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769382,
+            "name": "herdr-pty-75",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769383,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769386,
+            "name": "herdr-pty-76",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769388,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769391,
+            "name": "herdr-pty-77",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769393,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769396,
+            "name": "herdr-pty-78",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769398,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769409,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769410,
+            "name": "herdr-pty-79",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769416,
+            "name": "herdr-pty-80",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769421,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769439,
+            "name": "herdr-pty-81",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769450,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769466,
+            "name": "herdr-pty-82",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769482,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769483,
+            "name": "herdr-pty-83",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769490,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769491,
+            "name": "herdr-pty-84",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769493,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769498,
+            "name": "herdr-pty-85",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769499,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769506,
+            "name": "herdr-pty-86",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769507,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769511,
+            "name": "herdr-pty-87",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769512,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769520,
+            "name": "herdr-pty-88",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769521,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769528,
+            "name": "herdr-pty-89",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769530,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769535,
+            "name": "herdr-pty-90",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769536,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769542,
+            "name": "herdr-pty-91",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769543,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769551,
+            "name": "herdr-pty-92",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769555,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769556,
+            "name": "herdr-pty-93",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769561,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769563,
+            "name": "herdr-pty-94",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769564,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769568,
+            "name": "herdr-pty-95",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769571,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769572,
+            "name": "herdr-pty-96",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769573,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769579,
+            "name": "herdr-pty-97",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769580,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769584,
+            "name": "herdr-pty-98",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769585,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769588,
+            "name": "herdr-pty-99",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769592,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769593,
+            "name": "herdr-pty-100",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769599,
+            "name": "herdr-final-rel",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2769600,
+            "name": "herdr-final-rel",
+            "cpu_ticks": 0
+          }
+        ],
+        "thread_snapshot_total_ticks": 483
+      },
+      {
+        "variant": "head-release",
+        "round": 3,
+        "server_pid": 2797737,
+        "client_pid": 2798537,
+        "workspaces": 100,
+        "attached_client_output_bytes": 27650,
+        "elapsed_s": 60.01881224801764,
+        "cpu_ticks": 499,
+        "server_cpu_percent_one_core": 8.314059897386281,
+        "server_fds": 320,
+        "thread_groups_ticks": {
+          "main": 2,
+          "herdr-final-rel": 12,
+          "tokio-rt-worker": 460,
+          "ctrl-c": 0,
+          "herdr-pty-1": 0,
+          "herdr-pty-2": 0,
+          "herdr-pty-3": 0,
+          "herdr-pty-4": 0,
+          "herdr-pty-5": 0,
+          "herdr-pty-6": 0,
+          "herdr-pty-7": 0,
+          "herdr-pty-8": 0,
+          "herdr-pty-9": 0,
+          "herdr-pty-10": 0,
+          "herdr-pty-11": 0,
+          "herdr-pty-12": 0,
+          "herdr-pty-13": 0,
+          "herdr-pty-14": 0,
+          "herdr-pty-15": 0,
+          "herdr-pty-16": 0,
+          "herdr-pty-17": 0,
+          "herdr-pty-18": 0,
+          "herdr-pty-19": 0,
+          "herdr-pty-20": 0,
+          "herdr-pty-21": 0,
+          "herdr-pty-22": 0,
+          "herdr-pty-23": 0,
+          "herdr-pty-24": 0,
+          "herdr-pty-25": 0,
+          "herdr-pty-26": 0,
+          "herdr-pty-27": 0,
+          "herdr-pty-28": 0,
+          "herdr-pty-29": 0,
+          "herdr-pty-30": 0,
+          "herdr-pty-31": 0,
+          "herdr-pty-32": 0,
+          "herdr-pty-33": 0,
+          "herdr-pty-34": 0,
+          "herdr-pty-35": 0,
+          "herdr-pty-36": 0,
+          "herdr-pty-37": 0,
+          "herdr-pty-38": 0,
+          "herdr-pty-39": 0,
+          "herdr-pty-40": 0,
+          "herdr-pty-41": 0,
+          "herdr-pty-42": 0,
+          "herdr-pty-43": 0,
+          "herdr-pty-44": 0,
+          "herdr-pty-45": 0,
+          "herdr-pty-46": 0,
+          "herdr-pty-47": 0,
+          "herdr-pty-48": 0,
+          "herdr-pty-49": 0,
+          "herdr-pty-50": 0,
+          "herdr-pty-51": 0,
+          "herdr-pty-52": 0,
+          "herdr-pty-53": 0,
+          "herdr-pty-54": 0,
+          "herdr-pty-55": 0,
+          "herdr-pty-56": 0,
+          "herdr-pty-57": 0,
+          "herdr-pty-58": 0,
+          "herdr-pty-59": 0,
+          "herdr-pty-60": 0,
+          "herdr-pty-61": 0,
+          "herdr-pty-62": 0,
+          "herdr-pty-63": 0,
+          "herdr-pty-64": 0,
+          "herdr-pty-65": 0,
+          "herdr-pty-66": 0,
+          "herdr-pty-67": 0,
+          "herdr-pty-68": 0,
+          "herdr-pty-69": 0,
+          "herdr-pty-70": 0,
+          "herdr-pty-71": 0,
+          "herdr-pty-72": 0,
+          "herdr-pty-73": 0,
+          "herdr-pty-74": 0,
+          "herdr-pty-75": 0,
+          "herdr-pty-76": 0,
+          "herdr-pty-77": 0,
+          "herdr-pty-78": 0,
+          "herdr-pty-79": 0,
+          "herdr-pty-80": 0,
+          "herdr-pty-81": 0,
+          "herdr-pty-82": 0,
+          "herdr-pty-83": 0,
+          "herdr-pty-84": 0,
+          "herdr-pty-85": 0,
+          "herdr-pty-86": 0,
+          "herdr-pty-87": 0,
+          "herdr-pty-88": 0,
+          "herdr-pty-89": 0,
+          "herdr-pty-90": 0,
+          "herdr-pty-91": 0,
+          "herdr-pty-92": 0,
+          "herdr-pty-93": 0,
+          "herdr-pty-94": 0,
+          "herdr-pty-95": 0,
+          "herdr-pty-96": 0,
+          "herdr-pty-97": 0,
+          "herdr-pty-98": 0,
+          "herdr-pty-99": 0,
+          "herdr-pty-100": 0,
+          "notify-rs inoti": 4
+        },
+        "thread_rows": [
+          {
+            "tid": 2797742,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 90
+          },
+          {
+            "tid": 2797740,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 89
+          },
+          {
+            "tid": 2797743,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 87
+          },
+          {
+            "tid": 2797746,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 85
+          },
+          {
+            "tid": 2797741,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 82
+          },
+          {
+            "tid": 2797745,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 27
+          },
+          {
+            "tid": 2797739,
+            "name": "herdr-final-rel",
+            "cpu_ticks": 12
+          },
+          {
+            "tid": 2798598,
+            "name": "notify-rs inoti",
+            "cpu_ticks": 4
+          },
+          {
+            "tid": 2797737,
+            "name": "herdr-final-rel",
+            "cpu_ticks": 2
+          },
+          {
+            "tid": 2797744,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797747,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797752,
+            "name": "ctrl-c",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797753,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797762,
+            "name": "herdr-pty-1",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797767,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797768,
+            "name": "herdr-pty-2",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797773,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797774,
+            "name": "herdr-pty-3",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797780,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797781,
+            "name": "herdr-pty-4",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797784,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797785,
+            "name": "herdr-pty-5",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797789,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797790,
+            "name": "herdr-pty-6",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797793,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797794,
+            "name": "herdr-pty-7",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797800,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797802,
+            "name": "herdr-pty-8",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797808,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797809,
+            "name": "herdr-pty-9",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797812,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797813,
+            "name": "herdr-pty-10",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797817,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797818,
+            "name": "herdr-pty-11",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797822,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797823,
+            "name": "herdr-pty-12",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797843,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797844,
+            "name": "herdr-pty-13",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797857,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797858,
+            "name": "herdr-pty-14",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797863,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797864,
+            "name": "herdr-pty-15",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797869,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797870,
+            "name": "herdr-pty-16",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797873,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797874,
+            "name": "herdr-pty-17",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797878,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797879,
+            "name": "herdr-pty-18",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797883,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797884,
+            "name": "herdr-pty-19",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797889,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797890,
+            "name": "herdr-pty-20",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797894,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797895,
+            "name": "herdr-pty-21",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797899,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797900,
+            "name": "herdr-pty-22",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797905,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797906,
+            "name": "herdr-pty-23",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797912,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797913,
+            "name": "herdr-pty-24",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797917,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797918,
+            "name": "herdr-pty-25",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797922,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797923,
+            "name": "herdr-pty-26",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797926,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797927,
+            "name": "herdr-pty-27",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797931,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797932,
+            "name": "herdr-pty-28",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797937,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797938,
+            "name": "herdr-pty-29",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797942,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797943,
+            "name": "herdr-pty-30",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797947,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797948,
+            "name": "herdr-pty-31",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797952,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797953,
+            "name": "herdr-pty-32",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797958,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797959,
+            "name": "herdr-pty-33",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797962,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797963,
+            "name": "herdr-pty-34",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797967,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797968,
+            "name": "herdr-pty-35",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797978,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797979,
+            "name": "herdr-pty-36",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797985,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797986,
+            "name": "herdr-pty-37",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797991,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797992,
+            "name": "herdr-pty-38",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797995,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2797996,
+            "name": "herdr-pty-39",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798000,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798001,
+            "name": "herdr-pty-40",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798005,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798006,
+            "name": "herdr-pty-41",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798009,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798010,
+            "name": "herdr-pty-42",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798013,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798014,
+            "name": "herdr-pty-43",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798033,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798034,
+            "name": "herdr-pty-44",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798062,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798063,
+            "name": "herdr-pty-45",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798082,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798083,
+            "name": "herdr-pty-46",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798088,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798089,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798090,
+            "name": "herdr-pty-47",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798113,
+            "name": "herdr-pty-48",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798117,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798122,
+            "name": "herdr-pty-49",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798123,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798127,
+            "name": "herdr-pty-50",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798146,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798150,
+            "name": "herdr-pty-51",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798151,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798164,
+            "name": "herdr-pty-52",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798165,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798168,
+            "name": "herdr-pty-53",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798170,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798175,
+            "name": "herdr-pty-54",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798176,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798183,
+            "name": "herdr-pty-55",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798185,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798206,
+            "name": "herdr-pty-56",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798208,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798217,
+            "name": "herdr-pty-57",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798218,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798221,
+            "name": "herdr-pty-58",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798222,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798226,
+            "name": "herdr-pty-59",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798227,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798232,
+            "name": "herdr-pty-60",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798234,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798237,
+            "name": "herdr-pty-61",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798238,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798242,
+            "name": "herdr-pty-62",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798245,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798246,
+            "name": "herdr-pty-63",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798249,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798252,
+            "name": "herdr-pty-64",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798253,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798256,
+            "name": "herdr-pty-65",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798257,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798261,
+            "name": "herdr-pty-66",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798262,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798265,
+            "name": "herdr-pty-67",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798266,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798272,
+            "name": "herdr-pty-68",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798273,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798276,
+            "name": "herdr-pty-69",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798280,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798281,
+            "name": "herdr-pty-70",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798282,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798285,
+            "name": "herdr-pty-71",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798289,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798290,
+            "name": "herdr-pty-72",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798291,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798303,
+            "name": "herdr-pty-73",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798322,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798327,
+            "name": "herdr-pty-74",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798328,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798351,
+            "name": "herdr-pty-75",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798352,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798364,
+            "name": "herdr-pty-76",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798365,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798371,
+            "name": "herdr-pty-77",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798375,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798376,
+            "name": "herdr-pty-78",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798377,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798384,
+            "name": "herdr-pty-79",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798385,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798390,
+            "name": "herdr-pty-80",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798394,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798395,
+            "name": "herdr-pty-81",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798398,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798399,
+            "name": "herdr-pty-82",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798404,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798405,
+            "name": "herdr-pty-83",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798406,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798409,
+            "name": "herdr-pty-84",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798410,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798413,
+            "name": "herdr-pty-85",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798415,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798419,
+            "name": "herdr-pty-86",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798421,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798423,
+            "name": "herdr-pty-87",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798425,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798430,
+            "name": "herdr-pty-88",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798431,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798434,
+            "name": "herdr-pty-89",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798437,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798439,
+            "name": "herdr-pty-90",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798441,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798453,
+            "name": "herdr-pty-91",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798460,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798471,
+            "name": "herdr-pty-92",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798477,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798479,
+            "name": "herdr-pty-93",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798481,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798490,
+            "name": "herdr-pty-94",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798499,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798512,
+            "name": "herdr-pty-95",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798513,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798516,
+            "name": "herdr-pty-96",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798519,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798521,
+            "name": "herdr-pty-97",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798522,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798525,
+            "name": "herdr-pty-98",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798527,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798530,
+            "name": "herdr-pty-99",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798532,
+            "name": "tokio-rt-worker",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798534,
+            "name": "herdr-pty-100",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798539,
+            "name": "herdr-final-rel",
+            "cpu_ticks": 0
+          },
+          {
+            "tid": 2798540,
+            "name": "herdr-final-rel",
+            "cpu_ticks": 0
+          }
+        ],
+        "thread_snapshot_total_ticks": 478
+      }
+    ]
+  }
+}
