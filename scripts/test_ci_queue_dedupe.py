@@ -459,21 +459,24 @@ class EvidenceTests(unittest.TestCase):
             self.assertFalse(any("pulls?" in c and parse_qs(urlsplit(c).query)["page"] == ["2"]
                                  for c in self.api.calls))
 
-    def test_distinct_queue_candidate_does_not_poison_exact_success(self):
+    def test_distinct_queue_candidate_after_success_is_not_traversed(self):
         second = deepcopy(self.api.queue)
         second["number"] = 101
+        second["head"]["sha"] = f"{9:040x}"
+        self.api.fail = "commits/" + second["head"]["sha"]
         self.api.prs.append(second)
         result = self.inspect()
         self.assertTrue(result["dedupe"], result)
         self.assertEqual(result["queue_pr"], 100)
-        self.assertIn("snapshot", result["candidates"][1]["reason"])
+        self.assertEqual(len(result["candidates"]), 1)
+        self.assertFalse(any(self.api.fail in call for call in self.api.calls))
 
     def test_older_distinct_cancelled_queue_head_does_not_poison_newer_success(self):
         old_head = f"{9:040x}"
         old_pr = deepcopy(self.api.queue)
         old_pr.update(number=99, created_at="2026-10-03T10:00:00Z")
         old_pr["head"].update(sha=old_head, ref="mergify/merge-queue/old")
-        self.api.prs.append(old_pr)
+        self.api.prs = [old_pr, self.api.queue]
         self.api.commits[old_head] = commit(old_head, (BEFORE,))
         old_run = deepcopy(self.api.run)
         old_run.update(id=6, head_sha=old_head, head_branch=old_pr["head"]["ref"],
@@ -483,7 +486,85 @@ class EvidenceTests(unittest.TestCase):
         result = self.inspect()
         self.assertTrue(result["dedupe"], result)
         self.assertEqual(result["queue_pr"], 100)
-        self.assertIn("not successful", result["candidates"][1]["reason"])
+        self.assertIn("not successful", result["candidates"][0]["reason"])
+
+    def crowded_queue(self):
+        """Thirty speculative trees, twenty dequeues, then three invalid requeues."""
+        candidates = []
+        for index in range(53):
+            number = 1000 + index
+            head_sha = f"{1000 + index:040x}"
+            candidate = deepcopy(self.api.queue)
+            candidate.update(number=number)
+            candidate["head"].update(
+                sha=head_sha,
+                ref=f"mergify/merge-queue/dequeued-{index}/pr-{number}",
+            )
+            self.api.commits[head_sha] = commit(
+                head_sha, (BEFORE,),
+                tree=TREE if index >= 30 and index != 51 else f"{2000 + index:040x}"
+            )
+            candidates.append(candidate)
+            if index < 30 or index == 51:
+                continue  # speculative heads never tested this tree.
+            run_id = 100 + index
+            run = deepcopy(self.api.run)
+            run.update(
+                id=run_id,
+                head_sha=head_sha,
+                head_branch=candidate["head"]["ref"],
+                created_at="2026-10-03T10:00:00Z",
+                updated_at="2026-10-03T11:00:00Z",
+                conclusion="failure" if index == 52 else "success" if index == 50 else "cancelled",
+            )
+            run["pull_requests"] = [{"number": number, "head": deepcopy(candidate["head"]),
+                                      "base": deepcopy(candidate["base"])}]
+            self.api.details[run_id] = run
+            jobs = deepcopy(self.api.jobs)
+            for job in jobs:
+                job["run_id"] = run_id
+                job["head_sha"] = head_sha
+            if index == 50:  # Missing required lane remains a hard failure past the old cap.
+                jobs = [job for job in jobs if job["name"] != "check (windows-latest)"]
+            self.api.attempts[(run_id, 1)] = jobs
+            self.api.head_runs = self.api.head_runs or {}
+            self.api.head_runs[head_sha] = [run]
+        self.api.prs = [*candidates, self.api.queue]
+        self.api.head_runs[HEAD] = self.api.runs
+
+    def test_queue_candidates_beyond_fifty_keep_fences_and_find_late_success(self):
+        self.crowded_queue()
+        result = self.inspect()
+        self.assertTrue(result["dedupe"], result)
+        self.assertEqual(result["queue_pr"], 100)
+        self.assertEqual(len(result["candidates"]), 54)
+        self.assertEqual(result["candidates"][50]["reason"],
+                         "missing or duplicate required job: check (windows-latest)")
+        self.assertEqual(result["candidates"][51]["reason"], "queue head tree mismatch")
+        self.assertIn("not successful", result["candidates"][52]["reason"])
+        self.assertEqual(len(result["candidates"][-1]["checkouts"]), 3)
+
+    def test_queue_candidates_beyond_fifty_without_complete_proof_fall_back(self):
+        for case in ["wrong tree", "latest failure", "missing lane"]:
+            with self.subTest(case=case):
+                self.api = FixtureApi()
+                self.crowded_queue()
+                if case == "wrong tree":
+                    self.api.commits[HEAD]["commit"]["tree"]["sha"] = BEFORE
+                    expected = "queue head tree mismatch"
+                elif case == "latest failure":
+                    newer = deepcopy(self.api.run)
+                    newer.update(id=8, created_at="2026-10-03T11:05:00Z", conclusion="failure")
+                    self.api.runs.append(newer)
+                    self.api.details[8] = newer
+                    expected = "latest queue CI run is not successful"
+                else:
+                    self.api.jobs[:] = [job for job in self.api.jobs
+                                        if job["name"] != "check (macos-latest)"]
+                    expected = "missing or duplicate required job: check (macos-latest)"
+                result = self.fallback()
+                self.assertEqual(len(result["candidates"]), 54)
+                self.assertEqual(result["candidates"][-1]["reason"], expected)
 
     def test_future_queue_draft_cannot_poison_premerge_proof(self):
         future = deepcopy(self.api.queue)
