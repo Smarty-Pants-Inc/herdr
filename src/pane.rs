@@ -1639,7 +1639,7 @@ fn truncate_handoff_history(history: String, max_bytes: usize) -> String {
 }
 
 fn pane_shell(configured_shell: &str) -> String {
-    pane_shell_from(configured_shell, std::env::var("SHELL").ok())
+    pane_shell_from(configured_shell, crate::environment::var("SHELL").ok())
 }
 
 fn pane_shell_from(configured_shell: &str, env_shell: Option<String>) -> String {

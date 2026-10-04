@@ -25,10 +25,12 @@ pub fn client_socket_path() -> PathBuf {
         return crate::session::client_socket_path_for(crate::session::active_name().as_deref());
     }
     client_socket_path_from_overrides(
-        std::env::var(crate::api::SOCKET_PATH_ENV_VAR)
+        crate::environment::var(crate::api::SOCKET_PATH_ENV_VAR)
             .ok()
             .as_deref(),
-        std::env::var(CLIENT_SOCKET_PATH_ENV_VAR).ok().as_deref(),
+        crate::environment::var(CLIENT_SOCKET_PATH_ENV_VAR)
+            .ok()
+            .as_deref(),
     )
 }
 
@@ -104,7 +106,8 @@ mod tests {
 
     #[test]
     fn client_socket_path_defaults_to_config_dir() {
-        std::env::remove_var(crate::session::SESSION_ENV_VAR);
+        let env = crate::environment::test_env();
+        env.remove(crate::session::SESSION_ENV_VAR);
         crate::session::clear_explicit_session_for_test();
         let path = client_socket_path_from_overrides(None, None);
         assert_eq!(path, crate::config::config_dir().join("herdr-client.sock"));

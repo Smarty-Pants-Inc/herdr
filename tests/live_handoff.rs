@@ -447,6 +447,8 @@ fn wait_for_pid_marker(path: &Path, timeout: Duration) -> u32 {
 
 #[test]
 fn pid_marker_waits_for_complete_line() {
+    // Caught panics still run the cleanup hook; exclude active server fixtures.
+    let _guard = test_lock();
     let base = unique_test_dir();
     fs::create_dir_all(&base).unwrap();
     let marker = base.join("child.pid");
