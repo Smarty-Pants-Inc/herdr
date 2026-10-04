@@ -3775,25 +3775,24 @@ fn try_accept_ready_client_connections(
     server_event_tx: &mpsc::Sender<ServerEvent>,
     handoff_in_progress: bool,
 ) -> io::Result<()> {
-    match readiness.try_io(tokio::io::Interest::READABLE, |_| {
-        accept_pending_client_connections_with(
-            || {
+    accept_pending_client_connections_with(
+        || {
+            // Keep each accept inside try_io so a drained listener clears the
+            // reactor readiness. Wrapping the whole drain would leave stale
+            // readiness after its inner WouldBlock is consumed.
+            readiness.try_io(tokio::io::Interest::READABLE, |_| {
                 #[cfg(test)]
                 if let Some(err) = injected_client_accept_error() {
                     return Err(err);
                 }
                 listener.accept()
-            },
-            next_client_id,
-            should_quit,
-            server_event_tx,
-            handoff_in_progress,
-        )
-    }) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == io::ErrorKind::WouldBlock => Ok(()),
-        Err(err) => Err(err),
-    }
+            })
+        },
+        next_client_id,
+        should_quit,
+        server_event_tx,
+        handoff_in_progress,
+    )
 }
 
 /// Waits without a timer, then drains accepts until WouldBlock clears readiness.
