@@ -654,13 +654,151 @@ mod shared_ssh_tests {
     }
 }
 
+/// Recover a legacy handoff root only when the transferred PTY itself binds it
+/// to the same live session-leader instance. Unsupported master queries decline
+/// attribution; a bare PID is never sufficient evidence.
+pub(crate) fn process_identity_for_pty(
+    child_pid: u32,
+    master_fd: std::os::fd::RawFd,
+) -> Option<crate::platform::ProcessIdentity> {
+    let identity = crate::platform::process_identity(child_pid)?;
+    let pid = libc::pid_t::try_from(child_pid)
+        .ok()
+        .filter(|pid| *pid > 0)?;
+    observe_pty_identity(
+        identity,
+        || {
+            // SAFETY: tcgetsid reads the session owner of this borrowed PTY fd.
+            let sid = unsafe { libc::tcgetsid(master_fd) };
+            // SAFETY: getsid reads the current instance's session leadership.
+            if unsafe { libc::getsid(pid) } != pid {
+                return None;
+            }
+            u32::try_from(sid).ok().filter(|sid| *sid > 0)
+        },
+        crate::platform::process_identity,
+    )
+}
+
+fn observe_pty_identity(
+    identity: crate::platform::ProcessIdentity,
+    session_owner: impl FnOnce() -> Option<u32>,
+    identity_of: impl Fn(u32) -> Option<crate::platform::ProcessIdentity>,
+) -> Option<crate::platform::ProcessIdentity> {
+    if identity_of(identity.pid) != Some(identity) {
+        return None;
+    }
+    let owner = session_owner()?;
+    (owner == identity.pid && identity_of(identity.pid) == Some(identity)).then_some(identity)
+}
+
+#[cfg(test)]
+mod pty_identity_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn legacy_pty_pin_checks_real_master_duplicate_mismatch_and_exit() {
+        use std::io::Write;
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        let pair = portable_pty::native_pty_system()
+            .openpty(portable_pty::PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("real PTY");
+        let mut command = portable_pty::CommandBuilder::new("sh");
+        command.args(["-c", "read line"]);
+        let mut child = pair.slave.spawn_command(command).expect("PTY root");
+        let pid = child.process_id().expect("root PID");
+        let original = crate::platform::process_identity(pid).expect("live root identity");
+        let master = pair.master.as_raw_fd().expect("master FD");
+        let duplicate = unsafe { libc::dup(master) };
+        assert!(duplicate >= 0);
+        // SAFETY: dup returned a new descriptor owned only by this fixture.
+        let duplicate = unsafe { OwnedFd::from_raw_fd(duplicate) };
+        assert_eq!(process_identity_for_pty(pid, master), Some(original));
+        assert_eq!(
+            process_identity_for_pty(pid, duplicate.as_raw_fd()),
+            Some(original)
+        );
+        assert_eq!(process_identity_for_pty(std::process::id(), master), None);
+        let mut writer = pair.master.take_writer().expect("PTY writer");
+        writer.write_all(b"\n").expect("release owned PTY root");
+        child.wait().expect("reap root");
+        assert_eq!(process_identity_for_pty(pid, master), None);
+    }
+
+    #[test]
+    fn legacy_pty_pin_requires_matching_live_session_owner() {
+        let root = crate::platform::ProcessIdentity {
+            pid: 100,
+            start_time: 10,
+        };
+        assert_eq!(
+            observe_pty_identity(root, || Some(root.pid), |_| Some(root)),
+            Some(root)
+        );
+        assert_eq!(
+            observe_pty_identity(root, || Some(200), |_| Some(root)),
+            None
+        );
+        assert_eq!(observe_pty_identity(root, || None, |_| Some(root)), None);
+        assert_eq!(
+            observe_pty_identity(
+                root,
+                || panic!("exited root must not reach fd query"),
+                |_| None
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn legacy_pty_pin_rejects_root_swap_or_exit_across_fd_query() {
+        let root = crate::platform::ProcessIdentity {
+            pid: 100,
+            start_time: 10,
+        };
+        for replacement in [
+            None,
+            Some(crate::platform::ProcessIdentity {
+                start_time: 20,
+                ..root
+            }),
+        ] {
+            let current = Cell::new(Some(root));
+            assert_eq!(
+                observe_pty_identity(
+                    root,
+                    || {
+                        current.set(replacement);
+                        Some(root.pid)
+                    },
+                    |_| current.get()
+                ),
+                None
+            );
+        }
+    }
+}
+
 /// Whether `pid` runs in the POSIX session that the pane child `child_pid` leads.
 /// A process gone or unreadable is not in the session.
+#[cfg(test)]
 pub(crate) fn process_in_pane_session(child_pid: u32, pid: u32) -> bool {
+    process_in_pane_session_checked(child_pid, pid).unwrap_or(false)
+}
+
+/// Unlike the discovery predicate, policy must retain failed OS observations.
+pub(crate) fn process_in_pane_session_checked(child_pid: u32, pid: u32) -> Option<bool> {
     let session_id = |pid: u32| {
         let pid = libc::pid_t::try_from(pid).ok().filter(|pid| *pid > 0)?;
         let sid = unsafe { libc::getsid(pid) };
         (sid > 0).then_some(sid)
     };
-    session_id(child_pid).is_some_and(|pane| session_id(pid) == Some(pane))
+    Some(session_id(child_pid)? == session_id(pid)?)
 }

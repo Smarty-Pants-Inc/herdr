@@ -58,6 +58,14 @@ pub struct ForegroundJob {
     pub processes: Vec<ForegroundProcess>,
 }
 
+/// Stable identity for a process instance. PIDs can be reused after a process exits;
+/// the start time makes ancestry transitions reject a reused PID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProcessIdentity {
+    pub(crate) pid: u32,
+    pub(crate) start_time: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Signal {
     Hangup,
@@ -89,9 +97,635 @@ impl ChildExitReason {
 
 #[cfg(unix)]
 pub(crate) use unix_common::{
-    classify_child_exit, poll_fd_readable, process_in_pane_session, read_fd,
+    classify_child_exit, poll_fd_readable, process_identity_for_pty, read_fd,
     shared_ssh_control_path,
 };
+
+#[cfg(all(unix, test))]
+pub(crate) use unix_common::process_in_pane_session;
+
+/// Capture process metadata across two checks of the transport's liveness
+/// primitive (native pidfd/audit token, or connected socket for the older Linux
+/// credential fallback), never a newly opened numeric PID handle.
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn capture_bound_peer_identity(
+    original_alive: impl Fn() -> bool,
+    identity_now: impl FnOnce() -> Option<ProcessIdentity>,
+) -> Option<ProcessIdentity> {
+    if !original_alive() {
+        return None;
+    }
+    let identity = identity_now()?;
+    original_alive().then_some(identity)
+}
+
+/// Whether checked pane membership validates ancestry itself, including the full
+/// chain to a process-tree root for a negative result. POSIX session membership
+/// does not cover detached descendants and needs a separate ancestor walk.
+pub(crate) fn checked_membership_covers_ancestry() -> bool {
+    #[cfg(test)]
+    if let Some(covers) = TEST_MEMBERSHIP_ANCESTRY.with(|value| value.get()) {
+        return covers;
+    }
+    cfg!(windows)
+}
+
+/// Accept-time pane provenance is a restriction, not an identity or authorization
+/// token. A marker never binds a public pane ID to its current terminal owner.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum PeerPaneOrigin {
+    Absent,
+    HasPane,
+    #[default]
+    Unknown,
+}
+
+pub(crate) fn process_initial_pane_origin(peer: ProcessIdentity) -> PeerPaneOrigin {
+    if process_identity(peer.pid) != Some(peer) {
+        return PeerPaneOrigin::Unknown;
+    }
+    let environment = process_initial_environment(peer);
+    if process_identity(peer.pid) != Some(peer) {
+        return PeerPaneOrigin::Unknown;
+    }
+    environment
+        .as_deref()
+        .map_or(PeerPaneOrigin::Unknown, pane_origin_from_environment)
+}
+
+fn process_initial_environment(peer: ProcessIdentity) -> Option<Vec<(String, String)>> {
+    #[cfg(target_os = "linux")]
+    return linux::process_initial_environment(peer);
+    #[cfg(target_os = "macos")]
+    return macos::process_initial_environment(peer);
+    #[cfg(windows)]
+    return windows::process_initial_environment(peer);
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    {
+        let _ = peer;
+        None
+    }
+}
+
+/// Missing both markers is readable absence. Partial, duplicated, or malformed
+/// markers cannot be used as proof of ordinary origin. Platform readers must
+/// return None for an unreadable or incomplete environment, not an empty list.
+fn pane_origin_from_environment(environment: &[(String, String)]) -> PeerPaneOrigin {
+    let mut herdr_env = None;
+    let mut pane_id = None;
+    for (key, value) in environment {
+        let slot = match key.as_str() {
+            "HERDR_ENV" => &mut herdr_env,
+            "HERDR_PANE_ID" => &mut pane_id,
+            _ => continue,
+        };
+        if slot.replace(value.as_str()).is_some() {
+            return PeerPaneOrigin::Unknown;
+        }
+    }
+    match (herdr_env, pane_id) {
+        (None, None) => PeerPaneOrigin::Absent,
+        (Some("1"), Some(pane)) if valid_pane_marker(pane.as_bytes()) => PeerPaneOrigin::HasPane,
+        _ => PeerPaneOrigin::Unknown,
+    }
+}
+
+fn valid_pane_marker(pane: &[u8]) -> bool {
+    let Ok(pane) = std::str::from_utf8(pane) else {
+        return false;
+    };
+    let Some((workspace, pane)) = pane.split_once(":p") else {
+        return false;
+    };
+    let Some(workspace) = workspace.strip_prefix('w') else {
+        return false;
+    };
+    !workspace.is_empty()
+        && !pane.is_empty()
+        && workspace.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        && pane.bytes().all(|byte| byte.is_ascii_alphanumeric())
+}
+
+/// Windows can prove a process is outside this server's descendants before pane
+/// roots are inspected. Other platforms keep their existing attribution path.
+// Individual variants are constructed only by their applicable platform (or tests).
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ServerAncestry {
+    NotApplicable,
+    ReachedServer,
+    Outside,
+    Unknown,
+}
+
+pub(crate) fn process_identity_server_ancestry(peer: ProcessIdentity) -> ServerAncestry {
+    #[cfg(test)]
+    if let Some((expected, observation)) = TEST_SERVER_ANCESTRY.with(|value| value.get()) {
+        if peer == expected {
+            return if process_identity(peer.pid) == Some(peer) {
+                observation
+            } else {
+                ServerAncestry::Unknown
+            };
+        }
+    }
+    #[cfg(windows)]
+    return server_ancestry_observation(windows::process_identity_outside_server_ancestry(peer));
+    #[cfg(not(windows))]
+    {
+        let _ = peer;
+        ServerAncestry::NotApplicable
+    }
+}
+
+#[cfg(any(windows, test))]
+fn server_ancestry_observation(observation: Option<bool>) -> ServerAncestry {
+    match observation {
+        Some(true) => ServerAncestry::Outside,
+        Some(false) => ServerAncestry::ReachedServer,
+        None => ServerAncestry::Unknown,
+    }
+}
+
+/// Identity-aware boundary around the numeric OS session observation.
+pub(crate) fn process_identity_in_pane_session(
+    root: ProcessIdentity,
+    peer: ProcessIdentity,
+) -> Option<bool> {
+    #[cfg(test)]
+    if let Some(observation) = TEST_MEMBERSHIP.with(|value| value.get()) {
+        return observe_pane_session(root, peer, process_identity, |_, _| observation);
+    }
+    #[cfg(unix)]
+    return observe_pane_session(
+        root,
+        peer,
+        process_identity,
+        unix_common::process_in_pane_session_checked,
+    );
+    #[cfg(windows)]
+    return observe_pane_session(root, peer, process_identity, |_, _| {
+        windows::process_identity_in_pane_session_checked(root, peer)
+    });
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (root, peer);
+        None
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_MEMBERSHIP: std::cell::Cell<Option<Option<bool>>> = const { std::cell::Cell::new(None) };
+    static TEST_MEMBERSHIP_ANCESTRY: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    static TEST_SERVER_ANCESTRY: std::cell::Cell<Option<(ProcessIdentity, ServerAncestry)>> = const { std::cell::Cell::new(None) };
+}
+
+/// Peer-keyed, thread-local OS-observation seam; never changes other callers or
+/// bypasses live endpoint checks. Drop restores the prior observation on panic.
+#[cfg(test)]
+pub(crate) fn with_server_ancestry_for_test<T>(
+    peer: ProcessIdentity,
+    observation: Option<bool>,
+    run: impl FnOnce() -> T,
+) -> T {
+    struct Reset(Option<(ProcessIdentity, ServerAncestry)>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_SERVER_ANCESTRY.with(|value| value.set(self.0));
+        }
+    }
+    let _reset = Reset(
+        TEST_SERVER_ANCESTRY
+            .with(|value| value.replace(Some((peer, server_ancestry_observation(observation))))),
+    );
+    run()
+}
+
+#[cfg(all(windows, test))]
+pub(crate) use windows::test_outside_server_ancestry_sequence;
+
+/// Scoped OS-observation seam: still runs endpoint checks and the actual app guard.
+#[cfg(test)]
+pub(crate) fn with_checked_membership_for_test<T>(
+    observation: Option<bool>,
+    run: impl FnOnce() -> T,
+) -> T {
+    struct Reset(Option<Option<bool>>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_MEMBERSHIP.with(|value| value.set(self.0));
+        }
+    }
+    let _reset = Reset(TEST_MEMBERSHIP.with(|value| value.replace(Some(observation))));
+    run()
+}
+
+/// Exercise the Windows complete-ancestry policy on any host, without bypassing
+/// endpoint validation or the real app guard. Observations remain explicitly scoped.
+#[cfg(test)]
+pub(crate) fn with_ancestry_membership_for_test<T>(
+    observation: Option<bool>,
+    run: impl FnOnce() -> T,
+) -> T {
+    struct Reset(Option<bool>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_MEMBERSHIP_ANCESTRY.with(|value| value.set(self.0));
+        }
+    }
+    let _reset = Reset(TEST_MEMBERSHIP_ANCESTRY.with(|value| value.replace(Some(true))));
+    with_checked_membership_for_test(observation, run)
+}
+
+#[cfg(any(unix, windows, test))]
+fn observe_pane_session(
+    root: ProcessIdentity,
+    peer: ProcessIdentity,
+    identity_of: impl Fn(u32) -> Option<ProcessIdentity>,
+    membership: impl FnOnce(u32, u32) -> Option<bool>,
+) -> Option<bool> {
+    if identity_of(peer.pid) != Some(peer) || identity_of(root.pid) != Some(root) {
+        return None;
+    }
+    let belongs = membership(root.pid, peer.pid)?;
+    // The OS observation reopens numeric PIDs. Never accept its answer for a
+    // replacement instance, including a successful hit that ends the ancestor walk.
+    (identity_of(peer.pid) == Some(peer) && identity_of(root.pid) == Some(root)).then_some(belongs)
+}
+
+/// Validate a parent link read together with the child's instance identity.
+/// Shared by the Unix implementations; an exited/reused endpoint ends the walk.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn checked_parent_process_identity(
+    child: ProcessIdentity,
+    observed_child: ProcessIdentity,
+    parent_pid: u32,
+) -> Option<ProcessIdentity> {
+    observe_parent_identity(child, observed_child, parent_pid, process_identity)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn observe_parent_identity(
+    child: ProcessIdentity,
+    observed_child: ProcessIdentity,
+    parent_pid: u32,
+    identity_of: impl Fn(u32) -> Option<ProcessIdentity>,
+) -> Option<ProcessIdentity> {
+    if child != observed_child {
+        return None;
+    }
+    let parent = identity_of(parent_pid)?;
+    (parent.start_time <= child.start_time
+        && identity_of(child.pid) == Some(child)
+        && identity_of(parent.pid) == Some(parent))
+    .then_some(parent)
+}
+
+#[cfg(test)]
+mod pane_origin_tests {
+    use super::*;
+
+    #[test]
+    fn marker_presence_distinguishes_readable_absence_from_malformed_markers() {
+        let pairs = |values: &[(&str, &str)]| {
+            values
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect::<Vec<_>>()
+        };
+        for values in [vec![], vec![("PATH", "/bin")]] {
+            assert_eq!(
+                pane_origin_from_environment(&pairs(&values)),
+                PeerPaneOrigin::Absent
+            );
+        }
+        assert_eq!(
+            pane_origin_from_environment(&pairs(&[
+                ("HERDR_ENV", "1"),
+                ("HERDR_PANE_ID", "w9V:p1")
+            ])),
+            PeerPaneOrigin::HasPane
+        );
+        for values in [
+            vec![("HERDR_ENV", "1")],
+            vec![("HERDR_PANE_ID", "w9V:p1")],
+            vec![("HERDR_ENV", "0"), ("HERDR_PANE_ID", "w9V:p1")],
+            vec![("HERDR_ENV", "1"), ("HERDR_PANE_ID", "")],
+            vec![("HERDR_ENV", "1"), ("HERDR_PANE_ID", "not-a-pane")],
+            vec![
+                ("HERDR_ENV", "1"),
+                ("HERDR_ENV", "1"),
+                ("HERDR_PANE_ID", "w9V:p1"),
+            ],
+        ] {
+            assert_eq!(
+                pane_origin_from_environment(&pairs(&values)),
+                PeerPaneOrigin::Unknown
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_process_marker_capture_is_unknown_not_readable_absence() {
+        assert_eq!(
+            process_initial_pane_origin(ProcessIdentity {
+                pid: 0,
+                start_time: 0
+            }),
+            PeerPaneOrigin::Unknown
+        );
+    }
+
+    #[test]
+    fn scoped_server_observation_is_peer_keyed_and_restores_after_panic() {
+        let peer = process_identity(std::process::id()).expect("test process");
+        let other = ProcessIdentity {
+            start_time: peer.start_time.saturating_add(1),
+            ..peer
+        };
+        let before = process_identity_server_ancestry(peer);
+        let panic = std::panic::catch_unwind(|| {
+            with_server_ancestry_for_test(peer, Some(true), || {
+                assert_eq!(
+                    process_identity_server_ancestry(peer),
+                    ServerAncestry::Outside
+                );
+                assert_ne!(
+                    process_identity_server_ancestry(other),
+                    ServerAncestry::Outside
+                );
+                panic!("exercise restoration");
+            });
+        });
+        assert!(panic.is_err());
+        assert_eq!(process_identity_server_ancestry(peer), before);
+    }
+}
+
+#[cfg(test)]
+mod membership_identity_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn original_generation_liveness_rejects_numeric_peer_replacement() {
+        let alive = Cell::new(true);
+        let replacement = ProcessIdentity {
+            pid: 100,
+            start_time: 30,
+        };
+        assert_eq!(
+            capture_bound_peer_identity(
+                || alive.get(),
+                || {
+                    alive.set(false);
+                    Some(replacement)
+                }
+            ),
+            None
+        );
+        assert_eq!(
+            capture_bound_peer_identity(
+                || false,
+                || panic!("dead original must not inspect a numeric replacement")
+            ),
+            None
+        );
+        assert_eq!(
+            capture_bound_peer_identity(|| true, || Some(replacement)),
+            Some(replacement)
+        );
+    }
+
+    #[test]
+    fn session_observation_rejects_root_swap_and_exited_endpoints() {
+        let root = ProcessIdentity {
+            pid: 100,
+            start_time: 10,
+        };
+        let peer = ProcessIdentity {
+            pid: 200,
+            start_time: 20,
+        };
+        for changed in [root, peer] {
+            for replacement in [
+                None,
+                Some(ProcessIdentity {
+                    start_time: 30,
+                    ..changed
+                }),
+            ] {
+                let current = Cell::new(Some(changed));
+                assert_eq!(
+                    observe_pane_session(
+                        root,
+                        peer,
+                        |pid| if pid == changed.pid {
+                            current.get()
+                        } else if pid == root.pid {
+                            Some(root)
+                        } else {
+                            Some(peer)
+                        },
+                        |_, _| {
+                            current.set(replacement);
+                            Some(true)
+                        },
+                    ),
+                    None
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn failed_session_observation_is_not_a_negative_match() {
+        let peer = ProcessIdentity {
+            pid: 200,
+            start_time: 20,
+        };
+        let root = ProcessIdentity {
+            pid: 100,
+            start_time: 10,
+        };
+        assert_eq!(
+            observe_pane_session(
+                root,
+                peer,
+                |pid| Some(if pid == root.pid { root } else { peer }),
+                |_, _| None
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn session_observation_accepts_only_stable_pinned_instances() {
+        let root = ProcessIdentity {
+            pid: 100,
+            start_time: 10,
+        };
+        let peer = ProcessIdentity {
+            pid: 200,
+            start_time: 20,
+        };
+        for belongs in [false, true] {
+            assert_eq!(
+                observe_pane_session(
+                    root,
+                    peer,
+                    |pid| if pid == root.pid {
+                        Some(root)
+                    } else {
+                        Some(peer)
+                    },
+                    |_, _| Some(belongs)
+                ),
+                Some(belongs)
+            );
+        }
+        assert_eq!(
+            observe_pane_session(
+                root,
+                peer,
+                |pid| if pid == root.pid {
+                    Some(root)
+                } else {
+                    Some(ProcessIdentity {
+                        start_time: 30,
+                        ..peer
+                    })
+                },
+                |_, _| panic!("reused peer must not reach OS observation")
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn parent_link_rejects_reused_exited_and_younger_instances() {
+        let child = ProcessIdentity {
+            pid: 200,
+            start_time: 20,
+        };
+        let parent = ProcessIdentity {
+            pid: 100,
+            start_time: 10,
+        };
+        for replacement in [
+            None,
+            Some(ProcessIdentity {
+                start_time: 30,
+                ..parent
+            }),
+        ] {
+            let reads = Cell::new(0);
+            assert_eq!(
+                observe_parent_identity(child, child, parent.pid, |pid| {
+                    if pid == child.pid {
+                        return Some(child);
+                    }
+                    let count = reads.get();
+                    reads.set(count + 1);
+                    if count == 0 {
+                        Some(parent)
+                    } else {
+                        replacement
+                    }
+                }),
+                None
+            );
+        }
+        assert_eq!(
+            observe_parent_identity(child, child, parent.pid, |pid| if pid == child.pid {
+                None
+            } else {
+                Some(parent)
+            }),
+            None
+        );
+        assert_eq!(
+            observe_parent_identity(child, child, parent.pid, |pid| if pid == child.pid {
+                Some(child)
+            } else {
+                Some(ProcessIdentity {
+                    start_time: 30,
+                    ..parent
+                })
+            }),
+            None
+        );
+        assert_eq!(
+            observe_parent_identity(child, child, parent.pid, |pid| if pid == child.pid {
+                Some(child)
+            } else {
+                Some(parent)
+            }),
+            Some(parent)
+        );
+        assert_eq!(
+            observe_parent_identity(
+                child,
+                ProcessIdentity {
+                    start_time: 30,
+                    ..child
+                },
+                parent.pid,
+                |_| panic!("replacement child snapshot must stop the transition")
+            ),
+            None
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn live_parent_link_preserves_instance_and_rejects_stale_child() {
+        let child = process_identity(std::process::id()).expect("live child");
+        // SAFETY: getppid only reads the calling process's parent PID.
+        let parent_pid = unsafe { libc::getppid() } as u32;
+        let parent = parent_process_identity(child).expect("live parent link");
+        assert_eq!(parent.pid, parent_pid);
+        assert_eq!(process_identity(parent_pid), Some(parent));
+        assert!(parent_process_identity(ProcessIdentity {
+            start_time: child.start_time.wrapping_add(1),
+            ..child
+        })
+        .is_none());
+    }
+
+    #[test]
+    fn session_observation_rejects_peer_swap_after_precheck() {
+        let root = ProcessIdentity {
+            pid: 100,
+            start_time: 10,
+        };
+        let peer = ProcessIdentity {
+            pid: 200,
+            start_time: 20,
+        };
+        let current = Cell::new(Some(peer));
+        assert_eq!(
+            observe_pane_session(
+                root,
+                peer,
+                |pid| if pid == root.pid {
+                    Some(root)
+                } else {
+                    current.get()
+                },
+                |_, _| {
+                    current.set(Some(ProcessIdentity {
+                        start_time: 30,
+                        ..peer
+                    }));
+                    Some(true)
+                },
+            ),
+            None
+        );
+    }
+}
 
 /// Registers a Unix local listener with Tokio's native readiness reactor
 /// (epoll on Linux, kqueue on macOS), without taking ownership of the listener.
@@ -105,12 +739,6 @@ pub(crate) fn local_listener_readiness(
     let crate::ipc::LocalListener::UdSocket(listener) = listener;
     let fd = listener.as_fd().try_clone_to_owned()?;
     tokio::io::unix::AsyncFd::with_interest(fd, tokio::io::Interest::READABLE)
-}
-
-/// Whether `pid` belongs to the process tree of the pane child `child_pid`.
-#[cfg(not(unix))]
-pub(crate) fn process_in_pane_session(child_pid: u32, pid: u32) -> bool {
-    child_pid == pid || session_processes(child_pid).contains(&pid)
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -211,9 +839,27 @@ pub(crate) fn terminal_grid_size() -> std::io::Result<(u16, u16)> {
     Ok((cols, rows))
 }
 
+/// Capture a process instance once at local-transport acceptance. Linux prefers
+/// a native socket-bound pidfd and falls back to connected-socket SO_PEERCRED plus
+/// a start-time pin. Missing/invalid evidence remains None and policy refuses it.
+#[cfg(unix)]
+pub(crate) fn local_socket_peer_identity(fd: std::os::fd::RawFd) -> Option<ProcessIdentity> {
+    #[cfg(target_os = "linux")]
+    return linux::local_socket_peer_identity_platform(fd);
+
+    #[cfg(target_os = "macos")]
+    return macos::local_socket_peer_identity_platform(fd);
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = fd;
+        None
+    }
+}
+
 /// Returns the PID connected to a Unix-domain socket when the platform exposes
 /// it. Unsupported or unavailable attribution deliberately returns `None`.
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 pub(crate) fn local_socket_peer_pid(fd: std::os::fd::RawFd) -> Option<u32> {
     #[cfg(target_os = "linux")]
     return linux::local_socket_peer_pid_platform(fd);

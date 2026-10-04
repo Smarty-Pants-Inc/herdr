@@ -172,6 +172,71 @@ pub(crate) fn write_config_temporary(
     output.sync_all()
 }
 
+// Exact opaque ABI from the Darwin SDK mach/message.h. Never interpret fields.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct AuditToken {
+    val: [libc::c_uint; 8],
+}
+
+// Exact Darwin libproc.h ABI. Resolve optionally so pre-macOS-11 systems
+// decline attribution rather than failing to load the binary.
+type AuditTokenPathQuery =
+    unsafe extern "C" fn(*mut AuditToken, *mut libc::c_void, u32) -> libc::c_int;
+
+fn audit_token_path_query() -> Option<AuditTokenPathQuery> {
+    static QUERY: OnceLock<Option<AuditTokenPathQuery>> = OnceLock::new();
+    *QUERY.get_or_init(|| {
+        // SAFETY: the symbol name is NUL-terminated; RTLD_DEFAULT searches the
+        // existing native libraries. No new library or process is opened.
+        let symbol =
+            unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"proc_pidpath_audittoken".as_ptr()) };
+        if symbol.is_null() {
+            return None;
+        }
+        // SAFETY: the SDK declares this exact native function-pointer ABI.
+        Some(unsafe { std::mem::transmute::<*mut libc::c_void, AuditTokenPathQuery>(symbol) })
+    })
+}
+
+/// LOCAL_PEERTOKEN retains the original generation. The native audit-token
+/// query checks that generation before/after the numeric start-time lookup;
+/// its path output is discarded and never used for policy or identity.
+pub(super) fn local_socket_peer_identity_platform(fd: RawFd) -> Option<super::ProcessIdentity> {
+    let query = audit_token_path_query()?;
+    let mut token = AuditToken { val: [0; 8] };
+    let mut len = std::mem::size_of::<AuditToken>() as libc::socklen_t;
+    // SAFETY: getsockopt writes into the exact-size opaque audit-token buffer.
+    let status = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERTOKEN,
+            (&mut token as *mut AuditToken).cast(),
+            &mut len,
+        )
+    };
+    if status != 0 || len != std::mem::size_of::<AuditToken>() as libc::socklen_t {
+        return None;
+    }
+    super::capture_bound_peer_identity(
+        || {
+            let mut original_token = token;
+            let mut path = [0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+            // SAFETY: native libproc receives the kernel-provided opaque token
+            // and a valid writable output buffer. Failure means no attribution.
+            unsafe {
+                query(
+                    &mut original_token,
+                    path.as_mut_ptr().cast(),
+                    path.len() as u32,
+                ) > 0
+            }
+        },
+        || process_identity(local_socket_peer_pid_platform(fd)?),
+    )
+}
+
 pub(super) fn local_socket_peer_pid_platform(fd: RawFd) -> Option<u32> {
     let mut pid: libc::pid_t = 0;
     let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
@@ -930,9 +995,34 @@ fn run_clipboard_command(command: &ClipboardCommand, bytes: &[u8]) -> bool {
     child.wait().map(|status| status.success()).unwrap_or(false)
 }
 
-/// The parent of `pid`, from `proc_pidinfo`. A process gone or unreadable has none.
-pub fn parent_process_id(pid: u32) -> Option<u32> {
-    process_bsdinfo(pid).map(|info| info.pbi_ppid)
+pub(crate) fn process_identity(pid: u32) -> Option<crate::platform::ProcessIdentity> {
+    let info = process_bsdinfo(pid)?;
+    if info.pbi_status == libc::SZOMB {
+        return None;
+    }
+    let start_time = info
+        .pbi_start_tvsec
+        .checked_mul(1_000_000)?
+        .checked_add(info.pbi_start_tvusec)?;
+    Some(crate::platform::ProcessIdentity { pid, start_time })
+}
+
+pub(crate) fn parent_process_identity(
+    identity: crate::platform::ProcessIdentity,
+) -> Option<crate::platform::ProcessIdentity> {
+    let info = process_bsdinfo(identity.pid)?;
+    let start_time = info
+        .pbi_start_tvsec
+        .checked_mul(1_000_000)?
+        .checked_add(info.pbi_start_tvusec)?;
+    crate::platform::checked_parent_process_identity(
+        identity,
+        crate::platform::ProcessIdentity {
+            pid: identity.pid,
+            start_time,
+        },
+        info.pbi_ppid,
+    )
 }
 
 fn process_bsdinfo(pid: u32) -> Option<libc::proc_bsdinfo> {
@@ -969,6 +1059,47 @@ fn comm_from_bsdinfo(info: &libc::proc_bsdinfo) -> Option<String> {
 fn process_argv(pid: u32) -> Option<Vec<String>> {
     let buf = kern_procargs2(pid)?;
     procargs2_argv(&buf)
+}
+
+/// Capture the peer's initial environment while its process instance remains pinned.
+/// A failed or malformed environment is unknown; an empty readable environment is absence.
+pub(crate) fn process_initial_environment(
+    peer: super::ProcessIdentity,
+) -> Option<Vec<(String, String)>> {
+    if peer.pid == 0 || super::process_identity(peer.pid) != Some(peer) {
+        return None;
+    }
+    let buffer = kern_procargs2(peer.pid)?;
+    let environment = procargs2_env(&buffer)?;
+    if super::process_identity(peer.pid) != Some(peer) {
+        return None;
+    }
+    parse_initial_environment(environment)
+}
+
+fn parse_initial_environment(bytes: &[u8]) -> Option<Vec<(String, String)>> {
+    if !bytes.is_empty() && bytes.last() != Some(&0) {
+        return None;
+    }
+    let mut pairs = Vec::new();
+    let mut trailing_empty = false;
+    for record in bytes.split(|&byte| byte == 0) {
+        if record.is_empty() {
+            trailing_empty = true;
+            continue;
+        }
+        if trailing_empty {
+            return None;
+        }
+        let separator = record.iter().position(|&byte| byte == b'=')?;
+        if separator == 0 {
+            return None;
+        }
+        let key = std::str::from_utf8(&record[..separator]).ok()?;
+        let value = std::str::from_utf8(&record[separator + 1..]).ok()?;
+        pairs.push((key.to_string(), value.to_string()));
+    }
+    Some(pairs)
 }
 
 /// Read a Herdr agent identity hint from a process environment.
@@ -1174,6 +1305,25 @@ pub fn process_exists(pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn initial_environment_parser_distinguishes_absence_and_malformed_data() {
+        assert_eq!(
+            parse_initial_environment(b"PATH=/bin\0TERM=xterm\0\0"),
+            Some(vec![
+                ("PATH".to_string(), "/bin".to_string()),
+                ("TERM".to_string(), "xterm".to_string()),
+            ])
+        );
+        assert_eq!(parse_initial_environment(b""), Some(Vec::new()));
+        assert_eq!(parse_initial_environment(b"PATH=/bin"), None);
+        assert_eq!(
+            parse_initial_environment(b"PATH=/bin\0\0TERM=xterm\0"),
+            None
+        );
+        assert_eq!(parse_initial_environment(b"BAD\0"), None);
+        assert_eq!(parse_initial_environment(b"\xff=bad\0"), None);
+    }
 
     #[test]
     fn nofile_target_raises_low_soft_limit_to_cap_when_hard_is_unlimited() {
