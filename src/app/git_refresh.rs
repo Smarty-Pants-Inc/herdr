@@ -1,8 +1,11 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Instant;
 
-use super::{App, GIT_REMOTE_STATUS_REFRESH_INTERVAL, GIT_REPO_DISCOVERY_REFRESH_INTERVAL};
+use super::{
+    git_watch::GitWatches, App, GIT_REMOTE_STATUS_REFRESH_INTERVAL,
+    GIT_REPO_DISCOVERY_REFRESH_INTERVAL, GIT_WATCH_DEBOUNCE,
+};
 use crate::events::AppEvent;
 use crate::workspace::{GitStatusCacheEntry, GitStatusRefreshDemand, WorkspaceGitStatus};
 
@@ -33,6 +36,89 @@ struct WorkspaceGitRefreshOutput {
 }
 
 impl App {
+    /// Reconcile native watches outside rendering. Main's headless loop calls
+    /// this after workspace/client changes; unchanged roots do no filesystem I/O.
+    pub(crate) fn sync_git_watches(&mut self) {
+        let demand = self.git_refresh_demand();
+        let roots: HashSet<_> = if demand.is_empty() {
+            HashSet::new()
+        } else {
+            self.workspace_git_refresh_items(false)
+                .into_iter()
+                // Consumer identity must not change when discovery supplies a
+                // canonical cache key for the same logical workspace CWD.
+                .map(|item| item.resolved_identity_cwd)
+                .collect()
+        };
+        if roots.is_empty() {
+            self.clear_git_watches();
+            return;
+        }
+        self.git_watch_demand = self.request_git_demand_growth(self.git_watch_demand);
+        if self
+            .git_watches
+            .as_ref()
+            .is_some_and(|watches| watches.roots_changed(&roots))
+        {
+            // Config dependencies belong to current consumers, not retired cache entries.
+            self.reconcile_git_config_watches();
+        }
+        if self.git_watches.is_none() {
+            match GitWatches::new(self.event_tx.clone()) {
+                Ok(mut watches) => {
+                    let cache_roots = self
+                        .workspace_git_refresh_items(false)
+                        .into_iter()
+                        .map(|item| item.cache_key_hint.unwrap_or(item.resolved_identity_cwd))
+                        .collect();
+                    watches.set_config_dependencies(self.git_config_dependency_paths(&cache_roots));
+                    self.git_watches = Some(watches);
+                }
+                Err(err) => {
+                    tracing::warn!(%err, "native git watches unavailable; using safety refresh");
+                    return;
+                }
+            }
+        }
+        if self
+            .git_watches
+            .as_ref()
+            .is_some_and(|watches| watches.has_new_roots(&roots))
+        {
+            self.mark_git_status_refresh_due(Instant::now());
+        }
+        if let Some(watches) = &mut self.git_watches {
+            watches.sync(roots);
+        }
+    }
+
+    /// A clientless headless server can release all native watcher resources.
+    pub(crate) fn clear_git_watches(&mut self) {
+        self.git_watches = None;
+        self.git_watch_demand = GitStatusRefreshDemand::default();
+        self.git_watch_refresh_deadline = None;
+    }
+
+    pub(super) fn handle_git_files_changed(&mut self, now: Instant) {
+        if self.git_refresh_demand().is_empty() {
+            self.clear_git_watches();
+            return;
+        }
+        if self
+            .git_watches
+            .as_ref()
+            .is_some_and(GitWatches::take_discovery_hint)
+        {
+            // Directory/marker changes can invalidate a negative cache or a
+            // cached checkout identity. Ordinary HEAD/index writes do neither.
+            self.request_git_identity_refresh(now);
+        }
+        // Bound bursts to one wakeup and one refresh per debounce window, even
+        // if a writer never goes quiet. In-flight refreshes keep this deadline.
+        self.git_watch_refresh_deadline
+            .get_or_insert(now + GIT_WATCH_DEBOUNCE);
+    }
+
     pub(crate) fn start_git_status_refresh_if_due(&mut self, now: Instant) {
         let Some(deadline) = self.git_refresh_deadline() else {
             return;
@@ -42,10 +128,23 @@ impl App {
             return;
         }
 
-        let refresh_repo_discovery = self.git_identity_refresh_requested
-            || now.saturating_duration_since(self.last_git_repo_discovery_refresh)
-                >= GIT_REPO_DISCOVERY_REFRESH_INTERVAL;
+        let safety_discovery_due = now
+            .saturating_duration_since(self.last_git_repo_discovery_refresh)
+            >= GIT_REPO_DISCOVERY_REFRESH_INTERVAL;
+        let refresh_repo_discovery = self.git_identity_refresh_requested || safety_discovery_due;
         let workspaces = self.workspace_git_refresh_items(refresh_repo_discovery);
+        self.git_watch_refresh_deadline = None;
+        if let Some(watches) = &mut self.git_watches {
+            watches.acknowledge();
+            if safety_discovery_due {
+                watches.rearm_requested = true;
+            }
+        }
+        // Explicit/native identity hints must not move the independent safety
+        // net; continuous metadata replacement cannot postpone reconciliation.
+        if safety_discovery_due {
+            self.last_git_repo_discovery_refresh = now;
+        }
 
         if workspaces.is_empty() {
             self.last_git_remote_status_refresh = now;
@@ -61,10 +160,24 @@ impl App {
             demand.branch = true;
         }
         self.git_identity_refresh_requested = false;
-        if refresh_repo_discovery {
-            self.last_git_repo_discovery_refresh = now;
-        }
+        #[cfg(test)]
+        let git_test_homes =
+            ["HOME", "XDG_CONFIG_HOME"].map(|key| (key, crate::environment::var_os(key)));
         std::thread::spawn(move || {
+            // Test scopes do not implicitly cross threads. Pass only this
+            // worker's Git fixture homes explicitly; production is unchanged.
+            #[cfg(test)]
+            let _git_env = {
+                let env = crate::environment::test_env();
+                for (key, value) in git_test_homes {
+                    if let Some(value) = value {
+                        env.set(key, value);
+                    } else {
+                        env.remove(key);
+                    }
+                }
+                env
+            };
             let output =
                 refresh_workspace_git_statuses_with_cache_and_demand(workspaces, &cache, demand);
             let _ = event_tx.blocking_send(AppEvent::GitStatusRefreshed {
@@ -96,10 +209,48 @@ impl App {
         (!self.git_refresh_in_flight
             && !self.state.workspaces.is_empty()
             && (self.git_identity_refresh_requested || !self.git_refresh_demand().is_empty()))
-        .then_some(self.last_git_remote_status_refresh + GIT_REMOTE_STATUS_REFRESH_INTERVAL)
+        .then(|| {
+            let safety = (self.last_git_remote_status_refresh + GIT_REMOTE_STATUS_REFRESH_INTERVAL)
+                .min(self.last_git_repo_discovery_refresh + GIT_REPO_DISCOVERY_REFRESH_INTERVAL);
+            self.git_watch_refresh_deadline
+                .map_or(safety, |deadline| safety.min(deadline))
+        })
     }
 
-    fn git_refresh_demand(&self) -> GitStatusRefreshDemand {
+    pub(super) fn request_git_demand_growth(
+        &mut self,
+        previous: GitStatusRefreshDemand,
+    ) -> GitStatusRefreshDemand {
+        let demand = self.git_refresh_demand();
+        if (demand.branch && !previous.branch) || (demand.ahead_behind && !previous.ahead_behind) {
+            self.mark_git_status_refresh_due(Instant::now());
+        }
+        demand
+    }
+
+    fn git_config_dependency_paths(&self, roots: &HashSet<PathBuf>) -> HashSet<PathBuf> {
+        roots
+            .iter()
+            .filter_map(|root| self.git_status_cache.get(root))
+            .flat_map(GitStatusCacheEntry::config_dependency_paths)
+            .collect()
+    }
+
+    pub(super) fn reconcile_git_config_watches(&mut self) {
+        // Only worker completion reads cached config dependencies. The regular
+        // unchanged-root app-loop sync never discovers files or clones deps.
+        let roots = self
+            .workspace_git_refresh_items(false)
+            .into_iter()
+            .map(|item| item.cache_key_hint.unwrap_or(item.resolved_identity_cwd))
+            .collect();
+        let paths = self.git_config_dependency_paths(&roots);
+        if let Some(watches) = &mut self.git_watches {
+            watches.set_config_dependencies(paths);
+        }
+    }
+
+    pub(super) fn git_refresh_demand(&self) -> GitStatusRefreshDemand {
         let mut demand = GitStatusRefreshDemand::default();
         for token in self.state.sidebar_spaces.rows.iter().flatten() {
             match token.parts().0 {
@@ -525,6 +676,303 @@ mod tests {
             .expect("refresh should be due once a workspace exists");
         assert!(deadline <= Instant::now());
     }
+
+    struct GitWatchRepo(PathBuf);
+
+    impl GitWatchRepo {
+        fn new(name: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "herdr-git-watch-{name}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            Self(root)
+        }
+
+        fn git(&self, args: &[&str]) -> String {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&self.0)
+                .args([
+                    "-c",
+                    "user.name=Git Watch Test",
+                    "-c",
+                    "user.email=git-watch@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        }
+
+        fn init(&self) {
+            self.git(&["init", "-b", "main"]);
+            self.git(&["commit", "--allow-empty", "-m", "initial"]);
+            self.git(&["branch", "upstream"]);
+            self.git(&["branch", "--set-upstream-to=upstream", "main"]);
+        }
+
+        fn app(&self) -> App {
+            let mut config = crate::config::Config::default();
+            config.ui.sidebar.spaces.rows = vec![vec![
+                crate::config::SpaceSidebarToken::Branch,
+                crate::config::SpaceSidebarToken::GitStatus,
+            ]];
+            let mut app = test_app(&config);
+            let mut ws = Workspace::test_new("watched");
+            ws.tabs.clear();
+            ws.identity_cwd = self.0.clone();
+            app.state.workspaces.push(ws);
+            app.mark_git_status_refresh_due(Instant::now());
+            drive_git_watch_refresh(&mut app);
+            app
+        }
+    }
+
+    impl Drop for GitWatchRepo {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Exercise the same sync -> scheduler -> worker -> App event application
+    /// path used by a headless server with an attached app consumer.
+    #[track_caller]
+    fn drive_git_watch_refresh(app: &mut App) -> (std::time::Duration, bool) {
+        let start = Instant::now();
+        loop {
+            let now = Instant::now();
+            assert!(
+                now.duration_since(start) < std::time::Duration::from_secs(1),
+                "native git refresh exceeded 1s"
+            );
+            app.sync_git_watches();
+            app.start_git_status_refresh_if_due(now);
+            while let Ok(event) = app.event_rx.try_recv() {
+                let completed = matches!(event, AppEvent::GitStatusRefreshed { .. });
+                let changed = app.handle_internal_event_with_render_impact(event);
+                if completed {
+                    return (start.elapsed(), changed);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    fn git_watch_commit_branch_and_atomic_index_refresh_through_app_under_one_second() {
+        let repo = GitWatchRepo::new("freshness");
+        repo.init();
+        let mut app = repo.app();
+        assert_eq!(app.state.workspaces[0].git_ahead_behind(), Some((0, 0)));
+
+        let start = Instant::now();
+        repo.git(&["commit", "--allow-empty", "-m", "watched"]);
+        let (commit_latency, changed) = drive_git_watch_refresh(&mut app);
+        assert!(changed);
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+        assert_eq!(app.state.workspaces[0].git_ahead_behind(), Some((1, 0)));
+
+        let start = Instant::now();
+        repo.git(&["switch", "-c", "feature/nested"]);
+        let (branch_latency, changed) = drive_git_watch_refresh(&mut app);
+        assert!(changed);
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+        assert_eq!(
+            app.state.workspaces[0].cached_git_branch.as_deref(),
+            Some("feature/nested")
+        );
+
+        // git add atomically replaces index. An index change requests an App
+        // refresh, but cannot invent dirty/staged fields or a visual change.
+        std::fs::write(repo.0.join("staged.txt"), "staged\n").unwrap();
+        let branch_before = app.state.workspaces[0].cached_git_branch.clone();
+        let status_before = app.state.workspaces[0].git_ahead_behind();
+        let start = Instant::now();
+        repo.git(&["add", "staged.txt"]);
+        let (index_latency, changed) = drive_git_watch_refresh(&mut app);
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+        assert!(!changed);
+        assert_eq!(app.state.workspaces[0].cached_git_branch, branch_before);
+        assert_eq!(app.state.workspaces[0].git_ahead_behind(), status_before);
+        eprintln!("native App refresh: commit={commit_latency:?} branch={branch_latency:?} index={index_latency:?}");
+
+        // Status reads must not create a feedback loop of native access events.
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert!(app.event_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn git_watch_linked_worktree_common_refs_packed_refs_and_config_refresh_through_app() {
+        let repo = GitWatchRepo::new("common-refs");
+        repo.init();
+        let linked = GitWatchRepo::new("linked");
+        repo.git(&[
+            "worktree",
+            "add",
+            "-b",
+            "linked",
+            linked.0.to_str().unwrap(),
+        ]);
+        linked.git(&["branch", "--set-upstream-to=upstream", "linked"]);
+        let mut app = linked.app();
+        assert_eq!(
+            app.state.workspaces[0].cached_git_branch.as_deref(),
+            Some("linked")
+        );
+        assert_eq!(app.state.workspaces[0].git_ahead_behind(), Some((0, 0)));
+
+        linked.git(&["commit", "--allow-empty", "-m", "linked commit"]);
+        drive_git_watch_refresh(&mut app);
+        assert_eq!(app.state.workspaces[0].git_ahead_behind(), Some((1, 0)));
+        let tip = linked.git(&["rev-parse", "HEAD"]);
+
+        // Common refs changed by another checkout must wake the linked one.
+        repo.git(&["update-ref", "refs/heads/upstream", &tip]);
+        drive_git_watch_refresh(&mut app);
+        assert_eq!(app.state.workspaces[0].git_ahead_behind(), Some((0, 0)));
+
+        repo.git(&["pack-refs", "--all", "--prune"]);
+        drive_git_watch_refresh(&mut app);
+        let initial = linked.git(&["rev-parse", "HEAD~1"]);
+        repo.git(&["update-ref", "refs/heads/upstream", &initial]);
+        repo.git(&["pack-refs", "--all", "--prune"]);
+        drive_git_watch_refresh(&mut app);
+        assert_eq!(app.state.workspaces[0].git_ahead_behind(), Some((1, 0)));
+
+        linked.git(&["config", "--unset", "branch.linked.remote"]);
+        drive_git_watch_refresh(&mut app);
+        assert_eq!(app.state.workspaces[0].git_ahead_behind(), None);
+
+        linked.git(&["switch", "-c", "topic/switched"]);
+        drive_git_watch_refresh(&mut app);
+        assert_eq!(
+            app.state.workspaces[0].cached_git_branch.as_deref(),
+            Some("topic/switched")
+        );
+    }
+
+    #[test]
+    fn git_watch_missed_event_safety_refresh_discovers_non_git_at_sixty_seconds() {
+        let repo = GitWatchRepo::new("missed-non-git");
+        let mut app = repo.app();
+        assert_eq!(app.state.workspaces[0].cached_git_branch, None);
+        let safety_start = app.last_git_repo_discovery_refresh;
+        // No .git existed when watches were installed, so init has no native hint.
+        repo.init();
+        assert!(app.event_rx.try_recv().is_err());
+        let before = safety_start + std::time::Duration::from_secs(59);
+        app.start_git_status_refresh_if_due(before);
+        assert!(!app.git_refresh_in_flight);
+        let due = safety_start + std::time::Duration::from_secs(60);
+        app.start_git_status_refresh_if_due(due);
+        assert!(app.git_refresh_in_flight);
+        drive_git_watch_refresh(&mut app);
+        assert_eq!(
+            app.state.workspaces[0].cached_git_branch.as_deref(),
+            Some("main")
+        );
+        assert_eq!(app.last_git_repo_discovery_refresh, due);
+    }
+
+    #[test]
+    fn git_watch_missed_event_safety_refresh_updates_existing_git_at_sixty_seconds() {
+        let repo = GitWatchRepo::new("missed-existing-git");
+        repo.init();
+        let mut app = repo.app();
+        assert_eq!(
+            app.state.workspaces[0].cached_git_branch.as_deref(),
+            Some("main")
+        );
+        assert_eq!(app.state.workspaces[0].git_ahead_behind(), Some((0, 0)));
+        let safety_start = app.last_git_repo_discovery_refresh;
+        let cached_before = app.git_status_cache.clone();
+
+        // Intentionally miss real git changes, not just repository discovery.
+        app.clear_git_watches();
+        repo.git(&["switch", "-c", "feature/missed"]);
+        repo.git(&["branch", "--set-upstream-to=upstream", "feature/missed"]);
+        repo.git(&["commit", "--allow-empty", "-m", "missed commit"]);
+        while let Ok(event) = app.event_rx.try_recv() {
+            // Drop any late native hint from the retired watcher too.
+            assert!(matches!(event, AppEvent::GitFilesChanged));
+        }
+
+        app.start_git_status_refresh_if_due(safety_start + std::time::Duration::from_secs(59));
+        assert!(!app.git_refresh_in_flight);
+        assert_eq!(
+            app.state.workspaces[0].cached_git_branch.as_deref(),
+            Some("main")
+        );
+        assert_eq!(app.state.workspaces[0].git_ahead_behind(), Some((0, 0)));
+        assert_eq!(app.git_status_cache, cached_before);
+
+        let due = safety_start + std::time::Duration::from_secs(60);
+        app.start_git_status_refresh_if_due(due);
+        assert!(app.git_refresh_in_flight);
+        let (_, changed) = drive_git_watch_refresh(&mut app);
+        assert!(changed);
+        assert_eq!(
+            app.state.workspaces[0].cached_git_branch.as_deref(),
+            Some("feature/missed")
+        );
+        assert_eq!(app.state.workspaces[0].git_ahead_behind(), Some((1, 0)));
+        assert_ne!(app.git_status_cache, cached_before);
+        assert_eq!(app.last_git_repo_discovery_refresh, due);
+    }
+
+    #[test]
+    fn git_watch_events_do_not_postpone_full_discovery_and_debounce_survives_in_flight() {
+        let repo = GitWatchRepo::new("deadlines");
+        repo.init();
+        let mut app = repo.app();
+        let now = Instant::now();
+        app.last_git_repo_discovery_refresh = now;
+        app.last_git_remote_status_refresh = now + std::time::Duration::from_secs(59);
+        assert_eq!(
+            app.git_refresh_deadline(),
+            Some(now + std::time::Duration::from_secs(60))
+        );
+        app.git_refresh_in_flight = true;
+        assert!(!app.handle_internal_event_with_render_impact(AppEvent::GitFilesChanged));
+        assert_eq!(app.git_refresh_deadline(), None);
+        let deadline = app.git_watch_refresh_deadline.unwrap();
+        app.handle_internal_event(AppEvent::GitStatusRefreshed {
+            results: Vec::new(),
+            cache_updates: Vec::new(),
+        });
+        assert_eq!(app.git_refresh_deadline(), Some(deadline));
+    }
+
+    #[test]
+    fn git_watch_workspace_removal_and_demand_removal_release_watcher() {
+        let repo = GitWatchRepo::new("app-removal");
+        repo.init();
+        let mut app = repo.app();
+        assert!(app.git_watches.is_some());
+        app.state.sidebar_spaces.rows = vec![vec![crate::config::SpaceSidebarToken::Workspace]];
+        app.sync_git_watches();
+        assert!(app.git_watches.is_none());
+        app.state.sidebar_spaces.rows = vec![vec![crate::config::SpaceSidebarToken::Branch]];
+        app.sync_git_watches();
+        assert!(app.git_watches.is_some());
+        app.state.workspaces.clear();
+        app.sync_git_watches();
+        assert!(app.git_watches.is_none());
+    }
+
+    include!("git_refresh_regression_tests.rs");
 
     fn test_app(config: &crate::config::Config) -> super::super::App {
         super::super::App::new(

@@ -5,7 +5,7 @@ use interprocess::local_socket::traits::{Listener as _, Stream as _};
 use tokio::sync::mpsc;
 use tracing::{debug, error, warn};
 
-use crate::ipc::LocalListener;
+use crate::ipc::{LocalListener, LocalStream};
 use crate::server::client_transport::{self, ServerEvent};
 
 /// Accepts pending thin-client connections and starts their handshake readers.
@@ -15,12 +15,37 @@ pub(crate) fn accept_pending_client_connections(
     should_quit: &Arc<AtomicBool>,
     server_event_tx: &mpsc::Sender<ServerEvent>,
 ) -> io::Result<()> {
+    if let Err(err) = accept_pending_client_connections_with(
+        || listener.accept(),
+        next_client_id,
+        should_quit,
+        server_event_tx,
+        false,
+    ) {
+        // Preserve the synchronous initial drain's log-and-continue behavior.
+        error!(err = %err, "client listener accept failed");
+    }
+    Ok(())
+}
+
+/// Shared drain/handshake path for synchronous and reactor-driven accepts.
+/// The reactor caller owns error-only retry scheduling; WouldBlock means drained.
+pub(crate) fn accept_pending_client_connections_with(
+    mut accept: impl FnMut() -> io::Result<LocalStream>,
+    next_client_id: &mut u64,
+    should_quit: &Arc<AtomicBool>,
+    server_event_tx: &mpsc::Sender<ServerEvent>,
+    reject: bool,
+) -> io::Result<()> {
     loop {
         if should_quit.load(Ordering::Acquire) {
             break;
         }
-        match listener.accept() {
+        match accept() {
             Ok(stream) => {
+                if reject {
+                    continue;
+                }
                 let client_id = *next_client_id;
                 *next_client_id = next_client_id.saturating_add(1);
 
@@ -43,10 +68,8 @@ pub(crate) fn accept_pending_client_connections(
                 });
             }
             Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => break,
-            Err(err) => {
-                error!(err = %err, "client listener accept failed");
-                break;
-            }
+            Err(ref err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
         }
     }
 

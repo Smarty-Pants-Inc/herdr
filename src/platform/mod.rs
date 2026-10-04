@@ -93,6 +93,20 @@ pub(crate) use unix_common::{
     shared_ssh_control_path,
 };
 
+/// Registers a Unix local listener with Tokio's native readiness reactor
+/// (epoll on Linux, kqueue on macOS), without taking ownership of the listener.
+/// The duplicate stays alive until the registration is dropped.
+#[cfg(unix)]
+pub(crate) fn local_listener_readiness(
+    listener: &crate::ipc::LocalListener,
+) -> std::io::Result<tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>> {
+    use std::os::fd::AsFd as _;
+
+    let crate::ipc::LocalListener::UdSocket(listener) = listener;
+    let fd = listener.as_fd().try_clone_to_owned()?;
+    tokio::io::unix::AsyncFd::with_interest(fd, tokio::io::Interest::READABLE)
+}
+
 /// Whether `pid` belongs to the process tree of the pane child `child_pid`.
 #[cfg(not(unix))]
 pub(crate) fn process_in_pane_session(child_pid: u32, pid: u32) -> bool {
