@@ -607,6 +607,8 @@ fn pane_command() -> Command {
                 .arg(flag("new-workspace"))
                 .arg(option("label", "TEXT"))
                 .arg(option("tab-label", "TEXT"))
+                .arg(flag("allow-project-change")
+                    .help("Intentionally allow agent sessions to change project ownership"))
                 .arg(flag("focus"))
                 .arg(flag("no-focus")),
         )
