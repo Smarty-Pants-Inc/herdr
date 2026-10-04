@@ -78,8 +78,14 @@ pub(super) fn write_composed_frame(
         }
     }
     writer.write_all(b"\x1b8")?;
-    writer.write_all(&encoded[insertion..])?;
-    io::Write::flush(&mut writer)?;
+    if let Err(error) = writer.write_all(&encoded[insertion..]) {
+        apply_upload_ledger_obligations(&pending_ledger);
+        return Err(error);
+    }
+    if let Err(error) = io::Write::flush(&mut writer) {
+        apply_upload_ledger_obligations(&pending_ledger);
+        return Err(error);
+    }
     apply_graphics_ledger_changes(pending_ledger);
     Ok(())
 }
@@ -99,8 +105,14 @@ pub(super) fn write_encoded_frame_with_graphics(
     writer.write_all(b"\x1b7")?;
     writer.write_all(graphics)?;
     writer.write_all(b"\x1b8")?;
-    writer.write_all(&encoded[insertion..])?;
-    writer.flush()?;
+    if let Err(error) = writer.write_all(&encoded[insertion..]) {
+        apply_upload_ledger_obligations(&kitty_graphics_image_commands(graphics));
+        return Err(error);
+    }
+    if let Err(error) = writer.flush() {
+        apply_upload_ledger_obligations(&kitty_graphics_image_commands(graphics));
+        return Err(error);
+    }
     record_received_kitty_graphics(graphics);
     Ok(())
 }
@@ -115,6 +127,17 @@ pub(super) fn record_received_kitty_graphics(bytes: &[u8]) {
         return;
     }
     apply_graphics_ledger_changes(commands);
+}
+
+fn apply_upload_ledger_obligations(commands: &[KittyGraphicsImageCommand]) {
+    let uploads = commands
+        .iter()
+        .filter_map(|command| match command {
+            KittyGraphicsImageCommand::Upload(id) => Some(KittyGraphicsImageCommand::Upload(*id)),
+            KittyGraphicsImageCommand::Delete(_) => None,
+        })
+        .collect();
+    apply_graphics_ledger_changes(uploads);
 }
 
 fn apply_graphics_ledger_changes(commands: Vec<KittyGraphicsImageCommand>) {

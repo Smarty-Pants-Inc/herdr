@@ -1318,6 +1318,7 @@ impl TerminalState {
                 .any(|(validated_source, _, _, _)| validated_source == source)
                 || !crate::detect::full_lifecycle_hook_authority(source, detected_label)
         });
+        let previous_session = self.current_session_identity_for_persistence();
         for (source, agent_label, session_ref, pending) in validated_replacement_sessions {
             self.forget_stale_full_lifecycle_hook_session(&source, &agent_label, &session_ref);
             self.reconcile_agent_name_owner(&agent_label, Some(&session_ref));
@@ -1330,6 +1331,9 @@ impl TerminalState {
                 self.hook_report_sequences.insert(source, pending.seq);
                 self.hook_authority = Some(pending.authority);
             }
+        }
+        if previous_session != self.current_session_identity_for_persistence() {
+            self.set_reported_resume(None);
         }
     }
 
