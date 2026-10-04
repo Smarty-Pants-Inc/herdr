@@ -65,8 +65,9 @@ use crate::server::notifications::{
     should_forward_toast_to_clients, toast_message_from_state_change, toast_notify_kind,
 };
 use crate::server::pane_input::{
-    apply_client_pane_input_events, apply_client_popup_input_events, apply_terminal_attach_input,
-    apply_terminal_attach_scroll, terminal_attach_mouse_position,
+    apply_client_pane_input_events, apply_client_pane_input_events_with_receipts,
+    apply_client_popup_input_events, apply_terminal_attach_input_with_receipt,
+    apply_terminal_attach_scroll_with_receipt, terminal_attach_mouse_position,
 };
 use crate::server::socket_paths::{
     client_socket_path, prepare_socket_path, restrict_socket_permissions,
@@ -76,6 +77,7 @@ use crate::server::terminal_attach::paste_payload_for_runtime;
 mod bootstrap;
 mod client_views;
 mod endpoint_requests;
+mod input_author;
 mod lifecycle;
 mod media;
 mod notifications;
@@ -95,6 +97,8 @@ use crate::protocol::MAX_GRAPHICS_FRAME_SIZE;
 use crate::protocol::RenderEncoding;
 #[cfg(test)]
 use crate::server::client_transport::ClientWriter;
+#[cfg(test)]
+use crate::server::pane_input::{apply_terminal_attach_input, apply_terminal_attach_scroll};
 #[cfg(test)]
 use std::fs;
 
@@ -1271,7 +1275,19 @@ impl HeadlessServer {
                 let terminal_id = terminal_id.clone();
                 if let Some(runtime) = self.runtime_for_terminal_id_string(&terminal_id) {
                     let payload = paste_payload_for_runtime(runtime, &path);
-                    match apply_terminal_attach_input(runtime, payload.into_bytes()) {
+                    let actual_terminal = self.terminal_id_by_string(&terminal_id);
+                    let event = protocol::ClientPaneInputEvent::Paste(path);
+                    let identity = self.clients.get(&client_id).map(|client| &client.identity);
+                    match apply_terminal_attach_input_with_receipt(
+                        runtime,
+                        payload.into_bytes(),
+                        |_| {
+                            if let Some(terminal) = actual_terminal.as_ref() {
+                                self.app
+                                    .record_client_input(terminal, client_id, identity, &event);
+                            }
+                        },
+                    ) {
                         Ok(true) => self.invalidate_terminal_input_attribution(&terminal_id),
                         Ok(false) => {}
                         Err(err) => {
@@ -1310,9 +1326,20 @@ impl HeadlessServer {
                 ) else {
                     return foreground_changed | geometry_changed;
                 };
-                match apply_client_pane_input_events(
+                let terminal = self
+                    .app
+                    .state
+                    .terminal_id_for_pane(workspace_index, runtime_pane_id);
+                let identity = self.clients.get(&client_id).map(|client| &client.identity);
+                match apply_client_pane_input_events_with_receipts(
                     runtime,
                     &[protocol::ClientPaneInputEvent::Paste(path)],
+                    |event| {
+                        if let Some(terminal) = terminal.as_ref() {
+                            self.app
+                                .record_client_input(terminal, client_id, identity, event);
+                        }
+                    },
                 ) {
                     Ok(true) => self.media.note_pane_input(
                         client_id,
@@ -1459,8 +1486,20 @@ impl HeadlessServer {
             return false;
         };
 
-        match apply_terminal_attach_scroll(
-            runtime, source, direction, lines, column, row, modifiers,
+        let actual_terminal = self.terminal_id_by_string(&terminal_id);
+        match apply_terminal_attach_scroll_with_receipt(
+            runtime,
+            source,
+            direction,
+            lines,
+            column,
+            row,
+            modifiers,
+            || {
+                if let Some(terminal) = actual_terminal.as_ref() {
+                    self.app.taint_terminal_input(terminal);
+                }
+            },
         ) {
             Ok(true) => self.invalidate_terminal_input_attribution(&terminal_id),
             Ok(false) => {}
@@ -1516,7 +1555,14 @@ impl HeadlessServer {
             lines: lines.max(1),
         };
         let interaction = !client_pane_input_releases_press(&event);
-        match apply_client_pane_input_events(runtime, &[event]) {
+        let actual_terminal = self.terminal_id_by_string(&terminal_id);
+        let identity = self.clients.get(&client_id).map(|client| &client.identity);
+        match apply_client_pane_input_events_with_receipts(runtime, &[event], |event| {
+            if let Some(terminal) = actual_terminal.as_ref() {
+                self.app
+                    .record_client_input(terminal, client_id, identity, event);
+            }
+        }) {
             Ok(true) if interaction => self.invalidate_terminal_input_attribution(&terminal_id),
             Ok(_) => {}
             Err(err) => {
@@ -2211,7 +2257,14 @@ impl HeadlessServer {
                 let terminal_id = terminal_id.clone();
                 if let Some(runtime) = self.runtime_for_terminal_id_string(&terminal_id) {
                     let interaction = !crate::raw_input::is_release_only(&data);
-                    match apply_terminal_attach_input(runtime, data) {
+                    let actual_terminal = self.terminal_id_by_string(&terminal_id);
+                    let identity = self.clients.get(&client_id).map(|client| &client.identity);
+                    match apply_terminal_attach_input_with_receipt(runtime, data, |data| {
+                        if let Some(terminal) = actual_terminal.as_ref() {
+                            self.app
+                                .record_raw_client_input(terminal, client_id, identity, data);
+                        }
+                    }) {
                         Ok(true) if interaction => {
                             self.invalidate_terminal_input_attribution(&terminal_id)
                         }
@@ -2557,8 +2610,22 @@ impl HeadlessServer {
                 };
                 let scroll_before = runtime.scroll_metrics();
                 let mut accepted_interaction = false;
+                let terminal = self
+                    .app
+                    .state
+                    .terminal_id_for_pane(workspace_index, runtime_pane_id);
+                let identity = self.clients.get(&client_id).map(|client| &client.identity);
                 for event in &events {
-                    match apply_client_pane_input_events(runtime, std::slice::from_ref(event)) {
+                    match apply_client_pane_input_events_with_receipts(
+                        runtime,
+                        std::slice::from_ref(event),
+                        |event| {
+                            if let Some(terminal) = terminal.as_ref() {
+                                self.app
+                                    .record_client_input(terminal, client_id, identity, event);
+                            }
+                        },
+                    ) {
                         Ok(true) => {
                             accepted_interaction |=
                                 client_pane_input_has_interaction(std::slice::from_ref(event));
@@ -2938,6 +3005,7 @@ impl HeadlessServer {
             // when the read completes or falls back. Resolve the current attachment
             // after the runtime borrow ends; never refresh the media owner or age.
             if outcome.input_accepted {
+                self.app.taint_terminal_input(&terminal_id);
                 self.invalidate_terminal_input_attribution(terminal_id.as_str());
             }
             if let Some(read) = outcome.pending {
@@ -3161,6 +3229,16 @@ impl HeadlessServer {
         }
 
         self.consume_api_input_receipts();
+        if matches!(
+            &msg.request.method,
+            api::schema::Method::PaneTakeInputAuthor(_)
+        ) {
+            // Pane-private evidence is neither presentation work nor a shell
+            // endpoint action. Drain lifecycle events before authorizing the peer.
+            self.drain_all_internal_events_with_forwarding();
+            self.handle_input_author_api_request(msg);
+            return false;
+        }
         if matches!(&msg.request.method, api::schema::Method::PaneLastInput(_)) {
             self.handle_last_input_api_request(msg);
             return false;

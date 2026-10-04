@@ -1909,6 +1909,53 @@ impl App {
         encode_success(id, ResponseResult::Ok {})
     }
 
+    pub(super) fn handle_pane_take_input_author(
+        &mut self,
+        id: String,
+        params: crate::api::schema::PaneTakeInputAuthorParams,
+        context: crate::api::ApiRequestContext,
+    ) -> String {
+        let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        let Some(caller) = context
+            .local_peer_pid
+            .and_then(|pid| self.pane_target_for_peer_pid(pid))
+        else {
+            return encode_error(
+                id,
+                "input_author_forbidden",
+                "input author requires a live local peer belonging to this pane",
+            );
+        };
+        let Some(terminal_id) = self.state.terminal_id_for_pane(ws_idx, pane_id) else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        if caller.ws_idx != ws_idx
+            || caller.pane_id != pane_id
+            || caller.terminal_id != terminal_id.as_str()
+            || self
+                .state
+                .runtime_for_pane_in_workspace(&self.terminal_runtimes, ws_idx, pane_id)
+                .is_none()
+        {
+            return encode_error(
+                id,
+                "input_author_forbidden",
+                "only this pane's own local process may take its input author",
+            );
+        }
+        // Authorization happens before reading or changing evidence. No caller
+        // identity, cross-pane permission or foreground fallback exists in JSON.
+        self.input_authors
+            .borrow_mut()
+            .retain_live(|terminal| self.state.terminals.contains_key(terminal));
+        let Some(author) = self.take_input_author(ws_idx, pane_id) else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        encode_success(id, ResponseResult::PaneInputAuthor { author })
+    }
+
     pub(super) fn handle_pane_send_text(
         &mut self,
         id: String,

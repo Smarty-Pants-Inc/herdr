@@ -29,6 +29,7 @@ mod theme_sync;
 mod window_title;
 mod worktrees;
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 #[cfg(unix)]
 use std::io;
@@ -105,7 +106,11 @@ impl AppPolicy {
 fn test_api_input_log_path() -> std::path::PathBuf {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let next = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    std::env::temp_dir().join(format!(
+    // Tests can use a short proc-fd alias for Unix sockets. The durable log must
+    // sync real directory ancestors, not the virtual /proc alias's ancestors.
+    let temp_dir = std::env::temp_dir();
+    let temp_dir = std::fs::canonicalize(&temp_dir).unwrap_or(temp_dir);
+    temp_dir.join(format!(
         "herdr-test-api-input-{}-{next}.jsonl",
         std::process::id()
     ))
@@ -116,9 +121,13 @@ pub struct App {
     /// Herdr's API input log (smarty-dev#931); see `api::input_log`.
     pub(crate) api_input_log: std::path::PathBuf,
     /// Transient receipt of API bytes accepted by a pane's input queue. The server
-    /// consumes this after dispatch to invalidate attribution in its sole pane tracker.
+    /// consumes this after dispatch to invalidate media's last-interaction display
+    /// attribution; cumulative input-author evidence is separate and never cleared.
     /// Not persisted state and not an ownership/history tracker.
     pub(crate) accepted_api_inputs: Vec<crate::layout::PaneId>,
+    /// Ordered, bounded input provenance keyed by stable terminal identity.
+    /// This is runtime evidence, not persisted AppState and never touched by render.
+    pub(crate) input_authors: RefCell<crate::server::input_author::InputAuthorTracker>,
     pub(crate) pane_graphics: pane_graphics::Runtime,
     pub(crate) pane_graphics_files: Arc<crate::pane_graphics_files::FileStore>,
     pub(crate) direct_graphics_available: bool,
@@ -588,6 +597,7 @@ impl App {
 
         let mut app = Self {
             accepted_api_inputs: Vec::new(),
+            input_authors: RefCell::new(crate::server::input_author::InputAuthorTracker::default()),
             api_input_log: if cfg!(test) {
                 test_api_input_log_path()
             } else {
@@ -655,6 +665,11 @@ impl App {
             client_shell_keybindings_profile,
             endpoint_commands,
         };
+        // Restored terminal/editor content has no authenticated receipt history.
+        // Never let its first new client Enter upgrade an old draft to human.
+        for terminal_id in app.state.terminals.keys() {
+            app.taint_terminal_input(terminal_id);
+        }
         app.configure_tab_bar_status(&config.ui.tab_bar_right, &config.ui.tab_bar_right_separator);
         app.configure_window_title(&config.ui.window_title);
         app
@@ -695,6 +710,9 @@ impl App {
         app.state.workspaces = workspaces;
         app.state.terminals = terminals;
         app.terminal_runtimes = runtimes.into();
+        for terminal_id in app.state.terminals.keys() {
+            app.taint_terminal_input(terminal_id);
+        }
         app.state.active = snapshot
             .active
             .filter(|&idx| idx < app.state.workspaces.len());
@@ -723,6 +741,118 @@ impl App {
     #[cfg(unix)]
     pub fn assume_handoff_ownership(&mut self) {
         self.terminal_runtimes.assume_handoff_ownership();
+    }
+
+    /// Called only after a nonempty child-input enqueue succeeds. Releases do
+    /// not create a fresh candidate; they cannot subtract any previous author.
+    pub(crate) fn record_client_input(
+        &self,
+        terminal_id: &crate::terminal::TerminalId,
+        client_id: u64,
+        identity: Option<&crate::server::client_identity::ClientIdentity>,
+        event: &crate::protocol::ClientPaneInputEvent,
+    ) {
+        if matches!(
+            event,
+            crate::protocol::ClientPaneInputEvent::Key {
+                kind: crate::protocol::ClientKeyKind::Release,
+                ..
+            }
+        ) {
+            return;
+        }
+        let source = if crate::server::input_author::semantic_input_is_uncertain(event) {
+            crate::api::schema::PaneInputAuthorSource::Api { caller: None }
+        } else {
+            crate::server::input_author::client_receipt(client_id, identity)
+        };
+        let mut authors = self.input_authors.borrow_mut();
+        authors.record(terminal_id.clone(), source);
+        if matches!(
+            event,
+            crate::protocol::ClientPaneInputEvent::Key {
+                code: crate::protocol::ClientKeyCode::Enter,
+                ..
+            }
+        ) {
+            authors.note_enter(terminal_id);
+        }
+    }
+
+    pub(crate) fn record_raw_client_input(
+        &self,
+        terminal_id: &crate::terminal::TerminalId,
+        client_id: u64,
+        identity: Option<&crate::server::client_identity::ClientIdentity>,
+        data: &[u8],
+    ) {
+        if data.is_empty() || crate::raw_input::is_release_only(data) {
+            return;
+        }
+        let source = if crate::server::input_author::raw_input_is_uncertain(data) {
+            crate::api::schema::PaneInputAuthorSource::Api { caller: None }
+        } else {
+            crate::server::input_author::client_receipt(client_id, identity)
+        };
+        let mut authors = self.input_authors.borrow_mut();
+        authors.record(terminal_id.clone(), source);
+        for _ in data.iter().filter(|&&byte| byte == b'\r') {
+            authors.note_enter(terminal_id);
+        }
+    }
+
+    pub(crate) fn record_api_input(
+        &self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+        context: crate::api::ApiRequestContext,
+    ) {
+        let Some(terminal_id) = self.state.terminal_id_for_pane(ws_idx, pane_id) else {
+            return;
+        };
+        let caller = context.local_peer_pid.map(|pid| {
+            let target = self.pane_target_for_peer_pid(pid);
+            crate::api::schema::PaneInputAuthorCaller {
+                pid: Some(pid),
+                pane: target
+                    .as_ref()
+                    .and_then(|target| self.public_pane_id(target.ws_idx, target.pane_id)),
+                agent: target
+                    .and_then(|target| self.agent_info(target.ws_idx, target.pane_id))
+                    .and_then(|agent| agent.name),
+            }
+        });
+        self.input_authors.borrow_mut().record(
+            terminal_id,
+            crate::api::schema::PaneInputAuthorSource::Api { caller },
+        );
+    }
+
+    pub(crate) fn record_unknown_api_input(&self, pane_id: crate::layout::PaneId) {
+        let terminal_id = self.state.workspaces.iter().find_map(|workspace| {
+            workspace
+                .pane_state(pane_id)
+                .map(|pane| pane.attached_terminal_id.clone())
+        });
+        if let Some(terminal_id) = terminal_id {
+            self.taint_terminal_input(&terminal_id);
+        }
+    }
+
+    pub(crate) fn taint_terminal_input(&self, terminal_id: &crate::terminal::TerminalId) {
+        self.input_authors.borrow_mut().record(
+            terminal_id.clone(),
+            crate::api::schema::PaneInputAuthorSource::Api { caller: None },
+        );
+    }
+
+    pub(crate) fn take_input_author(
+        &self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+    ) -> Option<crate::api::schema::PaneInputAuthor> {
+        let terminal_id = self.state.terminal_id_for_pane(ws_idx, pane_id)?;
+        Some(self.input_authors.borrow_mut().take(&terminal_id))
     }
 
     pub(crate) fn ensure_default_workspace(&mut self) -> bool {

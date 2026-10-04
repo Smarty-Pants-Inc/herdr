@@ -309,6 +309,7 @@ impl App {
             return false;
         }
 
+        self.record_unknown_api_input(pane_id);
         self.accepted_api_inputs.push(pane_id);
         self.terminal_runtimes.insert(terminal_id.clone(), runtime);
         if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {

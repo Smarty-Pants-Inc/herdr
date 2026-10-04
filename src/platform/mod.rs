@@ -13,6 +13,21 @@ pub(crate) use diagnostic_owner::{
 #[cfg(unix)]
 pub(crate) mod ssh_agent;
 
+/// Resolves connection identity from host-owned authentication facts, where supported.
+pub(crate) fn resolve_client_identity(
+    stream: &crate::ipc::LocalStream,
+) -> crate::server::client_identity::ClientIdentity {
+    #[cfg(target_os = "linux")]
+    {
+        linux::resolve_client_identity_platform(stream)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = stream;
+        crate::server::client_identity::ClientIdentity::default()
+    }
+}
+
 pub(crate) struct HostShutdownMonitor {
     task: Option<tokio::task::JoinHandle<()>>,
 }
@@ -218,6 +233,40 @@ pub(crate) fn local_socket_peer_pid(fd: std::os::fd::RawFd) -> Option<u32> {
 /// socket that cannot be confused with a later process reusing its PID.
 #[cfg(target_os = "linux")]
 pub(crate) use linux::LocalSocketPeerProcess;
+
+/// A process handle atomically obtained from the API socket peer.
+#[cfg(target_os = "linux")]
+pub(crate) use linux::LocalSocketPeerCustody;
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) struct LocalSocketPeerCustody;
+
+#[cfg(unix)]
+pub(crate) fn local_socket_peer_custody(fd: std::os::fd::RawFd) -> Option<LocalSocketPeerCustody> {
+    #[cfg(target_os = "linux")]
+    return linux::local_socket_peer_custody_platform(fd);
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = fd;
+        None
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn local_socket_peer_custody_alive(
+    fd: std::os::fd::RawFd,
+    custody: &LocalSocketPeerCustody,
+) -> bool {
+    #[cfg(target_os = "linux")]
+    return linux::local_socket_peer_custody_alive_platform(fd, custody);
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (fd, custody);
+        false
+    }
+}
 
 /// Platforms without a PID-reuse-safe process handle never get one: callers
 /// must not signal the peer by numeric PID instead.

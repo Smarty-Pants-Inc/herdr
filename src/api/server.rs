@@ -22,9 +22,9 @@ use crate::api::{
 };
 use crate::ipc::{
     bind_local_listener, is_connection_closed_error, local_stream_peer_closed,
-    local_stream_peer_pid, poll_local_stream_read, remove_socket_file_if_owned,
-    set_local_stream_polling, socket_file_identity, LocalStream, LocalStreamRead,
-    SocketFileIdentity,
+    local_stream_peer_custody, local_stream_peer_custody_alive, local_stream_peer_pid,
+    poll_local_stream_read, remove_socket_file_if_owned, set_local_stream_polling,
+    socket_file_identity, LocalStream, LocalStreamRead, SocketFileIdentity,
 };
 
 mod pane_graphics_stream;
@@ -368,6 +368,21 @@ fn handle_connection_with_stop(
     let request_id = request.id.clone();
     let method = api_method_name(&request.method);
     let changes_ui = request_changes_ui(&request);
+    let input_author_custody = if matches!(&request.method, Method::PaneTakeInputAuthor(_)) {
+        let custody = local_stream_peer_custody(&stream);
+        if custody.is_none() {
+            let response = error_response_json(
+                request_id.clone(),
+                "input_author_forbidden",
+                "the API socket peer cannot be held in live kernel custody".into(),
+            );
+            write_text_line_allow_disconnect(&mut stream, &response)?;
+            return Ok(());
+        }
+        custody
+    } else {
+        None
+    };
     crate::logging::api_request_started(&request_id, method, changes_ui);
 
     match request.method {
@@ -504,6 +519,19 @@ fn handle_connection_with_stop(
                 server_stop,
                 Some(response_write_rx),
             );
+            let response = if let Some(custody) = input_author_custody.as_ref() {
+                if local_stream_peer_custody_alive(&stream, custody) {
+                    response
+                } else {
+                    error_response_json(
+                        request_id.clone(),
+                        "input_author_forbidden",
+                        "the API socket peer exited before the author response was released".into(),
+                    )
+                }
+            } else {
+                response
+            };
             let result = write_text_line_allow_disconnect(&mut stream, &response);
             let _ = response_write_tx.send(());
             match &result {
@@ -708,6 +736,7 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::PaneCurrent(_) => "pane.current",
         Method::PaneGet(_) => "pane.get",
         Method::PaneLastInput(_) => "pane.last_input",
+        Method::PaneTakeInputAuthor(_) => "pane.take_input_author",
         Method::PaneFocus(_) => "pane.focus",
         Method::PaneInputSet(_) => "pane.input.set",
         Method::PaneLinkActivate(_) => "pane.link.activate",
@@ -1327,6 +1356,308 @@ mod tests {
         let client = crate::ipc::connect_local_stream(&path).unwrap();
         let server = listener.accept().unwrap();
         (client, server, path)
+    }
+
+    #[cfg(target_os = "linux")]
+    struct InputAuthorConnector {
+        client: std::os::unix::net::UnixStream,
+        control: std::os::unix::net::UnixStream,
+        child: Option<libc::pid_t>,
+        path: PathBuf,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl InputAuthorConnector {
+        fn exit_and_reap(&mut self) {
+            self.control.write_all(&[1]).unwrap();
+            let child = self.child.unwrap();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                let mut status = 0;
+                let result = unsafe { libc::waitpid(child, &mut status, libc::WNOHANG) };
+                if result == child {
+                    self.child = None;
+                    assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
+                    return;
+                }
+                assert_eq!(result, 0, "wait for original connector");
+                assert!(Instant::now() < deadline, "connector exit deadline");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for InputAuthorConnector {
+        fn drop(&mut self) {
+            if let Some(child) = self.child.take() {
+                // Also reap on assertion failure; no orphaned connector survives a test.
+                unsafe { libc::kill(child, libc::SIGKILL) };
+                let deadline = Instant::now() + Duration::from_secs(3);
+                loop {
+                    let result =
+                        unsafe { libc::waitpid(child, std::ptr::null_mut(), libc::WNOHANG) };
+                    if result == child
+                        || (result == -1
+                            && io::Error::last_os_error().raw_os_error() != Some(libc::EINTR))
+                        || Instant::now() >= deadline
+                    {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn input_author_socket_pair(name: &str) -> (LocalStream, InputAuthorConnector) {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::net::UnixStream;
+
+        let path = unique_test_path(name);
+        let listener = crate::ipc::bind_local_listener(&path).unwrap();
+        // Create before fork, but CONNECT in the child: SO_PEERCRED names the
+        // original connector while the parent owns an actually inherited writer.
+        let raw = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+        assert!(raw >= 0);
+        let client = unsafe { UnixStream::from_raw_fd(raw) };
+        client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        client
+            .set_write_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let (control, child_control) = UnixStream::pair().unwrap();
+        control
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let control_fd = child_control.as_raw_fd();
+        let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        let bytes = path.as_os_str().as_bytes();
+        assert!(bytes.len() < address.sun_path.len());
+        for (dst, src) in address.sun_path.iter_mut().zip(bytes) {
+            *dst = *src as libc::c_char;
+        }
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0);
+        if child == 0 {
+            // Only async-signal-safe syscalls after fork; no Rust allocation,
+            // locks, destructors, or test harness calls in this branch.
+            unsafe {
+                libc::alarm(10);
+                if libc::connect(
+                    raw,
+                    (&address as *const libc::sockaddr_un).cast(),
+                    std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+                ) != 0
+                {
+                    libc::_exit(1);
+                }
+                let mut byte = 1u8;
+                if libc::write(control_fd, (&byte as *const u8).cast(), 1) != 1 {
+                    libc::_exit(2);
+                }
+                let mut poll = libc::pollfd {
+                    fd: control_fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                if libc::poll(&mut poll, 1, 10_000) != 1
+                    || libc::read(control_fd, (&mut byte as *mut u8).cast(), 1) != 1
+                {
+                    libc::_exit(3);
+                }
+                libc::_exit(0);
+            }
+        }
+        drop(child_control);
+        let mut connector = InputAuthorConnector {
+            client,
+            control,
+            child: Some(child),
+            path,
+        };
+        let mut ready = [0];
+        connector.control.read_exact(&mut ready).unwrap();
+        assert_eq!(ready, [1]);
+        let server = listener.accept().unwrap();
+        assert_eq!(local_stream_peer_pid(&server), Some(child as u32));
+        (server, connector)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_input_author_socket_open(fd: std::os::fd::RawFd) {
+        let mut poll = libc::pollfd {
+            fd,
+            events: libc::POLLRDHUP,
+            revents: 0,
+        };
+        assert_eq!(
+            unsafe { libc::poll(&mut poll, 1, 0) },
+            0,
+            "inherited socket must mask original connector death"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn input_author_success() -> String {
+        serde_json::to_string(&SuccessResponse {
+            id: "take".into(),
+            result: ResponseResult::PaneInputAuthor {
+                author: crate::api::schema::PaneInputAuthor {
+                    v: 1,
+                    source: crate::api::schema::PaneInputAuthorSource::Client {
+                        client: crate::api::schema::PaneInputAuthorClient {
+                            client_id: 7,
+                            peer_pid: Some(123),
+                            uid: Some(456),
+                            principal: Some(crate::api::schema::PaneInputAuthorPrincipal {
+                                id: "custody-secret-id".into(),
+                                name: "custody-secret-name".into(),
+                                binding: "custody-secret-binding".into(),
+                            }),
+                        },
+                    },
+                },
+            },
+        })
+        .unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn receive_input_author_dispatch(
+        rx: &mut mpsc::UnboundedReceiver<ApiRequestMessage>,
+    ) -> ApiRequestMessage {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            match rx.try_recv() {
+                Ok(message) => return message,
+                Err(mpsc::error::TryRecvError::Empty) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "author request dispatch deadline"
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("author request was not dispatched: {error}"),
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn check_input_author_response_release(exit_while_pending: bool) {
+        use std::os::fd::AsRawFd;
+        let (server, mut connector) = input_author_socket_pair("author-release");
+        let child = connector.child.unwrap();
+        let LocalStream::UdSocket(socket) = &server;
+        let server_fd = socket.inner().as_raw_fd();
+        connector.client.write_all(b"{\"id\":\"take\",\"method\":\"pane.take_input_author\",\"params\":{\"pane_id\":\"ws_1:pane_1\"}}\n").unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = handle_connection_with_stop(
+                server,
+                &tx,
+                &EventHub::default(),
+                &Arc::new(AtomicBool::new(true)),
+                None,
+                None,
+                None,
+            );
+            let _ = done_tx.send(result);
+        });
+        let message = receive_input_author_dispatch(&mut rx);
+        assert!(matches!(
+            message.request.method,
+            Method::PaneTakeInputAuthor(_)
+        ));
+        assert_eq!(message.context.local_peer_pid, Some(child as u32));
+        if exit_while_pending {
+            connector.exit_and_reap();
+            // App has not replied, so the handler still owns server_fd. The
+            // inherited endpoint masks death, rather than yielding socket EOF.
+            assert_input_author_socket_open(server_fd);
+        }
+        let nominal = input_author_success();
+        message.respond_to.send(nominal.clone()).unwrap();
+        done_rx
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
+        worker.join().unwrap();
+        let mut response = String::new();
+        BufReader::new(&mut connector.client)
+            .read_line(&mut response)
+            .unwrap();
+        if exit_while_pending {
+            let parsed: serde_json::Value = serde_json::from_str(&response).unwrap();
+            assert_eq!(parsed["id"], "take");
+            assert_eq!(parsed["error"]["code"], "input_author_forbidden");
+            assert!(parsed.get("result").is_none());
+            assert!(
+                !response.contains("custody-secret"),
+                "principal must not leak"
+            );
+            assert!(!response.contains("principal"));
+        } else {
+            assert_eq!(
+                response.trim_end(),
+                nominal,
+                "live connector keeps the App success unchanged"
+            );
+            connector.exit_and_reap();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn input_author_custody_live_connector_preserves_app_success() {
+        check_input_author_response_release(false);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn input_author_custody_dead_connector_before_dispatch_is_forbidden() {
+        use std::os::fd::AsRawFd;
+        let (server, mut connector) = input_author_socket_pair("author-dead-before-dispatch");
+        connector.exit_and_reap();
+        let LocalStream::UdSocket(socket) = &server;
+        assert_input_author_socket_open(socket.inner().as_raw_fd());
+        // Write from the inherited endpoint AFTER reaping the actual connector.
+        connector.client.write_all(b"{\"id\":\"take\",\"method\":\"pane.take_input_author\",\"params\":{\"pane_id\":\"ws_1:pane_1\"}}\n").unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        handle_connection_with_stop(
+            server,
+            &tx,
+            &EventHub::default(),
+            &Arc::new(AtomicBool::new(true)),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(
+            matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+            "dead connector must never dispatch to App"
+        );
+        let mut response = String::new();
+        BufReader::new(&mut connector.client)
+            .read_line(&mut response)
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(parsed["id"], "take");
+        assert_eq!(parsed["error"]["code"], "input_author_forbidden");
+        assert!(parsed.get("result").is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn input_author_custody_connector_dies_pending_reply_hides_principal() {
+        check_input_author_response_release(true);
     }
 
     #[test]

@@ -602,6 +602,7 @@ impl App {
         };
 
         self.terminal_runtimes.insert(terminal_id.clone(), runtime);
+        self.taint_terminal_input(&terminal_id);
         if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
             terminal.clear_agent_runtime_identity_after_respawn();
         }
@@ -1202,6 +1203,9 @@ impl App {
             }
             Method::PaneList(params) => return self.handle_pane_list(request.id, params),
             Method::PaneCurrent(params) => return self.handle_pane_current(request.id, params),
+            Method::PaneTakeInputAuthor(params) => {
+                return self.handle_pane_take_input_author(request.id, params, context);
+            }
             Method::PaneGet(target) => return self.handle_pane_get(request.id, target),
             Method::PaneFocus(target) => return self.handle_pane_focus(request.id, target),
             Method::PaneInputSet(params) => return self.handle_pane_input_set(request.id, params),

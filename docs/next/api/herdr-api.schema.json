@@ -3547,6 +3547,18 @@
           },
           "type": "object"
         },
+        "PaneTakeInputAuthorParams": {
+          "description": "Takes fresh conservative evidence without clearing cumulative API/unknown\ntaint. Not an exact submitted-turn/editor-span attestation. The caller must\nbelong to this pane through its live local socket peer, never request text.",
+          "properties": {
+            "pane_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pane_id"
+          ],
+          "type": "object"
+        },
         "PaneTarget": {
           "properties": {
             "pane_id": {
@@ -6235,6 +6247,23 @@
           "type": "object"
         },
         {
+          "description": "Pane-private JSON API; never available via the client-shell endpoint.",
+          "properties": {
+            "method": {
+              "const": "pane.take_input_author",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneTakeInputAuthorParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
           "properties": {
             "method": {
               "const": "pane.focus",
@@ -8597,6 +8626,159 @@
           ],
           "type": "object"
         },
+        "PaneInputAuthor": {
+          "oneOf": [
+            {
+              "properties": {
+                "client": {
+                  "$ref": "#/schemas/success_response/$defs/PaneInputAuthorClient"
+                },
+                "source": {
+                  "const": "client",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "source",
+                "client"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "caller": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/schemas/success_response/$defs/PaneInputAuthorCaller"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "source": {
+                  "const": "api",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "source"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "reason": {
+                  "type": "string"
+                },
+                "source": {
+                  "const": "unknown",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "source",
+                "reason"
+              ],
+              "type": "object"
+            }
+          ],
+          "properties": {
+            "v": {
+              "format": "uint8",
+              "maximum": 255,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "v"
+          ],
+          "type": "object"
+        },
+        "PaneInputAuthorCaller": {
+          "properties": {
+            "agent": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "pane": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "pid": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "type": "object"
+        },
+        "PaneInputAuthorClient": {
+          "properties": {
+            "client_id": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "peer_pid": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "principal": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/PaneInputAuthorPrincipal"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "uid": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "client_id"
+          ],
+          "type": "object"
+        },
+        "PaneInputAuthorPrincipal": {
+          "properties": {
+            "binding": {
+              "type": "string"
+            },
+            "id": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "name",
+            "binding"
+          ],
+          "type": "object"
+        },
         "PaneLastInput": {
           "description": "Last accepted client-owned pane interaction (including mouse input).\nThe user is self-declared, never authenticated.",
           "properties": {
@@ -10242,6 +10424,23 @@
               },
               "required": [
                 "type"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "Conservative cumulative source evidence, not a byte/editor-span proof.",
+              "properties": {
+                "author": {
+                  "$ref": "#/schemas/success_response/$defs/PaneInputAuthor"
+                },
+                "type": {
+                  "const": "pane_input_author",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "author"
               ],
               "type": "object"
             },

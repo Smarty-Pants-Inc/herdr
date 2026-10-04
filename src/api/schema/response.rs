@@ -128,6 +128,10 @@ pub enum ResponseResult {
         /// Anonymous clients retain client_id/at with a null user.
         last_input: Option<super::panes::PaneLastInput>,
     },
+    /// Conservative cumulative source evidence, not a byte/editor-span proof.
+    PaneInputAuthor {
+        author: super::panes::PaneInputAuthor,
+    },
     PaneSwap {
         swap: PaneSwapResult,
     },

@@ -99,7 +99,7 @@ herdr pane read w1:p2 --source recent --lines 50
 | ワークスペース | `workspace.create`、`workspace.list`、`workspace.get`、`workspace.focus`、`workspace.rename`、`workspace.move`、`workspace.move_block`、`workspace.report_metadata`、`workspace.close` |
 | Worktree | `worktree.list`、`worktree.create`、`worktree.open`、`worktree.remove` |
 | タブ | `tab.create`、`tab.list`、`tab.get`、`tab.focus`、`tab.rename`、`tab.move`、`tab.close` |
-| ペイン | `pane.split`、`pane.swap`、`pane.move`、`pane.zoom`、`pane.layout`、`pane.process_info`、`pane.neighbor`、`pane.edges`、`pane.focus_direction`、`pane.resize`、`pane.list`、`pane.current`、`pane.get`、`pane.last_input`、`pane.rename`、`pane.send_text`、`pane.send_keys`、`pane.send_input`、`pane.send_input_guarded`、`pane.read`、`pane.graphics.info`、`pane.graphics.set`、`pane.graphics.clear`、`pane.graphics.stream`、`pane.report_agent`、`pane.report_agent_session`、`pane.report_metadata`、`pane.clear_agent_authority`、`pane.release_agent`、`pane.close`、`pane.wait_for_output` |
+| ペイン | `pane.split`、`pane.swap`、`pane.move`、`pane.zoom`、`pane.layout`、`pane.process_info`、`pane.neighbor`、`pane.edges`、`pane.focus_direction`、`pane.resize`、`pane.list`、`pane.current`、`pane.get`、`pane.last_input`、`pane.take_input_author`、`pane.rename`、`pane.send_text`、`pane.send_keys`、`pane.send_input`、`pane.send_input_guarded`、`pane.read`、`pane.graphics.info`、`pane.graphics.set`、`pane.graphics.clear`、`pane.graphics.stream`、`pane.report_agent`、`pane.report_agent_session`、`pane.report_metadata`、`pane.clear_agent_authority`、`pane.release_agent`、`pane.close`、`pane.wait_for_output` |
 | ポップアップ | `popup.close` |
 | レイアウト | `layout.export`、`layout.apply`、`layout.set_split_ratio` |
 | エージェント | `agent.list`、`agent.get`、`agent.read`、`agent.explain`、`agent.send_keys`、`agent.prompt`、`agent.wait`、`agent.rename`、`agent.focus`、`agent.start`、`agent.start_guarded` |
@@ -141,6 +141,27 @@ CLI の `herdr api snapshot` は、クライアントやエージェントが簡
 匿名の接続クライアントでも、`user: null`、`client_id`、`at` を持つレコードが作成されます。レコードは、そのペインへの次の入力、クライアントの切断、ペインの削除まで保持されます。メディアルーティングで要求される鮮度とは異なり、10 秒後に期限切れにはなりません。API からの入力が受け入れられると、表示用の送信元情報だけがクリアされ、以前のクライアント送信者を引き継がず `last_input` が `null` になります。既存のメディアルーティングの対象クライアントはクリアされません。API 呼び出し元の情報には、別の [API 入力ログ](#api-入力ログ)を使ってください。
 
 このクエリは入力テキストを含まず、メッセージ履歴を保持せず、送信されたプロンプトの作成者を証明しません。別のペインへの入力は、このペインの送信元情報を変更しません。
+
+### 保守的なペイン入力の作成者情報
+
+`pane.take_input_author` は、`pane.last_input` とは別の、新しいローカル JSON 専用メソッドです。認可された生きたソケットピアは、要求したペインに属していなければなりません。`pane_id` はペインを選ぶだけで、権限の根拠にはなりません。
+
+```json
+{"id":"input_author","method":"pane.take_input_author","params":{"pane_id":"w1:p1"}}
+{"id":"input_author","result":{"type":"pane_input_author","author":{"v":1,"source":"unknown","reason":"no_evidence"}}}
+```
+
+`author.v` は `1` で、`source` は `client`、`api`、`unknown` のいずれかです:
+
+- `client` は `client.client_id`、省略可能な診断用の `peer_pid` と `uid`、および `id`、`name`、`binding` を持つ省略可能な `principal` を含みます。
+- `api` は `caller` の診断情報（`pid`、`pane`、`agent`）を含む場合があります。混合または不確実な入力も、呼び出し元なしの `api` を返す場合があります。principal はありません。
+- `unknown` は `reason` を含み、principal はありません。
+
+これは保守的なターミナルの累積証拠であり、**完全なターン単位の識別情報ではありません**。現在、エディター送信の正確な区切りはありません。Enter、編集、`take_input_author`、TTL の失効では、API/unknown の証拠や持続する不確実な出自の印を消せません。take が消費するのは鮮度だけで、累積したソースではありません。後続のクライアント入力でも、API 入力後に安全なクライアント専用入力へ戻ったというラベルは付けられません。履歴、多行入力、曖昧な編集によって作成者を判定できない場合があります。送信済みターンの正確な帰属には、#2636 の受信側/エディター同期が必要です。
+
+ローカルまたは UID を共有する接続クライアントには、決して principal を付けません。`client.user`、hello の `user`、`pane.last_input` は表示/ルーティング用メタデータであり、本人性の証拠ではありません。リモートの本人性には Linux カーネル >= 6.5（`SO_PEERPIDFD`）、root 所有で書き込み不可のインストール済み Herdr バイナリ（サーバー/ブリッジの実行ファイル inode と一致）、および固定パス **`/etc/herdr/principals.json`** の信頼できる root 所有のマップが必要です。マップのパスの全構成要素は root 所有で、シンボリックリンクではなく、グループやその他のユーザーが書き込めない必要があります。sshd journal の SSH 鍵フィンガープリント**と** Tailscale whois の `Node.StableID` の両方が、同じ principal に対応しなければなりません。事実が欠けるか検証できなければ principal はありません。名前、環境変数の主張、UID へのフォールバックはありません。これは SSH トランスポートを証明するもので、実際に人間が操作していることの証明ではありません。
+
+固定マップの設定はホスト所有者に依頼してください。書き換え可能な環境変数や実行時のパス上書きはありません。v1 サーバーマップは `version: 1` と `principals` オブジェクト配列を使い、各オブジェクトは `id`、`name`、`sshKeys`（正確な OpenSSH SHA256 フィンガープリント）、`tailscaleNodes`（正確な `Node.StableID` 値）を持ちます。両リストは必須です。未知のフィールド/バージョン、重複や矛盾する対応はファイル全体の拒否につながります。これはサーバーマップ形式であり、組織の識別ポリシーではありません。
 
 ### 期待するターミナルのガード
 

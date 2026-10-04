@@ -223,6 +223,7 @@ impl App {
         if let Some(session) = persisted_agent_session {
             terminal.set_managed_agent_launch_session(session);
         }
+        self.record_unknown_api_input(pane_id);
         self.accepted_api_inputs.push(pane_id);
         self.state.mark_session_dirty();
         self.schedule_session_save();

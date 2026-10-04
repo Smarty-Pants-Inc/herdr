@@ -32,7 +32,39 @@ mod config_file_tests;
 mod shutdown;
 pub(crate) use shutdown::monitor_host_shutdown;
 
+#[path = "client_identity_linux.rs"]
+mod client_identity;
+
+pub(super) fn resolve_client_identity_platform(
+    stream: &crate::ipc::LocalStream,
+) -> crate::server::client_identity::ClientIdentity {
+    client_identity::resolve(stream)
+}
+
+pub(crate) use client_identity::LocalSocketPeerCustody;
+
+pub(super) fn local_socket_peer_custody_platform(fd: RawFd) -> Option<LocalSocketPeerCustody> {
+    LocalSocketPeerCustody::from_socket(fd)
+}
+
+pub(super) fn local_socket_peer_custody_alive_platform(
+    fd: RawFd,
+    custody: &LocalSocketPeerCustody,
+) -> bool {
+    custody.is_alive(fd)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct LocalSocketPeerCredentials {
+    pub(super) pid: u32,
+    pub(super) uid: u32,
+}
+
 pub(super) fn local_socket_peer_pid_platform(fd: RawFd) -> Option<u32> {
+    local_socket_peer_credentials(fd).map(|credentials| credentials.pid)
+}
+
+pub(super) fn local_socket_peer_credentials(fd: RawFd) -> Option<LocalSocketPeerCredentials> {
     let mut credentials = std::mem::MaybeUninit::<libc::ucred>::zeroed();
     let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
     let status = unsafe {
@@ -49,8 +81,11 @@ pub(super) fn local_socket_peer_pid_platform(fd: RawFd) -> Option<u32> {
     }
 
     // SAFETY: SO_PEERCRED populated the exact-size output buffer above.
-    let pid = unsafe { credentials.assume_init().pid };
-    u32::try_from(pid).ok().filter(|pid| *pid > 0)
+    let credentials = unsafe { credentials.assume_init() };
+    Some(LocalSocketPeerCredentials {
+        pid: u32::try_from(credentials.pid).ok().filter(|pid| *pid > 0)?,
+        uid: credentials.uid,
+    })
 }
 
 /// A pidfd on the process connected to a Unix-domain socket. Signalling it

@@ -37,7 +37,15 @@ impl App {
                 "input_log_unavailable",
                 format!("cannot record this input in the API input log, so it was not sent: {err}"),
             )
-        })
+        })?;
+        // Conservative pre-enqueue taint also covers delayed agent.prompt and
+        // accepted prefixes when a later enqueue fails. A refused queue may
+        // yield a false negative, never a borrowed client principal. Empty
+        // requests don't touch an editor (prompt still sends Enter).
+        if bytes > 0 || method == "agent.prompt" {
+            self.record_api_input(ws_idx, pane_id, context);
+        }
+        Ok(())
     }
 
     fn api_input_log_line(

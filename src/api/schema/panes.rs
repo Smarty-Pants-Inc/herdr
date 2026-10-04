@@ -59,6 +59,64 @@ pub struct PaneLastInput {
     pub at: u64,
 }
 
+/// Takes fresh conservative evidence without clearing cumulative API/unknown
+/// taint. Not an exact submitted-turn/editor-span attestation. The caller must
+/// belong to this pane through its live local socket peer, never request text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneTakeInputAuthorParams {
+    pub pane_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneInputAuthorPrincipal {
+    pub id: String,
+    pub name: String,
+    pub binding: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneInputAuthorClient {
+    pub client_id: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal: Option<PaneInputAuthorPrincipal>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneInputAuthorCaller {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "source", rename_all = "snake_case")]
+pub enum PaneInputAuthorSource {
+    Client {
+        client: PaneInputAuthorClient,
+    },
+    Api {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller: Option<PaneInputAuthorCaller>,
+    },
+    Unknown {
+        reason: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneInputAuthor {
+    pub v: u8,
+    #[serde(flatten)]
+    pub source: PaneInputAuthorSource,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PaneInputSetParams {
     pub pane_id: String,

@@ -131,6 +131,8 @@ impl ClientShellLocation {
 
 /// A connected client tracked by the server.
 pub(crate) struct ClientConnection {
+    /// Accept-time authenticated transport identity, never hello.user.
+    pub(crate) identity: crate::server::client_identity::ClientIdentity,
     /// Whether this connection owns the Herdr shell or one direct terminal stream.
     pub(crate) mode: ClientConnectionMode,
     /// The client's terminal size after clamping.
@@ -223,7 +225,12 @@ impl ClientConnection {
         render_encoding: RenderEncoding,
         writer: Option<ClientWriter>,
     ) -> Self {
+        let identity = writer
+            .as_ref()
+            .map(|writer| writer.identity.clone())
+            .unwrap_or_default();
         Self {
+            identity,
             mode,
             terminal_size,
             cell_size,

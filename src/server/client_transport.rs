@@ -120,6 +120,9 @@ const MAX_INPUT_EVENT_BATCH: usize = 4096;
 /// Channels owned by the server side of a client writer thread.
 #[derive(Clone, Debug)]
 pub(crate) struct ClientWriter {
+    /// Internal accept-time socket evidence carried by the connected ServerEvent.
+    /// It is never supplied by ClientMessage or serialized into a core codec.
+    pub(crate) identity: crate::server::client_identity::ClientIdentity,
     /// Reliable control messages such as shutdown, notifications, and clipboard writes.
     pub(crate) control: ClientControlWriter,
     /// Droppable render messages. Capacity is one so slow clients cannot build lag.
@@ -153,6 +156,7 @@ impl ClientWriter {
         let mut render_writer = ClientRenderWriter::queue(queue);
         render_writer.test_render = Some(render.clone());
         let writer = Self {
+            identity: crate::server::client_identity::ClientIdentity::default(),
             control: control_writer,
             render: render_writer,
         };
@@ -670,6 +674,10 @@ pub(crate) fn handle_client_handshake(
         return Ok(());
     }
 
+    // Resolve once from the actual connected socket before reading untrusted
+    // hello metadata; all process/filesystem work stays in this handshake worker.
+    let identity = crate::server::client_identity::resolve_client_identity(&stream);
+
     // Reset to blocking mode — the accept loop sets nonblocking but
     // the handshake thread needs blocking I/O for read_message/write_message.
     stream.set_nonblocking(false)?;
@@ -853,6 +861,7 @@ pub(crate) fn handle_client_handshake(
     // Create separate channels for reliable control messages and droppable renders.
     let writer_queue = ClientWriterQueue::new();
     let writer = ClientWriter {
+        identity,
         control: ClientControlWriter::queue(writer_queue.clone()),
         render: ClientRenderWriter::queue(writer_queue.clone()),
     };
@@ -1543,6 +1552,7 @@ mod tests {
         let queue = ClientWriterQueue::new();
         (
             ClientWriter {
+                identity: crate::server::client_identity::ClientIdentity::default(),
                 control: ClientControlWriter::queue(queue.clone()),
                 render: ClientRenderWriter::queue(queue.clone()),
             },

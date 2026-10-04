@@ -224,6 +224,9 @@ pub enum Method {
     PaneGet(PaneTarget),
     #[serde(rename = "pane.last_input")]
     PaneLastInput(PaneLastInputParams),
+    /// Pane-private JSON API; never available via the client-shell endpoint.
+    #[serde(rename = "pane.take_input_author")]
+    PaneTakeInputAuthor(PaneTakeInputAuthorParams),
     #[serde(rename = "pane.focus")]
     PaneFocus(PaneTarget),
     #[serde(rename = "pane.input.set")]

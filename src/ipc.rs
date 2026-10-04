@@ -25,6 +25,48 @@ pub(crate) fn local_stream_peer_pid(stream: &LocalStream) -> Option<u32> {
     }
 }
 
+#[cfg(unix)]
+pub(crate) fn local_stream_peer_custody(
+    stream: &LocalStream,
+) -> Option<crate::platform::LocalSocketPeerCustody> {
+    use std::os::fd::AsRawFd as _;
+
+    match stream {
+        LocalStream::UdSocket(stream) => {
+            crate::platform::local_socket_peer_custody(stream.inner().as_raw_fd())
+        }
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn local_stream_peer_custody(
+    _stream: &LocalStream,
+) -> Option<crate::platform::LocalSocketPeerCustody> {
+    None
+}
+
+#[cfg(unix)]
+pub(crate) fn local_stream_peer_custody_alive(
+    stream: &LocalStream,
+    custody: &crate::platform::LocalSocketPeerCustody,
+) -> bool {
+    use std::os::fd::AsRawFd as _;
+
+    match stream {
+        LocalStream::UdSocket(stream) => {
+            crate::platform::local_socket_peer_custody_alive(stream.inner().as_raw_fd(), custody)
+        }
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn local_stream_peer_custody_alive(
+    _stream: &LocalStream,
+    _custody: &crate::platform::LocalSocketPeerCustody,
+) -> bool {
+    false
+}
+
 #[cfg(windows)]
 pub(crate) fn local_stream_peer_pid(stream: &LocalStream) -> Option<u32> {
     use std::os::windows::io::{AsHandle, AsRawHandle};

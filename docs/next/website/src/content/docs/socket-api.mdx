@@ -103,7 +103,7 @@ Raw socket method names use dot notation:
 | Workspace | `workspace.create`, `workspace.create_linked`, `workspace.list`, `workspace.get`, `workspace.focus`, `workspace.rename`, `workspace.move`, `workspace.move_block`, `workspace.report_metadata`, `workspace.close` |
 | Worktree | `worktree.list`, `worktree.create`, `worktree.open`, `worktree.remove` |
 | Tab | `tab.create`, `tab.list`, `tab.get`, `tab.focus`, `tab.rename`, `tab.move`, `tab.close` |
-| Pane | `pane.split`, `pane.swap`, `pane.move`, `pane.zoom`, `pane.layout`, `pane.process_info`, `pane.neighbor`, `pane.edges`, `pane.focus_direction`, `pane.resize`, `pane.list`, `pane.current`, `pane.get`, `pane.last_input`, `pane.rename`, `pane.send_text`, `pane.send_keys`, `pane.send_input`, `pane.send_input_guarded`, `pane.read`, `pane.graphics.info`, `pane.graphics.set`, `pane.graphics.clear`, `pane.graphics.stream`, `pane.report_agent`, `pane.report_agent_session`, `pane.report_metadata`, `pane.clear_agent_authority`, `pane.release_agent`, `pane.close`, `pane.wait_for_output` |
+| Pane | `pane.split`, `pane.swap`, `pane.move`, `pane.zoom`, `pane.layout`, `pane.process_info`, `pane.neighbor`, `pane.edges`, `pane.focus_direction`, `pane.resize`, `pane.list`, `pane.current`, `pane.get`, `pane.last_input`, `pane.take_input_author`, `pane.rename`, `pane.send_text`, `pane.send_keys`, `pane.send_input`, `pane.send_input_guarded`, `pane.read`, `pane.graphics.info`, `pane.graphics.set`, `pane.graphics.clear`, `pane.graphics.stream`, `pane.report_agent`, `pane.report_agent_session`, `pane.report_metadata`, `pane.clear_agent_authority`, `pane.release_agent`, `pane.close`, `pane.wait_for_output` |
 | Popup | `popup.close` |
 | Layout | `layout.export`, `layout.apply`, `layout.set_split_ratio` |
 | Agent | `agent.list`, `agent.get`, `agent.read`, `agent.explain`, `agent.send_keys`, `agent.prompt`, `agent.wait`, `agent.rename`, `agent.focus`, `agent.start`, `agent.start_guarded`, `agent.view.set`, `agent.view.clear` |
@@ -159,6 +159,51 @@ A client's optional hello `user` field supplies the name. Herdr clients use the 
 An anonymous attached client still produces a record with `user: null`, `client_id`, and `at`. The record persists until the next input to that pane, the client disconnects, or the pane is removed; unlike media routing's freshness requirement, it does not expire after 10 seconds. Accepted API-sent input clears only the display attribution, so `last_input` becomes `null` rather than inheriting an earlier client sender; it does not clear the existing media routing owner. Use the separate [API input log](#api-input-log) for API caller information.
 
 This query does not include input text, keep a message history, or prove who authored a submitted prompt. Input to another pane does not change this pane's attribution.
+
+### Conservative pane input author
+
+`pane.take_input_author` is a new local JSON-only method, separate from
+`pane.last_input`. The authorized live socket peer must belong to the requested
+pane; `pane_id` selects the pane but does not establish authority.
+
+```json
+{"id":"input_author","method":"pane.take_input_author","params":{"pane_id":"w1:p1"}}
+{"id":"input_author","result":{"type":"pane_input_author","author":{"v":1,"source":"unknown","reason":"no_evidence"}}}
+```
+
+`author.v` is `1`; `source` is `client`, `api`, or `unknown`:
+
+- `client` includes `client.client_id`, optional diagnostic `peer_pid` and `uid`,
+  and an optional `principal` with `id`, `name`, and `binding`.
+- `api` may include `caller` diagnostics (`pid`, `pane`, `agent`); mixed or
+  uncertain input can also return `api` without a caller. It has no principal.
+- `unknown` includes a `reason` and has no principal.
+
+This is conservative cumulative terminal evidence, **not complete per-turn
+identity**. There is currently no exact editor-submit cut. Enter, edits,
+`take_input_author`, and TTL expiry cannot clear API/unknown evidence or sticky
+taint. A take consumes freshness only, not cumulative sources; later client input
+cannot establish a safe clean-after-API label. History, multiline input, and
+ambiguous editing may prevent attribution. Exact submitted-turn attribution
+requires receiver/editor synchronization under #2636.
+
+Local/shared-UID attached clients never have a principal. `client.user`, hello
+`user`, and `pane.last_input` are display/routing metadata, never identity proof.
+Remote identity requires Linux kernel >= 6.5 (`SO_PEERPIDFD`), a root-owned,
+non-writable installed Herdr binary matching the server/bridge executable inode,
+and a trusted root-owned map at **`/etc/herdr/principals.json`**. All map path
+components must be root-owned, non-symlink, and not group/other writable. Both the
+SSH key fingerprint from the sshd journal **and** the Tailscale whois
+`Node.StableID` must map to the same principal. Missing or unverifiable facts mean
+no principal; names, environment claims, and UID are not fallbacks. This attests
+SSH transport, not physical-human presence.
+
+Ask the host owner to configure the fixed map; there is no writable environment
+or runtime path override. The v1 server map uses `version: 1` and a `principals`
+array of objects with `id`, `name`, `sshKeys` (exact OpenSSH SHA256 fingerprints),
+and `tailscaleNodes` (exact `Node.StableID` values). Both lists are required;
+unknown fields/versions and duplicate or contradictory mappings reject the file.
+This is a server map format, not an organization identity policy.
 
 ### Expected terminal guard
 
