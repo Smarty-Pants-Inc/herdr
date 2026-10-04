@@ -115,7 +115,7 @@ fn load_from_path(path: &Path) -> Option<SessionSnapshot> {
     };
     match parse_snapshot(&content) {
         Ok(mut snapshot) => {
-            if let crate::platform::SnapshotFileTrust::Untrusted(reason) = trust {
+            if let Some(reason) = trust.refusal_reason() {
                 let mut refused = 0;
                 for workspace in &mut snapshot.workspaces {
                     for tab in &mut workspace.tabs {
@@ -253,7 +253,7 @@ mod tests {
         }"#).unwrap()
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn cold_restore_file_trust_strips_marks_before_private_autosave() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -284,6 +284,69 @@ mod tests {
                 .panes
                 .values()
                 .all(|pane| pane.cold_restore_argv == trusted));
+            std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn cold_restore_macos_disk_marks_fail_closed_before_autosave_and_second_restart() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        // Even owner-only, ACL-free files are refused until input ACL validation
+        // exists. Wider modes must not change that policy or mutate the input.
+        for mode in [0o600, 0o644, 0o666] {
+            let path = temp_session_path("argv-trust-macos");
+            let original = marked_snapshot();
+            save_to_path(&path, &original).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            let log_path = path.with_file_name("restore.log");
+            let log_file = std::fs::File::create(&log_path).unwrap();
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .without_time()
+                .with_writer(move || log_file.try_clone().unwrap())
+                .finish();
+            tracing::subscriber::with_default(subscriber, || {
+                let loaded = load_from_path(&path).unwrap();
+                assert_eq!(
+                    std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                    mode,
+                    "authorization must not repair the original input"
+                );
+                let assert_sanitized = |snapshot: &SessionSnapshot| {
+                    let panes = &snapshot.workspaces[0].tabs[0].panes;
+                    for (id, pane) in panes {
+                        let saved = &original.workspaces[0].tabs[0].panes[id];
+                        assert!(!pane.cold_restore_argv);
+                        assert_eq!(pane.launch_argv, saved.launch_argv);
+                        assert_eq!(pane.label, saved.label);
+                        assert_eq!(pane.cwd, saved.cwd);
+                    }
+                };
+                assert_sanitized(&loaded);
+                // Model the private autosave of sanitized state, then the next
+                // cold load: private replacement must never launder consent.
+                save_to_path(&path, &loaded).unwrap();
+                assert_eq!(
+                    std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
+                assert_sanitized(&load_from_path(&path).unwrap());
+            });
+            let log = std::fs::read_to_string(&log_path).unwrap();
+            assert_eq!(log.lines().count(), 1, "{log}");
+            assert!(log.contains("argv_trust_refused"), "{log}");
+            assert!(
+                log.contains("refusing cold restore argv from untrusted snapshot"),
+                "{log}"
+            );
+            assert!(
+                log.contains("snapshot owner/ACL verification unavailable on macOS"),
+                "{log}"
+            );
+            assert!(log.contains("panes=2"), "{log}");
+            assert!(!log.contains("secret argument"), "{log}");
             std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
         }
     }

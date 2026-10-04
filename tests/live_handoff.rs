@@ -1309,19 +1309,19 @@ done
 
 /// A genuine failed cold restore has state but no exported runtime FD. Neither
 /// successful preparation nor a rejected preparation may retry that recipe.
-#[cfg(all(debug_assertions, any(target_os = "linux", target_os = "macos")))]
+#[cfg(all(debug_assertions, target_os = "linux"))]
 #[test]
 fn live_handoff_preserves_unavailable_argv_without_replay() {
     exercise_unavailable_argv_handoff(false);
 }
 
-#[cfg(all(debug_assertions, any(target_os = "linux", target_os = "macos")))]
+#[cfg(all(debug_assertions, target_os = "linux"))]
 #[test]
 fn live_handoff_timeout_does_not_replay_unavailable_argv() {
     exercise_unavailable_argv_handoff(true);
 }
 
-#[cfg(all(debug_assertions, any(target_os = "linux", target_os = "macos")))]
+#[cfg(all(debug_assertions, target_os = "linux"))]
 fn exercise_unavailable_argv_handoff(rollback: bool) {
     use std::os::unix::fs::PermissionsExt;
 

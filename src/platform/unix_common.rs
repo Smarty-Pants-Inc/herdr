@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 /// Follow symlinks as before, but authorize and read the same resolved object.
 /// O_NONBLOCK prevents a FIFO path from blocking before its type can be checked.
+#[cfg(target_os = "linux")]
 pub(crate) fn read_session_snapshot_with_trust(
     path: &Path,
 ) -> std::io::Result<(String, super::SnapshotFileTrust)> {
@@ -13,6 +14,7 @@ pub(crate) fn read_session_snapshot_with_trust(
     read_opened_snapshot_with_trust(file)
 }
 
+#[cfg(target_os = "linux")]
 fn read_opened_snapshot_with_trust(
     mut file: std::fs::File,
 ) -> std::io::Result<(String, super::SnapshotFileTrust)> {
@@ -32,6 +34,7 @@ fn read_opened_snapshot_with_trust(
     Ok((content, trust))
 }
 
+#[cfg(target_os = "linux")]
 fn snapshot_owner_mode_trust(owner: u32, current_user: u32, mode: u32) -> super::SnapshotFileTrust {
     if owner != current_user {
         super::SnapshotFileTrust::Untrusted("snapshot is not owned by the current user")
@@ -522,6 +525,7 @@ pub(crate) fn set_default_plugin_pane_pwd(env: &mut Vec<(String, String)>, cwd: 
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn snapshot_trust_checks_original_opened_object_and_follows_trusted_target() {
         use std::os::unix::fs::{symlink, PermissionsExt};

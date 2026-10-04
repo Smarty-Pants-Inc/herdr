@@ -660,21 +660,25 @@ fn server_stop_then_restart_restores_pane_history() {
     cleanup_spawned_herdr(restarted, base);
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn cold_restore_replays_only_explicitly_authorized_argv_panes() {
     exercise_cold_restore_argv(false, false);
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn cold_restore_untrusted_snapshot_cannot_authorize_or_launder_ordinary_argv() {
     exercise_cold_restore_argv(true, false);
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn cold_restore_failed_argv_redacts_restart_log_and_preserves_successful_control() {
     exercise_cold_restore_argv(false, true);
 }
 
+#[cfg(target_os = "linux")]
 fn exercise_cold_restore_argv(untrusted_snapshot: bool, unavailable_executable: bool) {
     use std::os::unix::fs::PermissionsExt;
 

@@ -159,7 +159,7 @@ consent retroactively. Creation schedules normal session autosave; its response
 is not a synchronous disk durability guarantee.
 
 The server stores `cold_restore_argv` beside the launch argv in its session
-snapshot. On Linux/macOS, disk replay is trusted only when the **opened file**
+snapshot. On Linux, disk replay is trusted only when the **opened file**
 is regular, owned by the current user, and not writable by group or others.
 Metadata and bytes come from the same read-only handle; permissions are not
 repaired to authorize input. Symlinks retain existing read behavior: trust is
@@ -170,9 +170,16 @@ intentionally trusted. This is not a sandbox or protection against the same uid.
 Untrusted snapshots still restore session organization and plain shells, but
 all replay marks are removed **before load returns**, so a later private autosave
 cannot launder them into authority. One trust-refusal diagnostic is recorded
-without command arguments or environment values. On Windows, read-only owner/DACL
-verification is not yet implemented: disk marks are refused and stripped, and
-cold restore opens plain shells. **Do not rely on argv replay on Windows.**
+without command arguments or environment values.
+
+On macOS and Windows, disk replay fails closed until read-only verification of
+the opened file's owner and access controls is implemented (macOS extended ACLs;
+Windows DACLs). Disk marks are refused and stripped before load returns, cold
+restore opens plain shells, and the same trust-refusal diagnostic is recorded
+without command arguments or environment values. **Do not rely on argv replay
+on macOS or Windows.** Read-only owner/ACL verification for **both platforms** is
+tracked in [Smarty-Pants-Inc/smarty-dev#4526](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/4526).
+Herdr must not remove ACLs or repair permissions on input to authorize its contents.
 
 Eligible cold restore uses the saved cwd and existing workspace launch defaults;
 per-pane custom environment is not supported. Native agent resume retains
