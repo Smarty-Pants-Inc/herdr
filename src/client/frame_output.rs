@@ -47,10 +47,15 @@ pub(super) fn write_composed_frame(
     for operation in &graphics.operations {
         match operation {
             GraphicsOperation::Bytes(bytes) => {
+                let commands = kitty_graphics_image_commands(bytes);
+                apply_upload_ledger_obligations(&commands);
                 writer.write_all(bytes)?;
-                pending_ledger.extend(kitty_graphics_image_commands(bytes));
+                pending_ledger.extend(commands);
             }
             GraphicsOperation::Upload { control, data } => {
+                let header = format!("\x1b_G{control};\x1b\\");
+                let header_commands = kitty_graphics_image_commands(header.as_bytes());
+                apply_upload_ledger_obligations(&header_commands);
                 let file_eligible = control
                     .split(',')
                     .any(|part| matches!(part, "f=24" | "f=32" | "f=100"));
@@ -65,7 +70,6 @@ pub(super) fn write_composed_frame(
                     }
                 }
                 let path = file_eligible.then(|| files.prepare(data)).flatten();
-                let header = format!("\x1b_G{control};\x1b\\");
                 if let Some(path) = path.as_ref().and_then(|path| path.to_str()) {
                     let control = control.replace(",t=d,", ",t=t,");
                     let path = base64::engine::general_purpose::STANDARD.encode(path.as_bytes());
@@ -100,6 +104,7 @@ pub(super) fn write_encoded_frame_with_graphics(
     }
 
     let insertion = render_ansi::final_sync_output_end(encoded).unwrap_or(encoded.len());
+    apply_upload_ledger_obligations(&kitty_graphics_image_commands(graphics));
 
     writer.write_all(&encoded[..insertion])?;
     writer.write_all(b"\x1b7")?;
