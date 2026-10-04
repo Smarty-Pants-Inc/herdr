@@ -191,6 +191,11 @@ async fn client_listener_rendering_server_accepts_fresh_attach() {
     // drive the loop between render iterations.
     let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
     server.app.api_rx = api_rx;
+    let pane_id = install_shared_view_test_runtime(&mut server);
+    let terminal_id = server.app.state.workspaces[0].tabs[0]
+        .terminal_id(pane_id)
+        .unwrap()
+        .to_string();
     let path = server.client_socket_path.clone();
     let first = tokio::task::spawn_blocking({
         let path = path.clone();
@@ -225,7 +230,25 @@ async fn client_listener_rendering_server_accepts_fresh_attach() {
     let second_render_notify = render_notify.clone();
     let second = async move {
         let mut first_client = first.await.unwrap();
+        let terminal_id_for_attach = terminal_id.clone();
+        first_client = tokio::task::spawn_blocking(move || {
+            protocol::write_message(
+                &mut first_client,
+                &protocol::ClientMessage::AttachTerminal {
+                    terminal_id: terminal_id_for_attach,
+                    takeover: false,
+                },
+            )
+            .unwrap();
+            first_client
+        })
+        .await
+        .unwrap();
         tokio::time::sleep(Duration::from_millis(30)).await;
+        let accepts_before_second = RENDER_ACCEPT_TEST_COUNT.load(Ordering::Relaxed);
+        // Hold the idle select's accept path in its existing error backoff so
+        // only the render-iteration drain can accept the fresh client.
+        set_idle_client_accept_test_blocked(true);
         let second_path = path.clone();
         let welcome = tokio::task::spawn_blocking(move || {
             let mut client = crate::ipc::connect_local_stream(&second_path).unwrap();
@@ -249,8 +272,9 @@ async fn client_listener_rendering_server_accepts_fresh_attach() {
             .await
             .expect("fresh attach must not wait behind rendering")
             .unwrap());
+        set_idle_client_accept_test_blocked(false);
         assert!(
-            RENDER_ACCEPT_TEST_COUNT.load(Ordering::Relaxed) > 0,
+            RENDER_ACCEPT_TEST_COUNT.load(Ordering::Relaxed) > accepts_before_second,
             "the fresh attach must be accepted on a render iteration"
         );
         tokio::task::spawn_blocking(move || {

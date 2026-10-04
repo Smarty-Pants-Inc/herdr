@@ -3748,6 +3748,12 @@ struct ClientAcceptTestHook {
 std::thread_local! {
     static CLIENT_ACCEPT_TEST_HOOK: std::cell::RefCell<Option<ClientAcceptTestHook>> =
         const { std::cell::RefCell::new(None) };
+    static BLOCK_IDLE_CLIENT_ACCEPT_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(all(unix, test))]
+fn set_idle_client_accept_test_blocked(blocked: bool) {
+    BLOCK_IDLE_CLIENT_ACCEPT_TEST.with(|value| value.set(blocked));
 }
 
 #[cfg(all(unix, test))]
@@ -3789,7 +3795,12 @@ fn try_accept_ready_client_connections(
                 if let Some(err) = injected_client_accept_error() {
                     return Err(err);
                 }
-                listener.accept()
+                let result = listener.accept();
+                #[cfg(test)]
+                if result.is_ok() {
+                    RENDER_ACCEPT_TEST_COUNT.fetch_add(1, Ordering::Relaxed);
+                }
+                result
             })
         },
         next_client_id,
@@ -3818,15 +3829,14 @@ async fn accept_ready_client_connections(
             ready
                 .try_io(|_| {
                     #[cfg(test)]
+                    if BLOCK_IDLE_CLIENT_ACCEPT_TEST.with(|value| value.get()) {
+                        return Err(io::Error::from_raw_os_error(libc::EMFILE));
+                    }
+                    #[cfg(test)]
                     if let Some(err) = injected_client_accept_error() {
                         return Err(err);
                     }
-                    let result = listener.accept();
-                    #[cfg(test)]
-                    if result.is_ok() {
-                        RENDER_ACCEPT_TEST_COUNT.fetch_add(1, Ordering::Relaxed);
-                    }
-                    result
+                    listener.accept()
                 })
                 .unwrap_or_else(|_| Err(io::ErrorKind::WouldBlock.into()))
         },
