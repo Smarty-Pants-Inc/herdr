@@ -43,6 +43,23 @@ fn monitor_host_shutdown(
     None
 }
 
+/// Provenance of the opened snapshot object, not a serialized assertion.
+pub(crate) enum SnapshotFileTrust {
+    #[cfg(target_os = "linux")]
+    Trusted,
+    Untrusted(&'static str),
+}
+
+impl SnapshotFileTrust {
+    pub(crate) fn refusal_reason(&self) -> Option<&'static str> {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Trusted => None,
+            Self::Untrusted(reason) => Some(reason),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForegroundProcess {
     pub pid: u32,
