@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use crate::api::schema::{
     EventData, EventEnvelope, EventKind, ResponseResult, TabCreateParams, TabListParams,
-    TabMoveParams, TabRenameParams, TabTarget,
+    TabMoveParams, TabMoveProjectCheckedParams, TabRenameParams, TabTarget,
 };
 use crate::app::{App, Mode};
 
@@ -172,6 +172,30 @@ impl App {
     }
 
     pub(super) fn handle_tab_move(&mut self, id: String, params: TabMoveParams) -> String {
+        self.handle_tab_move_checked(id, params, false)
+    }
+
+    pub(super) fn handle_tab_move_project_checked(
+        &mut self,
+        id: String,
+        params: TabMoveProjectCheckedParams,
+    ) -> String {
+        self.handle_tab_move_checked(
+            id,
+            TabMoveParams {
+                tab_id: params.tab_id,
+                insert_index: params.insert_index,
+            },
+            params.allow_project_change,
+        )
+    }
+
+    fn handle_tab_move_checked(
+        &mut self,
+        id: String,
+        params: TabMoveParams,
+        allow_project_change: bool,
+    ) -> String {
         let Some((ws_idx, tab_idx)) = self.parse_tab_id(&params.tab_id) else {
             return tab_not_found(id, &params.tab_id);
         };
@@ -191,6 +215,24 @@ impl App {
             .unwrap_or_else(|| crate::workspace::public_tab_id_for_number(&ws.id, tab_idx + 1));
         let workspace_id = self.public_workspace_id(ws_idx);
         let insert_index = params.insert_index;
+        let mut projected = self.project_topology();
+        let tabs = &mut projected[ws_idx].tabs;
+        let target_idx = if tab_idx < insert_index {
+            insert_index.saturating_sub(1)
+        } else {
+            insert_index
+        }
+        .min(tabs.len().saturating_sub(1));
+        let tab = tabs.remove(tab_idx);
+        tabs.insert(target_idx, tab);
+        let project_changes = match self.precheck_project_change(
+            &projected,
+            allow_project_change,
+            "tab.move_project_checked",
+        ) {
+            Ok(changes) => changes,
+            Err(message) => return encode_error(id, "project_change_refused", message),
+        };
         let moved = self
             .state
             .workspaces
@@ -198,6 +240,7 @@ impl App {
             .is_some_and(|ws| ws.move_tab(tab_idx, insert_index));
         let tabs = self.tab_list_info(ws_idx);
         if moved {
+            Self::log_project_changes(&project_changes);
             self.schedule_session_save();
             self.emit_event(EventEnvelope {
                 event: EventKind::TabMoved,
@@ -225,6 +268,18 @@ impl App {
             return tab_not_found(id, &target.tab_id);
         };
         let closes_workspace = ws.tabs.len() <= 1;
+        let mut projected = self.project_topology();
+        if closes_workspace {
+            projected.remove(ws_idx);
+        } else {
+            projected[ws_idx].tabs.remove(tab_idx);
+        }
+        // Closing explicitly permits a project change for surviving sessions;
+        // the destroyed tab's sessions are absent from the projected topology.
+        let project_changes = match self.precheck_project_change(&projected, true, "tab.close") {
+            Ok(changes) => changes,
+            Err(message) => return encode_error(id, "project_change_refused", message),
+        };
         let terminal_ids = self.state.terminal_ids_for_tab(ws_idx, tab_idx);
         let pane_ids = ws
             .tabs
@@ -259,6 +314,10 @@ impl App {
                     workspace: Some(workspace),
                 },
             });
+            Self::log_project_changes_with_context(
+                &project_changes,
+                "tab.close (intentional close)",
+            );
             return encode_success(id, ResponseResult::Ok {});
         }
 
@@ -272,6 +331,7 @@ impl App {
                 format!("tab {} could not be closed", target.tab_id),
             );
         }
+        Self::log_project_changes_with_context(&project_changes, "tab.close (intentional close)");
         self.state.remove_plugin_pane_records(pane_ids);
         self.state.remove_unattached_terminal_ids(terminal_ids);
         self.shutdown_detached_terminal_runtimes();

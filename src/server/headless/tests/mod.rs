@@ -12,6 +12,8 @@ mod media_tests;
 mod pane_graphics_tests;
 #[path = "pane_move.rs"]
 mod pane_move_tests;
+#[path = "project_change.rs"]
+mod project_change_tests;
 #[path = "surface_delta.rs"]
 mod surface_delta_tests;
 #[path = "surface_interest.rs"]

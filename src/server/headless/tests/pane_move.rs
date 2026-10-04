@@ -61,6 +61,7 @@ async fn public_pane_move_focus_follows_the_moved_pane() {
     let moved = public_move(
         &mut server,
         PaneMoveParams {
+            allow_project_change: false,
             pane_id: source_id,
             destination: PaneMoveDestination::NewTab {
                 workspace_id: Some(destination_id.clone()),
@@ -152,6 +153,7 @@ async fn public_pane_move_focus_handles_source_removal_and_unchanged_server_targ
         let moved = public_move(
             &mut server,
             PaneMoveParams {
+                allow_project_change: false,
                 pane_id: source_id,
                 destination,
                 focus: true,
@@ -202,6 +204,7 @@ async fn public_pane_move_without_effective_focus_preserves_client_views() {
         let result = public_move(
             &mut server,
             PaneMoveParams {
+                allow_project_change: false,
                 pane_id: source_id,
                 destination: PaneMoveDestination::Tab {
                     tab_id,

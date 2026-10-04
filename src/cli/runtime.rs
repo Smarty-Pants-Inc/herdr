@@ -122,7 +122,9 @@ pub(super) fn pane_swap(params: PaneSwapParams) -> std::io::Result<i32> {
 }
 
 pub(super) fn pane_move(params: PaneMoveParams) -> std::io::Result<i32> {
-    print_method_response("cli:pane:move", Method::PaneMove(params))
+    // Never retry an unchecked method on an older server: that could silently
+    // ignore permission fields and recreate cross-project session ownership.
+    print_method_response("cli:pane:move", Method::PaneMoveProjectChecked(params))
 }
 
 pub(super) fn pane_close(pane_id: String) -> std::io::Result<i32> {
