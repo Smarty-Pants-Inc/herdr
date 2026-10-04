@@ -18,13 +18,35 @@ ALLOWED_TYPES = {
     "release",
 }
 SUBJECT_RE = re.compile(r"^(?P<kind>[a-z]+)(?:\([^)]+\))?!?:\s+\S")
+MERGIFY_AUTHOR_EMAIL = "37929162+mergify[bot]@users.noreply.github.com"
+MERGIFY_MERGE_RE = re.compile(
+    r"Merge pull request #[1-9][0-9]* from [A-Za-z0-9_.-]+/\S+"
+)
 
 
 def git_subjects(rev_range: str) -> list[str]:
     output = subprocess.check_output(
-        ["git", "log", "--pretty=format:%s", rev_range], text=True
-    ).strip()
-    return [line.strip() for line in output.splitlines() if line.strip()]
+        ["git", "log", "-z", "--format=%P%x00%ae%x00%s%x00%b", rev_range],
+        text=True,
+    )
+    fields = output.split("\0")
+    subjects = []
+    for index in range(0, len(fields) - 1, 4):
+        parents, author_email, subject, body = fields[index : index + 4]
+        subject = subject.strip()
+        # Legacy Mergify merges put the PR title in the body, not the subject.
+        # Never exempt arbitrary merge text or ordinary commits from validation.
+        if (
+            len(parents.split()) == 2
+            and author_email == MERGIFY_AUTHOR_EMAIL
+            and MERGIFY_MERGE_RE.fullmatch(subject)
+        ):
+            title = body.strip().splitlines()[0] if body.strip() else ""
+            if valid_subject(title):
+                subject = title
+        if subject:
+            subjects.append(subject)
+    return subjects
 
 
 def valid_subject(subject: str) -> bool:
