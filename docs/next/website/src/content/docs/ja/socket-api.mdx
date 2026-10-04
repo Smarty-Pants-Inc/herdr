@@ -99,10 +99,10 @@ herdr pane read w1:p2 --source recent --lines 50
 | ワークスペース | `workspace.create`、`workspace.list`、`workspace.get`、`workspace.focus`、`workspace.rename`、`workspace.move`、`workspace.move_block`、`workspace.report_metadata`、`workspace.close` |
 | Worktree | `worktree.list`、`worktree.create`、`worktree.open`、`worktree.remove` |
 | タブ | `tab.create`、`tab.list`、`tab.get`、`tab.focus`、`tab.rename`、`tab.move`、`tab.close` |
-| ペイン | `pane.split`、`pane.swap`、`pane.move`、`pane.zoom`、`pane.layout`、`pane.process_info`、`pane.neighbor`、`pane.edges`、`pane.focus_direction`、`pane.resize`、`pane.list`、`pane.current`、`pane.get`、`pane.rename`、`pane.send_text`、`pane.send_keys`、`pane.send_input`、`pane.read`、`pane.graphics.info`、`pane.graphics.set`、`pane.graphics.clear`、`pane.graphics.stream`、`pane.report_agent`、`pane.report_agent_session`、`pane.report_metadata`、`pane.clear_agent_authority`、`pane.release_agent`、`pane.close`、`pane.wait_for_output` |
+| ペイン | `pane.split`、`pane.swap`、`pane.move`、`pane.zoom`、`pane.layout`、`pane.process_info`、`pane.neighbor`、`pane.edges`、`pane.focus_direction`、`pane.resize`、`pane.list`、`pane.current`、`pane.get`、`pane.last_input`、`pane.rename`、`pane.send_text`、`pane.send_keys`、`pane.send_input`、`pane.send_input_guarded`、`pane.read`、`pane.graphics.info`、`pane.graphics.set`、`pane.graphics.clear`、`pane.graphics.stream`、`pane.report_agent`、`pane.report_agent_session`、`pane.report_metadata`、`pane.clear_agent_authority`、`pane.release_agent`、`pane.close`、`pane.wait_for_output` |
 | ポップアップ | `popup.close` |
 | レイアウト | `layout.export`、`layout.apply`、`layout.set_split_ratio` |
-| エージェント | `agent.list`、`agent.get`、`agent.read`、`agent.explain`、`agent.send_keys`、`agent.prompt`、`agent.wait`、`agent.rename`、`agent.focus`、`agent.start` |
+| エージェント | `agent.list`、`agent.get`、`agent.read`、`agent.explain`、`agent.send_keys`、`agent.prompt`、`agent.wait`、`agent.rename`、`agent.focus`、`agent.start`、`agent.start_guarded` |
 | イベント | `events.subscribe`、`events.wait` |
 | インテグレーション | `integration.install`、`integration.uninstall` |
 | プラグイン | `plugin.link`、`plugin.list`、`plugin.unlink`、`plugin.enable`、`plugin.disable`、`plugin.action.list`、`plugin.action.invoke`、`plugin.log.list`、`plugin.pane.open`、`plugin.pane.focus`、`plugin.pane.close` |
@@ -116,6 +116,44 @@ herdr pane read w1:p2 --source recent --lines 50
 CLI の `herdr api snapshot` は、クライアントやエージェントが簡単にブートストラップできるよう、現在の `session.snapshot` レスポンスを JSON で出力します。
 
 ペイン制御メソッドは `w1:p1` のような公開ペイン id を使います。スキーマ上 `pane_id` が省略可能なメソッドは、省略時にサーバーのアクティブなフォーカス中ペインを使います。`pane.move` は常に送信元の `pane_id` を要求します。
+
+### ペインへの最後の入力
+
+`pane.last_input` は、メディアルーティングと同じペイン単位の追跡データを使い、そのペインで最後に受け入れられたクライアント入力の送信元情報を読み取ります。クライアント入力にはマウス操作も含まれる場合があり、キーボード入力やプロンプト送信だけではありません。公開ペイン id を `pane` に指定します。`pane_id` もエイリアスとして使えます。
+
+```json
+{"id":"last_input","method":"pane.last_input","params":{"pane":"w1:p1"}}
+```
+
+標準の成功レスポンスには `result.type: "pane_last_input"` があり、`last_input` フィールドはオブジェクトまたは `null` です:
+
+```json
+{"id":"last_input","result":{"type":"pane_last_input","last_input":{"user":"Alice","client_id":7,"at":1780000000123}}}
+{"id":"last_input","result":{"type":"pane_last_input","last_input":null}}
+```
+
+- `user` はクライアントが任意で自己申告する名前です。文字列、または取得できない場合は `null` です。
+- `client_id` はサーバーが割り当てる数値のクライアント接続 id であり、アカウント id ではありません。
+- `at` はサーバーが記録した入力時刻で、Unix エポックからのミリ秒数です。秒数ではありません。
+
+名前はクライアントの hello の省略可能な `user` フィールドから取得します。Herdr クライアントは設定された [`identity.name`](/ja/docs/configuration/#クライアントの識別名) を使い、未設定の場合はクライアントの `USER`、次に `USERNAME` を使います。名前は表示用メタデータにすぎず、認証、認可、検証済みの送信者情報ではありません。
+
+匿名の接続クライアントでも、`user: null`、`client_id`、`at` を持つレコードが作成されます。レコードは、そのペインへの次の入力、クライアントの切断、ペインの削除まで保持されます。メディアルーティングで要求される鮮度とは異なり、10 秒後に期限切れにはなりません。API からの入力が受け入れられると、表示用の送信元情報だけがクリアされ、以前のクライアント送信者を引き継がず `last_input` が `null` になります。既存のメディアルーティングの対象クライアントはクリアされません。API 呼び出し元の情報には、別の [API 入力ログ](#api-入力ログ)を使ってください。
+
+このクエリは入力テキストを含まず、メッセージ履歴を保持せず、送信されたプロンプトの作成者を証明しません。別のペインへの入力は、このペインの送信元情報を変更しません。
+
+### 期待するターミナルのガード
+
+`agent.start` と `pane.send_input` は、省略可能な `expected_terminal` 文字列を受け付けます。対象ペインの現在のレコードから、不透明な識別子 `terminal_id` をそのままコピーしてください。サーバーはリクエストを処理している間に、この値をペインに接続されているターミナルと比較し、検証したターミナルに対して操作を実行します。ペインが存在しない、識別子が不明、文字列の形式が不正、または接続されているターミナルが異なる場合は、入力ログへの記録、PTY への入力、エージェント名の関連付け、起動待ち状態の設定より前に `terminal_identity_mismatch` を返します。フィールドが存在し、その値が `null` または文字列以外の場合は `invalid_request` です。ガードなしの動作を維持するには、フィールドを省略してください。
+
+この機能を使う前に、`ping.result.capabilities.expected_terminal_guard == true` を確認してください。ガード付きの操作には `agent.start_guarded` と `pane.send_input_guarded` を使います。これらのメソッドでは `expected_terminal` が必須で、古いサーバーはフィールドを黙って無視するのではなく、メソッドを拒否します。能力の確認と操作に別々の接続を使うこともできます。その間にサーバーが置き換わっても、ガード付きメソッドは安全を確認できなければ操作を拒否します。拒否された後にガードなしの操作へフォールバックしないでください。CLI は `agent start --expected-terminal` と `pane run --expected-terminal` にこれらのメソッドを使い、未対応のサーバーを `expected_terminal_unsupported` で拒否します。
+
+```json
+{"id":"guarded_input","method":"pane.send_input_guarded","params":{"pane_id":"w1:p1","expected_terminal":"term_opaque_from_pane_get","text":"echo ready","keys":["Enter"]}}
+{"id":"guarded_start","method":"agent.start_guarded","params":{"pane_id":"w1:p1","expected_terminal":"term_opaque_from_pane_get","name":"worker","kind":"pi"}}
+```
+
+このガードが識別するのはターミナルであり、その中のエージェント名、プロセス、ネイティブエージェントセッションではありません。別途定められたペイン間入力ポリシーは変更しません。
 
 `pane.send_keys` と `pane.send_input.keys` は Herdr のキーコンボ文字列を受け付けます: 通常の印字可能キー、`enter` や `esc` のような特殊キー、`ctrl+h`、`control+j`、`alt+x`、`shift+tab` のような修飾キーコード、`f1` のようなファンクションキー、`minus` や `plus` のような名前付き記号です。`prefix+` のバインド文字列は受け付けません。
 

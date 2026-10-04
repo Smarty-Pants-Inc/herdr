@@ -34,6 +34,14 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
+// Missing means unguarded; a present null or non-string must never disable the guard.
+fn deserialize_expected_terminal<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    String::deserialize(deserializer).map(Some)
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Request {
     pub id: String,
@@ -152,6 +160,9 @@ pub enum Method {
     AgentFocus(AgentTarget),
     #[serde(rename = "agent.start")]
     AgentStart(AgentStartParams),
+    /// Requires `expected_terminal`; older servers reject instead of ignoring the guard.
+    #[serde(rename = "agent.start_guarded")]
+    AgentStartGuarded(AgentStartParams),
     #[serde(rename = "agent.prompt")]
     AgentPrompt(AgentPromptParams),
     #[serde(rename = "agent.wait")]
@@ -200,6 +211,8 @@ pub enum Method {
     PaneCurrent(PaneCurrentParams),
     #[serde(rename = "pane.get")]
     PaneGet(PaneTarget),
+    #[serde(rename = "pane.last_input")]
+    PaneLastInput(PaneLastInputParams),
     #[serde(rename = "pane.focus")]
     PaneFocus(PaneTarget),
     #[serde(rename = "pane.input.set")]
@@ -216,6 +229,9 @@ pub enum Method {
     PaneSendKeys(PaneSendKeysParams),
     #[serde(rename = "pane.send_input")]
     PaneSendInput(PaneSendInputParams),
+    /// Requires `expected_terminal`; older servers reject instead of ignoring the guard.
+    #[serde(rename = "pane.send_input_guarded")]
+    PaneSendInputGuarded(PaneSendInputParams),
     #[serde(rename = "pane.read")]
     PaneRead(PaneReadParams),
     #[serde(rename = "pane.graphics.set")]

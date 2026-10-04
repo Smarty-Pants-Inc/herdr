@@ -98,6 +98,7 @@ fn agent_start_and_prompt_requests_round_trip() {
             name: "reviewer".into(),
             kind: "pi".into(),
             pane_id: "w1:p2".into(),
+            expected_terminal: None,
             args: vec!["--no-session".into()],
             timeout_ms: Some(30_000),
             allow_cross_pane: false,
@@ -438,6 +439,89 @@ fn missing_required_params_are_rejected() {
 }
 
 #[test]
+fn expected_terminal_guard_is_optional_but_present_values_must_be_strings() {
+    for method in [
+        "agent.start",
+        "agent.start_guarded",
+        "pane.send_input",
+        "pane.send_input_guarded",
+    ] {
+        let mut value = serde_json::json!({
+            "id": "guard",
+            "method": method,
+            "params": {"name": "worker", "kind": "pi", "pane_id": "w1:p1"},
+        });
+        let request: Request = serde_json::from_value(value.clone()).unwrap();
+        let encoded = serde_json::to_value(request).unwrap();
+        assert!(encoded["params"].get("expected_terminal").is_none());
+        value["params"]["expected_terminal"] = serde_json::json!("term_opaque");
+        let request: Request = serde_json::from_value(value.clone()).unwrap();
+        let encoded = serde_json::to_value(request).unwrap();
+        assert_eq!(encoded["params"]["expected_terminal"], "term_opaque");
+        assert_eq!(encoded["method"], method);
+        for malformed in [
+            serde_json::Value::Null,
+            serde_json::json!(1),
+            serde_json::json!(false),
+            serde_json::json!({}),
+        ] {
+            value["params"]["expected_terminal"] = malformed;
+            assert!(serde_json::from_value::<Request>(value.clone()).is_err());
+        }
+    }
+}
+
+#[test]
+fn old_server_capabilities_do_not_advertise_expected_terminal_guard() {
+    let caps: ServerCapabilities =
+        serde_json::from_value(serde_json::json!({"live_handoff": false})).unwrap();
+    assert!(!caps.expected_terminal_guard);
+}
+
+#[test]
+fn pane_last_input_accepts_pane_and_pane_id_alias_without_changing_existing_targets() {
+    for key in ["pane", "pane_id"] {
+        let request: Request = serde_json::from_value(serde_json::json!({
+            "id": "last", "method": "pane.last_input", "params": {key: "p_7"}
+        }))
+        .unwrap();
+        let Method::PaneLastInput(ref target) = request.method else {
+            panic!("last input method");
+        };
+        assert_eq!(target.pane, "p_7");
+        assert_eq!(
+            serde_json::to_value(request).unwrap()["params"],
+            serde_json::json!({"pane":"p_7"})
+        );
+    }
+    assert!(serde_json::from_value::<Request>(serde_json::json!({
+        "id":"last", "method":"pane.last_input", "params":{}
+    }))
+    .is_err());
+    let result = ResponseResult::PaneLastInput { last_input: None };
+    assert_eq!(
+        serde_json::to_value(result).unwrap(),
+        serde_json::json!({"type":"pane_last_input","last_input":null})
+    );
+    let result = ResponseResult::PaneLastInput {
+        last_input: Some(PaneLastInput {
+            user: None,
+            client_id: 7,
+            at: 1_700_000_000_001,
+        }),
+    };
+    let value = serde_json::to_value(&result).unwrap();
+    assert_eq!(
+        value,
+        serde_json::json!({"type":"pane_last_input","last_input":{"user":null,"client_id":7,"at":1_700_000_000_001u64}})
+    );
+    assert_eq!(
+        serde_json::from_value::<ResponseResult>(value).unwrap(),
+        result
+    );
+}
+
+#[test]
 fn pane_send_input_defaults_to_empty_text_and_keys() {
     let json = r#"
     {
@@ -732,6 +816,7 @@ fn success_response_round_trips() {
                 health_check: true,
                 ssh_agent_registration: false,
                 guarded_live_handoff: true,
+                expected_terminal_guard: true,
             }),
         },
     };

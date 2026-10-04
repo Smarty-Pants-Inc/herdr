@@ -475,6 +475,7 @@ fn agent_command() -> Command {
                         .required(true)
                         .help("Existing pane at an interactive shell prompt"),
                 )
+                .arg(expected_terminal_option())
                 .arg(
                     option("timeout", "MS")
                         .value_parser(clap::value_parser!(u64))
@@ -699,6 +700,7 @@ fn pane_command() -> Command {
                 .about("Run a command in a pane")
                 .arg(required("pane_id", "PANE_ID"))
                 .arg(required("command", "COMMAND").num_args(1..).action(ArgAction::Append))
+                .arg(expected_terminal_option())
                 .arg(
                     flag("allow-cross-pane")
                         .help("Deliberately allow an agent-originated request to target another pane"),
@@ -709,6 +711,11 @@ fn pane_command() -> Command {
         .subcommand(report_agent_session_command())
         .subcommand(release_agent_command())
         .subcommand(report_metadata_command())
+}
+
+fn expected_terminal_option() -> Arg {
+    option("expected-terminal", "TERMINAL_ID")
+        .help("Refuse unless the pane still owns this terminal_id; requires server support")
 }
 
 fn report_agent_command() -> Command {

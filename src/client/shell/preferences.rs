@@ -14,6 +14,38 @@ pub(super) struct ClientRemoteCollapsedGroups {
     pub(super) collapsed_groups: Vec<String>,
 }
 
+/// Client-only stable keys; unrelated to server-local worktree collapse identities.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub(super) enum ClientGroupedCollapse {
+    Org(String),
+    Project(String, String),
+    OrgAgents(String),
+    Ungrouped,
+}
+
+impl From<super::grouped_projection::GroupKey> for ClientGroupedCollapse {
+    fn from(key: super::grouped_projection::GroupKey) -> Self {
+        use super::grouped_projection::GroupKey;
+        match key {
+            GroupKey::Org(org) => Self::Org(org),
+            GroupKey::Project(org, project) => Self::Project(org, project),
+            GroupKey::OrgAgents(org) => Self::OrgAgents(org),
+            GroupKey::Ungrouped => Self::Ungrouped,
+        }
+    }
+}
+
+impl From<ClientGroupedCollapse> for super::grouped_projection::GroupKey {
+    fn from(key: ClientGroupedCollapse) -> Self {
+        match key {
+            ClientGroupedCollapse::Org(org) => Self::Org(org),
+            ClientGroupedCollapse::Project(org, project) => Self::Project(org, project),
+            ClientGroupedCollapse::OrgAgents(org) => Self::OrgAgents(org),
+            ClientGroupedCollapse::Ungrouped => Self::Ungrouped,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub(super) struct ClientChromePreferences {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -28,6 +60,8 @@ pub(super) struct ClientChromePreferences {
     pub(super) collapsed_groups: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(super) remote_collapsed_groups: Vec<ClientRemoteCollapsedGroups>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) grouped_collapsed: Vec<ClientGroupedCollapse>,
 }
 
 pub(super) fn path_for_local_endpoint(socket_path: &Path) -> PathBuf {

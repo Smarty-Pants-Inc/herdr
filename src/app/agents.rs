@@ -146,6 +146,13 @@ impl App {
         &mut self,
         params: AgentStartParams,
     ) -> Result<(crate::api::schema::AgentInfo, Vec<String>), AgentStartError> {
+        let pane = self.parse_current_public_pane_id(&params.pane_id);
+        let terminal_id =
+            pane.and_then(|(ws_idx, pane_id)| self.state.terminal_id_for_pane(ws_idx, pane_id));
+        self.check_expected_terminal(params.expected_terminal.as_deref(), terminal_id.as_ref())
+            .map_err(AgentStartError::TerminalIdentityMismatch)?;
+        // No await or mutable target resolution between the guard, name binding and
+        // PTY enqueue: all startup effects use this checked server-owned terminal.
         let name = params.name;
         if !valid_agent_name(&name) {
             return Err(AgentStartError::InvalidName);
@@ -169,16 +176,10 @@ impl App {
                 candidates: conflicts,
             });
         }
-        let Some((ws_idx, pane_id)) = self.parse_current_public_pane_id(&params.pane_id) else {
-            return Err(AgentStartError::TargetNotFound(params.pane_id));
-        };
-        let terminal_id = self
-            .state
-            .workspaces
-            .get(ws_idx)
-            .and_then(|workspace| workspace.terminal_id(pane_id))
-            .cloned()
-            .ok_or_else(|| AgentStartError::TargetNotFound(params.pane_id.clone()))?;
+        let (ws_idx, pane_id) =
+            pane.ok_or_else(|| AgentStartError::TargetNotFound(params.pane_id.clone()))?;
+        let terminal_id =
+            terminal_id.ok_or_else(|| AgentStartError::TargetNotFound(params.pane_id.clone()))?;
         let terminal = self
             .state
             .terminals
@@ -222,6 +223,7 @@ impl App {
         if let Some(session) = persisted_agent_session {
             terminal.set_managed_agent_launch_session(session);
         }
+        self.accepted_api_inputs.push(pane_id);
         self.state.mark_session_dirty();
         self.schedule_session_save();
 
@@ -236,6 +238,7 @@ impl App {
         err: AgentStartError,
     ) -> crate::api::schema::ErrorBody {
         match err {
+            AgentStartError::TerminalIdentityMismatch(error) => error,
             AgentStartError::InvalidName => crate::api::schema::ErrorBody {
                 code: "invalid_agent_name".into(),
                 message: INVALID_AGENT_NAME_MESSAGE.into(),
@@ -447,6 +450,7 @@ fn live_runtime_agent(runtime: &crate::terminal::TerminalRuntime) -> Option<crat
 }
 
 pub(super) enum AgentStartError {
+    TerminalIdentityMismatch(crate::api::schema::ErrorBody),
     InvalidName,
     UnsupportedKind(String),
     InvalidArgument,

@@ -51,4 +51,7 @@ pub struct ServerCapabilities {
     /// source server and a replacement that cannot report its sockets.
     #[serde(default)]
     pub guarded_live_handoff: bool,
+    /// Supports the fail-closed `expected_terminal` guard on `agent.start` and `pane.send_input`.
+    #[serde(default)]
+    pub expected_terminal_guard: bool,
 }

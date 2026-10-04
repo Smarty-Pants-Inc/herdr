@@ -42,6 +42,23 @@ pub struct PaneSplitParams {
     pub env: HashMap<String, String>,
 }
 
+/// Queries server-owned sender attribution, independent of the client's pane spelling.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneLastInputParams {
+    #[serde(alias = "pane_id")]
+    pub pane: String,
+}
+
+/// Last accepted client-owned pane interaction (including mouse input).
+/// The user is self-declared, never authenticated.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneLastInput {
+    pub user: Option<String>,
+    pub client_id: u64,
+    /// Unix epoch milliseconds, recorded when input was accepted by the server.
+    pub at: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PaneInputSetParams {
     pub pane_id: String,
@@ -351,6 +368,14 @@ pub struct PaneSendKeysParams {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PaneSendInputParams {
     pub pane_id: String,
+    /// Refuse input unless the pane still owns this opaque terminal identity.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "super::deserialize_expected_terminal"
+    )]
+    #[schemars(with = "String")]
+    pub expected_terminal: Option<String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub text: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

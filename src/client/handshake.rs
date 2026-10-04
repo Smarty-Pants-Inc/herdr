@@ -170,6 +170,9 @@ pub(super) fn do_handshake(
     let endpoint_shell = shell_surface_size.is_some();
     let hello = if let Some(surface_size) = shell_surface_size {
         let hello = EndpointClientHello {
+            // Load on the client machine, including SSH connections and reconnects.
+            // The remote server's account name must never stand in for the sender.
+            user: crate::config::Config::load().config.identity.name,
             generation: ENDPOINT_PROTOCOL_GENERATION,
             cell_width_px,
             cell_height_px,

@@ -382,10 +382,31 @@ fn serialize_voice_name<S: serde::Serializer>(
     name.serialize(serializer)
 }
 
+/// Client-local, self-declared identity. This is a display label, not authentication.
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub struct IdentityConfig {
+    pub name: Option<String>,
+}
+
+impl Default for IdentityConfig {
+    fn default() -> Self {
+        Self {
+            name: default_identity_name(std::env::var("USER").ok(), std::env::var("USERNAME").ok()),
+        }
+    }
+}
+
+fn default_identity_name(user: Option<String>, username: Option<String>) -> Option<String> {
+    user.filter(|name| !name.trim().is_empty())
+        .or_else(|| username.filter(|name| !name.trim().is_empty()))
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub onboarding: Option<bool>,
+    pub identity: IdentityConfig,
     pub media: MediaMode,
     pub voice: VoiceConfig,
     pub theme: ThemeConfig,
@@ -2013,6 +2034,27 @@ delay_seconds = {}
     fn missing_onboarding_shows_setup() {
         let config = Config::default();
         assert!(config.should_show_onboarding());
+    }
+
+    #[test]
+    fn identity_name_defaults_to_client_environment_and_accepts_override() {
+        assert_eq!(
+            default_identity_name(Some("unix".into()), Some("windows".into())),
+            Some("unix".into())
+        );
+        assert_eq!(
+            default_identity_name(None, Some("windows".into())),
+            Some("windows".into())
+        );
+        assert_eq!(
+            default_identity_name(Some(" ".into()), Some("windows".into())),
+            Some("windows".into())
+        );
+        assert_eq!(default_identity_name(None, None), None);
+        let config: Config = toml::from_str("[identity]\nname = \"Alice\"\n").unwrap();
+        assert_eq!(config.identity.name.as_deref(), Some("Alice"));
+        let config: Config = toml::from_str("[identity]\nname = \"\"\n").unwrap();
+        assert_eq!(config.identity.name.as_deref(), Some(""));
     }
 
     #[test]

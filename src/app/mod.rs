@@ -115,6 +115,10 @@ pub struct App {
     pub state: AppState,
     /// Herdr's API input log (smarty-dev#931); see `api::input_log`.
     pub(crate) api_input_log: std::path::PathBuf,
+    /// Transient receipt of API bytes accepted by a pane's input queue. The server
+    /// consumes this after dispatch to invalidate attribution in its sole pane tracker.
+    /// Not persisted state and not an ownership/history tracker.
+    pub(crate) accepted_api_inputs: Vec<crate::layout::PaneId>,
     pub(crate) pane_graphics: pane_graphics::Runtime,
     pub(crate) pane_graphics_files: Arc<crate::pane_graphics_files::FileStore>,
     pub(crate) direct_graphics_available: bool,
@@ -583,6 +587,7 @@ impl App {
             custom_commands::EndpointCommandRegistry::new(&state.keybinds.custom_commands);
 
         let mut app = Self {
+            accepted_api_inputs: Vec::new(),
             api_input_log: if cfg!(test) {
                 test_api_input_log_path()
             } else {
@@ -2853,6 +2858,7 @@ mod tests {
                 name: "worker".into(),
                 kind: "pi".into(),
                 pane_id,
+                expected_terminal: None,
                 args: Vec::new(),
                 timeout_ms: Some(1_000),
                 allow_cross_pane: false,
@@ -2896,6 +2902,7 @@ mod tests {
                 name: "worker".into(),
                 kind: "codex".into(),
                 pane_id: pane_id.clone(),
+                expected_terminal: None,
                 args: vec!["resume".into(), "codex-session".into()],
                 timeout_ms: Some(4_000),
                 allow_cross_pane: false,

@@ -42,6 +42,18 @@
       ]
     },
     {
+      "id": "identity",
+      "title": "Client identity",
+      "keys": [
+        {
+          "key": "identity.name",
+          "type": "string",
+          "default": "USER / USERNAME",
+          "description": "Optional self-declared client display name sent as user in the JSON hello. The default is dynamic: the client's non-empty USER environment variable, then USERNAME, or no name when neither is available. An empty string disables declaring a name. Exposed by pane.last_input for the last accepted client input, which can include mouse input. This is display metadata, never authentication or authorization."
+        }
+      ]
+    },
+    {
       "id": "server",
       "title": "Server",
       "keys": [
@@ -1112,6 +1124,72 @@
           "type": "list of token rows",
           "default": "[[\"state_icon\", \"workspace\"], [\"branch\", \"git_status\"]]",
           "description": "Expanded Space sidebar layout. Entries may be token strings or inline { token, fg, bold, dim, rules } style tables. Text-valued built-ins and $name metadata tokens accept up to 16 ordered rules using equals, contains, starts_with, gt, or lt; the first match overrides specified styles. Text conditions optionally accept ignore_case for ASCII matching; numeric conditions require full finite numbers. state_icon and git_status accept fixed styles only. At most 16 rows and 16 tokens per row."
+        },
+        {
+          "key": "ui.sidebar.grouping.enabled",
+          "type": "boolean",
+          "default": "false",
+          "description": "Opt in to a client-side organization > project > lane sidebar using existing workspace metadata tokens. Machines remains the default; set false and reload config for immediate rollback. Unmapped workspaces and compatible servers without metadata reporting remain Ungrouped. Grouping does not change endpoint-local routing, servers, or endpoint codecs."
+        },
+        {
+          "key": "ui.sidebar.grouping.org_id",
+          "type": "string",
+          "default": "\"smarty_org_id\"",
+          "description": "Workspace metadata token key containing the stable organization ID. Optional mapping; specify the key without a $ prefix. The default matches the launcher contract."
+        },
+        {
+          "key": "ui.sidebar.grouping.org_label",
+          "type": "string",
+          "default": "\"smarty_org_label\"",
+          "description": "Workspace metadata token key containing the readable organization label. Optional mapping; specify the key without a $ prefix. The label is not grouping identity."
+        },
+        {
+          "key": "ui.sidebar.grouping.project_id",
+          "type": "string",
+          "default": "\"smarty_project_id\"",
+          "description": "Workspace metadata token key containing the stable project ID within an organization. Optional mapping; specify the key without a $ prefix. Herdr does not infer project identity from paths or display names."
+        },
+        {
+          "key": "ui.sidebar.grouping.project_label",
+          "type": "string",
+          "default": "\"smarty_project_label\"",
+          "description": "Workspace metadata token key containing the readable project label. Optional mapping; specify the key without a $ prefix. The label is not grouping identity."
+        },
+        {
+          "key": "ui.sidebar.grouping.lane_id",
+          "type": "string",
+          "default": "\"smarty_lane_id\"",
+          "description": "Workspace metadata token key containing the stable lane or assignment ID. Optional mapping; specify the key without a $ prefix. Resource routing still uses the originating endpoint and server-local IDs."
+        },
+        {
+          "key": "ui.sidebar.grouping.lane_purpose",
+          "type": "string",
+          "default": "\"smarty_lane_purpose\"",
+          "description": "Workspace metadata token key containing the lane's short task purpose. Optional mapping; specify the key without a $ prefix. Display hint only."
+        },
+        {
+          "key": "ui.sidebar.grouping.issue",
+          "type": "string",
+          "default": "\"smarty_issue\"",
+          "description": "Workspace metadata token key containing the tracking issue display hint. Optional mapping; specify the key without a $ prefix. Issue text does not choose an endpoint or confer routing authority."
+        },
+        {
+          "key": "ui.sidebar.grouping.host",
+          "type": "string",
+          "default": "\"smarty_host\"",
+          "description": "Workspace metadata token key containing the execution host display hint. Optional mapping; specify the key without a $ prefix. A host hint is not a routing target."
+        },
+        {
+          "key": "ui.sidebar.grouping.role",
+          "type": "string",
+          "default": "\"smarty_role\"",
+          "description": "Workspace metadata token key containing the workspace's display role. Optional mapping; specify the key without a $ prefix. Herdr does not interpret launcher or organization configuration files."
+        },
+        {
+          "key": "ui.sidebar.grouping.lead",
+          "type": "string",
+          "default": "\"smarty_lead\"",
+          "description": "Workspace metadata token key containing the readable owning lead name. Optional mapping; specify the key without a $ prefix. Display hint only, with no routing authority."
         },
         {
           "key": "ui.accent",

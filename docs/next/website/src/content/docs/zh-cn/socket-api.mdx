@@ -99,10 +99,10 @@ herdr pane read w1:p2 --source recent --lines 50
 | 工作区 | `workspace.create`、`workspace.list`、`workspace.get`、`workspace.focus`、`workspace.rename`、`workspace.move`、`workspace.move_block`、`workspace.report_metadata`、`workspace.close` |
 | Worktree | `worktree.list`、`worktree.create`、`worktree.open`、`worktree.remove` |
 | 标签页 | `tab.create`、`tab.list`、`tab.get`、`tab.focus`、`tab.rename`、`tab.move`、`tab.close` |
-| 窗格 | `pane.split`、`pane.swap`、`pane.move`、`pane.zoom`、`pane.layout`、`pane.process_info`、`pane.neighbor`、`pane.edges`、`pane.focus_direction`、`pane.resize`、`pane.list`、`pane.current`、`pane.get`、`pane.rename`、`pane.send_text`、`pane.send_keys`、`pane.send_input`、`pane.read`、`pane.graphics.info`、`pane.graphics.set`、`pane.graphics.clear`、`pane.graphics.stream`、`pane.report_agent`、`pane.report_agent_session`、`pane.report_metadata`、`pane.clear_agent_authority`、`pane.release_agent`、`pane.close`、`pane.wait_for_output` |
+| 窗格 | `pane.split`、`pane.swap`、`pane.move`、`pane.zoom`、`pane.layout`、`pane.process_info`、`pane.neighbor`、`pane.edges`、`pane.focus_direction`、`pane.resize`、`pane.list`、`pane.current`、`pane.get`、`pane.last_input`、`pane.rename`、`pane.send_text`、`pane.send_keys`、`pane.send_input`、`pane.send_input_guarded`、`pane.read`、`pane.graphics.info`、`pane.graphics.set`、`pane.graphics.clear`、`pane.graphics.stream`、`pane.report_agent`、`pane.report_agent_session`、`pane.report_metadata`、`pane.clear_agent_authority`、`pane.release_agent`、`pane.close`、`pane.wait_for_output` |
 | 弹窗 | `popup.close` |
 | 布局 | `layout.export`、`layout.apply`、`layout.set_split_ratio` |
-| 智能体 | `agent.list`、`agent.get`、`agent.read`、`agent.explain`、`agent.send_keys`、`agent.prompt`、`agent.wait`、`agent.rename`、`agent.focus`、`agent.start` |
+| 智能体 | `agent.list`、`agent.get`、`agent.read`、`agent.explain`、`agent.send_keys`、`agent.prompt`、`agent.wait`、`agent.rename`、`agent.focus`、`agent.start`、`agent.start_guarded` |
 | 事件 | `events.subscribe`、`events.wait` |
 | 集成 | `integration.install`、`integration.uninstall` |
 | 插件 | `plugin.link`、`plugin.list`、`plugin.unlink`、`plugin.enable`、`plugin.disable`、`plugin.action.list`、`plugin.action.invoke`、`plugin.log.list`、`plugin.pane.open`、`plugin.pane.focus`、`plugin.pane.close` |
@@ -125,6 +125,44 @@ herdr pane read w1:p2 --source recent --lines 50
 CLI 的 `herdr api snapshot` 会把当前 `session.snapshot` 响应输出为 JSON,让客户端和智能体可以简单地完成引导。
 
 窗格控制方法使用 `w1:p1` 这类公开窗格 id。schema 中 `pane_id` 可选的方法,在省略它时使用服务器当前聚焦的活动窗格。`pane.move` 总是要求来源 `pane_id`。
+
+### 窗格最近的输入
+
+`pane.last_input` 使用与媒体路由相同的逐窗格跟踪数据，读取某个窗格最后一次被接受的客户端输入归属信息。客户端输入也可能包含鼠标交互，不仅限于键盘输入或提示提交。通过 `pane` 指定公开窗格 id；也接受 `pane_id` 作为别名。
+
+```json
+{"id":"last_input","method":"pane.last_input","params":{"pane":"w1:p1"}}
+```
+
+标准成功响应包含 `result.type: "pane_last_input"`，其中 `last_input` 字段为一个对象或 `null`：
+
+```json
+{"id":"last_input","result":{"type":"pane_last_input","last_input":{"user":"Alice","client_id":7,"at":1780000000123}}}
+{"id":"last_input","result":{"type":"pane_last_input","last_input":null}}
+```
+
+- `user` 是客户端可选的自报名称，为字符串；不可用时为 `null`。
+- `client_id` 是服务器分配的数字客户端连接 id，而非账号 id。
+- `at` 是服务器记录的输入时间，以 Unix 纪元毫秒表示，而不是秒。
+
+名称来自客户端 hello 中可选的 `user` 字段。Herdr 客户端使用配置的 [`identity.name`](/zh-cn/docs/configuration/#客户端身份名称)，未设置时依次回退到客户端的 `USER` 和 `USERNAME`。该名称只是显示元数据，绝不是身份验证、授权或经过验证的发送者身份。
+
+匿名的已连接客户端也会产生包含 `user: null`、`client_id` 和 `at` 的记录。记录会一直保留，直到该窗格收到下一次输入、客户端断开连接或窗格被移除；与媒体路由的时效要求不同，它不会在 10 秒后过期。接受 API 发送的输入后只会清除显示用的归属信息，使 `last_input` 变为 `null`，而不是继承更早的客户端发送者；现有媒体路由所属的客户端不会被清除。有关 API 调用者的信息，请使用独立的 [API 输入日志](#api-输入日志)。
+
+此查询不包含输入文本，不保留消息历史，也不能证明已提交提示的作者。向另一个窗格输入不会改变此窗格的归属信息。
+
+### 预期终端守卫
+
+`agent.start` 和 `pane.send_input` 接受可选的 `expected_terminal` 字符串。请从目标窗格的当前记录中原样复制不透明的标识符 `terminal_id`。服务器在持有并处理该请求时，将它与窗格所连接的终端进行比较，并对已验证的终端执行操作。窗格不存在、标识符未知、字符串格式错误或所连接的终端不同，都会在记录输入日志、向 PTY 发送输入、绑定智能体名称或设置待启动状态之前返回 `terminal_identity_mismatch`。字段存在但值为 `null` 或非字符串时，返回 `invalid_request`；省略该字段可保留无守卫的行为。
+
+使用此功能前，请检查 `ping.result.capabilities.expected_terminal_guard == true`。需要守卫的操作应使用 `agent.start_guarded` 和 `pane.send_input_guarded`：这些方法要求提供 `expected_terminal`，旧服务器会拒绝该方法，而不是静默忽略该字段。能力协商和操作可以使用不同的连接；即使服务器在两者之间被替换，守卫方法仍会在无法确认安全时拒绝操作。请求被拒绝后，不要回退到无守卫的操作。CLI 的 `agent start --expected-terminal` 和 `pane run --expected-terminal` 使用这些方法，并以 `expected_terminal_unsupported` 拒绝不支持的服务器。
+
+```json
+{"id":"guarded_input","method":"pane.send_input_guarded","params":{"pane_id":"w1:p1","expected_terminal":"term_opaque_from_pane_get","text":"echo ready","keys":["Enter"]}}
+{"id":"guarded_start","method":"agent.start_guarded","params":{"pane_id":"w1:p1","expected_terminal":"term_opaque_from_pane_get","name":"worker","kind":"pi"}}
+```
+
+该守卫标识的是终端，而不是终端内的智能体名称、进程或原生智能体会话。它不会改变单独的跨窗格输入策略。
 
 `pane.send_keys` 和 `pane.send_input.keys` 接受 Herdr 组合键字符串: 普通可打印键、`enter` 和 `esc` 这类特殊键、`ctrl+h`、`control+j`、`alt+x`、`shift+tab` 这类修饰组合键、`f1` 这类功能键,以及 `minus` 和 `plus` 这类命名标点。它们不接受 `prefix+` 绑定字符串。
 

@@ -123,6 +123,11 @@ pub enum ResponseResult {
     PaneCurrent {
         pane: PaneInfo,
     },
+    PaneLastInput {
+        /// Null for no client input or attribution invalidated by API input.
+        /// Anonymous clients retain client_id/at with a null user.
+        last_input: Option<super::panes::PaneLastInput>,
+    },
     PaneSwap {
         swap: PaneSwapResult,
     },

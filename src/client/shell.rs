@@ -19,6 +19,8 @@ mod endpoints;
 pub(super) use endpoints::*;
 mod global_menu;
 mod graphics;
+mod grouped_projection;
+mod grouped_sidebar;
 mod input;
 mod input_source;
 mod link_hover;

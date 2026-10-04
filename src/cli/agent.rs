@@ -291,6 +291,7 @@ struct AgentStartArgs {
     name: String,
     kind: String,
     pane_id: String,
+    expected_terminal: Option<String>,
     timeout_ms: Option<u64>,
     allow_cross_pane: bool,
     agent_args: Vec<String>,
@@ -312,6 +313,7 @@ fn parse_agent_start_args(args: &[String]) -> Result<AgentStartArgs, clap::Error
                 .get_one::<String>("pane")
                 .expect("Clap requires the pane target"),
         ),
+        expected_terminal: matches.get_one::<String>("expected-terminal").cloned(),
         timeout_ms: matches.get_one::<u64>("timeout").copied(),
         allow_cross_pane: matches.get_flag("allow-cross-pane"),
         agent_args: matches
@@ -326,6 +328,7 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
         name,
         kind,
         pane_id,
+        expected_terminal,
         timeout_ms,
         allow_cross_pane,
         agent_args,
@@ -351,10 +354,8 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
     let mut response = loop {
         if let Some(previous_busy_response) = previous_busy_response.as_ref() {
             let retry_expired = retry_deadline.is_some_and(|deadline| Instant::now() >= deadline);
-            if retry_expired
-                || pane_terminal_id(&pane_id)? != pinned_terminal_id
-                || !pane_shell_is_initializing(&pane_id)?
-            {
+            // Let one fresh agent.start ask the server after a transient process snapshot.
+            if retry_expired || pane_terminal_id(&pane_id)? != pinned_terminal_id {
                 return super::print_response(previous_busy_response);
             }
         }
@@ -365,6 +366,7 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
                 name: name.clone(),
                 kind: kind.clone(),
                 pane_id: pane_id.clone(),
+                expected_terminal: expected_terminal.clone(),
                 args: agent_args.clone(),
                 timeout_ms,
                 allow_cross_pane,
@@ -1002,6 +1004,20 @@ mod tests {
     }
 
     #[test]
+    fn start_parses_expected_terminal_without_normalizing_it() {
+        let parsed = parse_agent_start_args(&args(&[
+            "--expected-terminal=term_opaque",
+            "reviewer",
+            "--kind",
+            "pi",
+            "--pane",
+            "w1:p1",
+        ]))
+        .unwrap();
+        assert_eq!(parsed.expected_terminal.as_deref(), Some("term_opaque"));
+    }
+
+    #[test]
     fn start_accepts_option_first_and_preserves_trailing_agent_args() {
         let parsed = parse_agent_start_args(&args(&[
             "--allow-cross-pane",
@@ -1022,6 +1038,7 @@ mod tests {
         assert_eq!(parsed.kind, "omp");
         assert_eq!(parsed.pane_id, "w1:p1");
         assert_eq!(parsed.timeout_ms, Some(45_000));
+        assert_eq!(parsed.expected_terminal, None);
         assert!(parsed.allow_cross_pane);
         assert_eq!(parsed.agent_args, ["--resume", "/tmp/session.jsonl"]);
     }

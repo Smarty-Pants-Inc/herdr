@@ -93,6 +93,8 @@ Herdr の外では何もしないように、`HERDR_ENV=1` で必要な変数が
 
 移植可能なインテグレーションには `HERDR_BIN_PATH` と CLI ラッパーを使ってください。直接 IPC が必要なコードでは、[Socket API](/ja/docs/socket-api/) に記載された同等の `pane.report_agent`、`pane.report_agent_session`、`pane.release_agent` リクエストを送信できます。
 
+カスタムインテグレーションは、`{"pane":"<pane_id>"}` を指定して [`pane.last_input`](/ja/docs/socket-api/#ペインへの最後の入力) を問い合わせ、最後に受け入れられたクライアント入力の表示名、接続 id、タイムスタンプを取得できます。入力にはキー入力だけでなくマウス入力も含まれる場合があります。名前はクライアントの hello の省略可能な `user` フィールドから取得し、通常は `identity.name` またはクライアントの環境変数 `USER`/`USERNAME` で決まります。これは自己申告のメタデータであり、認証ではありません。ペイン単位のスナップショットであって、メッセージごとの送信者を保証しません。API 入力が受け入れられると表示用の送信元情報は `null` になり、メディアルーティングの対象クライアントは変わりません。名前を申告しないクライアントは `user: null` です。現在のレコードが存在しない場合や匿名の場合、以前の名前を再利用しないでください。
+
 [Prime Agent の組み込み Herdr レポーター](https://github.com/PrimeIntellect-ai/prime-agent/blob/main/packages/coding-agent/src/core/extensions/builtin/herdr-agent-state.ts)は実際の実装例です。Herdr 内でのみ有効になり、エージェントイベントを `working`、`idle`、`blocked` に対応付け、セッションをまたいで報告順序を維持し、終了時に権威を解放します。
 
 一部のインテグレーションは、エージェントのネイティブセッション参照を報告します。Herdr は公式のセッション参照を使って、`[session] resume_agents_on_restore = false` で無効化されていない限り、Herdr サーバーの再起動後に Claude Code、Codex、Devin CLI、Droid、Kimi Code CLI、Qoder CLI、Qwen Code、Letta Code、Cursor Agent CLI、Grok CLI、GitHub Copilot CLI、Pi、OMP、Hermes Agent、OpenCode、Kilo Code CLI、MastraCode、Antigravity CLI のペインを resume します。
@@ -114,6 +116,14 @@ Herdr はバンドルされた拡張を次の場所に書き込みます:
 ```
 
 `PI_CODING_AGENT_DIR` が設定されている場合は、代わりに `$PI_CODING_AGENT_DIR/extensions/herdr-agent-state.ts` に書き込みます。Pi の agent ディレクトリが存在する場合、Herdr は extensions ディレクトリを作成します。アンインストールはその拡張ファイルだけを削除します。
+
+### 送信元の表示
+
+Herdr は現在、送信元の表示用メタデータを `pane.last_input` API でのみ公開しています。Pi の作成者バッジや送信元情報のセッションエントリは提供していません。この API は最新入力のスナップショットであり、特定の Pi 入力送信との対応付けではありません。同じ内容の follow-up と steering メッセージが順序を入れ替えて配信されたり、compaction 中にキューへ入った入力が、別のクライアントの後続入力より後で処理されたりする場合があります。その時点のスナップショットを読むと、別のメッセージに名前を付ける可能性があります。
+
+受け入れられた Pi の表示とキューで安全に保持するメタデータの後続作業は、Herdr の API スコープとは別に [smarty-dev#4078](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/4078) で追跡しています。
+
+Pi `0.87.1` はメタデータのみのカスタムエントリと `registerEntryRenderer()` をサポートしています。それでも、安全な対応付けには、上流側で実際の入力送信を識別する ID と不変の source が必要です。カスタムエントリのメタデータをすべてのキューで保持し、受け入れられたネイティブのユーザーメッセージの直前に確定させる必要があります。名前をプロンプトへ入れてはいけません。名前は自己申告の表示用メタデータであり、認証ではありません。
 
 ## OMP
 

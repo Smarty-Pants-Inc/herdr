@@ -1358,6 +1358,10 @@
               },
               "type": "array"
             },
+            "expected_terminal": {
+              "description": "Refuse startup unless the pane still owns this opaque terminal identity.",
+              "type": "string"
+            },
             "kind": {
               "type": "string"
             },
@@ -2770,6 +2774,18 @@
           ],
           "type": "object"
         },
+        "PaneLastInputParams": {
+          "description": "Queries server-owned sender attribution, independent of the client's pane spelling.",
+          "properties": {
+            "pane": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pane"
+          ],
+          "type": "object"
+        },
         "PaneLayoutParams": {
           "properties": {
             "pane_id": {
@@ -3301,6 +3317,10 @@
             "allow_cross_pane": {
               "description": "Deliberately allow an agent-originated request to target another pane.",
               "type": "boolean"
+            },
+            "expected_terminal": {
+              "description": "Refuse input unless the pane still owns this opaque terminal identity.",
+              "type": "string"
             },
             "keys": {
               "items": {
@@ -5626,6 +5646,23 @@
           "type": "object"
         },
         {
+          "description": "Requires `expected_terminal`; older servers reject instead of ignoring the guard.",
+          "properties": {
+            "method": {
+              "const": "agent.start_guarded",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentStartParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
           "properties": {
             "method": {
               "const": "agent.prompt",
@@ -6012,6 +6049,22 @@
         {
           "properties": {
             "method": {
+              "const": "pane.last_input",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneLastInputParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "pane.focus",
               "type": "string"
             },
@@ -6125,6 +6178,23 @@
           "properties": {
             "method": {
               "const": "pane.send_input",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneSendInputParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Requires `expected_terminal`; older servers reject instead of ignoring the guard.",
+          "properties": {
+            "method": {
+              "const": "pane.send_input_guarded",
               "type": "string"
             },
             "params": {
@@ -8391,6 +8461,33 @@
           ],
           "type": "object"
         },
+        "PaneLastInput": {
+          "description": "Last accepted client-owned pane interaction (including mouse input).\nThe user is self-declared, never authenticated.",
+          "properties": {
+            "at": {
+              "description": "Unix epoch milliseconds, recorded when input was accepted by the server.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "client_id": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "user": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "client_id",
+            "at"
+          ],
+          "type": "object"
+        },
         "PaneLayoutPane": {
           "properties": {
             "focused": {
@@ -9991,6 +10088,29 @@
             },
             {
               "properties": {
+                "last_input": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/schemas/success_response/$defs/PaneLastInput"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "description": "Null for no client input or attribution invalidated by API input.\nAnonymous clients retain client_id/at with a null user."
+                },
+                "type": {
+                  "const": "pane_last_input",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
                 "swap": {
                   "$ref": "#/schemas/success_response/$defs/PaneSwapResult"
                 },
@@ -11000,6 +11120,11 @@
                 "integer",
                 "null"
               ]
+            },
+            "expected_terminal_guard": {
+              "default": false,
+              "description": "Supports the fail-closed `expected_terminal` guard on `agent.start` and `pane.send_input`.",
+              "type": "boolean"
             },
             "guarded_live_handoff": {
               "default": false,
