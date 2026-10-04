@@ -320,9 +320,6 @@ fn forget_recorded_panes(dir: &Path) {
 // App loads and restores it.
 #[tokio::test]
 async fn defaults_survive_a_server_restart_on_the_restored_record_only() {
-    let _guard = crate::config::test_config_env_lock()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     // Point the session file at a private config home before any App exists:
     // the session writer resolves its path when the App is built.
     let _env = ConfigHomeGuard::new("restart");
@@ -425,8 +422,8 @@ async fn defaults_survive_a_server_restart_on_the_restored_record_only() {
 
 struct ConfigHomeGuard {
     dir: PathBuf,
-    previous_home: Option<std::ffi::OsString>,
-    previous_session: Option<std::ffi::OsString>,
+    _dirs: crate::config::TestConfigDirs,
+    _env: crate::environment::TestEnv,
 }
 
 impl ConfigHomeGuard {
@@ -435,26 +432,19 @@ impl ConfigHomeGuard {
             "herdr-env-inherit-config-{name}-{}",
             std::process::id()
         ));
-        let guard = Self {
+        let env = crate::environment::test_env();
+        env.remove(crate::session::SESSION_ENV_VAR);
+        let dirs = crate::config::test_config_dirs(&dir, &dir.join("state"));
+        Self {
             dir,
-            previous_home: std::env::var_os("XDG_CONFIG_HOME"),
-            previous_session: std::env::var_os(crate::session::SESSION_ENV_VAR),
-        };
-        std::env::set_var("XDG_CONFIG_HOME", &guard.dir);
-        std::env::remove_var(crate::session::SESSION_ENV_VAR);
-        guard
+            _dirs: dirs,
+            _env: env,
+        }
     }
 }
 
 impl Drop for ConfigHomeGuard {
     fn drop(&mut self) {
-        match &self.previous_home {
-            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
-            None => std::env::remove_var("XDG_CONFIG_HOME"),
-        }
-        if let Some(value) = &self.previous_session {
-            std::env::set_var(crate::session::SESSION_ENV_VAR, value);
-        }
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }

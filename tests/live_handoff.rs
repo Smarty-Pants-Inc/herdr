@@ -447,6 +447,8 @@ fn wait_for_pid_marker(path: &Path, timeout: Duration) -> u32 {
 
 #[test]
 fn pid_marker_waits_for_complete_line() {
+    // Caught panics still run the cleanup hook; exclude active server fixtures.
+    let _guard = test_lock();
     let base = unique_test_dir();
     fs::create_dir_all(&base).unwrap();
     let marker = base.join("child.pid");
@@ -2504,6 +2506,26 @@ fn socket_inode(path: &Path) -> u64 {
         .ino()
 }
 
+#[cfg(target_os = "linux")]
+fn wait_for_original_socket_inodes(api_socket: &Path, client_socket: &Path, expected: (u64, u64)) {
+    use std::os::unix::fs::MetadataExt;
+
+    // Importer death precedes source rollback; wait for both original identities.
+    let mut actual = None;
+    let restored = support::wait_until(Duration::from_secs(5), Duration::from_millis(25), || {
+        let api = fs::metadata(api_socket).map(|metadata| metadata.ino());
+        let client = fs::metadata(client_socket).map(|metadata| metadata.ino());
+        let matches =
+            api.as_ref().ok() == Some(&expected.0) && client.as_ref().ok() == Some(&expected.1);
+        actual = Some((api, client));
+        matches
+    });
+    assert!(
+        restored,
+        "original socket inodes were not restored within 5s: expected (api, client)={expected:?}; actual (api, client)={actual:?}"
+    );
+}
+
 #[test]
 fn live_handoff_to_replacement_that_never_becomes_ready_keeps_old_server() {
     let _lock = test_lock();
@@ -2973,6 +2995,7 @@ fn failed_pull_import_leaves_the_source_whole_and_exits_non_zero() {
         Some(libc::SIGKILL),
         "the source stops a hung importer"
     );
+    wait_for_original_socket_inodes(&api_socket, &client_socket, (api_inode, client_inode));
 
     assert!(spawned.child.try_wait().unwrap().is_none());
     assert_eq!(socket_inode(&api_socket), api_inode);
@@ -3038,6 +3061,7 @@ fn failed_pull_import_keeps_a_socket_report_split_across_the_rollback() {
     let status = wait_for_exit(&mut split.0, Duration::from_secs(20));
     use std::os::unix::process::ExitStatusExt;
     assert_eq!(status.signal(), Some(libc::SIGKILL));
+    wait_for_original_socket_inodes(&api_socket, &client_socket, (api_inode, client_inode));
 
     // Both of the importer's sockets were known to be its own, so both
     // original listeners are back and no recovery socket was needed.

@@ -22,6 +22,7 @@ mod client;
 mod config;
 mod copy_mode;
 mod detect;
+mod environment;
 mod events;
 mod ghostty;
 mod handoff_runtime;

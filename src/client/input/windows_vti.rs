@@ -60,7 +60,7 @@ pub(super) fn raw_console_reader_loop(
 
 #[cfg(windows)]
 pub(super) fn trace_input_transport(value: &str) {
-    let Some(path) = std::env::var_os("HERDR_WINDOWS_INPUT_TRACE_FILE") else {
+    let Some(path) = crate::environment::var_os("HERDR_WINDOWS_INPUT_TRACE_FILE") else {
         return;
     };
     if let Ok(mut output) = OpenOptions::new().create(true).append(true).open(path) {
@@ -1382,7 +1382,7 @@ fn resolve_ctrl_oem_char(key: WindowsKeyRecord) -> Option<char> {
 
 #[cfg(windows)]
 fn windows_input_trace_enabled() -> bool {
-    std::env::var_os("HERDR_WINDOWS_INPUT_TRACE").is_some()
+    crate::environment::var_os("HERDR_WINDOWS_INPUT_TRACE").is_some()
 }
 
 #[cfg(test)]
