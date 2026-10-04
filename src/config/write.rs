@@ -199,6 +199,7 @@ mod tests {
     use super::*;
 
     /// Files in a config directory, not counting the save lock: it is kept on purpose (herdr#127 r2).
+    #[cfg(unix)] // Its only callers are the Unix-only tests below.
     fn staged_and_config_files(dir: &std::path::Path) -> usize {
         std::fs::read_dir(dir)
             .unwrap()
