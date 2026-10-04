@@ -61,6 +61,152 @@ fn git_watch_identical_checkout_directories_share_watches_and_remain_until_last_
     std::fs::remove_dir_all(root).unwrap();
 }
 
+#[test]
+fn git_watch_linked_missing_roots_keep_only_their_own_shared_native_sentinels() {
+    let root = repository("linked-gap-sharing");
+    let first = root.with_extension("first-linked");
+    let second = root.with_extension("second-linked");
+    for args in [
+        vec![
+            "-c",
+            "user.name=Watch Test",
+            "-c",
+            "user.email=watch@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "initial",
+        ],
+        vec!["worktree", "add", "-b", "first", first.to_str().unwrap()],
+        vec!["worktree", "add", "-b", "second", second.to_str().unwrap()],
+    ] {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let native_root = root.canonicalize().unwrap();
+    let native_first = first.canonicalize().unwrap();
+    let native_second = second.canonicalize().unwrap();
+    let (tx, _rx) = mpsc::channel(256);
+    let mut watches = GitWatches::new(tx).unwrap();
+    watches.sync(HashSet::from([first.clone(), second.clone()]));
+    for path in [&native_root, &native_first, &native_second] {
+        assert!(watches.watched.contains_key(path));
+        assert!(watches
+            .targets
+            .read()
+            .unwrap()
+            .contains(&WatchTarget::Marker(path.clone())));
+    }
+    let retired = root.join("retired-metadata");
+    std::fs::rename(root.join(".git"), &retired).unwrap();
+    // Reconcile both before and after a missing worker result would be applied.
+    // No config dependency can lend a watch to either consumer here.
+    for _ in 0..2 {
+        watches.topology_dirty = true;
+        watches.sync(HashSet::from([first.clone(), second.clone()]));
+        assert_eq!(
+            watches.watched.keys().cloned().collect::<HashSet<_>>(),
+            HashSet::from([
+                native_root.clone(),
+                native_first.clone(),
+                native_second.clone()
+            ])
+        );
+    }
+    watches.sync(HashSet::from([second.clone()]));
+    assert_eq!(
+        watches.watched.keys().cloned().collect::<HashSet<_>>(),
+        HashSet::from([native_root.clone(), native_second.clone()])
+    );
+    assert_eq!(
+        watches
+            .targets
+            .read()
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>(),
+        HashSet::from([
+            WatchTarget::Marker(native_root),
+            WatchTarget::Marker(native_second)
+        ])
+    );
+    assert!(!watches.watched.contains_key(&native_first));
+    watches.sync(HashSet::new());
+    assert!(watches.watched.is_empty());
+    assert!(watches.targets.read().unwrap().is_empty());
+    // A removed root cannot reacquire its own former markers during the gap.
+    watches.sync(HashSet::from([second.clone()]));
+    assert!(watches.watched.is_empty());
+    assert!(watches.targets.read().unwrap().is_empty());
+    drop(watches);
+    std::fs::rename(retired, root.join(".git")).unwrap();
+    for path in [first, second] {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["worktree", "remove", "--force"])
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    // Git for Windows marks committed object files read-only. Clear only this
+    // owned fixture's object tree after native watches and worktrees are gone.
+    #[cfg(windows)]
+    {
+        #[allow(clippy::permissions_set_readonly_false)] // Windows readonly attribute, not Unix mode bits.
+        fn make_owned_objects_writable(path: &Path) {
+            let metadata = std::fs::symlink_metadata(path).unwrap();
+            if metadata.is_dir() {
+                for entry in std::fs::read_dir(path).unwrap() {
+                    make_owned_objects_writable(&entry.unwrap().path());
+                }
+            }
+            let mut permissions = metadata.permissions();
+            if permissions.readonly() {
+                permissions.set_readonly(false);
+                std::fs::set_permissions(path, permissions).unwrap();
+            }
+        }
+        make_owned_objects_writable(&root.join(".git/objects"));
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn git_watch_new_missing_root_cannot_borrow_removed_ancestor_sentinel() {
+    let root = repository("no-marker-borrow");
+    let nested = root.join("new-consumer");
+    std::fs::create_dir(&nested).unwrap();
+    let (tx, _rx) = mpsc::channel(256);
+    let mut watches = GitWatches::new(tx).unwrap();
+    watches.sync(HashSet::from([root.clone()]));
+    assert!(watches.watched.contains_key(&root.canonicalize().unwrap()));
+    std::fs::rename(root.join(".git"), root.join("retired-metadata")).unwrap();
+    // The new CWD is beneath a previous sentinel, but never owned that sentinel.
+    watches.sync(HashSet::from([nested]));
+    assert!(watches.watched.is_empty());
+    assert!(watches.targets.read().unwrap().is_empty());
+    drop(watches);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[cfg(unix)]
 #[test]
 fn git_watch_directory_aliases_share_registration_after_partial_removal() {

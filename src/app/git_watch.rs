@@ -120,6 +120,9 @@ fn structural_event(event: &Event, targets: &[WatchTarget]) -> bool {
 pub(super) struct GitWatches {
     watcher: RecommendedWatcher,
     roots: HashSet<PathBuf>,
+    // Sentinels belong to consumers, not path ancestry: a linked checkout's
+    // common .git may live beside (or entirely outside) its workspace CWD.
+    root_markers: HashMap<PathBuf, Vec<WatchTarget>>,
     watched: HashMap<PathBuf, RecursiveMode>,
     targets: Arc<RwLock<Vec<WatchTarget>>>,
     wakeup_pending: Arc<AtomicBool>,
@@ -178,6 +181,7 @@ impl GitWatches {
         Ok(Self {
             watcher,
             roots: HashSet::new(),
+            root_markers: HashMap::new(),
             watched: HashMap::new(),
             targets,
             wakeup_pending,
@@ -222,31 +226,28 @@ impl GitWatches {
         let rearm = std::mem::take(&mut self.rearm_requested);
         self.roots = roots;
         self.topology_dirty = false;
-        let previous_markers: Vec<_> = self
-            .targets
-            .read()
-            .map(|targets| {
-                targets
-                    .iter()
-                    .filter(|target| matches!(target, WatchTarget::Marker(_)))
-                    .cloned()
-                    .collect()
-            })
-            .unwrap_or_default();
+        self.root_markers
+            .retain(|root, _| self.roots.contains(root));
         let mut targets = HashSet::new();
         for root in &self.roots {
             let discovered = targets_for_root(root);
-            if discovered.is_empty() {
-                let native_root = root.canonicalize().unwrap_or_else(|_| root.clone());
-                // Keep an already-discovered checkout's exact .git sentinel
-                // across a removal gap. Initially non-Git roots still rely on
-                // the independent discovery safety net.
-                targets.extend(
-                    previous_markers
+            if !discovered.is_empty() {
+                // Successful discovery replaces this consumer's sentinels.
+                // Store native paths while they exist, before a removal gap.
+                self.root_markers.insert(
+                    root.clone(),
+                    discovered
                         .iter()
-                        .filter(|target| native_root.starts_with(target.directory()))
-                        .cloned(),
+                        .filter(|target| matches!(target, WatchTarget::Marker(_)))
+                        .cloned()
+                        .map(native_target)
+                        .collect(),
                 );
+            } else if let Some(markers) = self.root_markers.get(root) {
+                // Keep only this current consumer's own exact .git sentinels,
+                // including its non-ancestor common directory. New/missing
+                // roots cannot borrow markers from another or a removed root.
+                targets.extend(markers.iter().cloned());
             }
             targets.extend(discovered);
         }

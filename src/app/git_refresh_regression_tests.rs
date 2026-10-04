@@ -210,6 +210,119 @@ fn git_watch_repair_git_directory_recreated_after_removal_was_applied() {
     assert_eq!(app.state.workspaces[0].git_ahead_behind(), Some((1, 0)));
 }
 
+/// Reach a quiet native/app boundary, including late removal and re-arm hints.
+/// No synthetic event, forced refresh, or advanced safety clock may hide a lost watch.
+fn drain_git_watch_hints(app: &mut App) {
+    let start = Instant::now();
+    let mut quiet_since = Instant::now();
+    loop {
+        assert!(start.elapsed() < std::time::Duration::from_secs(3));
+        app.sync_git_watches();
+        app.start_git_status_refresh_if_due(Instant::now());
+        while let Ok(event) = app.event_rx.try_recv() {
+            app.handle_internal_event(event);
+            quiet_since = Instant::now();
+        }
+        if app.git_refresh_in_flight || app.git_watch_refresh_deadline.is_some() {
+            quiet_since = Instant::now();
+        } else if quiet_since.elapsed() >= std::time::Duration::from_millis(150) {
+            assert!(app.event_rx.is_empty());
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+}
+
+#[test]
+fn git_watch_repair_linked_only_common_directory_restored_after_missing_apply() {
+    let repo = GitWatchRepo::new("linked-common-gap-main");
+    repo.init();
+    let linked = GitWatchRepo::new("linked-common-gap-consumer");
+    repo.git(&[
+        "worktree",
+        "add",
+        "-b",
+        "linked",
+        linked.0.to_str().unwrap(),
+    ]);
+    assert!(!linked
+        .0
+        .canonicalize()
+        .unwrap()
+        .starts_with(repo.0.canonicalize().unwrap()));
+    linked.git(&["branch", "--set-upstream-to=upstream", "linked"]);
+    linked.git(&["commit", "--allow-empty", "-m", "linked ahead"]);
+    let tip = linked.git(&["rev-parse", "HEAD"]);
+    let marker = linked.0.join(".git");
+    let marker_before = std::fs::read(&marker).unwrap();
+    let marker_modified = std::fs::metadata(&marker).unwrap().modified().unwrap();
+    let mut app = linked.app(); // The main checkout is never an App consumer.
+    assert_eq!(app.state.workspaces.len(), 1);
+    assert_eq!(
+        app.state.workspaces[0].cached_git_branch.as_deref(),
+        Some("linked")
+    );
+    assert_eq!(app.state.workspaces[0].git_ahead_behind(), Some((1, 0)));
+    drain_git_watch_hints(&mut app);
+    let safety_deadline = app.last_git_repo_discovery_refresh + GIT_REPO_DISCOVERY_REFRESH_INTERVAL;
+    let common = repo.0.join(".git");
+    let retired = repo.0.join("retired-metadata");
+    make_tree_writable(&common);
+    std::fs::rename(&common, &retired).unwrap();
+    drive_git_watch_refresh(&mut app);
+    assert_eq!(app.state.workspaces[0].cached_git_branch, None);
+    assert_eq!(app.state.workspaces[0].git_ahead_behind(), None);
+    drain_git_watch_hints(&mut app);
+    let missing = app
+        .git_status_cache
+        .get(&app.state.workspaces[0].cached_git_status_key)
+        .unwrap();
+    assert!(missing.fingerprint.is_none());
+    assert!(missing.config_dependency_paths().is_empty());
+    assert!(!app.git_refresh_in_flight);
+    assert!(app.git_watch_refresh_deadline.is_none());
+
+    let start = Instant::now();
+    std::fs::rename(&retired, &common).unwrap();
+    let (restoration_latency, changed) = drive_git_watch_refresh(&mut app);
+    assert!(start.elapsed() < std::time::Duration::from_secs(1));
+    assert!(changed);
+    assert_eq!(
+        app.state.workspaces[0].cached_git_branch.as_deref(),
+        Some("linked")
+    );
+    assert_eq!(app.state.workspaces[0].git_ahead_behind(), Some((1, 0)));
+    drain_git_watch_hints(&mut app);
+
+    let start = Instant::now();
+    repo.git(&["update-ref", "refs/heads/upstream", &tip]);
+    let (ref_latency, changed) = drive_git_watch_refresh(&mut app);
+    assert!(start.elapsed() < std::time::Duration::from_secs(1));
+    assert!(changed);
+    assert_eq!(app.state.workspaces[0].git_ahead_behind(), Some((0, 0)));
+    drain_git_watch_hints(&mut app);
+    let start = Instant::now();
+    linked.git(&["switch", "-c", "after-common-restoration"]);
+    let (branch_latency, changed) = drive_git_watch_refresh(&mut app);
+    assert!(start.elapsed() < std::time::Duration::from_secs(1));
+    assert!(changed);
+    assert_eq!(
+        app.state.workspaces[0].cached_git_branch.as_deref(),
+        Some("after-common-restoration")
+    );
+    assert_eq!(std::fs::read(&marker).unwrap(), marker_before);
+    assert_eq!(
+        std::fs::metadata(&marker).unwrap().modified().unwrap(),
+        marker_modified
+    );
+    assert_eq!(
+        app.last_git_repo_discovery_refresh + GIT_REPO_DISCOVERY_REFRESH_INTERVAL,
+        safety_deadline
+    );
+    assert!(Instant::now() < safety_deadline);
+    eprintln!("linked common-gap native App refresh: restore={restoration_latency:?} ref={ref_latency:?} branch={branch_latency:?}");
+}
+
 fn upstream_config(reference: &str) -> String {
     format!("[branch \"main\"]\nremote = .\nmerge = refs/heads/{reference}\n")
 }
@@ -452,7 +565,10 @@ fn git_watch_repair_removed_workspace_drops_its_cached_config_dependency() {
     }
     second.git(&["config", "unused.removed", "changed"]);
     std::thread::sleep(std::time::Duration::from_millis(150));
-    assert!(app.event_rx.try_recv().is_err(), "retired config path still wakes App");
+    assert!(
+        app.event_rx.try_recv().is_err(),
+        "retired config path still wakes App"
+    );
     first.git(&["commit", "--allow-empty", "-m", "retained root"]);
     drive_git_watch_refresh(&mut app);
     assert_eq!(app.state.workspaces[0].git_ahead_behind(), Some((1, 0)));
