@@ -185,6 +185,7 @@ async fn client_listener_running_server_accepts_fresh_attach() {
 
 #[tokio::test]
 async fn client_listener_rendering_server_accepts_fresh_attach() {
+    RENDER_ACCEPT_TEST_COUNT.store(0, Ordering::Relaxed);
     let mut server = test_headless_server();
     // Keep the API receiver open so render notifications, not a closed channel,
     // drive the loop between render iterations.
@@ -248,6 +249,10 @@ async fn client_listener_rendering_server_accepts_fresh_attach() {
             .await
             .expect("fresh attach must not wait behind rendering")
             .unwrap());
+        assert!(
+            RENDER_ACCEPT_TEST_COUNT.load(Ordering::Relaxed) > 0,
+            "the fresh attach must be accepted on a render iteration"
+        );
         tokio::task::spawn_blocking(move || {
             protocol::write_message(&mut first_client, &protocol::ClientMessage::Detach).unwrap();
         })

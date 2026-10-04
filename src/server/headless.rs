@@ -3751,6 +3751,10 @@ std::thread_local! {
 }
 
 #[cfg(all(unix, test))]
+static RENDER_ACCEPT_TEST_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(all(unix, test))]
 fn injected_client_accept_error() -> Option<io::Error> {
     CLIENT_ACCEPT_TEST_HOOK.with(|hook| {
         let mut hook = hook.borrow_mut();
@@ -3817,7 +3821,12 @@ async fn accept_ready_client_connections(
                     if let Some(err) = injected_client_accept_error() {
                         return Err(err);
                     }
-                    listener.accept()
+                    let result = listener.accept();
+                    #[cfg(test)]
+                    if result.is_ok() {
+                        RENDER_ACCEPT_TEST_COUNT.fetch_add(1, Ordering::Relaxed);
+                    }
+                    result
                 })
                 .unwrap_or_else(|_| Err(io::ErrorKind::WouldBlock.into()))
         },
