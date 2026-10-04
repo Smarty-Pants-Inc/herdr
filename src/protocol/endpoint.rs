@@ -176,7 +176,6 @@ impl EndpointServerWelcome {
             capabilities: vec![
                 super::surface_reuse::CAPABILITY.into(),
                 super::surface_delta::CAPABILITY.into(),
-                super::surface_scroll::CAPABILITY.into(),
                 SURFACE_INTEREST_CAPABILITY.into(),
                 PRESENTATION_EFFECTS_FENCE_CAPABILITY.into(),
                 HEALTH_CHECK_CAPABILITY.into(),
@@ -464,7 +463,6 @@ mod tests {
             vec![
                 super::super::surface_reuse::CAPABILITY.to_string(),
                 super::super::surface_delta::CAPABILITY.to_string(),
-                super::super::surface_scroll::CAPABILITY.to_string(),
                 SURFACE_INTEREST_CAPABILITY.to_string(),
                 PRESENTATION_EFFECTS_FENCE_CAPABILITY.to_string(),
                 HEALTH_CHECK_CAPABILITY.to_string(),

@@ -20,7 +20,7 @@ fn apply_rows(frame: &mut FrameData, rows: &[crate::protocol::PaneSurfacePatchRo
 }
 
 #[tokio::test]
-async fn surface_scroll_sends_scrolling_output_as_a_shift_and_new_rows() {
+async fn negotiated_surface_scroll_still_sends_ordinary_patches() {
     let (mut server, _control_rx, render_rx, pane_id) =
         retained_test_server_with_control(&scrolling_lines(0..40));
     server
@@ -44,10 +44,7 @@ async fn surface_scroll_sends_scrolling_output_as_a_shift_and_new_rows() {
     assert!(server.render_retained_pane_surface_and_stream(&HashSet::from([pane_id])));
     let bytes = render_rx.recv_timeout(Duration::from_secs(1)).unwrap();
     let message = read_server_message(bytes.clone());
-    assert!(matches!(
-        &message,
-        ServerMessage::EndpointControl { kind, .. } if kind == protocol::surface_scroll::MESSAGE_KIND
-    ));
+    assert!(matches!(&message, ServerMessage::PaneSurfacePatch(_)));
 
     // The decoder hands the client shell an ordinary patch that reaches the
     // server's committed surface exactly.
@@ -63,14 +60,6 @@ async fn surface_scroll_sends_scrolling_output_as_a_shift_and_new_rows() {
     assert_eq!(shell.frame.cells, committed.frame.cells);
     assert!(frame_text(&shell.frame).contains("module_41"));
 
-    let expanded = HeadlessServer::frame_server_message(&ServerMessage::PaneSurfacePatch(patch))
-        .expect("expanded frame");
-    assert!(
-        bytes.len() * 4 < expanded.len(),
-        "scroll frame {} should be far smaller than the rows it replaces {}",
-        bytes.len(),
-        expanded.len()
-    );
     shutdown_test_runtimes(&mut server);
 }
 

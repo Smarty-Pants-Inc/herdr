@@ -19,7 +19,6 @@ pub(crate) enum ClientRenderState {
         surface_revision: u64,
         surface_reuse: bool,
         surface_delta: bool,
-        surface_scroll: bool,
         recompute_pending: bool,
     },
     /// Terminal-ANSI clients keep a terminal diff encoder and sequence number.
@@ -38,7 +37,6 @@ impl ClientRenderState {
                 surface_revision: 0,
                 surface_reuse: false,
                 surface_delta: false,
-                surface_scroll: false,
                 recompute_pending: false,
             },
             RenderEncoding::TerminalAnsi => Self::TerminalAnsi {
@@ -61,10 +59,8 @@ impl ClientRenderState {
         }
     }
 
-    pub(crate) fn enable_surface_scroll(&mut self, enabled: bool) {
-        if let Self::Semantic { surface_scroll, .. } = self {
-            *surface_scroll = enabled;
-        }
+    pub(crate) fn enable_surface_scroll(&mut self, _enabled: bool) {
+        // Accepted for older clients; detection is cut pending smarty-dev#4637.
     }
 
     pub(crate) fn request_recompute(&mut self) {
@@ -248,7 +244,6 @@ impl ClientRenderState {
         let Self::Semantic {
             last_surface,
             surface_revision,
-            surface_scroll,
             ..
         } = self
         else {
@@ -266,18 +261,9 @@ impl ClientRenderState {
         }
         let next_revision = surface_revision.saturating_add(1);
         patch.surface_revision = next_revision;
-        let scrolled = (*surface_scroll)
-            .then(|| crate::protocol::surface_scroll::message(last, &patch))
-            .flatten();
-        Some(match scrolled {
-            Some(message) => PreparedRender::SemanticPatch {
-                message,
-                encoded: Some(Box::new(patch)),
-            },
-            None => PreparedRender::SemanticPatch {
-                message: ServerMessage::PaneSurfacePatch(patch),
-                encoded: None,
-            },
+        Some(PreparedRender::SemanticPatch {
+            message: ServerMessage::PaneSurfacePatch(patch),
+            encoded: None,
         })
     }
 
@@ -636,6 +622,74 @@ mod tests {
             })),
             graphics: crate::protocol::SurfaceGraphicsScene::default(),
         }
+    }
+
+    #[test]
+    fn tall_many_pane_patch_stays_ordinary_even_with_scroll_requested() {
+        let mut surface = popup_surface("popup");
+        surface.popup = None;
+        surface.frame = FrameData::from_ratatui_buffer(
+            &ratatui::buffer::Buffer::empty(Rect::new(0, 0, 128, 1000)),
+            None,
+        );
+        for y in 0..1000usize {
+            for cell in &mut surface.frame.cells[y * 128..(y + 1) * 128] {
+                cell.symbol = format!("row-{y}");
+            }
+        }
+        let mut rows = Vec::new();
+        for index in 0..64u16 {
+            let rect = crate::protocol::SurfaceRect {
+                x: index * 2,
+                y: 0,
+                width: 2,
+                height: 1000,
+            };
+            surface.panes.push(crate::protocol::PaneSurfacePane {
+                pane_id: format!("w1:p{index}"),
+                content_revision: 1,
+                rect,
+                inner_rect: rect,
+                scrollbar_rect: None,
+                scroll: None,
+                focused: index == 0,
+                mouse_reporting: false,
+                sgr_pixel_mouse: false,
+                alternate_screen_active: false,
+                pixel_width: 0,
+                pixel_height: 0,
+            });
+            for y in 0..1000u16 {
+                let start = usize::from(y) * 128 + usize::from(rect.x);
+                let mut cells = surface.frame.cells[start..start + 2].to_vec();
+                for cell in &mut cells {
+                    cell.symbol = format!("row-{}", y + 1);
+                }
+                rows.push(crate::protocol::PaneSurfacePatchRow {
+                    x: rect.x,
+                    y,
+                    cells,
+                });
+            }
+        }
+        let mut state = ClientRenderState::new(RenderEncoding::SemanticFrame);
+        state.enable_surface_scroll(true);
+        let initial = state.prepare_pane_surface(surface.clone()).unwrap();
+        state.commit_sent_frame(initial);
+        let patch = PaneSurfacePatch {
+            boot_id: surface.boot_id,
+            projection_revision: surface.projection_revision,
+            base_surface_revision: 1,
+            surface_revision: 0,
+            rows,
+            panes: surface.panes,
+            cursor: None,
+        };
+        let prepared = state.prepare_pane_surface_patch(patch.clone()).unwrap();
+        let ServerMessage::PaneSurfacePatch(actual) = prepared.message() else {
+            panic!("scroll detection must never run, even for tall many-pane scrolling output");
+        };
+        assert_eq!(actual.rows, patch.rows);
     }
 
     #[test]

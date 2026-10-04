@@ -309,6 +309,7 @@ impl ClientState {
         }
         writer.write_all(&self.pending_native_cleanup)?;
         writer.flush()?;
+        record_received_kitty_graphics(&self.pending_native_cleanup);
         self.pending_native_cleanup.clear();
         Ok(())
     }
@@ -583,6 +584,63 @@ impl ClientState {
 #[cfg(all(test, unix))]
 mod native_cleanup_tests {
     use super::*;
+
+    #[test]
+    fn native_cleanup_retires_ledger_only_after_successful_write_and_flush() {
+        struct FlushFailure(Vec<u8>);
+        impl io::Write for FlushFailure {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Err(io::Error::other("test flush failure"))
+            }
+        }
+
+        // Observe teardown obligations without consuming the process-wide ledger.
+        fn ledger_contains(image_id: u32) -> bool {
+            let mut snapshot = FlushFailure(Vec::new());
+            let result = clear_received_kitty_graphics(&mut snapshot);
+            assert!(result.is_err() || snapshot.0.is_empty());
+            kitty_graphics_image_ids(&snapshot.0).contains(&image_id)
+        }
+
+        let image_id = 4_294_901_731;
+        assert!(!ledger_contains(image_id), "test ID must be fresh");
+        record_received_kitty_graphics(format!("\x1b_Ga=t,i={image_id};AAAA\x1b\\").as_bytes());
+        assert!(ledger_contains(image_id));
+        let mut state = ClientState::test_new();
+        state.queue_native_image_cleanup(image_id);
+        let deletion = state.pending_native_cleanup.clone();
+
+        let mut no_capacity = &mut [][..];
+        assert!(state.flush_native_cleanup(&mut no_capacity).is_err());
+        assert_eq!(state.pending_native_cleanup, deletion);
+        assert!(
+            ledger_contains(image_id),
+            "write failure must retain obligation"
+        );
+
+        let mut flush_failure = FlushFailure(Vec::new());
+        assert!(state.flush_native_cleanup(&mut flush_failure).is_err());
+        assert_eq!(flush_failure.0, deletion);
+        assert_eq!(state.pending_native_cleanup, deletion);
+        assert!(
+            ledger_contains(image_id),
+            "flush failure must retain obligation"
+        );
+
+        let mut output = Vec::new();
+        state.flush_native_cleanup(&mut output).unwrap();
+        assert_eq!(output, deletion);
+        assert!(state.pending_native_cleanup.is_empty());
+        assert!(
+            !ledger_contains(image_id),
+            "successful cleanup must retire obligation"
+        );
+    }
 
     #[test]
     fn retired_graphics_tombstones_survive_handoff_and_only_exact_files_consume_them() {
