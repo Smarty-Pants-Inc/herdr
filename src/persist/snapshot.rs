@@ -116,6 +116,8 @@ pub struct PaneSnapshot {
     pub agent_session: Option<PaneAgentSessionSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_argv: Option<Vec<String>>,
+    #[serde(default)]
+    pub cold_restore_argv: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -380,6 +382,7 @@ fn capture_tab(
                 managed_agent_kind,
                 agent_session,
                 launch_argv,
+                cold_restore_argv: terminal.is_some_and(|terminal| terminal.cold_restore_argv),
             },
         );
     }
@@ -413,6 +416,33 @@ pub(super) fn layout_fingerprint(snapshot: &SessionSnapshot) -> Option<String> {
     let mut value = serde_json::to_value(snapshot).ok()?;
     // The fingerprint is a layout identity; keep launch env (possible secrets) out of it.
     strip_launch_env(&mut value);
+    // Replay consent is not layout; omit both values to preserve pre-consent history identity.
+    if let Some(workspaces) = value
+        .get_mut("workspaces")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for workspace in workspaces {
+            let Some(tabs) = workspace
+                .get_mut("tabs")
+                .and_then(serde_json::Value::as_array_mut)
+            else {
+                continue;
+            };
+            for tab in tabs {
+                let Some(panes) = tab
+                    .get_mut("panes")
+                    .and_then(serde_json::Value::as_object_mut)
+                else {
+                    continue;
+                };
+                for pane in panes.values_mut() {
+                    if let Some(pane) = pane.as_object_mut() {
+                        pane.remove("cold_restore_argv");
+                    }
+                }
+            }
+        }
+    }
     // Sets serialize as arrays; normalize their order as well as JSON object keys.
     let mut collapsed: Vec<_> = snapshot.collapsed_space_keys.iter().collect();
     collapsed.sort_unstable();
@@ -683,6 +713,63 @@ mod tests {
     }
 
     #[test]
+    fn layout_fingerprint_ignores_replay_consent_but_tracks_layout() {
+        let mut snapshot = parse_snapshot(session_fixture("current-herdr-dev")).unwrap();
+        let default_value = serde_json::to_value(&snapshot).unwrap();
+        // This is a consent-only invariant, not a fixed historical fingerprint fixture.
+        let baseline = layout_fingerprint(&snapshot).unwrap();
+        for workspace in &mut snapshot.workspaces {
+            for tab in &mut workspace.tabs {
+                for pane in tab.panes.values_mut() {
+                    assert!(!pane.cold_restore_argv);
+                    pane.cold_restore_argv = true;
+                }
+            }
+        }
+        assert_eq!(layout_fingerprint(&snapshot).unwrap(), baseline);
+
+        // Consent still serializes; only the fingerprint's temporary JSON omits it.
+        let mut without_consent = serde_json::to_value(&snapshot).unwrap();
+        for workspace in without_consent["workspaces"].as_array_mut().unwrap() {
+            for tab in workspace["tabs"].as_array_mut().unwrap() {
+                for pane in tab["panes"].as_object_mut().unwrap().values_mut() {
+                    assert_eq!(pane["cold_restore_argv"], serde_json::json!(true));
+                    pane.as_object_mut().unwrap().remove("cold_restore_argv");
+                }
+            }
+        }
+        let mut defaulted =
+            parse_snapshot(&serde_json::to_string(&without_consent).unwrap()).unwrap();
+        assert_eq!(serde_json::to_value(&defaulted).unwrap(), default_value);
+        assert_eq!(layout_fingerprint(&defaulted).unwrap(), baseline);
+
+        // The recipe itself remains part of the fingerprint, unlike its consent metadata.
+        defaulted.workspaces[0].tabs[0]
+            .panes
+            .get_mut(&1)
+            .unwrap()
+            .launch_argv = Some(vec!["/program".into(), "recipe argument".into()]);
+        assert_ne!(layout_fingerprint(&defaulted).unwrap(), baseline);
+
+        // Mirror disk-load trust refusal without changing the actual trust policy.
+        for workspace in &mut snapshot.workspaces {
+            for tab in &mut workspace.tabs {
+                for pane in tab.panes.values_mut() {
+                    pane.cold_restore_argv = false;
+                }
+            }
+        }
+        assert_eq!(serde_json::to_value(&snapshot).unwrap(), default_value);
+        assert_eq!(layout_fingerprint(&snapshot).unwrap(), baseline);
+
+        match &mut snapshot.workspaces[1].tabs[0].layout {
+            LayoutSnapshot::Split { ratio, .. } => *ratio = 0.75,
+            LayoutSnapshot::Pane(_) => panic!("fixture must contain a split"),
+        }
+        assert_ne!(layout_fingerprint(&snapshot).unwrap(), baseline);
+    }
+
+    #[test]
     fn round_trip_empty_session() {
         let snap = SessionSnapshot {
             version: SNAPSHOT_VERSION,
@@ -724,6 +811,18 @@ mod tests {
     }
 
     #[test]
+    fn cold_restore_argv_defaults_false_and_round_trips() {
+        let mut pane: PaneSnapshot =
+            serde_json::from_str(r#"{"cwd":"/tmp","launch_argv":["/program","a b"]}"#).unwrap();
+        assert!(!pane.cold_restore_argv);
+        pane.cold_restore_argv = true;
+        let restored: PaneSnapshot =
+            serde_json::from_str(&serde_json::to_string(&pane).unwrap()).unwrap();
+        assert!(restored.cold_restore_argv);
+        assert_eq!(restored.launch_argv, pane.launch_argv);
+    }
+
+    #[test]
     fn round_trip_full_workspace_snapshot() {
         let mut panes = HashMap::new();
         panes.insert(
@@ -735,6 +834,7 @@ mod tests {
                 managed_agent_kind: None,
                 agent_session: None,
                 launch_argv: None,
+                cold_restore_argv: false,
             },
         );
         panes.insert(
@@ -746,6 +846,7 @@ mod tests {
                 managed_agent_kind: None,
                 agent_session: None,
                 launch_argv: None,
+                cold_restore_argv: false,
             },
         );
 
@@ -1398,6 +1499,7 @@ mod tests {
                 managed_agent_kind: None,
                 agent_session: None,
                 launch_argv: None,
+                cold_restore_argv: false,
             },
         );
         panes.insert(
@@ -1411,6 +1513,7 @@ mod tests {
                 managed_agent_kind: None,
                 agent_session: None,
                 launch_argv: None,
+                cold_restore_argv: false,
             },
         );
 

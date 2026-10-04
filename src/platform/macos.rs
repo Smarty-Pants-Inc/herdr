@@ -7,6 +7,32 @@ use std::process::{Command, Stdio};
 use std::ptr::NonNull;
 use std::sync::OnceLock;
 
+/// Fail closed until a non-mutating, same-handle owner/ACL validator exists.
+/// POSIX owner/mode checks alone cannot rule out Darwin extended ACL writers.
+pub(crate) fn read_session_snapshot_with_trust(
+    path: &Path,
+) -> std::io::Result<(String, super::SnapshotFileTrust)> {
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    // Do not block opening a FIFO before checking the resolved object's type.
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "snapshot is not a regular file",
+        ));
+    }
+    let mut content = String::new();
+    file.read_to_string(&mut content)?;
+    Ok((
+        content,
+        super::SnapshotFileTrust::Untrusted("snapshot owner/ACL verification unavailable on macOS"),
+    ))
+}
+
 pub(super) const REMOTE_BRIDGE_CLOCK: libc::clockid_t = libc::CLOCK_MONOTONIC;
 
 use super::{

@@ -1,5 +1,50 @@
 use std::path::{Path, PathBuf};
 
+/// Follow symlinks as before, but authorize and read the same resolved object.
+/// O_NONBLOCK prevents a FIFO path from blocking before its type can be checked.
+#[cfg(target_os = "linux")]
+pub(crate) fn read_session_snapshot_with_trust(
+    path: &Path,
+) -> std::io::Result<(String, super::SnapshotFileTrust)> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)?;
+    read_opened_snapshot_with_trust(file)
+}
+
+#[cfg(target_os = "linux")]
+fn read_opened_snapshot_with_trust(
+    mut file: std::fs::File,
+) -> std::io::Result<(String, super::SnapshotFileTrust)> {
+    use std::io::Read as _;
+    use std::os::unix::fs::MetadataExt as _;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "snapshot is not a regular file",
+        ));
+    }
+    let trust =
+        snapshot_owner_mode_trust(metadata.uid(), unsafe { libc::geteuid() }, metadata.mode());
+    let mut content = String::new();
+    file.read_to_string(&mut content)?;
+    Ok((content, trust))
+}
+
+#[cfg(target_os = "linux")]
+fn snapshot_owner_mode_trust(owner: u32, current_user: u32, mode: u32) -> super::SnapshotFileTrust {
+    if owner != current_user {
+        super::SnapshotFileTrust::Untrusted("snapshot is not owned by the current user")
+    } else if mode & 0o022 != 0 {
+        super::SnapshotFileTrust::Untrusted("snapshot is writable by group or others")
+    } else {
+        super::SnapshotFileTrust::Trusted
+    }
+}
+
 mod diagnostics;
 pub(crate) use diagnostics::{DiagnosticDirectoryScan, PrivateDiagnosticDirectory};
 
@@ -498,6 +543,60 @@ pub(crate) fn set_default_plugin_pane_pwd(env: &mut Vec<(String, String)>, cwd: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn snapshot_trust_checks_original_opened_object_and_follows_trusted_target() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-snapshot-handle-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session");
+        for original_trusted in [true, false] {
+            std::fs::write(&path, "original bytes").unwrap();
+            std::fs::set_permissions(
+                &path,
+                std::fs::Permissions::from_mode(if original_trusted { 0o600 } else { 0o666 }),
+            )
+            .unwrap();
+            let opened = std::fs::File::open(&path).unwrap();
+            std::fs::remove_file(&path).unwrap();
+            std::fs::write(&path, "replacement bytes").unwrap();
+            std::fs::set_permissions(
+                &path,
+                std::fs::Permissions::from_mode(if original_trusted { 0o666 } else { 0o600 }),
+            )
+            .unwrap();
+            let (bytes, trust) = read_opened_snapshot_with_trust(opened).unwrap();
+            assert_eq!(bytes, "original bytes");
+            assert_eq!(
+                matches!(trust, super::super::SnapshotFileTrust::Trusted),
+                original_trusted
+            );
+        }
+        let link = dir.join("link");
+        symlink(&path, &link).unwrap();
+        let (bytes, trust) = read_session_snapshot_with_trust(&link).unwrap();
+        assert_eq!(bytes, "replacement bytes");
+        assert!(matches!(trust, super::super::SnapshotFileTrust::Trusted));
+        assert!(matches!(
+            snapshot_owner_mode_trust(1, 2, 0o600),
+            super::super::SnapshotFileTrust::Untrusted(_)
+        ));
+        assert!(read_session_snapshot_with_trust(&dir).is_err());
+        use std::os::unix::ffi::OsStrExt as _;
+        let fifo = dir.join("fifo");
+        let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+        assert!(read_session_snapshot_with_trust(&fifo).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn plugin_pane_pwd_defaults_to_cwd_without_overriding_explicit_env() {
