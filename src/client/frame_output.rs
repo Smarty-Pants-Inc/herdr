@@ -1,5 +1,7 @@
 use std::collections::HashSet;
 use std::io::{self, Write as _};
+#[cfg(test)]
+use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
 
 use crate::kitty_graphics::{GraphicsOperation, GraphicsOutput};
@@ -28,7 +30,16 @@ impl std::ops::Deref for ComposedFrame {
     }
 }
 
+#[cfg(not(test))]
 static RECEIVED_KITTY_GRAPHICS_IDS: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
+
+#[cfg(test)]
+thread_local! {
+    // Each libtest thread models its own terminal. Isolate every caller, including
+    // ClientState and terminal restoration, rather than serializing selected tests.
+    // Keep the mutex so poisoning and cleanup's lock/write/flush behavior are unchanged.
+    static RECEIVED_KITTY_GRAPHICS_IDS: OnceLock<Arc<Mutex<HashSet<u32>>>> = const { OnceLock::new() };
+}
 
 pub(super) fn write_composed_frame(
     mut writer: impl io::Write,
@@ -150,7 +161,13 @@ fn apply_upload_ledger_obligations(commands: &[KittyGraphicsImageCommand]) {
 }
 
 fn apply_graphics_ledger_changes(commands: Vec<KittyGraphicsImageCommand>) {
+    #[cfg(not(test))]
     let set = RECEIVED_KITTY_GRAPHICS_IDS.get_or_init(|| Mutex::new(HashSet::new()));
+    #[cfg(test)]
+    let set = RECEIVED_KITTY_GRAPHICS_IDS.with(|ids| {
+        ids.get_or_init(|| Arc::new(Mutex::new(HashSet::new())))
+            .clone()
+    });
     if let Ok(mut set) = set.lock() {
         for command in commands {
             match command {
@@ -163,10 +180,18 @@ fn apply_graphics_ledger_changes(commands: Vec<KittyGraphicsImageCommand>) {
             }
         }
     }
+    // End the lock temporary's lifetime before releasing the test-local Arc.
+    #[cfg(test)]
+    drop(set);
 }
 
 pub(super) fn clear_received_kitty_graphics(mut writer: impl io::Write) -> io::Result<()> {
+    #[cfg(not(test))]
     let Some(set) = RECEIVED_KITTY_GRAPHICS_IDS.get() else {
+        return Ok(());
+    };
+    #[cfg(test)]
+    let Some(set) = RECEIVED_KITTY_GRAPHICS_IDS.with(|ids| ids.get().cloned()) else {
         return Ok(());
     };
     let Ok(mut set) = set.lock() else {

@@ -1578,8 +1578,72 @@ mod tests {
         }
     }
 
+    fn run_socket_peer_test_in_child(name: &str) -> bool {
+        use std::os::unix::process::CommandExt;
+
+        const CHILD_ENV: &str = "HERDR_TEST_SOCKET_PEER_CHILD";
+        if std::env::var(CHILD_ENV).as_deref() == Ok(name) {
+            return false;
+        }
+        // These peers fork without exec: in the parallel harness they would
+        // retain unrelated tests' flock descriptors until the peer exits.
+        // Re-exec first so only this fixture's descriptors reach the fork.
+        let mut child = Command::new(std::env::current_exe().expect("resolve test executable"))
+            .args(["--exact", name, "--test-threads=1", "--nocapture"])
+            .env(CHILD_ENV, name)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            // Include the forked peer in timeout cleanup, even if it holds
+            // the output pipes open after the isolated harness is killed.
+            .process_group(0)
+            .spawn()
+            .expect("run isolated socket peer test");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut wait_error = None;
+        let timed_out = loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break false,
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Ok(None) => break true,
+                Err(error) => {
+                    wait_error = Some(error);
+                    break false;
+                }
+            }
+        };
+        if timed_out || wait_error.is_some() {
+            // SAFETY: the unreaped child leads the private process group we
+            // created above; this also stops its owned forked socket peer.
+            unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
+            let _ = child.kill();
+        }
+        let output = child
+            .wait_with_output()
+            .expect("join isolated socket peer test");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !timed_out
+                && wait_error.is_none()
+                && output.status.success()
+                && stdout.contains("test result: ok. 1 passed; 0 failed;")
+                && stdout.contains(&format!("test {name} ... ok")),
+            "isolated {name}: timed_out={timed_out}, wait_error={wait_error:?}, status={}\n{stdout}\n{stderr}",
+            output.status,
+        );
+        true
+    }
+
     #[test]
     fn a_socket_peer_handle_never_signals_a_reaped_peer_pid() {
+        if run_socket_peer_test_in_child(
+            "platform::linux::tests::a_socket_peer_handle_never_signals_a_reaped_peer_pid",
+        ) {
+            return;
+        }
         use std::os::fd::AsRawFd;
         use std::os::unix::ffi::OsStrExt;
 
@@ -1636,6 +1700,11 @@ mod tests {
 
     #[test]
     fn socket_peer_identity_captures_live_original_and_rejects_exited_peer() {
+        if run_socket_peer_test_in_child(
+            "platform::linux::tests::socket_peer_identity_captures_live_original_and_rejects_exited_peer",
+        ) {
+            return;
+        }
         use std::os::{fd::AsRawFd, unix::ffi::OsStrExt};
         let dir = std::env::temp_dir().join(format!(
             "herdr-peer-pin-{}-{}",

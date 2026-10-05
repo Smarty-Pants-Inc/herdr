@@ -746,16 +746,80 @@ mod tests {
         }
     }
 
+    // Preserve the product's 1s native-refresh bound. Do not include waiting
+    // for another test's fixture setup in that latency measurement.
+    const GIT_WATCH_TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+    fn run_git_watch_test_in_child(name: &str) -> bool {
+        const CHILD_ENV: &str = "HERDR_TEST_GIT_WATCH_CHILD";
+        if std::env::var(CHILD_ENV).as_deref() == Ok(name) {
+            return false;
+        }
+        // Serializing just these fixtures avoids overlapping native watchers;
+        // re-exec also excludes unrelated PTY forks and process-wide fixtures.
+        static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--test-threads=1", "--nocapture"])
+            .env(CHILD_ENV, name)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("run isolated git watch test");
+        let start = Instant::now();
+        let timed_out = loop {
+            if child
+                .try_wait()
+                .expect("observe isolated git watch test")
+                .is_some()
+            {
+                break false;
+            }
+            if start.elapsed() >= std::time::Duration::from_secs(30) {
+                child.kill().expect("stop isolated git watch test");
+                break true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        let output = child
+            .wait_with_output()
+            .expect("join isolated git watch test");
+        assert!(
+            !timed_out
+                && output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
+            "isolated {name}: timed_out={timed_out}, status={}\n{}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        true
+    }
+
+    macro_rules! isolated_git_watch_test {
+        ($name:ident) => {
+            if run_git_watch_test_in_child(concat!("app::git_refresh::tests::", stringify!($name)))
+            {
+                return;
+            }
+        };
+    }
+
     /// Exercise the same sync -> scheduler -> worker -> App event application
     /// path used by a headless server with an attached app consumer.
     #[track_caller]
     fn drive_git_watch_refresh(app: &mut App) -> (std::time::Duration, bool) {
         let start = Instant::now();
+        // A safety refresh must never satisfy a native-event regression, even
+        // when a long-running test is close to its original safety deadline.
+        let safety_refresh = app.last_git_repo_discovery_refresh;
         loop {
             let now = Instant::now();
             assert!(
-                now.duration_since(start) < std::time::Duration::from_secs(1),
-                "native git refresh exceeded 1s"
+                now.duration_since(start) < GIT_WATCH_TEST_TIMEOUT,
+                "native git refresh exceeded {GIT_WATCH_TEST_TIMEOUT:?}: in_flight={}, watch_deadline={:?}",
+                app.git_refresh_in_flight,
+                app.git_watch_refresh_deadline
             );
             app.sync_git_watches();
             app.start_git_status_refresh_if_due(now);
@@ -763,6 +827,14 @@ mod tests {
                 let completed = matches!(event, AppEvent::GitStatusRefreshed { .. });
                 let changed = app.handle_internal_event_with_render_impact(event);
                 if completed {
+                    assert!(
+                        start.elapsed() < GIT_WATCH_TEST_TIMEOUT,
+                        "native git refresh application exceeded {GIT_WATCH_TEST_TIMEOUT:?}"
+                    );
+                    assert_eq!(
+                        app.last_git_repo_discovery_refresh, safety_refresh,
+                        "periodic safety discovery must not satisfy a native refresh wait"
+                    );
                     return (start.elapsed(), changed);
                 }
             }
@@ -772,6 +844,9 @@ mod tests {
 
     #[test]
     fn git_watch_commit_branch_and_atomic_index_refresh_through_app_under_one_second() {
+        isolated_git_watch_test!(
+            git_watch_commit_branch_and_atomic_index_refresh_through_app_under_one_second
+        );
         let repo = GitWatchRepo::new("freshness");
         repo.init();
         let mut app = repo.app();
@@ -781,14 +856,14 @@ mod tests {
         repo.git(&["commit", "--allow-empty", "-m", "watched"]);
         let (commit_latency, changed) = drive_git_watch_refresh(&mut app);
         assert!(changed);
-        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+        assert!(start.elapsed() < GIT_WATCH_TEST_TIMEOUT);
         assert_eq!(app.state.workspaces[0].git_ahead_behind(), Some((1, 0)));
 
         let start = Instant::now();
         repo.git(&["switch", "-c", "feature/nested"]);
         let (branch_latency, changed) = drive_git_watch_refresh(&mut app);
         assert!(changed);
-        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+        assert!(start.elapsed() < GIT_WATCH_TEST_TIMEOUT);
         assert_eq!(
             app.state.workspaces[0].cached_git_branch.as_deref(),
             Some("feature/nested")
@@ -802,7 +877,7 @@ mod tests {
         let start = Instant::now();
         repo.git(&["add", "staged.txt"]);
         let (index_latency, changed) = drive_git_watch_refresh(&mut app);
-        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+        assert!(start.elapsed() < GIT_WATCH_TEST_TIMEOUT);
         assert!(!changed);
         assert_eq!(app.state.workspaces[0].cached_git_branch, branch_before);
         assert_eq!(app.state.workspaces[0].git_ahead_behind(), status_before);
@@ -815,6 +890,9 @@ mod tests {
 
     #[test]
     fn git_watch_linked_worktree_common_refs_packed_refs_and_config_refresh_through_app() {
+        isolated_git_watch_test!(
+            git_watch_linked_worktree_common_refs_packed_refs_and_config_refresh_through_app
+        );
         let repo = GitWatchRepo::new("common-refs");
         repo.init();
         let linked = GitWatchRepo::new("linked");
@@ -865,6 +943,9 @@ mod tests {
 
     #[test]
     fn git_watch_missed_event_safety_refresh_discovers_non_git_at_sixty_seconds() {
+        isolated_git_watch_test!(
+            git_watch_missed_event_safety_refresh_discovers_non_git_at_sixty_seconds
+        );
         let repo = GitWatchRepo::new("missed-non-git");
         let mut app = repo.app();
         assert_eq!(app.state.workspaces[0].cached_git_branch, None);
@@ -888,6 +969,9 @@ mod tests {
 
     #[test]
     fn git_watch_missed_event_safety_refresh_updates_existing_git_at_sixty_seconds() {
+        isolated_git_watch_test!(
+            git_watch_missed_event_safety_refresh_updates_existing_git_at_sixty_seconds
+        );
         let repo = GitWatchRepo::new("missed-existing-git");
         repo.init();
         let mut app = repo.app();
@@ -934,6 +1018,9 @@ mod tests {
 
     #[test]
     fn git_watch_events_do_not_postpone_full_discovery_and_debounce_survives_in_flight() {
+        isolated_git_watch_test!(
+            git_watch_events_do_not_postpone_full_discovery_and_debounce_survives_in_flight
+        );
         let repo = GitWatchRepo::new("deadlines");
         repo.init();
         let mut app = repo.app();
@@ -957,6 +1044,7 @@ mod tests {
 
     #[test]
     fn git_watch_workspace_removal_and_demand_removal_release_watcher() {
+        isolated_git_watch_test!(git_watch_workspace_removal_and_demand_removal_release_watcher);
         let repo = GitWatchRepo::new("app-removal");
         repo.init();
         let mut app = repo.app();

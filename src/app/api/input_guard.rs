@@ -1315,7 +1315,26 @@ mod tests {
             .runtime_for_pane_in_workspace(&fixture.app.terminal_runtimes, 0, target_pane)
             .expect("target runtime")
             .test_set_child_pid(target_root.id());
-        let marked_child = GuardTestChild(
+        // Spawn can return before /proc exposes the exec-installed environment.
+        // Wait for the fixture's actual marker state before freezing its context.
+        let ready_context = |child: &mut GuardTestChild, expected| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            loop {
+                assert!(child.try_wait().expect("fixture child liveness").is_none());
+                let context = ApiRequestContext::for_local_peer_pid(Some(child.id()));
+                if context.local_peer_identity.is_some()
+                    && context.local_peer_pane_origin == expected
+                {
+                    break context;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "fixture marker readiness timed out: expected {expected:?}, got {context:?}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+        let mut marked_child = GuardTestChild(
             std::process::Command::new("sleep")
                 .arg("60")
                 .env("HERDR_ENV", "1")
@@ -1329,7 +1348,8 @@ mod tests {
             .runtime_for_pane_in_workspace(&fixture.app.terminal_runtimes, 0, source_pane)
             .expect("healthy agent runtime")
             .test_set_child_pid(marked_child.id());
-        let marked_context = ApiRequestContext::for_local_peer_pid(Some(marked_child.id()));
+        let marked_context =
+            ready_context(&mut marked_child, crate::platform::PeerPaneOrigin::HasPane);
         assert_eq!(
             marked_context.local_peer_pane_origin,
             crate::platform::PeerPaneOrigin::HasPane
@@ -1337,16 +1357,19 @@ mod tests {
         let peer = marked_context
             .local_peer_identity
             .expect("live marked caller");
-        let ordinary_peer = crate::platform::parent_process_identity(
-            crate::platform::process_identity(std::process::id()).expect("server"),
-        )
-        .expect("real older parent");
-        assert!(
-            ordinary_peer.start_time
-                < crate::platform::process_identity(std::process::id())
-                    .expect("server")
-                    .start_time
-        );
+        let server = crate::platform::process_identity(std::process::id()).expect("server");
+        let mut ordinary_peer =
+            crate::platform::parent_process_identity(server).expect("real parent");
+        // A freshly spawned runner can share the server's /proc start-time tick.
+        // Use a real older ancestor, not an assumed strictly older direct parent.
+        for _ in 0..64 {
+            if ordinary_peer.start_time < server.start_time {
+                break;
+            }
+            ordinary_peer = crate::platform::parent_process_identity(ordinary_peer)
+                .expect("real older ancestor");
+        }
+        assert!(ordinary_peer.start_time < server.start_time);
         let request = |id: &str, pane_id: String, text: &str| Request {
             id: id.into(),
             method: Method::PaneSendText(PaneSendTextParams {
@@ -1377,7 +1400,7 @@ mod tests {
                 assert!(fixture.target_rx.try_recv().is_err());
             }
 
-            // Check the native adapter against a real strictly older parent.
+            // Check the native adapter against a real strictly older ancestor.
             assert_eq!(
                 crate::platform::process_identity_server_ancestry(ordinary_peer),
                 crate::platform::ServerAncestry::Outside
@@ -1385,7 +1408,7 @@ mod tests {
             // Capture readable absence from an actual sanitized exec. Model its
             // older-server ancestry separately so this test remains valid when
             // nextest itself inherited pane markers from the enclosing harness.
-            let ordinary_child = GuardTestChild(
+            let mut ordinary_child = GuardTestChild(
                 std::process::Command::new("sleep")
                     .arg("60")
                     .env_remove("HERDR_ENV")
@@ -1393,7 +1416,8 @@ mod tests {
                     .spawn()
                     .expect("marker-free ordinary child"),
             );
-            let ordinary = ApiRequestContext::for_local_peer_pid(Some(ordinary_child.id()));
+            let ordinary =
+                ready_context(&mut ordinary_child, crate::platform::PeerPaneOrigin::Absent);
             assert_eq!(
                 ordinary.local_peer_pane_origin,
                 crate::platform::PeerPaneOrigin::Absent
@@ -1956,9 +1980,10 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn unsupported_pidfd_uses_accept_time_pin_through_actual_guard() {
+        use std::io::Read;
         use std::os::fd::AsRawFd;
         let mut fixture = attributed_agent_fixture();
-        let (server, client) = std::os::unix::net::UnixStream::pair().expect("socket pair");
+        let (mut server, client) = std::os::unix::net::UnixStream::pair().expect("socket pair");
         let context = ApiRequestContext::capture(
             crate::platform::local_socket_peer_identity_without_pidfd(server.as_raw_fd()),
         );
@@ -2000,6 +2025,27 @@ mod tests {
             }
         }
         drop(client);
+        // Parallel child spawns can hold a fork-inherited CLOEXEC client fd until
+        // exec. Dropping our copy is not proof of disconnect: wait for actual EOF.
+        server.set_nonblocking(true).expect("nonblocking EOF probe");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            match server.read(&mut [0]) {
+                Ok(0) => break,
+                Ok(_) => panic!("unexpected data on unused peer socket"),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                    ) => {}
+                Err(error) => panic!("peer disconnect probe: {error}"),
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "peer socket did not disconnect after dropping client"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
         let missing = ApiRequestContext::capture(
             crate::platform::local_socket_peer_identity_without_pidfd(server.as_raw_fd()),
         );

@@ -40,6 +40,7 @@ fn git_config_path(path: &std::path::Path) -> String {
 
 #[test]
 fn git_watch_repair_same_path_directory_replacement_then_real_change() {
+    isolated_git_watch_test!(git_watch_repair_same_path_directory_replacement_then_real_change);
     for directory in [".git/refs", ".git"] {
         let repo = GitWatchRepo::new("replacement");
         repo.init();
@@ -56,13 +57,7 @@ fn git_watch_repair_same_path_directory_replacement_then_real_change() {
             safety_deadline
         );
         // Retain the retired inode: stale registrations must not track it.
-        std::thread::sleep(std::time::Duration::from_millis(150));
-        while let Ok(event) = app.event_rx.try_recv() {
-            app.handle_internal_event(event);
-        }
-        if app.git_watch_refresh_deadline.is_some() {
-            drive_git_watch_refresh(&mut app);
-        }
+        drain_git_watch_hints(&mut app);
         repo.git(&["commit", "--allow-empty", "-m", "after replacement"]);
         drive_git_watch_refresh(&mut app);
         assert_eq!(
@@ -82,6 +77,7 @@ fn git_watch_repair_same_path_directory_replacement_then_real_change() {
 #[cfg(unix)]
 #[test]
 fn git_watch_repair_symlink_refs_target_edits_and_retarget() {
+    isolated_git_watch_test!(git_watch_repair_symlink_refs_target_edits_and_retarget);
     let repo = GitWatchRepo::new("symlink-refs");
     let external = GitWatchRepo::new("refs-targets");
     repo.init();
@@ -106,6 +102,9 @@ fn git_watch_repair_symlink_refs_target_edits_and_retarget() {
 
 #[test]
 fn git_watch_repair_user_config_fetch_refspec_and_missing_parent_creation() {
+    isolated_git_watch_test!(
+        git_watch_repair_user_config_fetch_refspec_and_missing_parent_creation
+    );
     let process_home = std::env::var_os("HOME");
     let process_xdg = std::env::var_os("XDG_CONFIG_HOME");
     let home = GitWatchRepo::new("user-home");
@@ -168,6 +167,7 @@ fn git_watch_repair_user_config_fetch_refspec_and_missing_parent_creation() {
 
 #[test]
 fn git_watch_repair_new_root_and_reactivated_consumer_get_initial_status() {
+    isolated_git_watch_test!(git_watch_repair_new_root_and_reactivated_consumer_get_initial_status);
     let first = GitWatchRepo::new("first-root");
     first.init();
     let mut app = first.app();
@@ -189,6 +189,7 @@ fn git_watch_repair_new_root_and_reactivated_consumer_get_initial_status() {
 
 #[test]
 fn git_watch_repair_git_directory_recreated_after_removal_was_applied() {
+    isolated_git_watch_test!(git_watch_repair_git_directory_recreated_after_removal_was_applied);
     let repo = GitWatchRepo::new("replacement-gap");
     repo.init();
     let mut app = repo.app();
@@ -212,11 +213,16 @@ fn git_watch_repair_git_directory_recreated_after_removal_was_applied() {
 
 /// Reach a quiet native/app boundary, including late removal and re-arm hints.
 /// No synthetic event, forced refresh, or advanced safety clock may hide a lost watch.
+#[track_caller]
 fn drain_git_watch_hints(app: &mut App) {
     let start = Instant::now();
+    let safety_refresh = app.last_git_repo_discovery_refresh;
     let mut quiet_since = Instant::now();
     loop {
-        assert!(start.elapsed() < std::time::Duration::from_secs(3));
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(3),
+            "native git hints did not settle within 3s"
+        );
         app.sync_git_watches();
         app.start_git_status_refresh_if_due(Instant::now());
         while let Ok(event) = app.event_rx.try_recv() {
@@ -227,6 +233,10 @@ fn drain_git_watch_hints(app: &mut App) {
             quiet_since = Instant::now();
         } else if quiet_since.elapsed() >= std::time::Duration::from_millis(150) {
             assert!(app.event_rx.is_empty());
+            assert_eq!(
+                app.last_git_repo_discovery_refresh, safety_refresh,
+                "periodic safety discovery must not satisfy a native quiet wait"
+            );
             return;
         }
         std::thread::sleep(std::time::Duration::from_millis(2));
@@ -235,6 +245,9 @@ fn drain_git_watch_hints(app: &mut App) {
 
 #[test]
 fn git_watch_repair_linked_only_common_directory_restored_after_missing_apply() {
+    isolated_git_watch_test!(
+        git_watch_repair_linked_only_common_directory_restored_after_missing_apply
+    );
     let repo = GitWatchRepo::new("linked-common-gap-main");
     repo.init();
     let linked = GitWatchRepo::new("linked-common-gap-consumer");
@@ -285,7 +298,7 @@ fn git_watch_repair_linked_only_common_directory_restored_after_missing_apply() 
     let start = Instant::now();
     std::fs::rename(&retired, &common).unwrap();
     let (restoration_latency, changed) = drive_git_watch_refresh(&mut app);
-    assert!(start.elapsed() < std::time::Duration::from_secs(1));
+    assert!(start.elapsed() < GIT_WATCH_TEST_TIMEOUT);
     assert!(changed);
     assert_eq!(
         app.state.workspaces[0].cached_git_branch.as_deref(),
@@ -297,14 +310,14 @@ fn git_watch_repair_linked_only_common_directory_restored_after_missing_apply() 
     let start = Instant::now();
     repo.git(&["update-ref", "refs/heads/upstream", &tip]);
     let (ref_latency, changed) = drive_git_watch_refresh(&mut app);
-    assert!(start.elapsed() < std::time::Duration::from_secs(1));
+    assert!(start.elapsed() < GIT_WATCH_TEST_TIMEOUT);
     assert!(changed);
     assert_eq!(app.state.workspaces[0].git_ahead_behind(), Some((0, 0)));
     drain_git_watch_hints(&mut app);
     let start = Instant::now();
     linked.git(&["switch", "-c", "after-common-restoration"]);
     let (branch_latency, changed) = drive_git_watch_refresh(&mut app);
-    assert!(start.elapsed() < std::time::Duration::from_secs(1));
+    assert!(start.elapsed() < GIT_WATCH_TEST_TIMEOUT);
     assert!(changed);
     assert_eq!(
         app.state.workspaces[0].cached_git_branch.as_deref(),
@@ -329,6 +342,7 @@ fn upstream_config(reference: &str) -> String {
 
 #[test]
 fn git_watch_repair_external_include_atomic_replacement_and_graph_change() {
+    isolated_git_watch_test!(git_watch_repair_external_include_atomic_replacement_and_graph_change);
     let repo = GitWatchRepo::new("external-config");
     let external = GitWatchRepo::new("include-files");
     repo.init();
@@ -370,6 +384,7 @@ fn git_watch_repair_external_include_atomic_replacement_and_graph_change() {
 #[cfg(unix)]
 #[test]
 fn git_watch_repair_external_symlink_retarget_then_target_edit() {
+    isolated_git_watch_test!(git_watch_repair_external_symlink_retarget_then_target_edit);
     let repo = GitWatchRepo::new("symlink-config");
     let external = GitWatchRepo::new("symlink-files");
     repo.init();
@@ -398,6 +413,9 @@ fn git_watch_repair_external_symlink_retarget_then_target_edit() {
 #[cfg(unix)]
 #[test]
 fn git_watch_repair_directory_symlink_retarget_and_missing_parent_migration() {
+    isolated_git_watch_test!(
+        git_watch_repair_directory_symlink_retarget_and_missing_parent_migration
+    );
     let repo = GitWatchRepo::new("directory-symlink-config");
     let external = GitWatchRepo::new("directory-symlink-files");
     repo.init();
@@ -449,6 +467,9 @@ fn git_watch_repair_directory_symlink_retarget_and_missing_parent_migration() {
 
 #[test]
 fn git_watch_repair_config_reload_expands_branch_only_demand_on_quiet_repo() {
+    isolated_git_watch_test!(
+        git_watch_repair_config_reload_expands_branch_only_demand_on_quiet_repo
+    );
     for in_flight in [false, true] {
         let repo = GitWatchRepo::new("demand-growth");
         repo.init();
@@ -504,6 +525,7 @@ fn git_watch_repair_config_reload_expands_branch_only_demand_on_quiet_repo() {
 #[cfg(target_os = "linux")]
 #[test]
 fn git_watch_repair_non_utf8_ancestor_relative_markers_common_ref_update() {
+    isolated_git_watch_test!(git_watch_repair_non_utf8_ancestor_relative_markers_common_ref_update);
     use std::os::unix::ffi::OsStringExt;
     let container = GitWatchRepo::new("native-paths");
     let ancestor = container
@@ -543,6 +565,7 @@ fn git_watch_repair_non_utf8_ancestor_relative_markers_common_ref_update() {
 
 #[test]
 fn git_watch_repair_removed_workspace_drops_its_cached_config_dependency() {
+    isolated_git_watch_test!(git_watch_repair_removed_workspace_drops_its_cached_config_dependency);
     let first = GitWatchRepo::new("retained-config-root");
     first.init();
     let mut app = first.app();
@@ -555,14 +578,8 @@ fn git_watch_repair_removed_workspace_drops_its_cached_config_dependency() {
     drive_git_watch_refresh(&mut app);
     app.state.workspaces.pop();
     app.sync_git_watches();
-    // Drain pending setup hints before changing the now-unobserved repository.
-    std::thread::sleep(std::time::Duration::from_millis(150));
-    while let Ok(event) = app.event_rx.try_recv() {
-        app.handle_internal_event(event);
-    }
-    if app.git_watch_refresh_deadline.is_some() {
-        drive_git_watch_refresh(&mut app);
-    }
+    // Wait for setup workers and late native hints, not just a fixed sleep.
+    drain_git_watch_hints(&mut app);
     second.git(&["config", "unused.removed", "changed"]);
     std::thread::sleep(std::time::Duration::from_millis(150));
     assert!(
