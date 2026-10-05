@@ -12,9 +12,9 @@ use crate::api::schema::{
     PaneRenameParams, PaneReportAgentParams, PaneReportAgentSessionParams,
     PaneReportMetadataParams, PaneResizeParams, PaneResizeReason, PaneResizeResult,
     PaneScrollParams, PaneSelectionReadParams, PaneSendInputParams, PaneSendKeysParams,
-    PaneSendTextParams, PaneSplitParams, PaneSwapParams, PaneSwapReason, PaneSwapResult,
-    PaneTarget, PaneTextPoint, PaneTextRange, PaneZoomMode, PaneZoomParams, PaneZoomReason,
-    PaneZoomResult, ResponseResult,
+    PaneSendTextParams, PaneSplitParams, PaneSwapParams, PaneSwapProjectCheckedParams,
+    PaneSwapReason, PaneSwapResult, PaneTarget, PaneTextPoint, PaneTextRange, PaneZoomMode,
+    PaneZoomParams, PaneZoomReason, PaneZoomResult, ResponseResult,
 };
 use crate::app::actions::{PaneZoomCommand, PaneZoomNoopReason};
 use crate::app::App;
@@ -765,6 +765,23 @@ impl App {
     }
 
     pub(super) fn handle_pane_swap(&mut self, id: String, params: PaneSwapParams) -> String {
+        self.handle_pane_swap_checked(id, params, false)
+    }
+
+    pub(super) fn handle_pane_swap_project_checked(
+        &mut self,
+        id: String,
+        params: PaneSwapProjectCheckedParams,
+    ) -> String {
+        self.handle_pane_swap_checked(id, params.params, params.allow_project_change)
+    }
+
+    fn handle_pane_swap_checked(
+        &mut self,
+        id: String,
+        params: PaneSwapParams,
+        allow_project_change: bool,
+    ) -> String {
         let directional = params.direction.is_some();
         let explicit = params.source_pane_id.is_some() || params.target_pane_id.is_some();
         if directional == explicit {
@@ -866,6 +883,24 @@ impl App {
         let mut changed = false;
         if reason.is_none() {
             if let Some(target_pane_id) = target_pane_id {
+                // Swapping leaves changes collect_agent_infos order even within
+                // one tab, and can change every survivor's first-Pi project.
+                let mut projected = self.project_topology();
+                for pane in &mut projected[ws_idx].tabs[tab_idx].panes {
+                    if *pane == source_pane_id {
+                        *pane = target_pane_id;
+                    } else if *pane == target_pane_id {
+                        *pane = source_pane_id;
+                    }
+                }
+                let project_changes = match self.precheck_project_change(
+                    &projected,
+                    allow_project_change,
+                    "pane.swap_project_checked",
+                ) {
+                    Ok(changes) => changes,
+                    Err(message) => return encode_error(id, "project_change_refused", message),
+                };
                 let previous_focus = self.state.current_pane_focus_target();
                 if let Some(tab) = self
                     .state
@@ -876,6 +911,7 @@ impl App {
                     changed = tab.layout.swap_panes(source_pane_id, target_pane_id);
                     tab.layout.focus_pane(source_pane_id);
                     if changed {
+                        Self::log_project_changes(&project_changes);
                         self.state.switch_workspace_tab(ws_idx, tab_idx);
                         self.state
                             .record_pane_focus_change(previous_focus, ws_idx, source_pane_id);
@@ -942,6 +978,7 @@ impl App {
             pane_id,
             destination,
             focus,
+            allow_project_change,
         } = params;
         let Some((source_ws_idx, source_pane_id)) = self.parse_pane_id(&pane_id) else {
             return encode_error(id, "pane_not_found", "source pane not found");
@@ -1123,6 +1160,63 @@ impl App {
             PaneMoveDestination::NewWorkspace { label, tab_label } => {
                 ResolvedPaneMoveDestination::NewWorkspace { label, tab_label }
             }
+        };
+
+        // Extraction can re-project sessions which do not themselves move.
+        let mut projected = self.project_topology();
+        projected[source_ws_idx].remove_pane(source_pane_id);
+        match &resolved {
+            ResolvedPaneMoveDestination::ExistingTab {
+                tab_id,
+                target_pane_id,
+                ..
+            } => {
+                let Some((ws_idx, tab_idx)) = self.parse_tab_id(tab_id) else {
+                    return encode_error(id, "tab_not_found", "target tab not found");
+                };
+                let root = self.state.workspaces[ws_idx].tabs[tab_idx].root_pane;
+                let Some(tab) = projected[ws_idx]
+                    .tabs
+                    .iter_mut()
+                    .find(|tab| tab.root == root)
+                else {
+                    return encode_error(id, "tab_not_found", "target tab not found");
+                };
+                let Some(position) = tab.panes.iter().position(|pane| pane == target_pane_id)
+                else {
+                    return encode_error(id, "target_pane_not_found", "target pane not found");
+                };
+                // Right/Down insertion creates the next layout leaf, not the last.
+                tab.panes.insert(position + 1, source_pane_id);
+            }
+            ResolvedPaneMoveDestination::NewTab { workspace_id, .. } => {
+                let Some(ws) = projected.iter_mut().find(|ws| &ws.id == workspace_id) else {
+                    return encode_error(id, "workspace_not_found", "target workspace not found");
+                };
+                ws.tabs.push(super::project_change::ProjectTab {
+                    root: source_pane_id,
+                    panes: vec![source_pane_id],
+                });
+            }
+            ResolvedPaneMoveDestination::NewWorkspace { .. } => {
+                projected.push(super::project_change::ProjectWorkspace {
+                    id: String::new(),
+                    tabs: vec![super::project_change::ProjectTab {
+                        root: source_pane_id,
+                        panes: vec![source_pane_id],
+                    }],
+                    checkout_path: None,
+                    tokens: std::collections::HashMap::new(),
+                });
+            }
+        }
+        let project_changes = match self.precheck_project_change(
+            &projected,
+            allow_project_change,
+            "pane.move_project_checked",
+        ) {
+            Ok(changes) => changes,
+            Err(message) => return encode_error(id, "project_change_refused", message),
         };
 
         let previous_focus = self.state.current_pane_focus_target();
@@ -1356,6 +1450,7 @@ impl App {
         }
         self.emit_layout_updated_snapshot((*move_result.target_layout).clone());
 
+        Self::log_project_changes(&project_changes);
         encode_success(id, ResponseResult::PaneMove { move_result })
     }
 
@@ -2018,6 +2113,16 @@ impl App {
                 "closing this pane would close a worktree group",
             ));
         }
+        let mut projected = self.project_topology();
+        projected[ws_idx].remove_pane(pane_id);
+        if projected[ws_idx].tabs.is_empty() {
+            projected.remove(ws_idx);
+        }
+        // Explicit close intentionally permits re-rooting only the sessions
+        // that survive. Plugin pane.close also uses this shared helper.
+        let project_changes = self
+            .precheck_project_change(&projected, true, "pane.close")
+            .map_err(|message| encode_error(id.clone(), "project_change_refused", message))?;
         let workspace_snapshot = self.workspace_info(ws_idx);
         let terminal_id = self.state.terminal_id_for_pane(ws_idx, pane_id);
         let should_close_workspace = {
@@ -2061,6 +2166,7 @@ impl App {
             }
         }
 
+        Self::log_project_changes_with_context(&project_changes, "pane.close (intentional close)");
         Ok(())
     }
 
@@ -2164,16 +2270,16 @@ impl App {
         if self.parse_pane_id(pane_id).is_some() {
             return;
         }
-        let Some(peer_pid) = context.local_peer_pid else {
+        let Some(peer_identity) = context.local_peer_identity else {
             return;
         };
         let Some(current) = self
-            .pane_target_for_peer_pid(peer_pid)
+            .pane_target_for_peer_identity(peer_identity)
             .and_then(|target| self.public_pane_id(target.ws_idx, target.pane_id))
         else {
             return;
         };
-        tracing::info!(stale = %pane_id, %current, peer_pid, "rebinding agent report to its pane");
+        tracing::info!(stale = %pane_id, %current, peer_pid = peer_identity.pid, "rebinding agent report to its pane");
         *pane_id = current;
     }
 
@@ -2529,7 +2635,8 @@ mod tests {
                     "ctrl+k".into(),
                     "ctrl+l".into(),
                 ],
-                allow_cross_pane: false,
+                // Synthetic payload fixture explicitly opts out of origin policy.
+                allow_cross_pane: true,
             }),
         });
 
@@ -2552,7 +2659,8 @@ mod tests {
             method: crate::api::schema::Method::PaneSendKeys(PaneSendKeysParams {
                 pane_id,
                 keys: vec!["shift+tab".into()],
-                allow_cross_pane: false,
+                // Synthetic payload fixture explicitly opts out of origin policy.
+                allow_cross_pane: true,
             }),
         });
 
@@ -2916,7 +3024,8 @@ mod tests {
             method: crate::api::schema::Method::PaneSendKeys(PaneSendKeysParams {
                 pane_id,
                 keys: vec!["C-c".into(), "c-c".into(), "ctrl+c".into()],
-                allow_cross_pane: false,
+                // Synthetic payload fixture explicitly opts out of origin policy.
+                allow_cross_pane: true,
             }),
         });
 
@@ -2945,7 +3054,8 @@ mod tests {
             method: crate::api::schema::Method::PaneSendKeys(PaneSendKeysParams {
                 pane_id,
                 keys: vec!["cmd+c".into()],
-                allow_cross_pane: false,
+                // Synthetic payload fixture explicitly opts out of origin policy.
+                allow_cross_pane: true,
             }),
         });
 
@@ -2968,7 +3078,8 @@ mod tests {
             method: crate::api::schema::Method::PaneSendKeys(PaneSendKeysParams {
                 pane_id,
                 keys: vec!["+".into()],
-                allow_cross_pane: false,
+                // Synthetic payload fixture explicitly opts out of origin policy.
+                allow_cross_pane: true,
             }),
         });
 
@@ -2998,7 +3109,8 @@ mod tests {
             method: crate::api::schema::Method::PaneSendKeys(PaneSendKeysParams {
                 pane_id,
                 keys: vec!["shift+?".into()],
-                allow_cross_pane: false,
+                // Synthetic payload fixture explicitly opts out of origin policy.
+                allow_cross_pane: true,
             }),
         });
 
@@ -3015,6 +3127,7 @@ mod tests {
         let (mut app, pane_id, mut rx) = app_with_send_key_runtime(2);
         let internal = app.state.workspaces[0].tabs[0].root_pane;
         let terminal_id = app.state.terminal_id_for_pane(0, internal).unwrap();
+        // Each synthetic request opts in explicitly to isolate expected-terminal policy.
         for expected in ["", "not-a-terminal", "term_unknown", pane_id.as_str()] {
             for method in [
                 "pane.send_input",
@@ -3024,7 +3137,7 @@ mod tests {
             ] {
                 let request: crate::api::schema::Request = serde_json::from_value(serde_json::json!({
                     "id": "guard-reject", "method": method,
-                    "params": {"pane_id": pane_id, "expected_terminal": expected,
+                    "params": {"pane_id": pane_id, "expected_terminal": expected, "allow_cross_pane": true,
                         "name": "worker", "kind": "pi", "text": "must not send", "keys": ["Enter"]},
                 })).unwrap();
                 let response = app.handle_api_request(request);
@@ -3042,7 +3155,7 @@ mod tests {
         for method in ["pane.send_input", "agent.start"] {
             let request = serde_json::from_value(serde_json::json!({
                 "id": "guard-missing-pane", "method": method,
-                "params": {"pane_id": "w999:p999", "expected_terminal": terminal_id.to_string(),
+                "params": {"pane_id": "w999:p999", "allow_cross_pane": true, "expected_terminal": terminal_id.to_string(),
                     "name": "worker", "kind": "pi", "text": "must not send"},
             }))
             .unwrap();
@@ -3053,7 +3166,7 @@ mod tests {
         for method in ["pane.send_input_guarded", "agent.start_guarded"] {
             let request = serde_json::from_value(serde_json::json!({
                 "id": "guard-required", "method": method,
-                "params": {"pane_id": pane_id, "name": "worker", "kind": "pi", "text": "must not send"},
+                "params": {"pane_id": pane_id, "allow_cross_pane": true, "name": "worker", "kind": "pi", "text": "must not send"},
             })).unwrap();
             let error: ErrorResponse =
                 serde_json::from_str(&app.handle_api_request(request)).unwrap();
@@ -3067,6 +3180,7 @@ mod tests {
         let (mut app, pane_id, mut original_rx) = app_with_send_key_runtime(2);
         let root = app.state.workspaces[0].tabs[0].root_pane;
         let original_id = app.state.terminal_id_for_pane(0, root).unwrap();
+        // Explicit request opt-ins isolate attachment identity, not process attribution.
         let other = app.state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
         app.state.ensure_test_terminals();
         let replacement_id = app.state.terminal_id_for_pane(0, other).unwrap();
@@ -3094,7 +3208,7 @@ mod tests {
         ] {
             let request = serde_json::from_value(serde_json::json!({
                 "id": "guard-stale", "method": method,
-                "params": {"pane_id": pane_id, "expected_terminal": original_id.to_string(),
+                "params": {"pane_id": pane_id, "allow_cross_pane": true, "expected_terminal": original_id.to_string(),
                     "name": "worker", "kind": "pi", "text": "must not send", "keys": ["Enter"]},
             }))
             .unwrap();
@@ -3109,7 +3223,7 @@ mod tests {
         }
         let request = serde_json::from_value(serde_json::json!({
             "id": "guard-match", "method": "pane.send_input_guarded",
-            "params": {"pane_id": pane_id, "expected_terminal": replacement_id.to_string(),
+            "params": {"pane_id": pane_id, "allow_cross_pane": true, "expected_terminal": replacement_id.to_string(),
                 "text": "matched", "keys": ["Enter"]},
         }))
         .unwrap();
@@ -3123,7 +3237,7 @@ mod tests {
         assert!(original_rx.try_recv().is_err());
         let request = serde_json::from_value(serde_json::json!({
             "id": "guard-start-match", "method": "agent.start_guarded",
-            "params": {"pane_id": pane_id, "expected_terminal": replacement_id.to_string(),
+            "params": {"pane_id": pane_id, "allow_cross_pane": true, "expected_terminal": replacement_id.to_string(),
                 "name": "worker", "kind": "pi"},
         }))
         .unwrap();
@@ -3143,7 +3257,7 @@ mod tests {
         // A pending launch and its reserved name must not mask a stale identity.
         let request = serde_json::from_value(serde_json::json!({
             "id": "guard-pending-stale", "method": "agent.start_guarded",
-            "params": {"pane_id": pane_id, "expected_terminal": original_id.to_string(),
+            "params": {"pane_id": pane_id, "allow_cross_pane": true, "expected_terminal": original_id.to_string(),
                 "name": "worker", "kind": "pi"},
         }))
         .unwrap();
@@ -3174,7 +3288,8 @@ mod tests {
                 text: "A != B".into(),
                 expected_terminal: None,
                 keys: vec!["Enter".into()],
-                allow_cross_pane: false,
+                // Synthetic payload fixture explicitly opts out of origin policy.
+                allow_cross_pane: true,
             }),
         });
 
@@ -3198,7 +3313,8 @@ mod tests {
                 text: String::new(),
                 expected_terminal: None,
                 keys: vec!["ctrl+j".into()],
-                allow_cross_pane: false,
+                // Synthetic payload fixture explicitly opts out of origin policy.
+                allow_cross_pane: true,
             }),
         });
 
@@ -3218,7 +3334,8 @@ mod tests {
             method: crate::api::schema::Method::PaneSendKeys(PaneSendKeysParams {
                 pane_id,
                 keys: vec!["ctrl+h".into(), "not-a-key".into()],
-                allow_cross_pane: false,
+                // Synthetic payload fixture explicitly opts out of origin policy.
+                allow_cross_pane: true,
             }),
         });
 
@@ -3240,7 +3357,8 @@ mod tests {
                 text: "hello".into(),
                 expected_terminal: None,
                 keys: vec!["ctrl+h".into(), raw_key.clone()],
-                allow_cross_pane: false,
+                // Synthetic payload fixture explicitly opts out of origin policy.
+                allow_cross_pane: true,
             }),
         });
 
@@ -3577,6 +3695,7 @@ mod tests {
         let response = app.handle_pane_move(
             "req".into(),
             PaneMoveParams {
+                allow_project_change: false,
                 pane_id: source_public.clone(),
                 destination: PaneMoveDestination::Tab {
                     tab_id: target_tab_public.clone(),
@@ -3634,6 +3753,7 @@ mod tests {
         let response = app.handle_pane_move(
             "req".into(),
             PaneMoveParams {
+                allow_project_change: false,
                 pane_id: previous_pane_id.clone(),
                 destination: PaneMoveDestination::Tab {
                     tab_id: target_tab_id.clone(),
@@ -3694,6 +3814,7 @@ mod tests {
         let response = app.handle_pane_move(
             "req".into(),
             PaneMoveParams {
+                allow_project_change: false,
                 pane_id: source_public,
                 destination: PaneMoveDestination::Tab {
                     tab_id: "t_2_1".into(),
@@ -3736,6 +3857,7 @@ mod tests {
         let response = app.handle_pane_move(
             "req".into(),
             PaneMoveParams {
+                allow_project_change: false,
                 pane_id: source_public.clone(),
                 destination: PaneMoveDestination::NewTab {
                     workspace_id: None,
@@ -3810,6 +3932,7 @@ mod tests {
         let response = app.handle_pane_move(
             "req".into(),
             PaneMoveParams {
+                allow_project_change: false,
                 pane_id: source_public,
                 destination: PaneMoveDestination::NewTab {
                     workspace_id: None,
@@ -3849,6 +3972,7 @@ mod tests {
         let response = app.handle_pane_move(
             "req".into(),
             PaneMoveParams {
+                allow_project_change: false,
                 pane_id: source_public.clone(),
                 destination: PaneMoveDestination::NewWorkspace {
                     label: Some("promoted".into()),
@@ -3946,6 +4070,7 @@ mod tests {
         let response = app.handle_pane_move(
             "req".into(),
             PaneMoveParams {
+                allow_project_change: false,
                 pane_id: source_public,
                 destination: PaneMoveDestination::Tab {
                     tab_id: source_tab,
@@ -3982,6 +4107,7 @@ mod tests {
         let response = app.handle_pane_move(
             "req".into(),
             PaneMoveParams {
+                allow_project_change: false,
                 pane_id: source_public,
                 destination: PaneMoveDestination::Tab {
                     tab_id: target_tab_public,
@@ -4019,6 +4145,7 @@ mod tests {
         let response = app.handle_pane_move(
             "req".into(),
             PaneMoveParams {
+                allow_project_change: false,
                 pane_id: source_public,
                 destination: PaneMoveDestination::Tab {
                     tab_id: target_tab_public,
@@ -4095,6 +4222,7 @@ mod tests {
         let response = app.handle_pane_move(
             "req".into(),
             PaneMoveParams {
+                allow_project_change: false,
                 pane_id: source_public,
                 destination: PaneMoveDestination::Tab {
                     tab_id: target_tab_public.clone(),

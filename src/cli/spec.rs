@@ -607,6 +607,8 @@ fn pane_command() -> Command {
                 .arg(flag("new-workspace"))
                 .arg(option("label", "TEXT"))
                 .arg(option("tab-label", "TEXT"))
+                .arg(flag("allow-project-change")
+                    .help("Intentionally allow agent sessions to change project ownership"))
                 .arg(flag("focus"))
                 .arg(flag("no-focus")),
         )
@@ -695,6 +697,7 @@ fn report_agent_command() -> Command {
         .arg(option("agent", "LABEL").required(true))
         .arg(pane_agent_state_option("state"))
         .arg(option("message", "TEXT"))
+        .arg(flag("allow-cross-pane"))
         .arg(option("seq", "N"))
         .arg(option("agent-session-id", "ID"))
         .arg(path_option("agent-session-path", "PATH"))
@@ -711,6 +714,7 @@ fn report_agent_session_command() -> Command {
         .arg(option("agent-session-id", "ID"))
         .arg(path_option("agent-session-path", "PATH"))
         .arg(option("session-start-source", "SOURCE"))
+        .arg(flag("allow-cross-pane"))
         .arg(resume_argv_arg())
 }
 
@@ -1332,6 +1336,15 @@ mod tests {
         assert!(pane
             .get_subcommands()
             .any(|subcommand| subcommand.get_name() == "wait-output"));
+    }
+
+    #[test]
+    fn spec_includes_resume_report_cross_pane_opt_in() {
+        let cmd = super::command();
+        for report in ["report-agent", "report-agent-session"] {
+            let report = command_path(&cmd, &["pane", report]);
+            assert!(has_option(report, "allow-cross-pane"));
+        }
     }
 
     #[test]

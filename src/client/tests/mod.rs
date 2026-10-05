@@ -1,12 +1,4 @@
 use super::*;
-use std::ffi::OsString;
-use std::sync::{Mutex, OnceLock};
-
-fn env_lock() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-}
-
 #[test]
 fn resize_signal_reports_even_when_polled_size_is_unchanged() {
     let size = (120, 40, 8, 16, true);
@@ -84,33 +76,6 @@ fn server_graphics_files_require_local_filesystem_not_just_local_terminal() {
     assert!(!server_graphics_files_allowed(&ssh, true));
 }
 
-fn restore_env_var(key: &str, value: Option<OsString>) {
-    if let Some(value) = value {
-        std::env::set_var(key, value);
-    } else {
-        std::env::remove_var(key);
-    }
-}
-
-struct EnvVarGuard {
-    key: &'static str,
-    previous: Option<OsString>,
-}
-
-impl EnvVarGuard {
-    fn set(key: &'static str, value: &str) -> Self {
-        let previous = std::env::var_os(key);
-        std::env::set_var(key, value);
-        Self { key, previous }
-    }
-}
-
-impl Drop for EnvVarGuard {
-    fn drop(&mut self) {
-        restore_env_var(self.key, self.previous.clone());
-    }
-}
-
 #[test]
 fn windows_virtual_terminal_input_mode_sets_only_vti_bit() {
     assert_eq!(windows_virtual_terminal_input_mode(0x01f0), 0x03f0);
@@ -119,56 +84,34 @@ fn windows_virtual_terminal_input_mode_sets_only_vti_bit() {
 
 #[test]
 fn windows_win32_input_mode_defaults_to_win32_and_honors_probe() {
-    let _guard = env_lock().lock().unwrap();
-    let _removed =
-        EnvVarsRemovedGuard::new(&["HERDR_WINDOWS_INPUT_PROBE", "SSH_CONNECTION", "SSH_TTY"]);
+    let env = crate::environment::test_env();
+    for key in ["HERDR_WINDOWS_INPUT_PROBE", "SSH_CONNECTION", "SSH_TTY"] {
+        env.remove(key);
+    }
 
     assert!(windows_win32_input_mode_enabled());
     {
-        let _ssh = EnvVarGuard::set("SSH_CONNECTION", "1 2 3 4");
+        let env = crate::environment::test_env();
+        env.set("SSH_CONNECTION", "1 2 3 4");
         assert!(windows_win32_input_mode_enabled());
-        let _probe = EnvVarGuard::set("HERDR_WINDOWS_INPUT_PROBE", "WiN32");
+        env.set("HERDR_WINDOWS_INPUT_PROBE", "WiN32");
         assert!(windows_win32_input_mode_enabled());
     }
     {
-        let _ssh = EnvVarGuard::set("SSH_TTY", "terminal");
+        let env = crate::environment::test_env();
+        env.set("SSH_TTY", "terminal");
         assert!(windows_win32_input_mode_enabled());
-        let _probe = EnvVarGuard::set("HERDR_WINDOWS_INPUT_PROBE", "vT");
+        env.set("HERDR_WINDOWS_INPUT_PROBE", "vT");
         assert!(!windows_win32_input_mode_enabled());
     }
-    let _probe = EnvVarGuard::set("HERDR_WINDOWS_INPUT_PROBE", "win32");
+    env.set("HERDR_WINDOWS_INPUT_PROBE", "win32");
     assert!(windows_win32_input_mode_enabled());
-}
-
-struct EnvVarsRemovedGuard {
-    previous: Vec<(&'static str, Option<OsString>)>,
-}
-
-impl EnvVarsRemovedGuard {
-    fn new(keys: &[&'static str]) -> Self {
-        let previous: Vec<_> = keys
-            .iter()
-            .map(|key| (*key, std::env::var_os(key)))
-            .collect();
-        for key in keys {
-            std::env::remove_var(key);
-        }
-        Self { previous }
-    }
-}
-
-impl Drop for EnvVarsRemovedGuard {
-    fn drop(&mut self) {
-        for (key, value) in self.previous.clone() {
-            restore_env_var(key, value);
-        }
-    }
 }
 
 #[test]
 fn remote_client_uses_extended_handshake_timeout() {
-    let _guard = env_lock().lock().unwrap();
-    let _remote = EnvVarGuard::set(crate::remote::REMOTE_KEYBINDINGS_ENV_VAR, "local");
+    let env = crate::environment::test_env();
+    env.set(crate::remote::REMOTE_KEYBINDINGS_ENV_VAR, "local");
 
     assert_eq!(handshake_read_timeout(), REMOTE_HANDSHAKE_READ_TIMEOUT);
 }
@@ -183,8 +126,8 @@ fn host_cursor_policy_auto_uses_platform_default() {
 
 #[test]
 fn host_cursor_policy_native_and_drawn_override_auto_detection() {
-    let _guard = env_lock().lock().unwrap();
-    let _env = EnvVarGuard::set("TERM_PROGRAM", "WezTerm");
+    let env = crate::environment::test_env();
+    env.set("TERM_PROGRAM", "WezTerm");
 
     assert!(!should_draw_host_cursor(
         crate::config::HostCursorModeConfig::Native
@@ -695,11 +638,9 @@ fn client_error_display_server_shutdown_no_reason() {
 
 #[test]
 fn client_error_display_detached_default_session_reattach_hint() {
-    let _guard = env_lock().lock().unwrap();
-    let _env = EnvVarsRemovedGuard::new(&[
-        crate::remote::REATTACH_COMMAND_ENV_VAR,
-        crate::session::SESSION_ENV_VAR,
-    ]);
+    let env = crate::environment::test_env();
+    env.remove(crate::remote::REATTACH_COMMAND_ENV_VAR);
+    env.remove(crate::session::SESSION_ENV_VAR);
     let err = ClientError::ServerShutdown {
         reason: Some("detached".into()),
     };
@@ -712,9 +653,9 @@ fn client_error_display_detached_default_session_reattach_hint() {
 
 #[test]
 fn client_error_display_detached_named_session_reattach_hint() {
-    let _guard = env_lock().lock().unwrap();
-    let _remote_env = EnvVarsRemovedGuard::new(&[crate::remote::REATTACH_COMMAND_ENV_VAR]);
-    let _session_env = EnvVarGuard::set(crate::session::SESSION_ENV_VAR, "work");
+    let env = crate::environment::test_env();
+    env.remove(crate::remote::REATTACH_COMMAND_ENV_VAR);
+    env.set(crate::session::SESSION_ENV_VAR, "work");
     let err = ClientError::ServerShutdown {
         reason: Some("detached".into()),
     };
@@ -727,12 +668,12 @@ fn client_error_display_detached_named_session_reattach_hint() {
 
 #[test]
 fn client_error_display_detached_remote_reattach_hint_takes_precedence() {
-    let _guard = env_lock().lock().unwrap();
-    let _remote_env = EnvVarGuard::set(
+    let env = crate::environment::test_env();
+    env.set(
         crate::remote::REATTACH_COMMAND_ENV_VAR,
         "herdr --remote host --session work",
     );
-    let _session_env = EnvVarGuard::set(crate::session::SESSION_ENV_VAR, "work");
+    env.set(crate::session::SESSION_ENV_VAR, "work");
     let err = ClientError::ServerShutdown {
         reason: Some("detached".into()),
     };
@@ -745,8 +686,8 @@ fn client_error_display_detached_remote_reattach_hint_takes_precedence() {
 
 #[test]
 fn client_error_display_connection_lost() {
-    let _guard = env_lock().lock().unwrap();
-    let _env = EnvVarsRemovedGuard::new(&[crate::remote::REATTACH_COMMAND_ENV_VAR]);
+    let env = crate::environment::test_env();
+    env.remove(crate::remote::REATTACH_COMMAND_ENV_VAR);
     let err = ClientError::ConnectionLost(io::Error::new(io::ErrorKind::BrokenPipe, "broken pipe"));
     let msg = err.to_string();
     assert!(
@@ -757,8 +698,8 @@ fn client_error_display_connection_lost() {
 
 #[test]
 fn client_error_display_remote_connection_lost_has_reattach_hint() {
-    let _guard = env_lock().lock().unwrap();
-    let _remote_env = EnvVarGuard::set(
+    let env = crate::environment::test_env();
+    env.set(
         crate::remote::REATTACH_COMMAND_ENV_VAR,
         "herdr --remote host --session work",
     );
@@ -801,7 +742,6 @@ fn sound_from_notify_message_rejects_unknown_payloads() {
 
 #[test]
 fn reload_local_client_config_refreshes_local_client_presentation_state() {
-    let _guard = crate::config::test_config_env_lock().lock().unwrap();
     let path = std::env::temp_dir().join(format!(
         "herdr-client-config-reload-{}-{}.toml",
         std::process::id(),
@@ -816,7 +756,8 @@ fn reload_local_client_config_refreshes_local_client_presentation_state() {
     )
     .unwrap();
     let path_string = path.to_string_lossy().to_string();
-    let _env = EnvVarGuard::set(crate::config::CONFIG_PATH_ENV_VAR, &path_string);
+    let env = crate::environment::test_env();
+    env.set(crate::config::CONFIG_PATH_ENV_VAR, &path_string);
     let mut sound_config = crate::config::SoundConfig::default();
     let mut redraw_on_focus_gained = true;
     let mut draw_host_cursor = false;
@@ -839,7 +780,6 @@ fn reload_local_client_config_refreshes_local_client_presentation_state() {
 
 #[test]
 fn reload_local_client_config_keeps_ui_preferences_when_ui_is_invalid() {
-    let _guard = crate::config::test_config_env_lock().lock().unwrap();
     let path = std::env::temp_dir().join(format!(
         "herdr-client-invalid-ui-reload-{}-{}.toml",
         std::process::id(),
@@ -850,7 +790,8 @@ fn reload_local_client_config_keeps_ui_preferences_when_ui_is_invalid() {
     ));
     std::fs::write(&path, "[ui]\nmouse_capture = \"invalid\"\n").unwrap();
     let path_string = path.to_string_lossy().to_string();
-    let _env = EnvVarGuard::set(crate::config::CONFIG_PATH_ENV_VAR, &path_string);
+    let env = crate::environment::test_env();
+    env.set(crate::config::CONFIG_PATH_ENV_VAR, &path_string);
     let mut sound_config = crate::config::SoundConfig::default();
     let mut redraw_on_focus_gained = false;
     let mut draw_host_cursor = true;
@@ -1087,8 +1028,8 @@ fn terminal_control_scroll_command_maps_to_attach_scroll() {
 
 #[test]
 fn forward_clipboard_uses_local_clipboard_path() {
-    let _guard = env_lock().lock().unwrap();
-    let _ssh = EnvVarGuard::set("SSH_CONNECTION", "1 2 3 4");
+    let env = crate::environment::test_env();
+    env.set("SSH_CONNECTION", "1 2 3 4");
     assert!(forward_clipboard("dGVzdA=="));
     assert!(!forward_clipboard("not base64"));
 }

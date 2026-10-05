@@ -1,5 +1,53 @@
 use std::path::{Path, PathBuf};
 
+/// Follow symlinks as before, but authorize and read the same resolved object.
+/// O_NONBLOCK prevents a FIFO path from blocking before its type can be checked.
+#[cfg(target_os = "linux")]
+pub(crate) fn read_session_snapshot_with_trust(
+    path: &Path,
+) -> std::io::Result<(String, super::SnapshotFileTrust)> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)?;
+    read_opened_snapshot_with_trust(file)
+}
+
+#[cfg(target_os = "linux")]
+fn read_opened_snapshot_with_trust(
+    mut file: std::fs::File,
+) -> std::io::Result<(String, super::SnapshotFileTrust)> {
+    use std::io::Read as _;
+    use std::os::unix::fs::MetadataExt as _;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "snapshot is not a regular file",
+        ));
+    }
+    let trust =
+        snapshot_owner_mode_trust(metadata.uid(), unsafe { libc::geteuid() }, metadata.mode());
+    let mut content = String::new();
+    file.read_to_string(&mut content)?;
+    Ok((content, trust))
+}
+
+#[cfg(target_os = "linux")]
+fn snapshot_owner_mode_trust(owner: u32, current_user: u32, mode: u32) -> super::SnapshotFileTrust {
+    if owner != current_user {
+        super::SnapshotFileTrust::Untrusted("snapshot is not owned by the current user")
+    } else if mode & 0o022 != 0 {
+        super::SnapshotFileTrust::Untrusted("snapshot is writable by group or others")
+    } else {
+        super::SnapshotFileTrust::Trusted
+    }
+}
+
+mod diagnostics;
+pub(crate) use diagnostics::{DiagnosticDirectoryScan, PrivateDiagnosticDirectory};
+
 pub(crate) fn classify_child_exit(status: &portable_pty::ExitStatus) -> super::ChildExitReason {
     if status.signal().is_some() {
         super::ChildExitReason::Interrupted
@@ -339,12 +387,28 @@ pub(crate) fn remote_private_temp_base() -> PathBuf {
 }
 
 pub(crate) fn remote_bridge_endpoint_path(readable_name: &str, short_name: &str) -> PathBuf {
-    let tmp = std::env::temp_dir();
-    let readable = tmp.join(readable_name);
+    remote_bridge_endpoint_path_for_temp_dir(readable_name, short_name, &std::env::temp_dir())
+}
+
+#[cfg(test)]
+pub(crate) fn remote_bridge_endpoint_path_in(
+    readable_name: &str,
+    short_name: &str,
+    temp_dir: &Path,
+) -> PathBuf {
+    remote_bridge_endpoint_path_for_temp_dir(readable_name, short_name, temp_dir)
+}
+
+fn remote_bridge_endpoint_path_for_temp_dir(
+    readable_name: &str,
+    short_name: &str,
+    temp_dir: &Path,
+) -> PathBuf {
+    let readable = temp_dir.join(readable_name);
     if fits_unix_socket_path(&readable) {
         return readable;
     }
-    let short = tmp.join(short_name);
+    let short = temp_dir.join(short_name);
     if fits_unix_socket_path(&short) {
         return short;
     }
@@ -479,6 +543,60 @@ pub(crate) fn set_default_plugin_pane_pwd(env: &mut Vec<(String, String)>, cwd: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn snapshot_trust_checks_original_opened_object_and_follows_trusted_target() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-snapshot-handle-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session");
+        for original_trusted in [true, false] {
+            std::fs::write(&path, "original bytes").unwrap();
+            std::fs::set_permissions(
+                &path,
+                std::fs::Permissions::from_mode(if original_trusted { 0o600 } else { 0o666 }),
+            )
+            .unwrap();
+            let opened = std::fs::File::open(&path).unwrap();
+            std::fs::remove_file(&path).unwrap();
+            std::fs::write(&path, "replacement bytes").unwrap();
+            std::fs::set_permissions(
+                &path,
+                std::fs::Permissions::from_mode(if original_trusted { 0o666 } else { 0o600 }),
+            )
+            .unwrap();
+            let (bytes, trust) = read_opened_snapshot_with_trust(opened).unwrap();
+            assert_eq!(bytes, "original bytes");
+            assert_eq!(
+                matches!(trust, super::super::SnapshotFileTrust::Trusted),
+                original_trusted
+            );
+        }
+        let link = dir.join("link");
+        symlink(&path, &link).unwrap();
+        let (bytes, trust) = read_session_snapshot_with_trust(&link).unwrap();
+        assert_eq!(bytes, "replacement bytes");
+        assert!(matches!(trust, super::super::SnapshotFileTrust::Trusted));
+        assert!(matches!(
+            snapshot_owner_mode_trust(1, 2, 0o600),
+            super::super::SnapshotFileTrust::Untrusted(_)
+        ));
+        assert!(read_session_snapshot_with_trust(&dir).is_err());
+        use std::os::unix::ffi::OsStrExt as _;
+        let fifo = dir.join("fifo");
+        let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+        assert!(read_session_snapshot_with_trust(&fifo).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn plugin_pane_pwd_defaults_to_cwd_without_overriding_explicit_env() {
@@ -635,13 +753,151 @@ mod shared_ssh_tests {
     }
 }
 
+/// Recover a legacy handoff root only when the transferred PTY itself binds it
+/// to the same live session-leader instance. Unsupported master queries decline
+/// attribution; a bare PID is never sufficient evidence.
+pub(crate) fn process_identity_for_pty(
+    child_pid: u32,
+    master_fd: std::os::fd::RawFd,
+) -> Option<crate::platform::ProcessIdentity> {
+    let identity = crate::platform::process_identity(child_pid)?;
+    let pid = libc::pid_t::try_from(child_pid)
+        .ok()
+        .filter(|pid| *pid > 0)?;
+    observe_pty_identity(
+        identity,
+        || {
+            // SAFETY: tcgetsid reads the session owner of this borrowed PTY fd.
+            let sid = unsafe { libc::tcgetsid(master_fd) };
+            // SAFETY: getsid reads the current instance's session leadership.
+            if unsafe { libc::getsid(pid) } != pid {
+                return None;
+            }
+            u32::try_from(sid).ok().filter(|sid| *sid > 0)
+        },
+        crate::platform::process_identity,
+    )
+}
+
+fn observe_pty_identity(
+    identity: crate::platform::ProcessIdentity,
+    session_owner: impl FnOnce() -> Option<u32>,
+    identity_of: impl Fn(u32) -> Option<crate::platform::ProcessIdentity>,
+) -> Option<crate::platform::ProcessIdentity> {
+    if identity_of(identity.pid) != Some(identity) {
+        return None;
+    }
+    let owner = session_owner()?;
+    (owner == identity.pid && identity_of(identity.pid) == Some(identity)).then_some(identity)
+}
+
+#[cfg(test)]
+mod pty_identity_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn legacy_pty_pin_checks_real_master_duplicate_mismatch_and_exit() {
+        use std::io::Write;
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        let pair = portable_pty::native_pty_system()
+            .openpty(portable_pty::PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("real PTY");
+        let mut command = portable_pty::CommandBuilder::new("sh");
+        command.args(["-c", "read line"]);
+        let mut child = pair.slave.spawn_command(command).expect("PTY root");
+        let pid = child.process_id().expect("root PID");
+        let original = crate::platform::process_identity(pid).expect("live root identity");
+        let master = pair.master.as_raw_fd().expect("master FD");
+        let duplicate = unsafe { libc::dup(master) };
+        assert!(duplicate >= 0);
+        // SAFETY: dup returned a new descriptor owned only by this fixture.
+        let duplicate = unsafe { OwnedFd::from_raw_fd(duplicate) };
+        assert_eq!(process_identity_for_pty(pid, master), Some(original));
+        assert_eq!(
+            process_identity_for_pty(pid, duplicate.as_raw_fd()),
+            Some(original)
+        );
+        assert_eq!(process_identity_for_pty(std::process::id(), master), None);
+        let mut writer = pair.master.take_writer().expect("PTY writer");
+        writer.write_all(b"\n").expect("release owned PTY root");
+        child.wait().expect("reap root");
+        assert_eq!(process_identity_for_pty(pid, master), None);
+    }
+
+    #[test]
+    fn legacy_pty_pin_requires_matching_live_session_owner() {
+        let root = crate::platform::ProcessIdentity {
+            pid: 100,
+            start_time: 10,
+        };
+        assert_eq!(
+            observe_pty_identity(root, || Some(root.pid), |_| Some(root)),
+            Some(root)
+        );
+        assert_eq!(
+            observe_pty_identity(root, || Some(200), |_| Some(root)),
+            None
+        );
+        assert_eq!(observe_pty_identity(root, || None, |_| Some(root)), None);
+        assert_eq!(
+            observe_pty_identity(
+                root,
+                || panic!("exited root must not reach fd query"),
+                |_| None
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn legacy_pty_pin_rejects_root_swap_or_exit_across_fd_query() {
+        let root = crate::platform::ProcessIdentity {
+            pid: 100,
+            start_time: 10,
+        };
+        for replacement in [
+            None,
+            Some(crate::platform::ProcessIdentity {
+                start_time: 20,
+                ..root
+            }),
+        ] {
+            let current = Cell::new(Some(root));
+            assert_eq!(
+                observe_pty_identity(
+                    root,
+                    || {
+                        current.set(replacement);
+                        Some(root.pid)
+                    },
+                    |_| current.get()
+                ),
+                None
+            );
+        }
+    }
+}
+
 /// Whether `pid` runs in the POSIX session that the pane child `child_pid` leads.
 /// A process gone or unreadable is not in the session.
+#[cfg(test)]
 pub(crate) fn process_in_pane_session(child_pid: u32, pid: u32) -> bool {
+    process_in_pane_session_checked(child_pid, pid).unwrap_or(false)
+}
+
+/// Unlike the discovery predicate, policy must retain failed OS observations.
+pub(crate) fn process_in_pane_session_checked(child_pid: u32, pid: u32) -> Option<bool> {
     let session_id = |pid: u32| {
         let pid = libc::pid_t::try_from(pid).ok().filter(|pid| *pid > 0)?;
         let sid = unsafe { libc::getsid(pid) };
         (sid > 0).then_some(sid)
     };
-    session_id(child_pid).is_some_and(|pane| session_id(pid) == Some(pane))
+    Some(session_id(child_pid)? == session_id(pid)?)
 }

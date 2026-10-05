@@ -782,6 +782,7 @@ fn parse_pane_move_args(args: &[String]) -> Result<PaneMoveParams, String> {
     let mut label = None;
     let mut tab_label = None;
     let mut focus = true;
+    let mut allow_project_change = false;
 
     let mut index = 1;
     while index < args.len() {
@@ -857,6 +858,10 @@ fn parse_pane_move_args(args: &[String]) -> Result<PaneMoveParams, String> {
                 focus = false;
                 index += 1;
             }
+            "--allow-project-change" => {
+                allow_project_change = true;
+                index += 1;
+            }
             other => return Err(format!("unknown option: {other}")),
         }
     }
@@ -904,11 +909,12 @@ fn parse_pane_move_args(args: &[String]) -> Result<PaneMoveParams, String> {
         pane_id,
         destination,
         focus,
+        allow_project_change,
     })
 }
 
 fn pane_move_usage() -> String {
-    "usage: herdr pane move <pane_id> --tab <tab_id> --split right|down [--target-pane ID] [--ratio FLOAT] [--focus|--no-focus]\n       herdr pane move <pane_id> --new-tab [--workspace ID] [--label TEXT] [--focus|--no-focus]\n       herdr pane move <pane_id> --new-workspace [--label TEXT] [--tab-label TEXT] [--focus|--no-focus]"
+    "usage: herdr pane move <pane_id> --tab <tab_id> --split right|down [--target-pane ID] [--ratio FLOAT] [--focus|--no-focus] [--allow-project-change]\n       herdr pane move <pane_id> --new-tab [--workspace ID] [--label TEXT] [--focus|--no-focus] [--allow-project-change]\n       herdr pane move <pane_id> --new-workspace [--label TEXT] [--tab-label TEXT] [--focus|--no-focus] [--allow-project-change]\n       --allow-project-change deliberately permits moving an agent session between projects (refused by default)"
         .into()
 }
 
@@ -1200,7 +1206,7 @@ fn parse_pane_wait_output_args(args: &[String]) -> Result<PaneWaitForOutputParam
 }
 
 fn pane_report_agent(args: &[String]) -> std::io::Result<i32> {
-    const USAGE: &str = "usage: herdr pane report-agent <pane_id> --source ID --agent LABEL --state idle|working|blocked|unknown [--message TEXT] [--seq N] [--agent-session-id ID] [--agent-session-path PATH] [-- <resume-command...>]";
+    const USAGE: &str = "usage: herdr pane report-agent <pane_id> --source ID --agent LABEL --state idle|working|blocked|unknown [--message TEXT] [--seq N] [--agent-session-id ID] [--agent-session-path PATH] [--allow-cross-pane] [-- <resume-command...>]";
 
     let (args, resume_argv) = split_resume_argv(args);
     let args = super::expand_equals_args(
@@ -1223,10 +1229,15 @@ fn pane_report_agent(args: &[String]) -> std::io::Result<i32> {
     let mut seq = None;
     let mut agent_session_id = None;
     let mut agent_session_path = None;
+    let mut allow_cross_pane = false;
 
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
+            "--allow-cross-pane" => {
+                allow_cross_pane = true;
+                index += 1;
+            }
             "--source" => {
                 let Some(value) = args.get(index + 1) else {
                     eprintln!("missing value for --source");
@@ -1319,6 +1330,7 @@ fn pane_report_agent(args: &[String]) -> std::io::Result<i32> {
     };
 
     super::send_ok_request(Method::PaneReportAgent(PaneReportAgentParams {
+        allow_cross_pane,
         pane_id,
         source,
         agent,
@@ -1339,7 +1351,7 @@ fn split_resume_argv(args: &[String]) -> (&[String], Option<Vec<String>>) {
 }
 
 fn pane_report_agent_session(args: &[String]) -> std::io::Result<i32> {
-    const USAGE: &str = "usage: herdr pane report-agent-session <pane_id> --source ID --agent LABEL [--seq N] [--agent-session-id ID] [--agent-session-path PATH] [--session-start-source SOURCE] [-- <resume-command...>]";
+    const USAGE: &str = "usage: herdr pane report-agent-session <pane_id> --source ID --agent LABEL [--seq N] [--agent-session-id ID] [--agent-session-path PATH] [--session-start-source SOURCE] [--allow-cross-pane] [-- <resume-command...>]";
 
     let (args, resume_argv) = split_resume_argv(args);
     let args = super::expand_equals_args(
@@ -1360,10 +1372,15 @@ fn pane_report_agent_session(args: &[String]) -> std::io::Result<i32> {
     let mut agent_session_id = None;
     let mut agent_session_path = None;
     let mut session_start_source = None;
+    let mut allow_cross_pane = false;
 
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
+            "--allow-cross-pane" => {
+                allow_cross_pane = true;
+                index += 1;
+            }
             "--source" => {
                 let Some(value) = args.get(index + 1) else {
                     eprintln!("missing value for --source");
@@ -1445,6 +1462,7 @@ fn pane_report_agent_session(args: &[String]) -> std::io::Result<i32> {
 
     super::send_ok_request(Method::PaneReportAgentSession(
         PaneReportAgentSessionParams {
+            allow_cross_pane,
             pane_id,
             source,
             agent,
@@ -1735,9 +1753,7 @@ fn print_pane_help() {
     );
     eprintln!("  herdr pane swap --direction left|right|up|down [--pane ID|--current]");
     eprintln!("  herdr pane swap --source-pane ID --target-pane ID");
-    eprintln!("  herdr pane move <pane_id> --tab <tab_id> --split right|down [--target-pane ID] [--ratio FLOAT] [--focus|--no-focus]");
-    eprintln!("  herdr pane move <pane_id> --new-tab [--workspace ID] [--label TEXT] [--focus|--no-focus]");
-    eprintln!("  herdr pane move <pane_id> --new-workspace [--label TEXT] [--tab-label TEXT] [--focus|--no-focus]");
+    eprintln!("  {}", pane_move_usage());
     eprintln!("  herdr pane close <pane_id>");
     eprintln!("  herdr pane send-text <pane_id> [--allow-cross-pane] <text>");
     eprintln!("  herdr pane send-keys <pane_id> [--allow-cross-pane] <key> [key ...]");
@@ -1962,6 +1978,104 @@ mod tests {
                 ratio: Some(0.25),
             }
         );
+    }
+
+    #[test]
+    fn parse_pane_move_args_defaults_to_refusing_project_change() {
+        for values in [
+            &[
+                "issue-1",
+                "--tab",
+                "issue:2",
+                "--split",
+                "right",
+                "--no-focus",
+            ][..],
+            &["issue-1", "--new-tab", "--workspace", "other-project"][..],
+            &["issue-1", "--new-workspace"][..],
+        ] {
+            let params = parse_pane_move_args(&args(values)).unwrap();
+            assert!(!params.allow_project_change, "{values:?}");
+        }
+    }
+
+    #[test]
+    fn parse_pane_move_args_accepts_explicit_project_change_for_all_destinations() {
+        for values in [
+            &[
+                "issue-1",
+                "--tab",
+                "issue:2",
+                "--split",
+                "right",
+                "--no-focus",
+            ][..],
+            &["issue-1", "--new-tab", "--workspace", "other-project"][..],
+            &["issue-1", "--new-workspace"][..],
+        ] {
+            let baseline = parse_pane_move_args(&args(values)).unwrap();
+            // The opt-in is a standalone flag anywhere after the pane selector.
+            for position in [1, values.len()] {
+                let mut input = args(values);
+                input.insert(position, "--allow-project-change".into());
+                let params = parse_pane_move_args(&input).unwrap();
+                assert!(params.allow_project_change);
+                assert_eq!(params.pane_id, baseline.pane_id);
+                assert_eq!(params.destination, baseline.destination);
+                assert_eq!(params.focus, baseline.focus);
+            }
+        }
+    }
+
+    #[test]
+    fn parse_pane_move_args_rejects_project_change_flag_values() {
+        for suffix in [
+            &["--allow-project-change=true"][..],
+            &["--allow-project-change=false"][..],
+            &["--allow-project-change", "true"][..],
+            &["--allow-project-change", "false"][..],
+            &["--allow-project-chang"][..],
+        ] {
+            let mut input = args(&["issue-1", "--new-workspace"]);
+            input.extend(args(suffix));
+            let err = parse_pane_move_args(&input).unwrap_err();
+            assert!(err.contains("unknown option:"), "{suffix:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn parse_pane_move_args_project_change_opt_in_preserves_validation() {
+        for values in [
+            &["issue-1", "--allow-project-change"][..],
+            &[
+                "issue-1",
+                "--allow-project-change",
+                "--new-tab",
+                "--new-workspace",
+            ][..],
+            &["issue-1", "--allow-project-change", "--tab", "issue:2"][..],
+            &["--allow-project-change", "--new-workspace"][..],
+        ] {
+            let err = parse_pane_move_args(&args(values)).unwrap_err();
+            assert!(err.contains("usage: herdr pane move"), "{values:?}: {err}");
+        }
+        let err = parse_pane_move_args(&args(&[
+            "issue-1",
+            "--allow-project-change",
+            "--new-tab",
+            "--workspace",
+        ]))
+        .unwrap_err();
+        assert_eq!(err, "missing value for --workspace");
+    }
+
+    #[test]
+    fn pane_move_usage_documents_project_change_opt_in_for_all_destinations() {
+        let usage = pane_move_usage();
+        for line in usage.lines().take(3) {
+            assert!(line.contains("[--allow-project-change]"), "{line}");
+        }
+        assert!(usage.contains("refused by default"));
     }
 
     #[test]

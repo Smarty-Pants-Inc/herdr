@@ -116,6 +116,24 @@ fn spawn_client_process_with_args_and_env(
     args: &[&str],
     extra_env: &[(&str, &str)],
 ) -> SpawnedHerdr {
+    spawn_client_process_with_command(
+        config_home,
+        runtime_dir,
+        api_socket_path,
+        args,
+        extra_env,
+        crate::test_command::herdr_pty_command(),
+    )
+}
+
+fn spawn_client_process_with_command(
+    config_home: &PathBuf,
+    runtime_dir: &PathBuf,
+    api_socket_path: &PathBuf,
+    args: &[&str],
+    extra_env: &[(&str, &str)],
+    mut cmd: portable_pty::CommandBuilder,
+) -> SpawnedHerdr {
     register_runtime_dir(runtime_dir);
     let pair = native_pty_system()
         .openpty(PtySize {
@@ -126,9 +144,14 @@ fn spawn_client_process_with_args_and_env(
         })
         .unwrap();
 
-    let mut cmd = crate::test_command::herdr_pty_command();
     cmd.args(args);
     cmd.env("HERDR_DISABLE_SOUND", "1");
+    let home = runtime_dir.join("home");
+    let tmp = runtime_dir.join("tmp");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&tmp).unwrap();
+    cmd.env("HOME", &home);
+    cmd.env("TMPDIR", &tmp);
     cmd.env("XDG_STATE_HOME", runtime_dir.join("state"));
     cmd.env("XDG_CONFIG_HOME", config_home);
     cmd.env("XDG_RUNTIME_DIR", runtime_dir);
@@ -188,6 +211,17 @@ fn spawn_server_with_config(
 
     let mut cmd = crate::test_command::herdr_pty_command();
     cmd.arg("server");
+    let home = runtime_dir.join("home");
+    let tmp = runtime_dir.join("tmp");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&tmp).unwrap();
+    cmd.env("HOME", &home);
+    cmd.env("TMPDIR", &tmp);
+    cmd.env("XDG_STATE_HOME", runtime_dir.join("state"));
+    cmd.env(
+        "HERDR_TEST_HANDOFF_OWNER_PID",
+        std::process::id().to_string(),
+    );
     cmd.env("XDG_CONFIG_HOME", config_home);
     cmd.env("XDG_RUNTIME_DIR", runtime_dir);
     cmd.env("HERDR_SOCKET_PATH", api_socket_path);
@@ -877,6 +911,12 @@ fn output_len(output: &SharedOutput) -> usize {
     output.lock().unwrap_or_else(|p| p.into_inner()).text.len()
 }
 
+fn rendered_active_workspace(screen: &str, endpoint: &str, pane_marker: &str) -> bool {
+    // The federated footer names the actual active endpoint, not keyboard navigation.
+    // The marker belongs to its unique workspace pane, never to the sidebar inventory.
+    screen.contains(&format!("new · {endpoint}")) && screen.contains(pane_marker)
+}
+
 fn sidebar_row_click(screen: &str, label: &str) -> Vec<u8> {
     let sidebar_width = screen
         .lines()
@@ -900,6 +940,40 @@ fn sidebar_row_click(screen: &str, label: &str) -> Vec<u8> {
 }
 
 #[test]
+fn rendered_selection_rejects_ready_inventory_with_ignored_click() {
+    let steady = "machines                 │\n ▾ Steady               ●│STEADY_ACTIVE_WORKSPACE\n   · steady-ready        │\n ▾ Handoff              ●│\n   · recovered-3         │\n new · Steady        menu│\n";
+    assert!(rendered_active_workspace(
+        steady,
+        "Steady",
+        "STEADY_ACTIVE_WORKSPACE"
+    ));
+    assert!(!rendered_active_workspace(
+        steady,
+        "Handoff",
+        "HANDOFF_ACTIVE_WORKSPACE"
+    ));
+    let handoff = steady
+        .replace("new · Steady", "new · Handoff")
+        .replace("STEADY_ACTIVE_WORKSPACE", "HANDOFF_ACTIVE_WORKSPACE");
+    assert!(rendered_active_workspace(
+        &handoff,
+        "Handoff",
+        "HANDOFF_ACTIVE_WORKSPACE"
+    ));
+    assert!(!rendered_active_workspace(
+        &handoff,
+        "Steady",
+        "STEADY_ACTIVE_WORKSPACE"
+    ));
+    // A footer switch alone is insufficient: require the intended workspace's surface.
+    assert!(!rendered_active_workspace(
+        &steady.replace("new · Steady", "new · Handoff"),
+        "Handoff",
+        "HANDOFF_ACTIVE_WORKSPACE"
+    ));
+}
+
+#[test]
 fn sidebar_row_click_ignores_notice_borders() {
     let screen = "┌─────────────────────────┐\n│● Endpoint unavailable   │\n└─────────────────────────┘\n   · local-returned      │\n";
     assert_eq!(
@@ -913,7 +987,11 @@ fn sidebar_row_click_tracks_restored_workspace_count() {
     for restored in [false, true] {
         let screen = format!(
             " machines                │\n                         │\n ▾ Local                 │local-returned in pane output\n{}   · local-returned      └─────────────────\n",
-            if restored { "   · restored            │\n" } else { "" }
+            if restored {
+                "   · restored            │\n"
+            } else {
+                ""
+            }
         );
         let row = if restored { 5 } else { 4 };
         assert_eq!(
@@ -1047,15 +1125,19 @@ fn federated_launch_opens_local_directly_while_saved_ssh_is_unavailable() {
             // the first rendered frame (the unavailable remote must not extend the wait). Retry
             // the write instead of assuming a single write lands, matching the recovered-Local
             // path below.
-            assert!(wait_until(Duration::from_secs(10), Duration::from_millis(100), || {
-                if read_output(&output).contains("LOCAL_DIRECT_READY") {
-                    return true;
-                }
-                input
-                    .write_all(&retry_shell_line("printf 'LOCAL_%s\\n' DIRECT_READY"))
-                    .unwrap();
-                false
-            }), "Local must accept input without waiting for SSH (remote selected: {select_remote}): {}", read_output(&output));
+            assert!(
+                wait_until(Duration::from_secs(10), Duration::from_millis(100), || {
+                    if read_output(&output).contains("LOCAL_DIRECT_READY") {
+                        return true;
+                    }
+                    input
+                        .write_all(&retry_shell_line("printf 'LOCAL_%s\\n' DIRECT_READY"))
+                        .unwrap();
+                    false
+                }),
+                "Local must accept input without waiting for SSH (remote selected: {select_remote}): {}",
+                read_output(&output)
+            );
             let text = read_output(&output);
             assert!(!text.contains("Local: connecting"), "{text}");
             assert!(!text.contains("Local: reconnecting"), "{text}");
@@ -1068,6 +1150,562 @@ fn federated_launch_opens_local_directly_while_saved_ssh_is_unavailable() {
         );
         cleanup_test_base(&base);
     }
+}
+
+#[test]
+fn detached_handoff_importer_is_stopped_before_runtime_removal() {
+    let _lock = test_lock();
+    for early_failure in [false, true] {
+        let base = unique_test_dir();
+        let config = base.join("config");
+        let runtime = base.join("runtime");
+        let api = runtime.join("herdr.sock");
+        let mut owned_pids = None;
+        let exercise =
+            || -> Result<(), &'static str> {
+                let mut cleanup = support::ScopedHandoffServer::new(&base);
+                let original =
+                    spawn_server(&config, &runtime, &api, &runtime.join("herdr-client.sock"));
+                wait_for_socket(&api, Duration::from_secs(10));
+                cleanup.track_original(original.child.process_id().unwrap());
+                let created = send_json_request(&api, &serde_json::json!({
+                "id": "cleanup-workload", "method": "workspace.create", "params": {"cwd": base}
+            }).to_string());
+                let pane = created["result"]["root_pane"]["pane_id"].as_str().unwrap();
+                let process = send_json_request(&api, &serde_json::json!({
+                "id": "cleanup-shell", "method": "pane.process_info", "params": {"pane_id": pane}
+            }).to_string());
+                let shell_pid = process["result"]["process_info"]["shell_pid"]
+                    .as_u64()
+                    .unwrap() as u32;
+                let importer = cleanup.importer_exe();
+                let output = crate::test_command::herdr_command()
+                    .args([
+                        "server",
+                        "live-handoff",
+                        "--import-exe",
+                        importer.to_str().unwrap(),
+                    ])
+                    .env("HOME", runtime.join("home"))
+                    .env("TMPDIR", runtime.join("tmp"))
+                    .env("XDG_CONFIG_HOME", &config)
+                    .env("XDG_STATE_HOME", runtime.join("state"))
+                    .env("XDG_RUNTIME_DIR", &runtime)
+                    .env("HERDR_SOCKET_PATH", &api)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let importer_pid = if early_failure {
+                    // Simulate failing before the caller can track the CLI result/socket.
+                    // Drop must recover ownership from the pre-registered wrapper record.
+                    let record = fs::read_to_string(base.join("importer-0.owner")).unwrap();
+                    record.lines().next().unwrap().parse().unwrap()
+                } else {
+                    cleanup.track_importer()
+                };
+                owned_pids = Some((importer_pid, shell_pid));
+                assert!(support::test_process_running(importer_pid));
+                drop(original);
+                assert!(
+                    support::test_process_running(importer_pid),
+                    "original child is not the importer owner"
+                );
+                assert!(
+                    runtime.exists(),
+                    "runtime must remain until importer termination"
+                );
+                if early_failure {
+                    return Err("simulated failure immediately after CLI handoff");
+                }
+                cleanup.stop_and_cleanup().unwrap();
+                Ok(())
+            };
+        let mut exercise = exercise;
+        assert_eq!(exercise().is_err(), early_failure);
+        let (importer_pid, shell_pid) = owned_pids.unwrap();
+        assert!(
+            !support::test_process_running(importer_pid),
+            "detached importer must terminate within test scope"
+        );
+        assert!(
+            wait_until(Duration::from_secs(5), Duration::from_millis(25), || {
+                !support::test_process_running(shell_pid)
+            }),
+            "imported scratch shell must also terminate"
+        );
+        assert!(
+            !base.exists(),
+            "remove runtime only after verified termination"
+        );
+        eprintln!(
+            "cleanup early_failure={early_failure} importer={importer_pid} shell={shell_pid} terminated; runtime removed"
+        );
+    }
+}
+
+#[test]
+fn federated_saved_machines_recover_snapshots_after_live_handoff() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config = base.join("config");
+    let runtime = base.join("runtime");
+    let api = runtime.join("herdr.sock");
+    let steady_base = base.join("steady");
+    let handoff_base = base.join("handoff");
+    let steady_config = steady_base.join("config");
+    let steady_runtime = steady_base.join("runtime");
+    let steady_api = steady_runtime.join("herdr.sock");
+    let handoff_config = handoff_base.join("config");
+    let handoff_runtime = handoff_base.join("runtime");
+    let handoff_api = handoff_runtime.join("herdr.sock");
+    // Declared before processes so unwinding drops clients/original children first,
+    // then stops detached importers before removing their exact private runtime.
+    let mut steady_cleanup = support::ScopedHandoffServer::new(&steady_base);
+    let mut handoff_cleanup = support::ScopedHandoffServer::new(&handoff_base);
+    let steady = spawn_server(
+        &steady_config,
+        &steady_runtime,
+        &steady_api,
+        &steady_runtime.join("herdr-client.sock"),
+    );
+    let handoff = spawn_server(
+        &handoff_config,
+        &handoff_runtime,
+        &handoff_api,
+        &handoff_runtime.join("herdr-client.sock"),
+    );
+    wait_for_socket(&steady_api, Duration::from_secs(10));
+    wait_for_socket(&handoff_api, Duration::from_secs(10));
+    steady_cleanup.track_original(steady.child.process_id().unwrap());
+    handoff_cleanup.track_original(handoff.child.process_id().unwrap());
+    let create = |socket: &PathBuf, label: &str| {
+        let response = send_json_request(
+            socket,
+            &serde_json::json!({
+                "id": "create", "method": "workspace.create",
+                "params": {"cwd": base, "focus": false, "label": label}
+            })
+            .to_string(),
+        );
+        assert!(response.get("error").is_none(), "{response}");
+        response["result"]["workspace"]["workspace_id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let steady_workspace = create(&steady_api, "steady-ready");
+    let first = create(&handoff_api, "handoff-ready");
+    let steady_pane = first_pane_id_in_workspace(&steady_api, &steady_workspace);
+    let handoff_pane = first_pane_id_in_workspace(&handoff_api, &first);
+    // Only the active workspace's pane surface is rendered; inventories alone cannot
+    // distinguish an ignored workspace click from a successful selection.
+    send_pane_shell_command(
+        &steady_api,
+        &steady_pane,
+        "printf 'STEADY_ACTIVE_WORKSPACE\\n'",
+    );
+    send_pane_shell_command(
+        &handoff_api,
+        &handoff_pane,
+        "printf 'HANDOFF_ACTIVE_WORKSPACE\\n'",
+    );
+    let snapshot_data = || {
+        let mut stream = UnixStream::connect(handoff_runtime.join("herdr-client.sock")).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let (_, error) = client_shell_handshake(&mut stream, CURRENT_PROTOCOL, 54, 23).unwrap();
+        assert!(error.is_none(), "{error:?}");
+        // Observe the negotiated endpoint codec, not the unrelated JSON API snapshot.
+        for _ in 0..8 {
+            let (variant, payload) = read_server_message(&mut stream).unwrap();
+            if variant == support::SERVER_MESSAGE_ENDPOINT_CONTROL {
+                let ((kind, data), consumed): ((String, String), usize) =
+                    bincode::serde::decode_from_slice(&payload, bincode::config::standard())
+                        .unwrap();
+                assert_eq!(consumed, payload.len());
+                if kind == "shell.snapshot.v1" {
+                    return data;
+                }
+            }
+        }
+        panic!("negotiated shell.snapshot.v1 did not arrive");
+    };
+    fs::create_dir_all(config.join(app_dir_name())).unwrap();
+    fs::write(
+        config.join(app_dir_name()).join("config.toml"),
+        "onboarding = false\n",
+    )
+    .unwrap();
+    let catalog_dir = runtime.join("state").join(app_dir_name()).join("client");
+    fs::create_dir_all(&catalog_dir).unwrap();
+    fs::write(catalog_dir.join("endpoints.json"), serde_json::json!({
+        "version": 1, "selected_profile": "0123456789abcdef0123456789abcdef",
+        "ssh": [
+            {"id":"0123456789abcdef0123456789abcdef", "label":"Steady", "target":"steady-test", "session":"default", "enabled":true},
+            {"id":"fedcba9876543210fedcba9876543210", "label":"Handoff", "target":"handoff-test", "session":"default", "enabled":true}
+        ]
+    }).to_string()).unwrap();
+    let bin = base.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_herdr"), bin.join("herdr")).unwrap();
+    let quote =
+        |path: &std::path::Path| format!("'{}'", path.display().to_string().replace('\'', "'\\''"));
+    fs::write(bin.join("ssh"), format!(
+        "#!/bin/sh\nfor arg do case \"$arg\" in steady-test) root={};; handoff-test) root={};; esac; last=\"$arg\"; done\nexport HOME=\"$root/runtime/home\" TMPDIR=\"$root/runtime/tmp\" XDG_CONFIG_HOME=\"$root/config\" XDG_STATE_HOME=\"$root/runtime/state\" XDG_RUNTIME_DIR=\"$root/runtime\" HERDR_SOCKET_PATH=\"$root/runtime/herdr.sock\"\nunset HERDR_CLIENT_SOCKET_PATH HERDR_SESSION\nexec /bin/sh -c \"$last\"\n",
+        quote(&steady_base), quote(&handoff_base)
+    )).unwrap();
+    fs::set_permissions(bin.join("ssh"), fs::Permissions::from_mode(0o700)).unwrap();
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let cli = |config: &PathBuf, runtime: &PathBuf, socket: &PathBuf, args: &[&str]| {
+        let result = crate::test_command::herdr_command()
+            .args(args)
+            .env("HOME", runtime.join("home"))
+            .env("TMPDIR", runtime.join("tmp"))
+            .env("XDG_CONFIG_HOME", config)
+            .env("XDG_STATE_HOME", runtime.join("state"))
+            .env("XDG_RUNTIME_DIR", runtime)
+            .env("HERDR_SOCKET_PATH", socket)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "CLI {args:?} failed: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        result.stdout
+    };
+    let status = || -> Value {
+        serde_json::from_slice(&cli(
+            &config,
+            &runtime,
+            &api,
+            &["status", "client", "--json"],
+        ))
+        .unwrap()
+    };
+    // Opt-in comparison against the exact incident-era client. Discovery/bridges and handoff
+    // still use the current test server binary. Older clients have no runtime readout.
+    let external_client = std::env::var_os("HERDR_RECONNECT_CLIENT_EXE");
+    // Opt in to keeping Steady selected for every handoff, including large snapshots.
+    // The default still clicks Handoff before the 100/110-workspace cases.
+    let inactive_large = std::env::var("HERDR_RECONNECT_INACTIVE_LARGE").as_deref() == Ok("1");
+    eprintln!("handoff inactive_large={inactive_large}");
+    let machines_ready = |expected: usize| {
+        if external_client.is_some() {
+            return [&steady_api, &handoff_api]
+                .iter()
+                .enumerate()
+                .all(|(index, socket)| {
+                    let response = send_json_request(
+                        socket,
+                        r#"{"id":"count","method":"workspace.list","params":{}}"#,
+                    );
+                    response["result"]["workspaces"]
+                        .as_array()
+                        .is_some_and(|workspaces| {
+                            workspaces.len() == if index == 0 { 1 } else { expected }
+                        })
+                });
+        }
+        let status = status();
+        status["readout"]["schema_version"] == 1
+            && status["readout"]["fresh"] == true
+            && status["running"] == true
+            && status["endpoints"].as_array().is_some_and(|machines| {
+                machines.len() == 2
+                    && machines.iter().all(|machine| {
+                        machine["connected"] == true
+                            && machine["listed"] == true
+                            && machine["ready"] == true
+                            && machine["workspace_count"]
+                                == if machine["label"] == "Handoff" {
+                                    expected
+                                } else {
+                                    1
+                                }
+                    })
+            })
+    };
+    let command = if let Some(executable) = &external_client {
+        assert!(
+            std::path::Path::new(executable).is_file(),
+            "external scratch client must exist"
+        );
+        eprintln!(
+            "external scratch client executable={}",
+            std::path::Path::new(executable).display()
+        );
+        let mut command = portable_pty::CommandBuilder::new(executable);
+        crate::test_command::sanitize_pty_command_env(&mut command);
+        command
+    } else {
+        crate::test_command::herdr_pty_command()
+    };
+    let client = spawn_client_process_with_command(
+        &config,
+        &runtime,
+        &api,
+        &["client"],
+        &[("PATH", &path)],
+        command,
+    );
+    let output = spawn_pty_drain(client._master.as_ref().unwrap().try_clone_reader().unwrap());
+    let screen = || {
+        terminal_screen::text(
+            &output.lock().unwrap_or_else(|p| p.into_inner()).bytes,
+            80,
+            24,
+        )
+    };
+    assert!(
+        wait_until(
+            Duration::from_secs(15),
+            Duration::from_millis(20),
+            || screen().contains("steady-ready") && screen().contains("handoff-ready")
+        ),
+        "both saved machines must bootstrap: {}",
+        screen()
+    );
+    let client_log = || {
+        fs::read_to_string(config.join(app_dir_name()).join("herdr-client.log")).unwrap_or_default()
+    };
+    let save_evidence = |phase: &str| {
+        if let Some(dir) = std::env::var_os("HERDR_RECONNECT_EVIDENCE_DIR") {
+            let dir = PathBuf::from(dir);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(
+                dir.join(format!("{phase}.pty")),
+                &output.lock().unwrap_or_else(|p| p.into_inner()).bytes,
+            )
+            .unwrap();
+            fs::write(dir.join(format!("{phase}.screen.txt")), screen()).unwrap();
+            fs::write(dir.join(format!("{phase}.client.log")), client_log()).unwrap();
+            fs::write(
+                dir.join(format!("{phase}.status.json")),
+                serde_json::to_vec_pretty(&status()).unwrap(),
+            )
+            .unwrap();
+        }
+    };
+    assert!(
+        wait_until(Duration::from_secs(10), Duration::from_millis(100), || {
+            rendered_active_workspace(&screen(), "Steady", "STEADY_ACTIVE_WORKSPACE")
+        }),
+        "bootstrap must render Steady's active workspace: {}",
+        screen()
+    );
+    save_evidence("bootstrap");
+    let mut input = client._master.as_ref().unwrap().take_writer().unwrap();
+    let mut count = 1;
+    for workspaces in [3, 100, 110] {
+        // By default cover inactive-small and selected-large; opt-in covers inactive-large.
+        if workspaces == 100 && !inactive_large {
+            input
+                .write_all(&sidebar_row_click(&screen(), "recovered-3"))
+                .unwrap();
+            assert!(
+                wait_until(Duration::from_secs(10), Duration::from_millis(100), || {
+                    rendered_active_workspace(&screen(), "Handoff", "HANDOFF_ACTIVE_WORKSPACE")
+                        && machines_ready(count)
+                }),
+                "selected handoff workspace must actually render after the click: {}",
+                screen()
+            );
+        }
+        while count < workspaces {
+            create(&handoff_api, &format!("workspace-{count:03}"));
+            count += 1;
+        }
+        let label = format!("recovered-{workspaces}");
+        let response = send_json_request(&handoff_api, &serde_json::json!({"id":"rename", "method":"workspace.rename", "params":{"workspace_id":first,"label":label}}).to_string());
+        assert!(response.get("error").is_none(), "{response}");
+        assert!(
+            wait_until(Duration::from_secs(10), Duration::from_millis(100), || {
+                screen().contains(&label)
+            }),
+            "unique pre-handoff frame label must be installed: {}",
+            screen()
+        );
+        let natural_snapshot = snapshot_data();
+        eprintln!(
+            "negotiated shell.snapshot.v1 workspaces={workspaces} natural_bytes={}",
+            natural_snapshot.len()
+        );
+        if workspaces >= 100 && natural_snapshot.len() < 200_000 {
+            // Persisted, bounded display-only labels qualify the 200 KB bootstrap size.
+            // Ephemeral workspace tokens are deliberately not carried through live handoff.
+            // Keep the real workspace/pane counts unchanged and every codec frozen.
+            let natural: Value = serde_json::from_str(&natural_snapshot).unwrap();
+            for pane in natural["panes"].as_array().unwrap() {
+                let response = send_json_request(&handoff_api, &serde_json::json!({
+                    "id":"padding", "method":"pane.rename",
+                    "params":{"pane_id":pane["pane_id"],"label":format!("qualification-{}", "x".repeat(1500))}
+                }).to_string());
+                assert!(response.get("error").is_none(), "{response}");
+            }
+        }
+        let snapshot = snapshot_data();
+        let snapshot_value: Value = serde_json::from_str(&snapshot).unwrap();
+        assert_eq!(
+            snapshot_value["workspaces"].as_array().unwrap().len(),
+            workspaces
+        );
+        if workspaces >= 100 {
+            assert!(
+                snapshot.len() >= 200_000,
+                "large snapshot must cross the incident's buffered size: {}",
+                snapshot.len()
+            );
+        }
+        eprintln!(
+            "negotiated shell.snapshot.v1 workspaces={workspaces} qualified_bytes={}",
+            snapshot.len()
+        );
+        if let Some(dir) = std::env::var_os("HERDR_RECONNECT_EVIDENCE_DIR") {
+            fs::write(
+                PathBuf::from(dir).join(format!("before-{workspaces}.snapshot.json")),
+                &snapshot,
+            )
+            .unwrap();
+        }
+        assert!(
+            wait_until(Duration::from_secs(10), Duration::from_millis(100), || {
+                machines_ready(workspaces)
+            }),
+            "both machine counts must be current before handoff: {}",
+            status()
+        );
+        let (active_endpoint, active_marker) = if workspaces >= 100 && !inactive_large {
+            ("Handoff", "HANDOFF_ACTIVE_WORKSPACE")
+        } else {
+            ("Steady", "STEADY_ACTIVE_WORKSPACE")
+        };
+        assert!(
+            rendered_active_workspace(&screen(), active_endpoint, active_marker),
+            "before {workspaces}: expected active {active_endpoint} workspace: {}",
+            screen()
+        );
+        save_evidence(&format!("before-{workspaces}"));
+        let log_watermark = client_log().len();
+        let importer_exe = handoff_cleanup.importer_exe();
+        let handoff_result = cli(
+            &handoff_config,
+            &handoff_runtime,
+            &handoff_api,
+            &[
+                "server",
+                "live-handoff",
+                "--import-exe",
+                importer_exe.to_str().unwrap(),
+            ],
+        );
+        handoff_cleanup.track_importer();
+        eprintln!(
+            "actual CLI live-handoff workspaces={workspaces} binary={} result={}",
+            env!("CARGO_BIN_EXE_herdr"),
+            String::from_utf8_lossy(&handoff_result)
+        );
+        let completed_at_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        // No input, observer handshake, rename, metadata report or other server mutation may
+        // wake rendering here. A new handshake and a post-handoff current-generation readout
+        // distinguish recovery from the identical retained pre-handoff frame/count.
+        // Older clients have no readout: observe only PTY/log files in this window, never
+        // poll their servers. Their post-boot count is checked by snapshot_data AFTER it.
+        let recovered = wait_until(Duration::from_secs(20), Duration::from_millis(100), || {
+            let log = client_log();
+            let tail = log.get(log_watermark..).unwrap_or_default();
+            let text = screen();
+            let machine_online = text
+                .lines()
+                .any(|line| line.contains("Handoff") && line.contains('●'));
+            let fresh_generation = external_client.is_some()
+                || status()["readout"]["updated_at_ms"]
+                    .as_u64()
+                    .is_some_and(|timestamp| timestamp >= completed_at_ms);
+            tail.contains("endpoint transport failed")
+                && tail.contains("endpoint handshake succeeded")
+                && text.contains(&label)
+                && text.contains("Steady")
+                && rendered_active_workspace(&text, active_endpoint, active_marker)
+                && machine_online
+                && !text.contains("reconnecting")
+                && fresh_generation
+                && (external_client.is_some() || machines_ready(workspaces))
+        });
+        save_evidence(&format!("no-input-after-{workspaces}"));
+        if !recovered {
+            // Diagnostic counterexample only AFTER the no-input acceptance window fails.
+            // A host focus event can request repaint without sending text into a pane.
+            input.write_all(b"\x1b[I").unwrap();
+            thread::sleep(Duration::from_millis(500));
+            save_evidence(&format!("diagnostic-focus-after-{workspaces}"));
+            eprintln!(
+                "no-input recovery failed; diagnostic focus frame:\n{}",
+                screen()
+            );
+        }
+        let snapshot = snapshot_data();
+        let snapshot_value: Value = serde_json::from_str(&snapshot).unwrap();
+        assert_eq!(
+            snapshot_value["workspaces"].as_array().unwrap().len(),
+            workspaces,
+            "post-handoff bootstrap must retain the workspace count"
+        );
+        if workspaces >= 100 {
+            assert!(
+                snapshot.len() >= 200_000,
+                "post-handoff bootstrap must retain the qualified size: {}",
+                snapshot.len()
+            );
+        }
+        eprintln!(
+            "post-handoff negotiated shell.snapshot.v1 workspaces={workspaces} bytes={}",
+            snapshot.len()
+        );
+        if let Some(dir) = std::env::var_os("HERDR_RECONNECT_EVIDENCE_DIR") {
+            fs::write(
+                PathBuf::from(dir).join(format!("after-{workspaces}.snapshot.json")),
+                &snapshot,
+            )
+            .unwrap();
+        }
+        assert!(
+            rendered_active_workspace(&screen(), active_endpoint, active_marker),
+            "after {workspaces}: expected retained active {active_endpoint} workspace: {}",
+            screen()
+        );
+        save_evidence(&format!("after-{workspaces}"));
+        eprintln!(
+            "handoff workspaces={workspaces} recovered={recovered} readout={}\n{}",
+            status(),
+            screen()
+        );
+        assert!(
+            recovered,
+            "handoff must restore the saved machine snapshot with {workspaces} workspaces"
+        );
+    }
+    drop(input);
+    drop(client);
+    drop(handoff);
+    drop(steady);
+    handoff_cleanup.stop_and_cleanup().unwrap();
+    steady_cleanup.stop_and_cleanup().unwrap();
+    cleanup_test_base(&base);
 }
 
 #[test]
@@ -2070,6 +2708,56 @@ fn unavailable_restored_pane_keeps_saved_cwd_in_server() {
     );
     assert!(sent.get("error").is_none(), "{sent}");
     cleanup_spawned_herdr(restarted, base);
+}
+
+#[test]
+fn server_stop_wakes_idle_server_without_client_or_pty_events() {
+    let _lock = test_lock();
+    for wait_for_app in [false, true] {
+        assert_server_stop_exits_without_other_events(wait_for_app);
+    }
+}
+
+fn assert_server_stop_exits_without_other_events(wait_for_app: bool) {
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let client_socket = runtime_dir.join("herdr-client.sock");
+    let mut spawned = spawn_server(&config_home, &runtime_dir, &api_socket, &client_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    if wait_for_app {
+        wait_for_socket(&client_socket, Duration::from_secs(10));
+        // Synchronize with App startup without creating a pane or a client that
+        // could accidentally wake the event loop after the stop flag is set.
+        let workspaces = send_json_request(
+            &api_socket,
+            r#"{"id":"ready","method":"workspace.list","params":{}}"#,
+        );
+        assert_eq!(workspaces["result"]["workspaces"], serde_json::json!([]));
+    }
+    // The other case stops as soon as the API binds, including startup before
+    // the App begins receiving requests or registers client readiness.
+    let stopped = send_json_request(
+        &api_socket,
+        r#"{"id":"stop","method":"server.stop","params":{}}"#,
+    );
+    assert!(stopped.get("error").is_none(), "{stopped}");
+
+    // The immediate API acknowledgement alone does not prove shutdown: the
+    // real server process must complete cleanup with no further socket traffic.
+    let mut exit_status = None;
+    assert!(
+        wait_until(Duration::from_secs(5), Duration::from_millis(20), || {
+            exit_status = spawned.child.try_wait().unwrap();
+            exit_status.is_some()
+        }),
+        "idle server did not exit after acknowledging server.stop"
+    );
+    assert!(exit_status.unwrap().success());
+    assert!(!api_socket.exists(), "API socket must be cleaned up");
+    assert!(!client_socket.exists(), "client socket must be cleaned up");
+    cleanup_spawned_herdr(spawned, base);
 }
 
 #[test]

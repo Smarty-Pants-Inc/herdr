@@ -568,6 +568,90 @@ fn pane_shell_gets_herdr_socket_and_pane_env() {
 }
 
 #[test]
+fn pane_resume_reports_transmit_cross_pane_opt_in() {
+    for (method, command) in [
+        ("pane.report_agent", "report-agent"),
+        ("pane.report_agent_session", "report-agent-session"),
+    ] {
+        for opt_in in [false, true] {
+            let base = unique_test_dir();
+            fs::create_dir_all(&base).unwrap();
+            let socket = base.join("herdr.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let server = thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    assert!(Instant::now() < deadline, "CLI did not send a report");
+                    let (mut stream, _) = match listener.accept() {
+                        Ok(connection) => connection,
+                        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(10));
+                            continue;
+                        }
+                        Err(err) => panic!("accept: {err}"),
+                    };
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let mut line = String::new();
+                    BufReader::new(stream.try_clone().unwrap())
+                        .read_line(&mut line)
+                        .unwrap();
+                    let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                    if request["method"] == "ping" {
+                        write_fake_pong(
+                            &mut stream,
+                            &request,
+                            "different-build-same-protocol",
+                            CURRENT_PROTOCOL,
+                        );
+                        continue;
+                    }
+                    writeln!(
+                        stream,
+                        "{}",
+                        serde_json::json!({"id": request["id"], "result": {"type": "ok"}})
+                    )
+                    .unwrap();
+                    return request;
+                }
+            });
+            let mut args = vec![
+                "pane",
+                command,
+                "w1:p1",
+                "--source",
+                "custom:pi",
+                "--agent",
+                "pi",
+            ];
+            if command == "report-agent" {
+                args.extend(["--state", "idle"]);
+            }
+            if opt_in {
+                args.push("--allow-cross-pane");
+            }
+            args.extend(["--", "pi", "--resume", "cli-session"]);
+            let output = run_cli(&socket, &args);
+            let request = server.join().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(request["method"], method);
+            assert_eq!(request["params"]["allow_cross_pane"], opt_in);
+            assert_eq!(
+                request["params"]["resume_argv"],
+                serde_json::json!(["pi", "--resume", "cli-session"])
+            );
+            cleanup_test_base(&base);
+        }
+    }
+}
+
+#[test]
 fn pane_agent_reports_accept_options_before_pane() {
     let base = unique_test_dir();
     let config_home = base.join("config");

@@ -593,6 +593,10 @@ impl TerminalRuntime {
         self.0.child_pid()
     }
 
+    pub(crate) fn child_process_identity(&self) -> Option<crate::platform::ProcessIdentity> {
+        self.0.child_process_identity()
+    }
+
     pub(crate) fn current_size(&self) -> (u16, u16) {
         self.0.current_size()
     }
@@ -618,6 +622,10 @@ impl TerminalRuntime {
 
     pub(crate) fn test_set_child_pid(&self, pid: u32) {
         self.0.test_set_child_pid(pid);
+    }
+
+    pub(crate) fn test_set_foreground_cwd(&self, cwd: Option<std::path::PathBuf>) {
+        self.0.test_set_foreground_cwd(cwd);
     }
 
     pub(crate) fn test_with_channel(cols: u16, rows: u16) -> (Self, mpsc::Receiver<Bytes>) {

@@ -89,12 +89,25 @@ pub struct PaneSwapParams {
     pub target_pane_id: Option<String>,
 }
 
+/// Project-checked swap, separate from the frozen legacy endpoint shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default)]
+pub struct PaneSwapProjectCheckedParams {
+    #[serde(flatten)]
+    pub params: PaneSwapParams,
+    /// Explicit permission to change the first-Pi project of a surviving session.
+    #[serde(default)]
+    pub allow_project_change: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PaneMoveParams {
     pub pane_id: String,
     pub destination: PaneMoveDestination,
     #[serde(default)]
     pub focus: bool,
+    /// Explicit permission to change ownership of a surviving agent session.
+    #[serde(default)]
+    pub allow_project_change: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -172,6 +185,16 @@ pub struct LayoutApplyParams {
     #[serde(default)]
     pub focus: bool,
     pub root: LayoutNode,
+}
+
+/// Project-checked layout apply, separate from the frozen legacy endpoint shape.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct LayoutApplyProjectCheckedParams {
+    #[serde(flatten)]
+    pub params: LayoutApplyParams,
+    /// Explicit permission to change the first-Pi project of a surviving session.
+    #[serde(default)]
+    pub allow_project_change: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -394,6 +417,9 @@ pub struct PaneReadParams {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PaneReportAgentParams {
+    /// Explicit permission to report a resume command for another pane.
+    #[serde(default)]
+    pub allow_cross_pane: bool,
     pub pane_id: String,
     pub source: String,
     pub agent: String,
@@ -414,6 +440,9 @@ pub struct PaneReportAgentParams {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PaneReportAgentSessionParams {
+    /// Explicit permission to report a resume command for another pane.
+    #[serde(default)]
+    pub allow_cross_pane: bool,
     pub pane_id: String,
     pub source: String,
     pub agent: String,

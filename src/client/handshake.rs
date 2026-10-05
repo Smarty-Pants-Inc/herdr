@@ -33,11 +33,11 @@ pub(super) const LOCAL_HANDSHAKE_READ_TIMEOUT: Duration = Duration::from_secs(5)
 pub(super) const REMOTE_HANDSHAKE_READ_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub(super) fn is_remote_client_process() -> bool {
-    std::env::var(crate::remote::REMOTE_KEYBINDINGS_ENV_VAR).is_ok()
+    crate::environment::var(crate::remote::REMOTE_KEYBINDINGS_ENV_VAR).is_ok()
 }
 
 pub(super) fn client_shell_keybinding_source() -> shell::ClientShellKeybindingSource {
-    match std::env::var(crate::remote::REMOTE_KEYBINDINGS_ENV_VAR)
+    match crate::environment::var(crate::remote::REMOTE_KEYBINDINGS_ENV_VAR)
         .ok()
         .as_deref()
     {
@@ -82,16 +82,16 @@ fn direct_graphics_capability(
 
 #[cfg(unix)]
 fn direct_graphics_profile_allowed() -> bool {
-    let term_program = std::env::var("TERM_PROGRAM").unwrap_or_default();
-    let term = std::env::var("TERM").unwrap_or_default();
+    let term_program = crate::environment::var("TERM_PROGRAM").unwrap_or_default();
+    let term = crate::environment::var("TERM").unwrap_or_default();
     direct_graphics_profile_values(
         &term_program,
         &term,
-        std::env::var_os("KITTY_WINDOW_ID").is_some(),
+        crate::environment::var_os("KITTY_WINDOW_ID").is_some(),
         is_remote_client_process()
             || is_ssh_session()
-            || std::env::var_os("TMUX").is_some()
-            || std::env::var_os("STY").is_some(),
+            || crate::environment::var_os("TMUX").is_some()
+            || crate::environment::var_os("STY").is_some(),
         io::stdin().is_terminal() && io::stdout().is_terminal(),
     )
 }

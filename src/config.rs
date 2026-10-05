@@ -87,12 +87,6 @@ pub(crate) fn app_dir_name() -> &'static str {
     io::app_dir_name()
 }
 
-#[cfg(test)]
-pub(crate) fn test_config_env_lock() -> &'static std::sync::Mutex<()> {
-    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-    LOCK.get_or_init(|| std::sync::Mutex::new(()))
-}
-
 impl Config {
     pub fn should_show_onboarding(&self) -> bool {
         self.onboarding.unwrap_or(true)

@@ -185,30 +185,35 @@ async fn accepted_client_api_direct_and_clipboard_input_have_explicit_sender_sem
 
     type_into(&mut server, 31, &pane_id);
     let before = last_input(&mut server, &pane_id);
+    // Explicit API opt-in isolates sender attribution from origin policy; it
+    // must not bypass the expected-terminal guard or borrow an attached user.
     // A fail-closed guard rejection does not erase accepted client input.
     let rejected: api::schema::Request = serde_json::from_value(serde_json::json!({
         "id":"reject", "method":"pane.send_input_guarded",
-        "params":{"pane_id":pane_id,"text":"bad", "expected_terminal":"wrong-terminal"}
+        "params":{"pane_id":pane_id,"text":"bad", "expected_terminal":"wrong-terminal","allow_cross_pane":true}
     }))
     .unwrap();
-    assert!(request(&mut server, rejected.method).get("error").is_some());
+    assert_eq!(
+        request(&mut server, rejected.method)["error"]["code"],
+        "terminal_identity_mismatch"
+    );
     assert_eq!(last_input(&mut server, &pane_id), before);
     for (method, params) in [
         (
             "pane.send_text",
-            serde_json::json!({"pane_id":pane_id,"text":"API"}),
+            serde_json::json!({"pane_id":pane_id,"text":"API","allow_cross_pane":true}),
         ),
         (
             "pane.send_keys",
-            serde_json::json!({"pane_id":pane_id,"keys":["enter"]}),
+            serde_json::json!({"pane_id":pane_id,"keys":["enter"],"allow_cross_pane":true}),
         ),
         (
             "pane.send_input",
-            serde_json::json!({"pane_id":pane_id,"text":"API"}),
+            serde_json::json!({"pane_id":pane_id,"text":"API","allow_cross_pane":true}),
         ),
         (
             "pane.send_input_guarded",
-            serde_json::json!({"pane_id":pane_id,"text":"API","expected_terminal":terminal_id.as_str()}),
+            serde_json::json!({"pane_id":pane_id,"text":"API","expected_terminal":terminal_id.as_str(),"allow_cross_pane":true}),
         ),
     ] {
         type_into(&mut server, 31, &pane_id);
@@ -359,8 +364,10 @@ async fn rejected_api_enqueue_keeps_attribution_and_empty_input_does_not_invalid
     let _client = connect(&mut server, 31, Some("Alice"));
     type_into(&mut server, 31, &pane_id);
     let before = last_input(&mut server, &pane_id);
+    // Deliberate per-request API opt-in lets this synthetic caller exercise
+    // empty-input and queue-capacity semantics without fabricating socket identity.
     let empty: api::schema::Request = serde_json::from_value(serde_json::json!({
-        "id":"empty", "method":"pane.send_input", "params":{"pane_id":pane_id}
+        "id":"empty", "method":"pane.send_input", "params":{"pane_id":pane_id,"allow_cross_pane":true}
     }))
     .unwrap();
     assert_eq!(request(&mut server, empty.method)["result"]["type"], "ok");
@@ -370,7 +377,7 @@ async fn rejected_api_enqueue_keeps_attribution_and_empty_input_does_not_invalid
         let _ = runtime.try_send_bytes(Bytes::from_static(b"fill"));
     }
     let text: api::schema::Request = serde_json::from_value(serde_json::json!({
-        "id":"full", "method":"pane.send_text", "params":{"pane_id":pane_id,"text":"API"}
+        "id":"full", "method":"pane.send_text", "params":{"pane_id":pane_id,"text":"API","allow_cross_pane":true}
     }))
     .unwrap();
     assert_eq!(

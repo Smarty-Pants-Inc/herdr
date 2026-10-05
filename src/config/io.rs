@@ -36,7 +36,7 @@ pub fn config_dir() -> PathBuf {
     {
         return dir;
     }
-    if let Ok(dir) = std::env::var("XDG_CONFIG_HOME") {
+    if let Ok(dir) = crate::environment::var("XDG_CONFIG_HOME") {
         return PathBuf::from(dir).join(app_dir_name());
     }
     #[cfg(test)]
@@ -52,7 +52,7 @@ pub fn state_dir() -> PathBuf {
     {
         return dir;
     }
-    if let Ok(dir) = std::env::var("XDG_STATE_HOME") {
+    if let Ok(dir) = crate::environment::var("XDG_STATE_HOME") {
         return PathBuf::from(dir).join(app_dir_name());
     }
     #[cfg(test)]
@@ -281,7 +281,7 @@ pub fn config_path() -> PathBuf {
     }) {
         return path;
     }
-    if let Ok(path) = std::env::var(CONFIG_PATH_ENV_VAR) {
+    if let Ok(path) = crate::environment::var(CONFIG_PATH_ENV_VAR) {
         return PathBuf::from(path);
     }
     config_dir().join("config.toml")
@@ -857,6 +857,80 @@ mod tests {
     use super::*;
 
     #[test]
+    fn environment_overrides_preserve_directory_scope_precedence() {
+        let env = crate::environment::test_env();
+        let config_home = test_root().join("env-config-home");
+        let state_home = test_root().join("env-state-home");
+        let custom_path = test_root().join("env-custom.toml");
+        env.set("XDG_CONFIG_HOME", &config_home);
+        env.set("XDG_STATE_HOME", &state_home);
+        env.set(CONFIG_PATH_ENV_VAR, &custom_path);
+        assert_eq!(config_dir(), config_home.join(app_dir_name()));
+        assert_eq!(state_dir(), state_home.join(app_dir_name()));
+        assert_eq!(config_path(), custom_path);
+        {
+            let scoped_home = test_root().join("env-scoped-home");
+            let _dirs = test_config_dirs(&scoped_home, &scoped_home.join("state"));
+            assert_eq!(config_dir(), scoped_home.join(app_dir_name()));
+            assert_eq!(state_dir(), scoped_home.join("state").join(app_dir_name()));
+            assert_eq!(
+                config_path(),
+                scoped_home.join(app_dir_name()).join("config.toml")
+            );
+        }
+        assert_eq!(config_path(), custom_path);
+        {
+            let inner = crate::environment::test_env();
+            inner.remove(CONFIG_PATH_ENV_VAR);
+            assert_eq!(
+                config_path(),
+                config_home.join(app_dir_name()).join("config.toml")
+            );
+            inner.remove("XDG_CONFIG_HOME");
+            inner.remove("XDG_STATE_HOME");
+            assert_eq!(
+                config_dir(),
+                test_root().join("config").join(app_dir_name())
+            );
+            assert_eq!(state_dir(), test_root().join("state").join(app_dir_name()));
+        }
+        assert_eq!(config_dir(), config_home.join(app_dir_name()));
+        assert_eq!(state_dir(), state_home.join(app_dir_name()));
+        assert_eq!(config_path(), custom_path);
+    }
+
+    #[test]
+    fn environment_config_reads_are_isolated_in_overlapping_threads() {
+        let original = std::env::var_os(CONFIG_PATH_ENV_VAR);
+        let (a_ready, a_wait) = std::sync::mpsc::channel();
+        let (b_ready, b_wait) = std::sync::mpsc::channel();
+        std::thread::scope(|threads| {
+            for (name, ready, wait) in [("env-a", a_ready, b_wait), ("env-b", b_ready, a_wait)] {
+                let original = original.clone();
+                threads.spawn(move || {
+                    let env = crate::environment::test_env();
+                    let home = test_root().join(name);
+                    let path = home.join("custom.toml");
+                    env.set("XDG_CONFIG_HOME", &home);
+                    env.set("XDG_STATE_HOME", home.join("state"));
+                    env.set(CONFIG_PATH_ENV_VAR, &path);
+                    ready.send(()).unwrap();
+                    wait.recv_timeout(std::time::Duration::from_secs(30))
+                        .expect("both environment scopes installed before config reads");
+                    assert_eq!(config_dir(), home.join(app_dir_name()));
+                    assert_eq!(state_dir(), home.join("state").join(app_dir_name()));
+                    assert_eq!(config_path(), path);
+                    assert_eq!(std::env::var_os(CONFIG_PATH_ENV_VAR), original);
+                    ready.send(()).unwrap();
+                    wait.recv_timeout(std::time::Duration::from_secs(30))
+                        .expect("keep config environment scopes overlapping through reads");
+                });
+            }
+        });
+        assert_eq!(std::env::var_os(CONFIG_PATH_ENV_VAR), original);
+    }
+
+    #[test]
     fn test_config_dirs_nested_scopes_restore_both_homes() {
         let outer_config = test_root().join("outer-config");
         let outer_state = test_root().join("outer-state");
@@ -1075,13 +1149,11 @@ mod tests {
 
     #[test]
     fn config_loaders_report_unreadable_path() {
-        let _guard = crate::config::test_config_env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let env = crate::environment::test_env();
         let path =
             std::env::temp_dir().join(format!("herdr-config-unreadable-{}", std::process::id()));
         std::fs::create_dir_all(&path).unwrap();
-        std::env::set_var(CONFIG_PATH_ENV_VAR, &path);
+        env.set(CONFIG_PATH_ENV_VAR, &path);
 
         assert!(TEST_CONFIG_DIRS.with(|dirs| dirs.borrow().is_none()));
         assert_eq!(config_path(), path);
@@ -1113,7 +1185,6 @@ mod tests {
             ))
         );
 
-        std::env::remove_var(CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_dir_all(path);
     }
 
@@ -1300,19 +1371,16 @@ mouse_captur = true
 
     #[test]
     fn startup_config_accepts_legacy_agent_panel_scope_without_warning() {
-        let _guard = crate::config::test_config_env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let env = crate::environment::test_env();
         let path = std::env::temp_dir().join(format!(
             "herdr-config-legacy-agent-panel-scope-{}.toml",
             std::process::id()
         ));
         std::fs::write(&path, "[ui]\nagent_panel_scope = \"all\"\n").unwrap();
-        std::env::set_var(CONFIG_PATH_ENV_VAR, &path);
+        env.set(CONFIG_PATH_ENV_VAR, &path);
 
         let loaded = Config::load();
 
-        std::env::remove_var(CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_file(path);
 
         assert!(loaded.diagnostics.is_empty(), "{:?}", loaded.diagnostics);
@@ -1320,9 +1388,7 @@ mouse_captur = true
 
     #[test]
     fn startup_config_load_warns_about_unknown_top_level_sections() {
-        let _guard = crate::config::test_config_env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let env = crate::environment::test_env();
         let path = std::env::temp_dir().join(format!(
             "herdr-config-unknown-section-{}.toml",
             std::process::id()
@@ -1338,7 +1404,7 @@ delivery = "system"
 "#,
         )
         .unwrap();
-        std::env::set_var(CONFIG_PATH_ENV_VAR, &path);
+        env.set(CONFIG_PATH_ENV_VAR, &path);
 
         let loaded = Config::load();
 
@@ -1351,7 +1417,6 @@ delivery = "system"
             super::super::ToastDelivery::System
         );
 
-        std::env::remove_var(CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_file(path);
     }
 
@@ -1440,9 +1505,7 @@ mouse_capture = false
 
     #[test]
     fn config_load_recovers_from_a_mid_file_bom() {
-        let _guard = crate::config::test_config_env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let env = crate::environment::test_env();
         let path = std::env::temp_dir().join(format!(
             "herdr-config-mid-file-bom-{}.toml",
             std::process::id()
@@ -1452,11 +1515,10 @@ mouse_capture = false
             b"onboarding = false\n\xEF\xBB\xBF[terminal]\ndefault_shell = \"pwsh.exe\"\n",
         )
         .unwrap();
-        std::env::set_var(CONFIG_PATH_ENV_VAR, &path);
+        env.set(CONFIG_PATH_ENV_VAR, &path);
 
         let loaded = Config::load();
 
-        std::env::remove_var(CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_file(path);
 
         assert!(loaded.diagnostics.is_empty(), "{:?}", loaded.diagnostics);

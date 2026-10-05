@@ -228,9 +228,13 @@ impl HeadlessServer {
         matches!(
             method,
             Method::CommandInvoke(_)
+                | Method::LayoutApply(_)
+                | Method::LayoutApplyRestorable(_)
+                | Method::LayoutApplyProjectChecked(_)
                 | Method::PaneClose(_)
                 | Method::PaneEditScrollback(_)
                 | Method::PaneMove(_)
+                | Method::PaneMoveProjectChecked(_)
                 | Method::PaneSplit(_)
                 | Method::TabClose(_)
                 | Method::TabCreate(_)
@@ -250,6 +254,9 @@ impl HeadlessServer {
             method,
             Method::AgentFocus(_)
                 | Method::CommandInvoke(_)
+                | Method::LayoutApply(_)
+                | Method::LayoutApplyRestorable(_)
+                | Method::LayoutApplyProjectChecked(_)
                 | Method::LayoutSetSplitRatio(_)
                 | Method::PaneClose(_)
                 | Method::PaneCopyMotion(_)
@@ -260,17 +267,20 @@ impl HeadlessServer {
                 | Method::PaneInputSet(_)
                 | Method::PaneLinkActivate(_)
                 | Method::PaneLinkResolve(_)
+                | Method::PaneMoveProjectChecked(_)
                 | Method::PaneRename(_)
                 | Method::PaneResize(_)
                 | Method::PaneScroll(_)
                 | Method::PaneClear(_)
                 | Method::PaneSplit(_)
                 | Method::PaneSwap(_)
+                | Method::PaneSwapProjectChecked(_)
                 | Method::PaneZoom(_)
                 | Method::TabClose(_)
                 | Method::TabCreate(_)
                 | Method::TabFocus(_)
                 | Method::TabMove(_)
+                | Method::TabMoveProjectChecked(_)
                 | Method::TabRename(_)
                 | Method::WorkspaceClose(_)
                 | Method::WorkspaceCreate(_)
@@ -292,14 +302,20 @@ impl HeadlessServer {
             method,
             Method::AgentFocus(_)
                 | Method::CommandInvoke(_)
+                | Method::LayoutApply(_)
+                | Method::LayoutApplyRestorable(_)
+                | Method::LayoutApplyProjectChecked(_)
                 | Method::LayoutSetSplitRatio(_)
                 | Method::PaneClose(_)
                 | Method::PaneEditScrollback(_)
                 | Method::PaneFocus(_)
                 | Method::PaneFocusDirection(_)
                 | Method::PaneResize(_)
+                | Method::PaneMove(_)
+                | Method::PaneMoveProjectChecked(_)
                 | Method::PaneSplit(_)
                 | Method::PaneSwap(_)
+                | Method::PaneSwapProjectChecked(_)
                 | Method::PaneZoom(_)
                 | Method::TabClose(_)
                 | Method::TabCreate(_)
@@ -860,7 +876,8 @@ impl HeadlessServer {
         };
         let inspect_pane_move = matches!(
             &msg.request.method,
-            api::schema::Method::PaneMove(params) if params.focus
+            api::schema::Method::PaneMove(params)
+                | api::schema::Method::PaneMoveProjectChecked(params) if params.focus
         );
         let response_proxy = (agent_focus_target.is_some() || inspect_pane_move).then(|| {
             let (proxy_tx, proxy_rx) = std::sync::mpsc::channel();
@@ -961,5 +978,75 @@ impl HeadlessServer {
                     || self.resize_shell_tab_if_controller(client_id, false)
             };
         changed | navigation_changed | geometry_changed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn checked_topology_receiver_classifications_match_legacy_semantics() {
+        use api::schema::Method;
+        use serde_json::json;
+
+        // Order: location reconciliation, shell geometry claims, public geometry.
+        // Legacy pane.move is intentionally not a shell geometry-claiming endpoint;
+        // its advertised checked replacement is. Preserve that capability boundary.
+        let cases = [
+            (
+                "pane.swap",
+                "pane.swap_project_checked",
+                json!({}),
+                [false, true, true],
+                [false, true, true],
+            ),
+            (
+                "layout.apply",
+                "layout.apply_project_checked",
+                json!({"root": {"type": "pane"}}),
+                [true, true, true],
+                [true, true, true],
+            ),
+            (
+                "layout.apply",
+                "layout.apply_restorable",
+                json!({"root": {"type": "pane", "command": [crate::app::exiting_test_command()]}}),
+                [true, true, true],
+                [true, true, true],
+            ),
+            (
+                "pane.move",
+                "pane.move_project_checked",
+                json!({"pane_id": "p1", "destination": {"type": "new_tab"}}),
+                [true, false, true],
+                [true, true, true],
+            ),
+            (
+                "tab.move",
+                "tab.move_project_checked",
+                json!({"tab_id": "t1", "insert_index": 0}),
+                [false, true, false],
+                [false, true, false],
+            ),
+        ];
+        for (legacy, checked, params, legacy_expected, checked_expected) in cases {
+            for (name, expected) in [(legacy, legacy_expected), (checked, checked_expected)] {
+                let method: Method = serde_json::from_value(json!({
+                    "method": name,
+                    "params": params,
+                }))
+                .expect("topology classification fixture must deserialize");
+                assert_eq!(
+                    [
+                        HeadlessServer::shell_locations_may_need_reconcile(&method),
+                        HeadlessServer::shell_endpoint_claims_geometry(&method),
+                        HeadlessServer::public_request_may_change_geometry(&method),
+                    ],
+                    expected,
+                    "receiver classification for {name}",
+                );
+            }
+        }
     }
 }

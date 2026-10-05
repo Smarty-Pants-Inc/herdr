@@ -105,7 +105,7 @@ Raw socket method names use dot notation:
 | Tab | `tab.create`, `tab.list`, `tab.get`, `tab.focus`, `tab.rename`, `tab.move`, `tab.close` |
 | Pane | `pane.split`, `pane.swap`, `pane.move`, `pane.zoom`, `pane.layout`, `pane.process_info`, `pane.neighbor`, `pane.edges`, `pane.focus_direction`, `pane.resize`, `pane.list`, `pane.current`, `pane.get`, `pane.last_input`, `pane.rename`, `pane.send_text`, `pane.send_keys`, `pane.send_input`, `pane.send_input_guarded`, `pane.read`, `pane.report_agent`, `pane.report_agent_session`, `pane.report_metadata`, `pane.clear_agent_authority`, `pane.release_agent`, `pane.close`, `pane.wait_for_output` |
 | Popup | `popup.close` |
-| Layout | `layout.export`, `layout.apply`, `layout.set_split_ratio` |
+| Layout | `layout.export`, `layout.apply`, `layout.apply_restorable`, `layout.set_split_ratio` |
 | Agent | `agent.list`, `agent.get`, `agent.read`, `agent.explain`, `agent.send_keys`, `agent.prompt`, `agent.wait`, `agent.rename`, `agent.focus`, `agent.start`, `agent.start_guarded`, `agent.view.set`, `agent.view.clear` |
 | Events | `events.subscribe`, `events.wait` |
 | Integrations | `integration.install`, `integration.uninstall` |
@@ -134,6 +134,67 @@ as JSON for clients and agents that want a simple bootstrap command.
 Pane control methods use public pane ids such as `w1:p1`. Methods whose
 schema makes `pane_id` optional use the server's active focused pane when it is
 omitted. `pane.move` always requires the source `pane_id`.
+
+### Restorable argv tabs
+
+`layout.apply_restorable` explicitly opts a newly created command terminal into
+cold-start replay. It uses the **same params and `layout_apply` response** as
+`layout.apply`, but accepts only a single root `type: "pane"` with a `command`
+argv array, no `tab_id` (no replacement), and no nonempty pane `env`. The program
+must be an absolute path, argv must be nonempty with a nonempty program, and no
+argument may contain NUL. Arguments are passed directly, never joined or evaluated
+as shell source.
+
+```json
+{"id":"mirror","method":"layout.apply_restorable","params":{"workspace_id":"w1","tab_label":"mirror","focus":false,"root":{"type":"pane","cwd":"/home/alice/project","command":["/home/alice/bin/mirror-attach","session-id"]}}}
+```
+
+Endpoint clients must check that the server advertises `layout.apply_restorable`
+in its welcome `methods`. An older server rejects the method; do not fall back
+to `layout.apply` and claim restart safety. In particular, Smarty Code's mirror
+attach consumer (#4062/#3918) must choose this method at creation when it wants
+restart-safe visibility. Ordinary `layout.apply` and `pane.split` remain
+non-restorable, even when they launch identical argv. Existing panes do not gain
+consent retroactively. Creation schedules normal session autosave; its response
+is not a synchronous disk durability guarantee.
+
+The server stores `cold_restore_argv` beside the launch argv in its session
+snapshot. On Linux, disk replay is trusted only when the **opened file**
+is regular, owned by the current user, and not writable by group or others.
+Metadata and bytes come from the same read-only handle; permissions are not
+repaired to authorize input. Symlinks retain existing read behavior: trust is
+based on the opened target, not the link. Group/other read permission alone does
+not fail this write-protection check. Same-user edits to protected snapshots are
+intentionally trusted. This is not a sandbox or protection against the same uid.
+
+Untrusted snapshots still restore session organization and plain shells, but
+all replay marks are removed **before load returns**, so a later private autosave
+cannot launder them into authority. One trust-refusal diagnostic is recorded
+without command arguments or environment values.
+
+On macOS and Windows, disk replay fails closed until read-only verification of
+the opened file's owner and access controls is implemented (macOS extended ACLs;
+Windows DACLs). Disk marks are refused and stripped before load returns, cold
+restore opens plain shells, and the same trust-refusal diagnostic is recorded
+without command arguments or environment values. **Do not rely on argv replay
+on macOS or Windows.** Read-only owner/ACL verification for **both platforms** is
+tracked in [Smarty-Pants-Inc/smarty-dev#4526](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/4526).
+Herdr must not remove ACLs or repair permissions on input to authorize its contents.
+
+Eligible cold restore uses the saved cwd and existing workspace launch defaults;
+per-pane custom environment is not supported. Native agent resume retains
+precedence (including duplicate suppression). Replay does not inject saved screen
+history. Live handoff adopts an imported existing process without reexecuting argv,
+while preserving its mark and launch metadata. A marked pane with no runtime to
+import stays unavailable, retaining its saved cwd, recipe, mark and restore-error
+intent. Handoff preparation never retries that recipe, even if its executable
+has become available or the handoff later rolls back; only a subsequent cold
+restart can retry it. The separate native-agent resume path is unchanged.
+If the saved directory or executable
+is unavailable, the pane and replay intent remain with a restore error; no
+replacement process is launched elsewhere. When the terminal converts to a shell,
+the existing shell-respawn lifecycle clears the mark; it does not restart the
+command in a loop.
 
 ### Last pane input
 
@@ -729,6 +790,8 @@ Session-only official integrations report native session references with `pane.r
 ```
 
 Both methods accept an optional `resume_argv` array with the command that resumes the reporter's current session after a Herdr server restart. Its first element must be a plain command name, not a path. It allows at most 64 elements and 8 KiB in total, and no element may contain an apostrophe or control character; invalid values fail with `invalid_resume_argv` and the report is not applied. A custom agent must hold the pane through `pane.report_agent` before it can attach a command; otherwise the request fails with `resume_not_accepted`. Herdr keeps the command only while the same `source` and `agent` hold the pane, and it takes precedence over Herdr's built-in resume command for that agent. Older Herdr versions ignore the field.
+
+Reports containing `resume_argv` are content writes: Herdr attributes a local agent caller, including its child processes, to its terminal and rejects another-pane targets with `cross_pane_input_denied`. An unattributable caller receives `input_origin_unknown`. Both report methods accept `allow_cross_pane` (default `false`) to explicitly opt in; the CLI exposes it as `herdr pane report-agent ... --allow-cross-pane -- <resume-command...>` or `herdr pane report-agent-session ... --allow-cross-pane -- <resume-command...>`. Reports without `resume_argv` remain metadata-only and do not require this opt-in. Opt-in bypasses only the cross-pane policy, not resume validation or report authority rules.
 
 ```json
 {

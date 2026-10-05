@@ -13,8 +13,8 @@ test:
 
 # Run repository maintenance contract tests
 maintenance-test:
-    {{python}} -m unittest scripts.test_agent_detection_manifest_check scripts.test_changelog scripts.test_config_reference_check scripts.test_docs_translation_parity scripts.test_hermes_integration_asset scripts.test_package_windows_conpty scripts.test_preview scripts.test_release scripts.test_unix_installer scripts.test_vendor_libghostty_vt scripts.test_vendor_portable_pty scripts.test_windows_cross scripts.test_windows_input
-    bun test scripts/release-workflows.test.ts
+    {{python}} -m unittest scripts.test_agent_detection_manifest_check scripts.test_changelog scripts.test_config_reference_check scripts.test_conventional_commits scripts.test_ci_plan scripts.test_ci_queue_dedupe scripts.test_docs_translation_parity scripts.test_hermes_integration_asset scripts.test_package_windows_conpty scripts.test_preview scripts.test_release scripts.test_unix_installer scripts.test_vendor_libghostty_vt scripts.test_vendor_portable_pty scripts.test_windows_cross scripts.test_windows_input
+    bun test scripts/release-workflows.test.ts scripts/ci-workflow.test.ts
 
 # Local interactive Windows Terminal input qualification (never runs in normal CI).
 [windows]

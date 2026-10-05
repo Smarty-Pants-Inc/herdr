@@ -1,15 +1,16 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crate::workspace::{GitSpaceMetadata, WorkspaceGitStatusSnapshot};
+use crate::workspace::{
+    git_worktree_info, GitSpaceMetadata, GitWorktreeInfo, WorkspaceGitStatusSnapshot,
+};
 
 use super::{
     config::{deps_current, read_config, stamp, upstream_full_ref, ConfigCtx, FileDep},
     discovery::{
         automatic_workspace_label, canonicalize_best_effort_path, fallback_label_from_cwd,
         git_ref_storage_is_reftable, git_rev_parse_verify, git_space_metadata_from_info,
-        git_symbolic_head_full, git_worktree_info, read_git_ref_file, read_ref_oid,
-        GitWorktreeInfo,
+        git_symbolic_head_full, read_git_ref_file, read_ref_oid,
     },
 };
 
@@ -36,6 +37,27 @@ pub struct GitStatusCacheEntry {
     pub fingerprint: Option<GitStatusFingerprint>,
     pub retry_after: Option<Instant>,
     pub snapshot: WorkspaceGitStatusSnapshot,
+}
+
+impl GitStatusCacheEntry {
+    /// Effective config inputs recorded by the last upstream refresh, including
+    /// missing files and both logical symlink paths and their canonical targets.
+    /// Reads the cache only: no filesystem access or config parsing. Branch-only
+    /// refreshes need not have computed config dependencies.
+    pub(crate) fn config_dependency_paths(&self) -> Vec<PathBuf> {
+        let mut paths: Vec<_> = self
+            .fingerprint
+            .as_ref()
+            .and_then(|fingerprint| fingerprint.repository_context.3.as_ref())
+            .into_iter()
+            .flat_map(|context| &context.2)
+            .flat_map(|dep| std::iter::once(&dep.0).chain(dep.3.as_ref()))
+            .cloned()
+            .collect();
+        paths.sort();
+        paths.dedup();
+        paths
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -320,7 +342,16 @@ fn git_ahead_behind_between(
     upstream_oid: &str,
 ) -> Option<(usize, usize)> {
     let range = format!("{head_oid}...{upstream_oid}");
-    let output = crate::noninteractive_process::command("git")
+    let mut command = crate::noninteractive_process::command("git");
+    #[cfg(test)]
+    for key in ["HOME", "XDG_CONFIG_HOME"] {
+        if let Some(value) = crate::environment::var_os(key) {
+            command.env(key, value);
+        } else {
+            command.env_remove(key);
+        }
+    }
+    let output = command
         .arg("-C")
         .arg(cwd)
         .args(["rev-list", "--left-right", "--count", &range])
@@ -368,6 +399,91 @@ mod tests {
         );
 
         std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn config_dependency_paths_include_missing_external_files() {
+        let (base, repo, checkout) =
+            crate::workspace::git::test_support::create_repo_with_linked_worktree(
+                "missing-config-deps",
+            );
+        let repo = std::fs::canonicalize(repo).unwrap();
+        let missing = base.join("external/missing.cfg");
+        run_git(
+            &repo,
+            &["config", "include.path", "../../external/missing.cfg"],
+        );
+
+        let (_, branch_only) = git_status_snapshot_for_cwd_with_demand(
+            &checkout,
+            None,
+            GitStatusRefreshDemand {
+                branch: true,
+                ahead_behind: false,
+            },
+        );
+        assert!(branch_only.unwrap().config_dependency_paths().is_empty());
+        let (_, entry) = git_status_snapshot_for_cwd(&checkout, None);
+        let entry = entry.unwrap();
+        let paths = entry.config_dependency_paths();
+        assert!(paths.contains(&repo.join(".git/config")));
+        assert!(paths.contains(&repo.join(".git/../../external/missing.cfg")));
+        assert!(!missing.exists());
+        if let Some(home) = std::env::var_os("HOME") {
+            assert!(paths.contains(&PathBuf::from(home).join(".gitconfig")));
+        }
+        let xdg = std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")));
+        if let Some(xdg) = xdg {
+            assert!(paths.contains(&xdg.join("git/config")));
+        }
+
+        std::fs::remove_dir_all(base).unwrap();
+        assert_eq!(
+            entry.config_dependency_paths(),
+            paths,
+            "getter reads cached paths only"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_dependency_paths_include_logical_symlink_and_canonical_target() {
+        use std::os::unix::fs::symlink;
+
+        let (base, repo, checkout) =
+            crate::workspace::git::test_support::create_repo_with_linked_worktree(
+                "symlink-config-deps",
+            );
+        let external = std::fs::canonicalize(&base).unwrap().join("external");
+        std::fs::create_dir_all(&external).unwrap();
+        let target = external.join("target.cfg");
+        let logical = external.join("included.cfg");
+        std::fs::write(
+            &target,
+            "[branch \"testr56\"]\n\tremote = .\n\tmerge = refs/heads/testr56\n",
+        )
+        .unwrap();
+        symlink("target.cfg", &logical).unwrap();
+        run_git(
+            &repo,
+            &["config", "include.path", logical.to_str().unwrap()],
+        );
+
+        let (snapshot, entry) = git_status_snapshot_for_cwd(&checkout, None);
+        assert_eq!(snapshot.ahead_behind, Some((0, 0)));
+        let entry = entry.unwrap();
+        let paths = entry.config_dependency_paths();
+        assert!(paths.contains(&logical));
+        assert!(paths.contains(&std::fs::canonicalize(&target).unwrap()));
+        assert!(
+            paths.windows(2).all(|pair| pair[0] < pair[1]),
+            "paths are a deduplicated union"
+        );
+
+        std::fs::remove_dir_all(base).unwrap();
+        assert_eq!(entry.config_dependency_paths(), paths);
     }
 
     #[test]

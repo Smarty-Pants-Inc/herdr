@@ -37,7 +37,7 @@ impl std::fmt::Display for ClientError {
                 match reason.as_deref() {
                     Some("detached") => {
                         if let Ok(reattach_command) =
-                            std::env::var(crate::remote::REATTACH_COMMAND_ENV_VAR)
+                            crate::environment::var(crate::remote::REATTACH_COMMAND_ENV_VAR)
                         {
                             write!(f, "detached from remote server")?;
                             write!(f, "\nRun `{reattach_command}` to reattach")?;
@@ -60,7 +60,8 @@ impl std::fmt::Display for ClientError {
                 Ok(())
             }
             ClientError::ConnectionLost(err) => {
-                if let Ok(reattach_command) = std::env::var(crate::remote::REATTACH_COMMAND_ENV_VAR)
+                if let Ok(reattach_command) =
+                    crate::environment::var(crate::remote::REATTACH_COMMAND_ENV_VAR)
                 {
                     write!(f, "lost connection to remote Herdr: {err}")?;
                     write!(f, "\nIf the remote server survived the SSH or network drop, its panes may still be running.")?;
