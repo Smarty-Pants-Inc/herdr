@@ -405,3 +405,315 @@ fn prompt_wait_is_sent_as_one_agent_request() {
     server.join().unwrap();
     cleanup_test_base(&base);
 }
+
+// Use the actual executable: leaf-parser tests cannot catch pre-dispatch
+// extraction. Bound the receiver even when a regression exits before any ping.
+fn record_prompt_cli(
+    socket_path: &Path,
+    run: impl FnOnce() -> std::process::Output,
+) -> (std::process::Output, Vec<serde_json::Value>) {
+    fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
+    let listener = UnixListener::bind(socket_path).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let receiver = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut operations = Vec::new();
+        loop {
+            let (mut stream, _) = match listener.accept() {
+                Ok(connection) => connection,
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    if done_rx.try_recv().is_ok() || Instant::now() >= deadline {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                Err(err) => panic!("recording receiver accept failed: {err}"),
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+            let response = match request["method"].as_str().unwrap() {
+                "ping" => serde_json::json!({
+                    "id": request["id"],
+                    "result": {
+                        "type": "pong", "protocol": CURRENT_PROTOCOL,
+                        "version": "different-build-same-protocol",
+                        "capabilities": {
+                            "live_handoff": true,
+                            "expected_terminal_guard": true,
+                            "expected_terminal_agent_prompt_guard": true
+                        }
+                    }
+                }),
+                "pane.get" => serde_json::json!({
+                    "id": request["id"],
+                    "result": { "type": "pane_info", "pane": { "terminal_id": "term_1" } }
+                }),
+                "agent.start" => serde_json::json!({
+                    "id": request["id"],
+                    "error": { "code": "recorded_start", "message": "no real agent launched" }
+                }),
+                _ => serde_json::json!({
+                    "id": request["id"], "result": { "type": "agent_prompted" }
+                }),
+            };
+            if request["method"] != "ping" {
+                operations.push(request);
+            }
+            writeln!(stream, "{response}").unwrap();
+            stream.flush().unwrap();
+        }
+        operations
+    });
+    let output = run();
+    let _ = done_tx.send(());
+    (output, receiver.join().unwrap())
+}
+
+#[test]
+fn prompt_globals_preserve_literal_target_and_text_in_real_executable() {
+    let base = unique_test_dir();
+    let socket_path = base.join("herdr.sock");
+    for (target, text) in [
+        ("worker", "--session=payload"),
+        ("worker", "--session"),
+        ("worker", "--remote=host"),
+        ("worker", "--remote"),
+        ("worker", "--remote-keybindings=server"),
+        ("worker", "--remote-keybindings"),
+        ("worker", "--handoff"),
+        ("worker", "--session=λ\n日本語\nsecond line"),
+        ("worker", "--remote=λ\n日本語\nsecond line"),
+        ("--session=target", "--assignment\nλ 日本語"),
+        ("--session", "--remote"),
+        ("--remote=target", "--session=payload"),
+        ("--handoff", "--wait"),
+        ("worker", "--help"),
+        ("worker", "-h"),
+        ("worker", "--"),
+    ] {
+        let (output, operations) = record_prompt_cli(&socket_path, || {
+            run_cli(
+                &socket_path,
+                &[
+                    "agent",
+                    "prompt",
+                    target,
+                    text,
+                    "--expected-terminal",
+                    "opaque:λ/42",
+                    "--wait",
+                    "--until",
+                    "done",
+                    "--timeout",
+                    "1234",
+                    "--allow-cross-pane",
+                ],
+            )
+        });
+        fs::remove_file(&socket_path).unwrap();
+        assert!(
+            output.status.success(),
+            "{target:?} {text:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stderr.is_empty());
+        assert_eq!(operations.len(), 1, "{target:?} {text:?}: {operations:?}");
+        let request = &operations[0];
+        assert_eq!(request["method"], "agent.prompt_guarded");
+        assert_eq!(request["params"]["target"], target);
+        assert_eq!(request["params"]["text"], text);
+        assert_eq!(request["params"]["expected_terminal"], "opaque:λ/42");
+        assert_eq!(
+            request["params"]["wait"]["until"],
+            serde_json::json!(["done"])
+        );
+        assert_eq!(request["params"]["wait"]["timeout_ms"], 1234);
+        assert_eq!(request["params"]["allow_cross_pane"], true);
+    }
+    cleanup_test_base(&base);
+}
+
+#[test]
+fn prompt_globals_authentic_session_still_selects_named_receiver() {
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let named_socket = named_session_socket(&config_home, "selected");
+    let decoy_socket = base.join("inherited.sock");
+    for args in [
+        vec![
+            "--session",
+            "selected",
+            "agent",
+            "prompt",
+            "--remote=target",
+            "--session=payload",
+        ],
+        vec![
+            "agent",
+            "--session=selected",
+            "prompt",
+            "--remote=target",
+            "--session=payload",
+        ],
+        vec![
+            "agent",
+            "prompt",
+            "--remote=target",
+            "--session=payload",
+            "--session",
+            "selected",
+        ],
+        vec![
+            "agent",
+            "prompt",
+            "--remote=target",
+            "--session=payload",
+            "--session=selected",
+        ],
+    ] {
+        let mut args = args;
+        args.extend(["--expected-terminal=opaque:λ/42"]);
+        let (output, operations) = record_prompt_cli(&named_socket, || {
+            run_named_cli_with_socket_override(
+                &config_home,
+                &runtime_dir,
+                &args,
+                Some(&decoy_socket),
+            )
+        });
+        fs::remove_file(&named_socket).unwrap();
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(operations.len(), 1);
+        assert_eq!(operations[0]["method"], "agent.prompt_guarded");
+        assert_eq!(operations[0]["params"]["target"], "--remote=target");
+        assert_eq!(operations[0]["params"]["text"], "--session=payload");
+        assert_eq!(operations[0]["params"]["expected_terminal"], "opaque:λ/42");
+    }
+    cleanup_test_base(&base);
+}
+
+#[test]
+fn prompt_globals_other_commands_keep_full_global_scans() {
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let named_socket = named_session_socket(&config_home, "selected");
+    for args in [
+        vec!["--session", "selected", "server", "reload-config"],
+        vec!["server", "--session=selected", "reload-config"],
+        vec!["server", "reload-config", "--session", "selected"],
+    ] {
+        let (output, operations) = record_prompt_cli(&named_socket, || {
+            run_named_cli(&config_home, &runtime_dir, &args)
+        });
+        fs::remove_file(&named_socket).unwrap();
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(operations.len(), 1);
+        assert_eq!(operations[0]["method"], "server.reload_config");
+    }
+    for args in [
+        vec!["--remote", "host", "server", "reload-config"],
+        vec!["server", "--remote=host", "reload-config"],
+        vec!["server", "reload-config", "--remote", "host"],
+        vec!["agent", "prompt", "worker", "text", "--remote=host"],
+        vec![
+            "--remote=host",
+            "agent",
+            "prompt",
+            "worker",
+            "--remote=payload",
+        ],
+        vec![
+            "agent",
+            "--remote",
+            "host",
+            "prompt",
+            "worker",
+            "--remote=payload",
+        ],
+        vec![
+            "agent",
+            "prompt",
+            "worker",
+            "--remote=payload",
+            "--remote",
+            "host",
+        ],
+    ] {
+        let (output, operations) = record_prompt_cli(&base.join("herdr.sock"), || {
+            run_cli(&base.join("herdr.sock"), &args)
+        });
+        fs::remove_file(base.join("herdr.sock")).unwrap();
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(String::from_utf8_lossy(&output.stderr)
+            .contains("--remote can only be used with the default launch command"));
+        assert!(
+            operations.is_empty(),
+            "a real --remote must not dispatch locally"
+        );
+    }
+    let (output, operations) = record_prompt_cli(&base.join("herdr.sock"), || {
+        run_cli(
+            &base.join("herdr.sock"),
+            &["agent", "prompt", "worker", "text", "--handoff"],
+        )
+    });
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unknown option: --handoff"));
+    assert!(
+        operations.is_empty(),
+        "only the two payload slots are protected"
+    );
+    cleanup_test_base(&base);
+}
+
+#[test]
+fn prompt_globals_agent_start_child_separator_is_unchanged() {
+    let base = unique_test_dir();
+    let socket_path = base.join("herdr.sock");
+    let child_args = [
+        "--session",
+        "child",
+        "--session=child",
+        "--remote",
+        "host",
+        "--remote=host",
+        "--remote-keybindings=server",
+        "--handoff",
+    ];
+    let mut args = vec![
+        "agent", "start", "worker", "--kind", "pi", "--pane", "w1:p1", "--",
+    ];
+    args.extend(child_args);
+    let (output, operations) = record_prompt_cli(&socket_path, || run_cli(&socket_path, &args));
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("recorded_start"));
+    assert_eq!(operations.len(), 2);
+    assert_eq!(operations[0]["method"], "pane.get");
+    assert_eq!(operations[1]["method"], "agent.start");
+    assert_eq!(
+        operations[1]["params"]["args"],
+        serde_json::json!(child_args)
+    );
+    cleanup_test_base(&base);
+}

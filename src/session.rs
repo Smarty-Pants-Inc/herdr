@@ -42,6 +42,35 @@ pub struct SessionInfo {
     pub session_dir: String,
 }
 
+/// The prompt leaf parser owns exactly two literal argv values: TARGET and TEXT.
+/// Locate those slots before either global extractor can remove flag-shaped data.
+/// Only skip options these extractors remove; all other command paths keep their
+/// existing full-argv scans, and options after the two slots remain global.
+pub(crate) fn agent_prompt_payload_slots(args: &[String]) -> std::ops::Range<usize> {
+    let mut index = 1;
+    for command in ["agent", "prompt"] {
+        while let Some(arg) = args.get(index) {
+            match arg.as_str() {
+                "--session" | "--remote" | "--remote-keybindings" => index += 2,
+                "--handoff" => index += 1,
+                value
+                    if value.starts_with("--session=")
+                        || value.starts_with("--remote=")
+                        || value.starts_with("--remote-keybindings=") =>
+                {
+                    index += 1;
+                }
+                _ => break,
+            }
+        }
+        if args.get(index).map(String::as_str) != Some(command) {
+            return 0..0;
+        }
+        index += 1;
+    }
+    index..index + 2
+}
+
 pub fn configure_from_args(args: &[String]) -> Result<Vec<String>, String> {
     let mut cleaned = Vec::with_capacity(args.len());
     if let Some(program) = args.first() {
@@ -67,6 +96,7 @@ pub fn configure_from_args(args: &[String]) -> Result<Vec<String>, String> {
         return Ok(cleaned);
     }
 
+    let payload_slots = agent_prompt_payload_slots(args);
     let mut requested_session = None;
     let mut index = 1;
     while index < args.len() {
@@ -74,6 +104,11 @@ pub fn configure_from_args(args: &[String]) -> Result<Vec<String>, String> {
         if arg == "--" {
             cleaned.extend_from_slice(&args[index..]);
             break;
+        }
+        if payload_slots.contains(&index) {
+            cleaned.push(arg.clone());
+            index += 1;
+            continue;
         }
         if arg == "--session" {
             let Some(value) = args.get(index + 1) else {
