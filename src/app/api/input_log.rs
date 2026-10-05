@@ -57,6 +57,30 @@ impl App {
         let caller_agent = caller
             .as_ref()
             .and_then(|target| self.agent_info(target.ws_idx, target.pane_id));
+        let mut caller_fields = serde_json::json!({
+            "pid": context.local_peer_pid(),
+            "pane": caller_pane,
+            "agent": caller_agent.as_ref().and_then(|agent| agent.name.clone()),
+            "session": caller_agent
+                .as_ref()
+                .and_then(|agent| agent.agent_session.as_ref())
+                .map(|session| session.value.clone()),
+        });
+        // One best-effort snapshot per logged write, independent of pane attribution.
+        if let Some(metadata) = context
+            .local_peer_identity
+            .and_then(crate::platform::process_caller_metadata)
+        {
+            if let Some(exe) = metadata.exe {
+                caller_fields["exe"] = exe.into();
+            }
+            if let Some(ppid) = metadata.ppid {
+                caller_fields["ppid"] = ppid.into();
+            }
+            if let Some(unit) = metadata.unit {
+                caller_fields["unit"] = unit.into();
+            }
+        }
         let ts_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|elapsed| elapsed.as_millis())
@@ -71,15 +95,7 @@ impl App {
                 .terminal_id_for_pane(ws_idx, pane_id)
                 .map(|terminal| terminal.to_string()),
             "bytes": bytes,
-            "caller": {
-                "pid": context.local_peer_pid(),
-                "pane": caller_pane,
-                "agent": caller_agent.as_ref().and_then(|agent| agent.name.clone()),
-                "session": caller_agent
-                    .as_ref()
-                    .and_then(|agent| agent.agent_session.as_ref())
-                    .map(|session| session.value.clone()),
-            },
+            "caller": caller_fields,
         })
         .to_string()
     }

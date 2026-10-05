@@ -1026,6 +1026,13 @@ pub(crate) fn process_identity(pid: u32) -> Option<crate::platform::ProcessIdent
     if info.pbi_status == libc::SZOMB {
         return None;
     }
+    process_identity_from_bsdinfo(pid, &info)
+}
+
+fn process_identity_from_bsdinfo(
+    pid: u32,
+    info: &libc::proc_bsdinfo,
+) -> Option<crate::platform::ProcessIdentity> {
     let start_time = info
         .pbi_start_tvsec
         .checked_mul(1_000_000)?
@@ -1033,22 +1040,51 @@ pub(crate) fn process_identity(pid: u32) -> Option<crate::platform::ProcessIdent
     Some(crate::platform::ProcessIdentity { pid, start_time })
 }
 
+pub(crate) fn process_caller_metadata_platform(
+    peer: super::ProcessIdentity,
+) -> Option<super::CallerMetadata> {
+    if peer.pid == 0 {
+        return None;
+    }
+    let info = process_bsdinfo(peer.pid)?;
+    if info.pbi_status == libc::SZOMB
+        || process_identity_from_bsdinfo(peer.pid, &info) != Some(peer)
+    {
+        return None;
+    }
+    let metadata = super::CallerMetadata {
+        exe: process_executable_basename(peer.pid),
+        ppid: Some(info.pbi_ppid),
+        unit: None,
+    };
+    (process_identity(peer.pid) == Some(peer)).then_some(metadata)
+}
+
+/// Best-effort diagnostic path lookup; the caller pins the process generation
+/// before and after this numeric-PID query, independently of its success.
+fn process_executable_basename(pid: u32) -> Option<String> {
+    let pid = libc::c_int::try_from(pid).ok()?;
+    let mut buffer = [0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    // SAFETY: libproc receives a valid writable buffer and its exact capacity.
+    let length =
+        unsafe { libc::proc_pidpath(pid, buffer.as_mut_ptr().cast(), buffer.len() as u32) };
+    let length = usize::try_from(length).ok()?;
+    if length == 0 || length >= buffer.len() {
+        return None;
+    }
+    let end = buffer[..=length].iter().position(|&byte| byte == 0)?;
+    Path::new(OsStr::from_bytes(&buffer[..end]))
+        .file_name()?
+        .to_str()
+        .map(str::to_owned)
+}
+
 pub(crate) fn parent_process_identity(
     identity: crate::platform::ProcessIdentity,
 ) -> Option<crate::platform::ProcessIdentity> {
     let info = process_bsdinfo(identity.pid)?;
-    let start_time = info
-        .pbi_start_tvsec
-        .checked_mul(1_000_000)?
-        .checked_add(info.pbi_start_tvusec)?;
-    crate::platform::checked_parent_process_identity(
-        identity,
-        crate::platform::ProcessIdentity {
-            pid: identity.pid,
-            start_time,
-        },
-        info.pbi_ppid,
-    )
+    let observed = process_identity_from_bsdinfo(identity.pid, &info)?;
+    crate::platform::checked_parent_process_identity(identity, observed, info.pbi_ppid)
 }
 
 /// Prove that a live peer is not descended from this server using the shared,

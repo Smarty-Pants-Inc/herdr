@@ -952,6 +952,14 @@ terminal, the byte count, and the caller as herdr knows it from the socket peer 
 its pid, pane, agent name, and agent session. It never records the text. If herdr cannot
 write the line, it refuses the input with `input_log_unavailable`.
 
+On Linux and macOS, `caller.exe` and `caller.ppid` record the executable basename
+(not a mutable process label) and parent PID at write time, even when the caller is
+outside every pane. Linux also
+records `caller.unit` when the caller's cgroup names a systemd `.service` or `.scope`.
+These fields are omitted when unavailable; they are not recorded on Windows or other
+platforms. Metadata lookup failure does not refuse input. Typed input does not add an
+API log record.
+
 A reader of an agent's session can then tell turns that the API sent into a pane from
 turns typed there, without anything in the terminal byte stream.
 
