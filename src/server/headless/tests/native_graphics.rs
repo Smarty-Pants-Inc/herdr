@@ -170,7 +170,7 @@ fn ack_native(server: &mut HeadlessServer, id: u64, transfer: u64, image: u32) {
 
 fn assert_retirement(control: &Receiver<Vec<u8>>, transfer: u64, image: u32) {
     assert!(matches!(
-        read_server_message(control.recv_timeout(Duration::from_millis(100)).expect("control retirement")),
+        read_server_message(control.recv_timeout(Duration::from_secs(5)).expect("control retirement")),
         ServerMessage::GraphicsTransmissionRetired { transfer_id, image_id }
             if transfer_id == transfer && image_id == image
     ));

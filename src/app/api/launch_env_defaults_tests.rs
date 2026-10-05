@@ -409,7 +409,10 @@ async fn defaults_survive_a_server_restart_on_the_restored_record_only() {
         }
     }
     assert!(copies > 0, "expected a recovery copy of the session with A");
-    let (d, _d_root) = h.create_workspace(&[]);
+    let (d, d_root) = h.create_workspace(&[]);
+    // Every other launched pane has already published its capture. Wait for D
+    // too before cleanup can encounter its in-flight .tmp write/rename.
+    assert_eq!(h.seen(&d_root), UNSET);
     let d_idx = h.app.parse_workspace_id(&d).unwrap();
     h.app.state.workspaces[d_idx].id = a.clone();
     forget_recorded_panes(&h.dir);

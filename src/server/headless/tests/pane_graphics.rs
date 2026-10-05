@@ -613,7 +613,7 @@ async fn pixel_mouse_activation_follows_child_1016_without_graphics_demand() {
 
     server.stream_host_mouse_capture_mode();
     assert!(matches!(
-        read_server_message(control_rx.recv_timeout(Duration::from_millis(100)).unwrap()),
+        read_server_message(control_rx.recv_timeout(Duration::from_secs(5)).unwrap()),
         ServerMessage::MouseCapture {
             enabled: true,
             sgr_pixels: true

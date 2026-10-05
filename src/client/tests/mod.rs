@@ -321,6 +321,55 @@ fn kitty_graphics_image_id_parser_tracks_herdr_ids_only() {
 }
 
 #[test]
+fn kitty_graphics_test_ledgers_isolate_overlapping_output_and_cleanup() {
+    let upload = b"\x1b_Ga=T,i=490004;AAAA\x1b\\";
+    let expected = b"\x1b_Ga=d,d=I,i=490004,q=2;\x1b\\";
+    // The parent also owns the same ID, through the raw/direct upload path.
+    super::frame_output::record_pending_kitty_uploads(upload);
+    let (uploaded_tx, uploaded_rx) = std::sync::mpsc::channel();
+    let (cleaned_tx, cleaned_rx) = std::sync::mpsc::channel();
+    let timeout = std::time::Duration::from_secs(10);
+    let (first, second) = std::thread::scope(|scope| {
+        let first = scope.spawn(move || {
+            write_encoded_frame_with_graphics(&mut Vec::new(), b"frame", upload).unwrap();
+            uploaded_rx.recv_timeout(timeout).unwrap();
+            let mut cleanup = Vec::new();
+            clear_received_kitty_graphics(&mut cleanup).unwrap();
+            cleaned_tx.send(()).unwrap();
+            cleanup
+        });
+        let second = scope.spawn(move || {
+            let graphics = crate::kitty_graphics::GraphicsOutput::from_bytes(upload.to_vec());
+            super::frame_output::write_composed_frame(
+                &mut Vec::new(),
+                b"frame",
+                &graphics,
+                &mut super::image_files::FileTransport::default(),
+            )
+            .unwrap();
+            uploaded_tx.send(()).unwrap();
+            // Force cleanup in the other thread before observing this obligation.
+            cleaned_rx.recv_timeout(timeout).unwrap();
+            let mut cleanup = Vec::new();
+            clear_received_kitty_graphics(&mut cleanup).unwrap();
+            cleanup
+        });
+        (first.join().unwrap(), second.join().unwrap())
+    });
+    assert_eq!(first, expected);
+    assert_eq!(second, expected);
+    let mut cleanup = Vec::new();
+    clear_received_kitty_graphics(&mut cleanup).unwrap();
+    assert_eq!(cleanup, expected);
+    cleanup.clear();
+    clear_received_kitty_graphics(&mut cleanup).unwrap();
+    assert!(
+        cleanup.is_empty(),
+        "successful teardown must retire the obligation"
+    );
+}
+
+#[test]
 fn sec_r2_fresh_upload_failure_preserves_obligation_at_every_write_boundary() {
     struct Broken {
         remaining: usize,

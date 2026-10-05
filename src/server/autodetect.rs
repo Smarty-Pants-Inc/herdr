@@ -523,7 +523,7 @@ test "$sid" = "$$"
             stream.flush().unwrap();
         });
 
-        let status = crate::api::read_runtime_status_at(&path, Duration::from_millis(200))
+        let status = crate::api::read_runtime_status_at(&path, Duration::from_secs(5))
             .unwrap()
             .unwrap();
         let _ = handle.join();

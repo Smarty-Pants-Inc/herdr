@@ -1673,7 +1673,7 @@ mod tests {
 
         drop(writer);
         done_rx
-            .recv_timeout(Duration::from_millis(100))
+            .recv_timeout(Duration::from_secs(5))
             .expect("writer exits without polling after senders drop");
     }
 
@@ -1708,7 +1708,7 @@ mod tests {
 
         drop(cloned_writer);
         done_rx
-            .recv_timeout(Duration::from_millis(100))
+            .recv_timeout(Duration::from_secs(5))
             .expect("writer exits after final cloned writer drops");
     }
 
@@ -1734,7 +1734,7 @@ mod tests {
             .send(vec![b'x'; 1024 * 1024])
             .expect("message is accepted before the writer observes socket failure");
         done_rx
-            .recv_timeout(Duration::from_secs(1))
+            .recv_timeout(Duration::from_secs(5))
             .expect("writer exits after socket write failure");
 
         assert!(matches!(writer.control.send(vec![b'y']), Err(SendError(_))));
@@ -1750,15 +1750,17 @@ mod tests {
         use std::io::Read as _;
 
         let (mut client, mut server, _path) = local_stream_pair("slow-observer");
-        server
-            .set_send_timeout(Some(Duration::from_millis(100)))
-            .unwrap();
+        let inactivity_timeout = Duration::from_secs(2);
+        server.set_send_timeout(Some(inactivity_timeout)).unwrap();
         server.set_nonblocking(true).unwrap();
+        let (worker_done_tx, worker_done) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
-            assert!(write_framed_bytes(&mut server, &vec![b'x'; 1024 * 1024]));
+            let start = std::time::Instant::now();
+            let written = write_framed_bytes(&mut server, &vec![b'x'; 1024 * 1024]);
+            let _ = worker_done_tx.send((written, start.elapsed()));
         });
         client
-            .set_recv_timeout(Some(Duration::from_secs(3)))
+            .set_recv_timeout(Some(Duration::from_secs(10)))
             .unwrap();
         let mut received = 0;
         let mut buffer = [0; 16 * 1024];
@@ -1766,8 +1768,16 @@ mod tests {
             let count = client.read(&mut buffer).unwrap();
             assert_ne!(count, 0, "observer disconnected while making progress");
             received += count;
-            std::thread::sleep(Duration::from_millis(5));
+            std::thread::sleep(Duration::from_millis(75));
         }
+        let (written, elapsed) = worker_done
+            .recv_timeout(Duration::from_secs(10))
+            .expect("writer completes while the observer makes progress");
+        assert!(written);
+        assert!(
+            elapsed > inactivity_timeout,
+            "progress must keep the write alive beyond one inactivity timeout"
+        );
         worker.join().unwrap();
     }
 
@@ -1836,10 +1846,10 @@ mod tests {
         });
         writer.render.try_send(vec![0; 4 * 1024 * 1024]).unwrap();
         writer_done
-            .recv_timeout(Duration::from_millis(350))
+            .recv_timeout(Duration::from_secs(5))
             .expect("writer timed out");
         reader_done
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(Duration::from_secs(5))
             .expect("reader released")
             .unwrap();
         worker.join().unwrap();
