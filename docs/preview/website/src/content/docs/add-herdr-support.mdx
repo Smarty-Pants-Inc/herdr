@@ -89,7 +89,7 @@ If your agent exits without releasing, Herdr notices once the pane is back at it
 
 - Don't let Herdr slow your agent down. Send reports in the background or with a short timeout, and ignore failures.
 - Send only the latest state. If several changes queue up while a report is in flight, drop the older ones.
-- The CLI `--` resume suffix needs Herdr 0.9.2 or later (this release is 0.9.3). Older CLIs reject that suffix and send no report, so version-gate it: send the plain state or session report on older versions. Socket clients can continue to use optional `resume_argv` fields.
+- Older Herdr versions ignore the resume command, so everything else keeps working there.
 
 ## Use the socket directly
 
