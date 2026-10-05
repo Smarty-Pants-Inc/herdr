@@ -5,9 +5,15 @@ on:
     types: [opened, synchronize, reopened]
   push:
     branches: [master, windows]
-  # A maintainer dispatches the full matrix, macOS included, on a pushed exact merge candidate,
-  # because queue entry needs review/astra and Astra can require macOS first (smarty-dev#4345).
+  # Hosted macOS is opt-in and needs the product owner's spend yes (smarty-dev#1246).
+  # Native macOS evidence comes from the owned Mac until Herdr CI is admitted
+  # to the owned Mac runner group.
   workflow_dispatch:
+    inputs:
+      hosted_macos:
+        description: Run hosted macOS checks (requires product owner's spend yes)
+        type: boolean
+        default: false
 
 permissions:
   contents: read

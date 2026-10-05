@@ -120,60 +120,42 @@ class CIPlanTests(unittest.TestCase):
         self.assertEqual(matrix, BASE_MATRIX)
         self.assertFalse(conpty)
 
-    def test_master_push_keeps_full_matrix_even_for_docs_only(self) -> None:
+    def test_push_keeps_linux_and_windows_even_for_docs_only(self) -> None:
         self.write("docs/page.md")
-        matrix, conpty = self.plan(self.event(self.commit()), "push")
-        self.assertEqual(matrix, FULL_MATRIX)
-        self.assertFalse(conpty)
+        event = self.event(self.commit())
+        event["inputs"] = {"hosted_macos": "true"}
+        for branch in ("master", "windows", "smarty-preview-source"):
+            with self.subTest(branch=branch):
+                event["ref"] = f"refs/heads/{branch}"
+                self.assertEqual(self.plan(event, "push"), (BASE_MATRIX, False))
 
-    def test_manual_dispatch_selects_full_matrix_and_conservative_conpty(self) -> None:
-        self.write("docs/page.md")
-        self.assertEqual(self.plan({"ref": "refs/heads/ci/candidate", "inputs": {}}, "workflow_dispatch"), (FULL_MATRIX, True))
+    def test_manual_dispatch_requires_explicit_hosted_macos_opt_in(self) -> None:
+        for inputs in (None, {}, {"hosted_macos": False}, {"hosted_macos": "false"}):
+            with self.subTest(inputs=inputs):
+                event = {"ref": "refs/heads/ci/candidate"}
+                if inputs is not None:
+                    event["inputs"] = inputs
+                self.assertEqual(self.plan(event, "workflow_dispatch"), (BASE_MATRIX, True))
 
-    def test_windows_push_does_not_select_macos(self) -> None:
-        event = self.event()
-        event["ref"] = "refs/heads/windows"
-        self.assertEqual(self.plan(event, "push"), (BASE_MATRIX, False))
+    def test_manual_dispatch_opt_in_selects_macos_with_filter(self) -> None:
+        for value in (True, "true"):
+            with self.subTest(value=value):
+                event = {"ref": "refs/heads/ci/candidate", "inputs": {"hosted_macos": value}}
+                self.assertEqual(self.plan(event, "workflow_dispatch"), (FULL_MATRIX, True))
+                self.assertEqual(FULL_MATRIX["include"][1]["nextest_filter"], ci_plan.MACOS_FILTER)
 
-    def test_genuine_queue_selects_macos_on_both_supported_bases_without_draft(self) -> None:
+    def test_queue_keeps_linux_and_windows_on_both_supported_bases(self) -> None:
         for base in ("master", "smarty-preview-source"):
             for draft in (False, True, None):
                 with self.subTest(base=base, draft=draft):
                     event = self.event(queue=True)
+                    event["inputs"] = {"hosted_macos": "true"}
                     event["pull_request"]["base"]["ref"] = base
                     if draft is None:
                         del event["pull_request"]["draft"]
                     else:
                         event["pull_request"]["draft"] = draft
-                    self.assertEqual(self.plan(event), (FULL_MATRIX, False))
-
-    def test_queue_identity_requires_all_gates(self) -> None:
-        changes = (
-            ("user", "id", 123),
-            ("user", "id", "37929162"),
-            ("user", "id", 37929162.0),
-            ("head", "ref", "feature"),
-            ("head", "ref", None),
-            ("base", "ref", "windows"),
-            ("head", "repo", {"full_name": "external/herdr"}),
-            ("head", "repo", None),
-            ("base", "repo", {}),
-        )
-        for section, key, value in changes:
-            with self.subTest(section=section, key=key, value=value):
-                event = self.event(queue=True)
-                event["pull_request"][section][key] = value
-                self.assertEqual(self.plan(event)[0], BASE_MATRIX)
-        event = self.event(queue=True)
-        event["ref"] = "refs/heads/windows"
-        self.assertEqual(self.plan(event, "push")[0], BASE_MATRIX)
-
-    def test_preview_source_ordinary_pr_and_push_do_not_select_macos(self) -> None:
-        event = self.event()
-        event["pull_request"]["base"]["ref"] = "smarty-preview-source"
-        event["ref"] = "refs/heads/smarty-preview-source"
-        self.assertEqual(self.plan(event)[0], BASE_MATRIX)
-        self.assertEqual(self.plan(event, "push")[0], BASE_MATRIX)
+                    self.assertEqual(self.plan(event), (BASE_MATRIX, False))
 
     def test_all_build_and_package_inputs_enable_conpty(self) -> None:
         paths = (
