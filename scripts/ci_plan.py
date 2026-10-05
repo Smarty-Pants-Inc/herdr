@@ -48,30 +48,9 @@ def object_or_empty(value: object) -> dict:
 
 
 def check_matrix(event_name: str, event: dict) -> dict:
-    pr = object_or_empty(event.get("pull_request"))
-    head = object_or_empty(pr.get("head"))
-    base = object_or_empty(pr.get("base"))
-    head_repo = object_or_empty(head.get("repo")).get("full_name")
-    base_repo = object_or_empty(base.get("repo")).get("full_name")
-    author = object_or_empty(pr.get("user")).get("id")
-    head_ref = head.get("ref")
-    queue = (
-        event_name == "pull_request"
-        and type(author) is int
-        and author == 37929162
-        and isinstance(head_ref, str)
-        and head_ref.startswith("mergify/merge-queue/")
-        and base.get("ref") in ("master", "smarty-preview-source")
-        and isinstance(head_repo, str)
-        and bool(head_repo)
-        and head_repo == base_repo
-    )
+    hosted_macos = object_or_empty(event.get("inputs")).get("hosted_macos")
     include = [{"os": "ubuntu-latest", "kind": "unix", "nextest_filter": "all()"}]
-    if (
-        queue
-        or (event_name == "push" and event.get("ref") == "refs/heads/master")
-        or event_name == "workflow_dispatch"
-    ):
+    if event_name == "workflow_dispatch" and (hosted_macos is True or hosted_macos == "true"):
         include.append({"os": "macos-latest", "kind": "unix", "nextest_filter": MACOS_FILTER})
     include.append({"os": "windows-latest", "kind": "windows"})
     return {"include": include}
