@@ -6,6 +6,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -28,7 +29,7 @@ STARTED = "2026-10-03T11:00:00Z"
 FINISHED = "2026-10-03T11:30:00Z"
 EXPECTED_JOBS = {"smarty-ci", "check (ubuntu-latest)",
                  "check (windows-latest)", "conventional-commits"}
-CONPTY_JOB = "windows-conpty-package"
+CONPTY_JOB = "Windows ConPTY package"
 FAKE_TOKEN = "fake-job-log-token"
 REAL_POPEN = subprocess.Popen
 
@@ -204,6 +205,23 @@ class EvidenceTests(unittest.TestCase):
             self.assertIn(reason, result["reason"])
         return result
 
+    def test_required_build_job_names_match_workflow_display_names(self):
+        workflow = (Path(__file__).resolve().parents[1] / dedupe.WORKFLOW).read_text(encoding="utf-8")
+        # These exact top-level job/name lines are the REST job.name contract;
+        # avoid a YAML dependency for this maintenance test.
+        def display_name(job_id):
+            matches = re.findall(r"^  " + re.escape(job_id) + r":\n    name: ([^\n]+)$",
+                                 workflow, re.MULTILINE)
+            self.assertEqual(len(matches), 1, job_id)
+            return matches[0]
+
+        self.assertEqual(dedupe.CONPTY_JOB, display_name("windows-conpty-package"))
+        self.assertEqual(CONPTY_JOB, dedupe.CONPTY_JOB)
+        check_name = display_name("check")
+        expected = {check_name.replace("${{ matrix.os }}", lane["os"]) for lane in
+                    ci_plan.check_matrix("pull_request", {})["include"]}
+        self.assertEqual(dedupe.MATRIX_JOBS, expected)
+
     def test_exact_queue_proof(self):
         result = self.inspect()
         self.assertIs(result["dedupe"], True, result)
@@ -373,7 +391,8 @@ class EvidenceTests(unittest.TestCase):
                              ("completed_at", "2026-10-03T12:00:01Z")]:
             with self.subTest(field=field):
                 self.api = FixtureApi()
-                self.api.jobs[0][field] = value
+                job = next(j for j in self.api.jobs if j["name"] == "check (ubuntu-latest)")
+                job[field] = value
                 self.fallback()
 
     def test_required_job_missing_duplicate_or_conflicting_failure(self):

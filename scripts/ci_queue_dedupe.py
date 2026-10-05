@@ -53,7 +53,7 @@ MERGIFY_ID = 37929162
 WORKFLOW = ".github/workflows/ci.yml"
 MATRIX_JOBS = {f"check ({lane['os']})" for lane in check_matrix("pull_request", {})["include"]}
 REQUIRED_JOBS = {"smarty-ci", "conventional-commits"} | MATRIX_JOBS
-CONPTY_JOB = "windows-conpty-package"
+CONPTY_JOB = "Windows ConPTY package"
 SUBJECT = re.compile(
     r"^(?:feat|fix|perf|docs|ci|test|refactor|chore|release)"
     r"(?:\([^)\r\n]+\))?!?:\s+\S.* \(#([1-9][0-9]*)\)$"
