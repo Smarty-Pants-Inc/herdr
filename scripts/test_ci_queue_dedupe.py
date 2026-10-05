@@ -6,6 +6,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -16,6 +17,7 @@ import unittest
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 
+from scripts import ci_plan
 from scripts import ci_queue_dedupe as dedupe
 
 REPO = "example/herdr"
@@ -25,8 +27,9 @@ CHECKED = f"{8:040x}"
 COMMITTED = "2026-10-03T12:00:00Z"
 STARTED = "2026-10-03T11:00:00Z"
 FINISHED = "2026-10-03T11:30:00Z"
-EXPECTED_JOBS = {"smarty-ci", "check (ubuntu-latest)", "check (macos-latest)",
+EXPECTED_JOBS = {"smarty-ci", "check (ubuntu-latest)",
                  "check (windows-latest)", "conventional-commits"}
+CONPTY_JOB = "Windows ConPTY package"
 FAKE_TOKEN = "fake-job-log-token"
 REAL_POPEN = subprocess.Popen
 
@@ -135,10 +138,10 @@ class FixtureApi:
         self.jobs = [{"id": 1000 + index, "name": name, "run_id": 7, "run_attempt": 1, "head_sha": HEAD,
                       "status": "completed", "conclusion": "success",
                       "started_at": STARTED, "completed_at": FINISHED}
-                     for index, name in enumerate(sorted(EXPECTED_JOBS))]
+                     for index, name in enumerate(sorted(EXPECTED_JOBS | {CONPTY_JOB}))]
         self.attempts = {(7, 1): self.jobs}
         self.logs = {f"repos/{REPO}/actions/jobs/{job['id']}/logs": checkout_log()
-                     for job in self.jobs if job["name"].startswith("check (")}
+                     for job in self.jobs if job["name"].startswith("check (") or job["name"] == CONPTY_JOB}
         self.calls = []
         self.fail = None
 
@@ -202,6 +205,23 @@ class EvidenceTests(unittest.TestCase):
             self.assertIn(reason, result["reason"])
         return result
 
+    def test_required_build_job_names_match_workflow_display_names(self):
+        workflow = (Path(__file__).resolve().parents[1] / dedupe.WORKFLOW).read_text(encoding="utf-8")
+        # These exact top-level job/name lines are the REST job.name contract;
+        # avoid a YAML dependency for this maintenance test.
+        def display_name(job_id):
+            matches = re.findall(r"^  " + re.escape(job_id) + r":\n    name: ([^\n]+)$",
+                                 workflow, re.MULTILINE)
+            self.assertEqual(len(matches), 1, job_id)
+            return matches[0]
+
+        self.assertEqual(dedupe.CONPTY_JOB, display_name("windows-conpty-package"))
+        self.assertEqual(CONPTY_JOB, dedupe.CONPTY_JOB)
+        check_name = display_name("check")
+        expected = {check_name.replace("${{ matrix.os }}", lane["os"]) for lane in
+                    ci_plan.check_matrix("pull_request", {})["include"]}
+        self.assertEqual(dedupe.MATRIX_JOBS, expected)
+
     def test_exact_queue_proof(self):
         result = self.inspect()
         self.assertIs(result["dedupe"], True, result)
@@ -212,10 +232,31 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(result["range"][0]["merged_by_id"], dedupe.MERGIFY_ID)
         self.assertEqual(result["range"][0]["committer_id"], 19864447)
         self.assertEqual(dedupe.REQUIRED_JOBS, EXPECTED_JOBS)
-        self.assertEqual(result["candidates"][0]["checkout_evidence"], "three matrix checkout logs")
+        self.assertEqual(result["candidates"][0]["checkout_evidence"], "3 selected build checkout logs")
+        planned = {f"check ({lane['os']})" for lane in
+                   ci_plan.check_matrix("pull_request", {"pull_request": self.api.queue})["include"]}
+        self.assertEqual(planned, {"check (ubuntu-latest)", "check (windows-latest)"})
+        self.assertEqual({c["job"] for c in result["candidates"][0]["checkouts"]}, planned | {CONPTY_JOB})
         self.assertEqual({c["sha"] for c in result["candidates"][0]["checkouts"]}, {CHECKED})
         self.assertTrue(any("/attempts/1/jobs?" in call for call in self.api.calls))
         self.assertFalse(any("check-runs" in call for call in self.api.calls))
+
+    def test_two_lane_queue_with_explicitly_skipped_conpty_is_reusable(self):
+        package = next(job for job in self.api.jobs if job["name"] == CONPTY_JOB)
+        package.update(conclusion="skipped", started_at=None, completed_at=None)
+        del self.api.logs[f"repos/{REPO}/actions/jobs/{package['id']}/logs"]
+        result = self.inspect()
+        self.assertTrue(result["dedupe"], result)
+        self.assertEqual(len(result["candidates"][0]["checkouts"]), 2)
+        self.assertEqual(result["candidates"][0]["checkout_evidence"], "2 selected build checkout logs")
+        self.assertFalse(any(f"/jobs/{package['id']}/logs" in call for call in self.api.calls))
+        self.api.jobs.remove(package)
+        self.fallback("missing or duplicate required job: " + CONPTY_JOB)
+
+    def test_conpty_neutral_is_not_selection_evidence(self):
+        package = next(job for job in self.api.jobs if job["name"] == CONPTY_JOB)
+        package["conclusion"] = "neutral"
+        self.fallback("neither successful nor explicitly skipped")
 
     def test_direct_push_spoofed_email_or_login_not_identity(self):
         self.api.commits[AFTER]["committer"] = {"id": 1, "login": "mergify[bot]"}
@@ -350,11 +391,12 @@ class EvidenceTests(unittest.TestCase):
                              ("completed_at", "2026-10-03T12:00:01Z")]:
             with self.subTest(field=field):
                 self.api = FixtureApi()
-                self.api.jobs[0][field] = value
+                job = next(j for j in self.api.jobs if j["name"] == "check (ubuntu-latest)")
+                job[field] = value
                 self.fallback()
 
     def test_required_job_missing_duplicate_or_conflicting_failure(self):
-        for name in sorted(EXPECTED_JOBS):
+        for name in sorted(EXPECTED_JOBS | {CONPTY_JOB}):
             with self.subTest(missing=name):
                 self.api = FixtureApi()
                 self.api.jobs[:] = [j for j in self.api.jobs if j["name"] != name]
@@ -560,8 +602,8 @@ class EvidenceTests(unittest.TestCase):
                     expected = "latest queue CI run is not successful"
                 else:
                     self.api.jobs[:] = [job for job in self.api.jobs
-                                        if job["name"] != "check (macos-latest)"]
-                    expected = "missing or duplicate required job: check (macos-latest)"
+                                        if job["name"] != "check (ubuntu-latest)"]
+                    expected = "missing or duplicate required job: check (ubuntu-latest)"
                 result = self.fallback()
                 self.assertEqual(len(result["candidates"]), 54)
                 self.assertEqual(result["candidates"][-1]["reason"], expected)
@@ -576,7 +618,7 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(len(result["candidates"]), 1)
         self.assertFalse(any(c.endswith("commits/" + future["head"]["sha"]) for c in self.api.calls))
 
-    def test_all_three_matrix_logs_required_and_no_raw_log_output(self):
+    def test_all_selected_build_logs_required_and_no_raw_log_output(self):
         result = self.inspect()
         self.assertNotIn("[command]", json.dumps(result))
         for endpoint in list(self.api.logs):
