@@ -198,6 +198,71 @@ pub(crate) fn write_config_temporary(
     output.sync_all()
 }
 
+// Exact opaque ABI from the Darwin SDK mach/message.h. Never interpret fields.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct AuditToken {
+    val: [libc::c_uint; 8],
+}
+
+// Exact Darwin libproc.h ABI. Resolve optionally so pre-macOS-11 systems
+// decline attribution rather than failing to load the binary.
+type AuditTokenPathQuery =
+    unsafe extern "C" fn(*mut AuditToken, *mut libc::c_void, u32) -> libc::c_int;
+
+fn audit_token_path_query() -> Option<AuditTokenPathQuery> {
+    static QUERY: OnceLock<Option<AuditTokenPathQuery>> = OnceLock::new();
+    *QUERY.get_or_init(|| {
+        // SAFETY: the symbol name is NUL-terminated; RTLD_DEFAULT searches the
+        // existing native libraries. No new library or process is opened.
+        let symbol =
+            unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"proc_pidpath_audittoken".as_ptr()) };
+        if symbol.is_null() {
+            return None;
+        }
+        // SAFETY: the SDK declares this exact native function-pointer ABI.
+        Some(unsafe { std::mem::transmute::<*mut libc::c_void, AuditTokenPathQuery>(symbol) })
+    })
+}
+
+/// LOCAL_PEERTOKEN retains the original generation. The native audit-token
+/// query checks that generation before/after the numeric start-time lookup;
+/// its path output is discarded and never used for policy or identity.
+pub(super) fn local_socket_peer_identity_platform(fd: RawFd) -> Option<super::ProcessIdentity> {
+    let query = audit_token_path_query()?;
+    let mut token = AuditToken { val: [0; 8] };
+    let mut len = std::mem::size_of::<AuditToken>() as libc::socklen_t;
+    // SAFETY: getsockopt writes into the exact-size opaque audit-token buffer.
+    let status = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERTOKEN,
+            (&mut token as *mut AuditToken).cast(),
+            &mut len,
+        )
+    };
+    if status != 0 || len != std::mem::size_of::<AuditToken>() as libc::socklen_t {
+        return None;
+    }
+    super::capture_bound_peer_identity(
+        || {
+            let mut original_token = token;
+            let mut path = [0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+            // SAFETY: native libproc receives the kernel-provided opaque token
+            // and a valid writable output buffer. Failure means no attribution.
+            unsafe {
+                query(
+                    &mut original_token,
+                    path.as_mut_ptr().cast(),
+                    path.len() as u32,
+                ) > 0
+            }
+        },
+        || process_identity(local_socket_peer_pid_platform(fd)?),
+    )
+}
+
 pub(super) fn local_socket_peer_pid_platform(fd: RawFd) -> Option<u32> {
     let mut pid: libc::pid_t = 0;
     let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
@@ -956,9 +1021,45 @@ fn run_clipboard_command(command: &ClipboardCommand, bytes: &[u8]) -> bool {
     child.wait().map(|status| status.success()).unwrap_or(false)
 }
 
-/// The parent of `pid`, from `proc_pidinfo`. A process gone or unreadable has none.
-pub fn parent_process_id(pid: u32) -> Option<u32> {
-    process_bsdinfo(pid).map(|info| info.pbi_ppid)
+pub(crate) fn process_identity(pid: u32) -> Option<crate::platform::ProcessIdentity> {
+    let info = process_bsdinfo(pid)?;
+    if info.pbi_status == libc::SZOMB {
+        return None;
+    }
+    let start_time = info
+        .pbi_start_tvsec
+        .checked_mul(1_000_000)?
+        .checked_add(info.pbi_start_tvusec)?;
+    Some(crate::platform::ProcessIdentity { pid, start_time })
+}
+
+pub(crate) fn parent_process_identity(
+    identity: crate::platform::ProcessIdentity,
+) -> Option<crate::platform::ProcessIdentity> {
+    let info = process_bsdinfo(identity.pid)?;
+    let start_time = info
+        .pbi_start_tvsec
+        .checked_mul(1_000_000)?
+        .checked_add(info.pbi_start_tvusec)?;
+    crate::platform::checked_parent_process_identity(
+        identity,
+        crate::platform::ProcessIdentity {
+            pid: identity.pid,
+            start_time,
+        },
+        info.pbi_ppid,
+    )
+}
+
+/// Prove that a live peer is not descended from this server using the shared,
+/// chronology-checked walker. Darwin supplies only the pinned process identity
+/// and parent edge observations; the policy and bounded traversal live in
+/// `platform::mod` so Linux tests exercise the same algorithm.
+pub(crate) fn process_identity_outside_server_ancestry(
+    peer: crate::platform::ProcessIdentity,
+) -> Option<bool> {
+    let server = process_identity(std::process::id())?;
+    super::observe_outside_server_ancestry(peer, server, process_identity, parent_process_identity)
 }
 
 fn process_bsdinfo(pid: u32) -> Option<libc::proc_bsdinfo> {
@@ -995,6 +1096,47 @@ fn comm_from_bsdinfo(info: &libc::proc_bsdinfo) -> Option<String> {
 fn process_argv(pid: u32) -> Option<Vec<String>> {
     let buf = kern_procargs2(pid)?;
     procargs2_argv(&buf)
+}
+
+/// Capture the peer's initial environment while its process instance remains pinned.
+/// A failed or malformed environment is unknown; an empty readable environment is absence.
+pub(crate) fn process_initial_environment(
+    peer: super::ProcessIdentity,
+) -> Option<Vec<(String, String)>> {
+    if peer.pid == 0 || super::process_identity(peer.pid) != Some(peer) {
+        return None;
+    }
+    let buffer = kern_procargs2(peer.pid)?;
+    let environment = procargs2_env(&buffer)?;
+    if super::process_identity(peer.pid) != Some(peer) {
+        return None;
+    }
+    parse_initial_environment(environment)
+}
+
+fn parse_initial_environment(bytes: &[u8]) -> Option<Vec<(String, String)>> {
+    if !bytes.is_empty() && bytes.last() != Some(&0) {
+        return None;
+    }
+    let mut pairs = Vec::new();
+    let mut trailing_empty = false;
+    for record in bytes.split(|&byte| byte == 0) {
+        if record.is_empty() {
+            trailing_empty = true;
+            continue;
+        }
+        if trailing_empty {
+            return None;
+        }
+        let separator = record.iter().position(|&byte| byte == b'=')?;
+        if separator == 0 {
+            return None;
+        }
+        let key = std::str::from_utf8(&record[..separator]).ok()?;
+        let value = std::str::from_utf8(&record[separator + 1..]).ok()?;
+        pairs.push((key.to_string(), value.to_string()));
+    }
+    Some(pairs)
 }
 
 /// Read a Herdr agent identity hint from a process environment.
@@ -1068,9 +1210,31 @@ fn procargs2_env(buf: &[u8]) -> Option<&[u8]> {
     }
 
     let rest = &buf[4..];
+    // A missing executable is malformed, not readable environment absence.
+    if rest.first() == Some(&0) {
+        return None;
+    }
     let argv_start = procargs2_argv_start(rest)?;
     let env_start = skip_nul_strings(rest, argv_start, argc as usize)?;
-    rest.get(env_start..)
+    let environment = rest.get(env_start..)?;
+    // Darwin can omit the entire environment even for a known marked exec.
+    // No bytes after argv is missing evidence, not an explicit empty record.
+    if environment.is_empty() {
+        return None;
+    }
+    let mut end = 0;
+    while end < environment.len() {
+        let record_len = environment[end..].iter().position(|&byte| byte == 0)?;
+        if record_len == 0 {
+            // Darwin follows the empty environment terminator with an Apple
+            // vector. Its strings (even KEY=value strings) are not environment.
+            return Some(&environment[..end]);
+        }
+        end += record_len + 1;
+    }
+    // Retain complete NUL-ended environment prefixes without an Apple vector.
+    // An empty environment is readable only via the explicit terminator above.
+    Some(environment)
 }
 
 /// Get the current working directory of a process.
@@ -1202,6 +1366,142 @@ mod tests {
     use super::*;
 
     #[test]
+    fn accepted_socket_captures_original_identity_and_readable_initial_environment() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::{UnixListener, UnixStream};
+
+        // Darwin's sun_path is short; the native runner's TMPDIR can already
+        // consume most of it. Keep this owned socket fixture bounded.
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("test clock")
+            .as_nanos();
+        let path = std::path::Path::new("/tmp")
+            .join(format!("herdr-peer-{}-{suffix}.sock", std::process::id()));
+        let listener = UnixListener::bind(&path).expect("bind test listener");
+        let _client = UnixStream::connect(&path).expect("connect real test socket");
+        let (accepted, _) = listener.accept().expect("accept real test socket");
+        std::fs::remove_file(&path).expect("remove test socket pathname");
+
+        let original = process_identity(std::process::id()).expect("original process pin");
+        let peer = local_socket_peer_identity_platform(accepted.as_raw_fd())
+            .expect("accepted socket audit-token capture");
+        assert_eq!(peer, original);
+        // Exercise the actual KERN_PROCARGS2 read/framing/parser, not a numeric
+        // caller-context seam. Do not log environment values or assume this
+        // runner has no inherited pane markers.
+        assert!(process_initial_environment(peer).is_some());
+        assert_eq!(process_identity(peer.pid), Some(original));
+    }
+
+    struct OwnedTestChild(std::process::Child);
+
+    impl Drop for OwnedTestChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[test]
+    fn native_known_marked_sleep_never_reports_absent() {
+        let child = OwnedTestChild(
+            Command::new("/bin/sleep")
+                .arg("60")
+                .env_clear()
+                .env("LANG", "C")
+                .env("HERDR_ENV", "1")
+                .env("HERDR_PANE_ID", "w9V:p1")
+                .spawn()
+                .expect("real known-marked sleep exec"),
+        );
+        let peer = process_identity(child.0.id()).expect("live sleep pin");
+        let environment = process_initial_environment(peer);
+        let origin = super::super::process_initial_pane_origin(peer);
+        eprintln!(
+            "known_marked_sleep pid={} initial_environment_readable={} origin={origin:?}",
+            peer.pid,
+            environment.is_some()
+        );
+        assert_eq!(
+            origin,
+            if environment.is_some() {
+                super::super::PeerPaneOrigin::HasPane
+            } else {
+                super::super::PeerPaneOrigin::Unknown
+            },
+            "a known marked exec must never become positive absence"
+        );
+    }
+
+    #[test]
+    fn native_real_exec_test_binary_markers_are_readable_has_pane() {
+        use std::io::BufRead;
+        use std::process::Stdio;
+        let mut child = OwnedTestChild(
+            Command::new(std::env::current_exe().expect("unsigned test executable"))
+                .args([
+                    "--exact",
+                    "app::api::input_guard::tests::guard_exec_peer_helper",
+                    "--nocapture",
+                ])
+                .env("HERDR_GUARD_EXEC_HELPER", "marked")
+                .env("HERDR_ENV", "1")
+                .env("HERDR_PANE_ID", "w9V:p1")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .expect("real marked test binary exec"),
+        );
+        let output = std::io::BufReader::new(child.0.stdout.take().expect("helper stdout"));
+        let ready = output.lines().any(|line| {
+            line.expect("exec marker receipt")
+                .ends_with(&format!("guard-exec-ready {}", child.0.id()))
+        });
+        assert!(ready, "exec marker receipt missing");
+        let peer = process_identity(child.0.id()).expect("live test binary pin");
+        assert_eq!(
+            super::super::process_initial_pane_origin(peer),
+            super::super::PeerPaneOrigin::HasPane,
+            "test binary confirmed exec markers but Darwin environment is unobservable or malformed"
+        );
+    }
+
+    #[test]
+    fn live_ordinary_child_reaches_this_server() {
+        let child = OwnedTestChild(
+            Command::new("/bin/sleep")
+                .arg("60")
+                .spawn()
+                .expect("spawn ordinary child"),
+        );
+        let identity = process_identity(child.0.id()).expect("child identity");
+        assert_eq!(
+            process_identity_outside_server_ancestry(identity),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn initial_environment_parser_distinguishes_absence_and_malformed_data() {
+        assert_eq!(
+            parse_initial_environment(b"PATH=/bin\0TERM=xterm\0\0"),
+            Some(vec![
+                ("PATH".to_string(), "/bin".to_string()),
+                ("TERM".to_string(), "xterm".to_string()),
+            ])
+        );
+        assert_eq!(parse_initial_environment(b""), Some(Vec::new()));
+        assert_eq!(parse_initial_environment(b"PATH=/bin"), None);
+        assert_eq!(
+            parse_initial_environment(b"PATH=/bin\0\0TERM=xterm\0"),
+            None
+        );
+        assert_eq!(parse_initial_environment(b"BAD\0"), None);
+        assert_eq!(parse_initial_environment(b"\xff=bad\0"), None);
+    }
+
+    #[test]
     fn nofile_target_raises_low_soft_limit_to_cap_when_hard_is_unlimited() {
         assert_eq!(
             target_nofile_soft_limit(256, libc::RLIM_INFINITY, 8192),
@@ -1281,6 +1581,106 @@ mod tests {
 
         let env = procargs2_env(&buf).expect("expected env block");
         assert_eq!(crate::platform::parse_agent_env_hint(env), None);
+    }
+
+    #[test]
+    fn procargs2_env_stops_before_apple_vector() {
+        for (entries, expected) in [
+            (vec!["PATH=/bin"], super::super::PeerPaneOrigin::Absent),
+            (vec![], super::super::PeerPaneOrigin::Absent),
+            (
+                vec!["HERDR_ENV=1", "HERDR_PANE_ID=w9V:p1"],
+                super::super::PeerPaneOrigin::HasPane,
+            ),
+            (vec!["HERDR_ENV=1"], super::super::PeerPaneOrigin::Unknown),
+            (
+                vec!["HERDR_PANE_ID=w9V:p1"],
+                super::super::PeerPaneOrigin::Unknown,
+            ),
+            (
+                vec!["HERDR_ENV=1", "HERDR_ENV=1", "HERDR_PANE_ID=w9V:p1"],
+                super::super::PeerPaneOrigin::Unknown,
+            ),
+        ] {
+            let mut buf = build_procargs2("/bin/tool", &["tool", "arg"], &entries);
+            // Empty environments require their own explicit record terminator.
+            if entries.is_empty() {
+                buf.push(0);
+            }
+            let expected_env = procargs2_env(&buf)
+                .expect("legacy NUL-ended environment")
+                .to_vec();
+            buf.extend_from_slice(
+                b"\0executable_path=/bin/tool\0HERDR_ENV=1\0HERDR_PANE_ID=w9V:p2\0HERDR_AGENT=claude\0apple-string\0\0\0",
+            );
+            let env = procargs2_env(&buf).expect("environment before Apple vector");
+            assert_eq!(env, expected_env);
+            let pairs = parse_initial_environment(env).expect("readable environment prefix");
+            assert_eq!(super::super::pane_origin_from_environment(&pairs), expected);
+            assert_eq!(super::super::parse_agent_env_hint(env), None);
+        }
+        let mut buf = build_procargs2("/bin/tool", &["tool"], &["HERDR_AGENT=codex"]);
+        buf.extend_from_slice(b"\0HERDR_AGENT=claude\0\0");
+        assert_eq!(
+            super::super::parse_agent_env_hint(procargs2_env(&buf).expect("env prefix")),
+            Some(crate::detect::Agent::Codex)
+        );
+    }
+
+    #[test]
+    fn procargs2_env_missing_block_is_unknown_but_explicit_empty_is_readable() {
+        let mut buf = build_procargs2("/bin/sleep", &["sleep", "60"], &[]);
+        assert_eq!(procargs2_env(&buf), None, "no environment bytes");
+        buf.push(0);
+        assert_eq!(procargs2_env(&buf), Some(&b""[..]));
+        // Do not scan behind an empty separator for apparent hidden markers:
+        // those are Apple-vector strings, not environment evidence.
+        buf.extend_from_slice(b"HERDR_ENV=1\0HERDR_PANE_ID=w9V:p1\0");
+        let env = procargs2_env(&buf).expect("explicit empty record");
+        assert_eq!(env, b"");
+        assert_eq!(
+            super::super::pane_origin_from_environment(
+                &parse_initial_environment(env).expect("readable empty environment")
+            ),
+            super::super::PeerPaneOrigin::Absent
+        );
+    }
+
+    #[test]
+    fn procargs2_env_rejects_malformed_prefix_before_apple_vector() {
+        for entries in [vec!["BAD"], vec!["=bad"], vec!["PATH=/bin", "BAD"]] {
+            let mut buf = build_procargs2("/bin/tool", &["tool"], &entries);
+            buf.extend_from_slice(b"\0HERDR_ENV=1\0HERDR_PANE_ID=w9V:p1\0\0");
+            assert_eq!(
+                parse_initial_environment(procargs2_env(&buf).expect("framed prefix")),
+                None
+            );
+        }
+        let mut invalid_utf8 = build_procargs2("/bin/tool", &["tool"], &[]);
+        invalid_utf8.extend_from_slice(b"KEY=\xff\0\0apple\0");
+        assert_eq!(
+            parse_initial_environment(procargs2_env(&invalid_utf8).expect("framed prefix")),
+            None
+        );
+
+        for buf in [
+            vec![],
+            vec![1, 0, 0],
+            build_procargs2("/bin/tool", &[], &[]),
+            build_procargs2("", &["tool"], &[]),
+            [1i32.to_ne_bytes().as_slice(), b"/bin/tool"].concat(),
+            [1i32.to_ne_bytes().as_slice(), b"/bin/tool\0\0"].concat(),
+            [1i32.to_ne_bytes().as_slice(), b"/bin/tool\0\0tool"].concat(),
+            [2i32.to_ne_bytes().as_slice(), b"/bin/tool\0\0tool\0arg"].concat(),
+            [
+                1i32.to_ne_bytes().as_slice(),
+                b"/bin/tool\0\0tool\0PATH=/bin",
+            ]
+            .concat(),
+            [(-1i32).to_ne_bytes().as_slice(), b"/bin/tool\0\0tool\0"].concat(),
+        ] {
+            assert_eq!(procargs2_env(&buf), None, "malformed framing: {buf:?}");
+        }
     }
 
     #[test]
