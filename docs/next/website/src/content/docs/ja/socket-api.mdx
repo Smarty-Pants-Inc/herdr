@@ -768,6 +768,8 @@ worktree のイベント購読には `worktree.created`、`worktree.opened`、`w
 
 `pane.send_text`、`pane.send_input`、`pane.send_keys`、`agent.send_keys`、`agent.prompt` がペインに書き込む前に、herdr は状態ディレクトリの `api-input.jsonl`（例: `~/.local/state/herdr/api-input.jsonl`。所有者だけが読めるファイル）に JSON を 1 行追記します。行には時刻（`ts_ms`）、メソッド、対象のペインとターミナル、バイト数、そしてソケットのピアプロセスから herdr が知る呼び出し元（pid、ペイン、エージェント名、エージェントセッション）が入ります。テキストは記録しません。herdr がこの行を書けない場合、入力は `input_log_unavailable` で拒否されます。
 
+Linux と macOS では、`caller.exe` と `caller.ppid` に書き込み時の実行ファイルのベース名（変更可能なプロセスラベルではありません）と親 PID を記録します。呼び出し元がどのペインにも属さない場合も同じです。Linux では、呼び出し元の cgroup に systemd の `.service` または `.scope` がある場合、`caller.unit` も記録します。取得できないフィールドは省略し、Windows やその他のプラットフォームではこれらのフィールドを記録しません。メタデータの取得失敗によって入力を拒否することはありません。打鍵された入力は API ログに記録しません。
+
 これにより、エージェントのセッションを読む側は、ターミナルのバイト列に何も加えずに、API がペインに送ったターンと打鍵されたターンを区別できます。
 
 ## ペインの読み取り
