@@ -249,6 +249,10 @@ impl TerminalRuntime {
         self.0.set_full_lifecycle_authority_active(active);
     }
 
+    pub fn set_self_reported_agent_active(&self, active: bool) {
+        self.0.set_self_reported_agent_active(active);
+    }
+
     pub fn resize(&self, rows: u16, cols: u16, cell_width_px: u32, cell_height_px: u32) {
         self.0.resize(rows, cols, cell_width_px, cell_height_px);
     }
@@ -454,6 +458,10 @@ impl TerminalRuntime {
         self.0.kitty_image_placements_with_data_filter(needs_data)
     }
 
+    pub(crate) fn kitty_image_fingerprints(&self, image_ids: &[u32]) -> Vec<Option<u64>> {
+        self.0.kitty_image_fingerprints(image_ids)
+    }
+
     pub fn keyboard_protocol(&self) -> crate::input::KeyboardProtocol {
         self.0.keyboard_protocol()
     }
@@ -600,6 +608,11 @@ impl TerminalRuntime {
 
 #[cfg(test)]
 impl TerminalRuntime {
+    #[cfg(unix)]
+    pub(crate) fn test_enable_kitty_source_forwarding(&self) {
+        self.0.test_enable_kitty_source_forwarding();
+    }
+
     pub(crate) fn test_contend_during_dirty_collection(
         &self,
         bytes: Vec<u8>,

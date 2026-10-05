@@ -41,6 +41,8 @@ impl App {
             }
             Method::AgentPrompt(params) => params.allow_cross_pane,
             Method::AgentSendKeys(params) => params.allow_cross_pane,
+            Method::PaneReportAgent(params) => params.allow_cross_pane,
+            Method::PaneReportAgentSession(params) => params.allow_cross_pane,
             Method::PaneSendText(params) => params.allow_cross_pane,
             Method::PaneSendKeys(params) => params.allow_cross_pane,
             Method::PaneSendInput(params) | Method::PaneSendInputGuarded(params) => {
@@ -62,6 +64,12 @@ impl App {
             Method::PaneSendInput(params) | Method::PaneSendInputGuarded(params) => {
                 self.pane_target(&params.pane_id)
             }
+            Method::PaneReportAgent(params) if params.resume_argv.is_some() => {
+                self.pane_target(&params.pane_id)
+            }
+            Method::PaneReportAgentSession(params) if params.resume_argv.is_some() => {
+                self.pane_target(&params.pane_id)
+            }
             _ => None,
         }
     }
@@ -77,8 +85,8 @@ mod tests {
     use super::*;
     use crate::api::schema::{
         AgentPromptParams, AgentSendKeysParams, AgentStartParams, ErrorResponse,
-        PaneSendInputParams, PaneSendKeysParams, PaneSendTextParams, ResponseResult,
-        SuccessResponse,
+        PaneReportAgentParams, PaneSendInputParams, PaneSendKeysParams, PaneSendTextParams,
+        ResponseResult, SuccessResponse,
     };
     use crate::app::Mode;
     use crate::config::Config;
@@ -675,6 +683,58 @@ mod tests {
             Bytes::from_static(b"deliberate")
         );
         assert!(fixture.source_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn resume_reports_are_cross_pane_content_writes_but_own_pane_reports_work() {
+        let mut fixture = attributed_agent_fixture();
+        let target_response = fixture.app.handle_api_request_with_context(
+            Request {
+                id: "foreign-resume".into(),
+                method: Method::PaneReportAgent(PaneReportAgentParams {
+                    allow_cross_pane: false,
+                    pane_id: fixture.target_pane_id.clone(),
+                    source: "custom:pi".into(),
+                    agent: "pi".into(),
+                    state: crate::api::schema::PaneAgentState::Working,
+                    message: None,
+                    seq: Some(1),
+                    agent_session_id: None,
+                    agent_session_path: None,
+                    resume_argv: Some(vec!["attacker".into()]),
+                }),
+            },
+            attributed_context(),
+        );
+        assert_denied(&target_response);
+        let (_, target_pane) = fixture.app.parse_pane_id(&fixture.target_pane_id).unwrap();
+        let target_terminal_id = fixture.app.state.workspaces[0]
+            .terminal_id(target_pane)
+            .unwrap()
+            .clone();
+        assert!(fixture.app.state.terminals[&target_terminal_id]
+            .reported_resume()
+            .is_none());
+
+        let own_response = fixture.app.handle_api_request_with_context(
+            Request {
+                id: "own-resume".into(),
+                method: Method::PaneReportAgent(PaneReportAgentParams {
+                    allow_cross_pane: false,
+                    pane_id: fixture.source_pane_id.clone(),
+                    source: "custom:pi".into(),
+                    agent: "pi".into(),
+                    state: crate::api::schema::PaneAgentState::Working,
+                    message: None,
+                    seq: Some(1),
+                    agent_session_id: None,
+                    agent_session_path: None,
+                    resume_argv: Some(vec!["pi".into()]),
+                }),
+            },
+            attributed_context(),
+        );
+        assert_ok(&own_response);
     }
 
     #[tokio::test]
@@ -1980,7 +2040,6 @@ mod tests {
             context,
             respond_to,
             response_write_complete: None,
-            stream_active: None,
         })
         .expect("queued request");
         child.kill().expect("stop peer");
@@ -2189,7 +2248,6 @@ finally:
             context: accepted,
             respond_to,
             response_write_complete: None,
-            stream_active: None,
         })
         .expect("queued before intermediate exit");
         tree.orphan();
@@ -2350,8 +2408,66 @@ finally:
         let _ = ordinary_peer.wait();
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn resume_reports_from_agent_child_guard_own_foreign_opt_in_and_metadata() {
+        for method in ["pane.report_agent", "pane.report_agent_session"] {
+            let mut fixture = attributed_agent_fixture();
+            let child = detached_sleep_child();
+            let context = ApiRequestContext::for_local_peer_pid(Some(child.id()));
+            let source = fixture
+                .app
+                .pane_target(&fixture.source_pane_id)
+                .expect("source");
+            let origin = fixture.app.input_origin_for_context(context);
+            assert!(
+                matches!(origin, InputOrigin::Agent(ref target) if target.terminal_id == source.terminal_id)
+            );
+            for (pane_id, opt_in, resume, denied) in [
+                (fixture.source_pane_id.clone(), false, true, false),
+                (fixture.target_pane_id.clone(), false, true, true),
+                (fixture.target_pane_id.clone(), true, true, false),
+                (fixture.target_pane_id.clone(), false, false, false),
+            ] {
+                let mut params = serde_json::json!({
+                    "pane_id": pane_id, "source": "custom:pi", "agent": "pi",
+                    "state": "working", "allow_cross_pane": opt_in,
+                });
+                if resume {
+                    params["resume_argv"] = serde_json::json!(["pi", "--resume", "guard-session"]);
+                }
+                let request: Request = serde_json::from_value(serde_json::json!({
+                    "id": "child-resume", "method": method, "params": params,
+                }))
+                .expect("report request");
+                let response = fixture
+                    .app
+                    .handle_api_request_with_context(request, context);
+                if denied {
+                    assert_denied(&response);
+                    let target = fixture
+                        .app
+                        .pane_target(&fixture.target_pane_id)
+                        .expect("target");
+                    assert!(fixture.app.state.terminals[target.terminal_id.as_str()]
+                        .reported_resume()
+                        .is_none());
+                } else {
+                    assert_ok(&response);
+                    if resume {
+                        let target = fixture.app.pane_target(&pane_id).expect("report target");
+                        assert!(fixture.app.state.terminals[target.terminal_id.as_str()]
+                            .reported_resume()
+                            .is_some());
+                    }
+                }
+            }
+        }
+    }
+
     fn report_working(pane_id: &str) -> Method {
         Method::PaneReportAgent(crate::api::schema::PaneReportAgentParams {
+            allow_cross_pane: false,
             pane_id: pane_id.into(),
             // A plain hook source: the rebind is source-agnostic, and the Pi
             // lifecycle source adds session-anchoring rules this test does not need.
@@ -2362,6 +2478,7 @@ finally:
             seq: Some(1),
             agent_session_id: None,
             agent_session_path: None,
+            resume_argv: None,
         })
     }
 

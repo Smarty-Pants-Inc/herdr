@@ -697,9 +697,11 @@ fn report_agent_command() -> Command {
         .arg(option("agent", "LABEL").required(true))
         .arg(pane_agent_state_option("state"))
         .arg(option("message", "TEXT"))
+        .arg(flag("allow-cross-pane"))
         .arg(option("seq", "N"))
         .arg(option("agent-session-id", "ID"))
         .arg(path_option("agent-session-path", "PATH"))
+        .arg(resume_argv_arg())
 }
 
 fn report_agent_session_command() -> Command {
@@ -712,6 +714,16 @@ fn report_agent_session_command() -> Command {
         .arg(option("agent-session-id", "ID"))
         .arg(path_option("agent-session-path", "PATH"))
         .arg(option("session-start-source", "SOURCE"))
+        .arg(flag("allow-cross-pane"))
+        .arg(resume_argv_arg())
+}
+
+fn resume_argv_arg() -> Arg {
+    Arg::new("resume_argv")
+        .value_name("RESUME_ARG")
+        .num_args(0..)
+        .last(true)
+        .help("Command that resumes this session after a Herdr restart; starts with a plain command name")
 }
 
 fn release_agent_command() -> Command {
@@ -1324,6 +1336,15 @@ mod tests {
         assert!(pane
             .get_subcommands()
             .any(|subcommand| subcommand.get_name() == "wait-output"));
+    }
+
+    #[test]
+    fn spec_includes_resume_report_cross_pane_opt_in() {
+        let cmd = super::command();
+        for report in ["report-agent", "report-agent-session"] {
+            let report = command_path(&cmd, &["pane", report]);
+            assert!(has_option(report, "allow-cross-pane"));
+        }
     }
 
     #[test]

@@ -3328,6 +3328,7 @@ action = "missing"
         let _ = app.handle_pane_report_agent(
             "report".into(),
             crate::api::schema::PaneReportAgentParams {
+                allow_cross_pane: false,
                 pane_id: pane_public.clone(),
                 source: "test".into(),
                 agent: "codex".into(),
@@ -3336,6 +3337,7 @@ action = "missing"
                 seq: None,
                 agent_session_id: None,
                 agent_session_path: None,
+                resume_argv: None,
             },
         );
 

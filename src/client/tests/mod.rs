@@ -62,6 +62,21 @@ fn direct_graphics_profile_is_narrow_and_transport_safe() {
 }
 
 #[test]
+fn server_graphics_files_require_local_filesystem_not_just_local_terminal() {
+    let local = endpoint::ClientEndpointId::Local;
+    let ssh = endpoint::ClientEndpointId::Ssh(
+        endpoint::ProfileId::parse("0123456789abcdef0123456789abcdef").unwrap(),
+    );
+    // Keep old local peers working without requiring a negotiated capability.
+    assert!(server_graphics_files_allowed(&local, false));
+    // Saved SSH endpoints run in the normal local client process.
+    assert!(!server_graphics_files_allowed(&ssh, false));
+    // A standalone --remote bridge can retain the Local endpoint identity.
+    assert!(!server_graphics_files_allowed(&local, true));
+    assert!(!server_graphics_files_allowed(&ssh, true));
+}
+
+#[test]
 fn windows_virtual_terminal_input_mode_sets_only_vti_bit() {
     assert_eq!(windows_virtual_terminal_input_mode(0x01f0), 0x03f0);
     assert_eq!(windows_virtual_terminal_input_mode(0x03f0), 0x03f0);
@@ -306,13 +321,136 @@ fn kitty_graphics_image_id_parser_tracks_herdr_ids_only() {
 }
 
 #[test]
+fn sec_r2_fresh_upload_failure_preserves_obligation_at_every_write_boundary() {
+    struct Broken {
+        remaining: usize,
+    }
+    impl std::io::Write for Broken {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self.remaining == 0 {
+                return Err(std::io::ErrorKind::BrokenPipe.into());
+            }
+            let count = bytes.len().min(self.remaining);
+            self.remaining -= count;
+            Ok(count)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }
+    }
+    for remaining in 0..100 {
+        let id = 490_001;
+        let upload = format!("\x1b_Ga=t,i={id};AAAA\x1b\\");
+        assert!(super::frame_output::write_encoded_frame_with_graphics(
+            Broken { remaining },
+            b"frame",
+            upload.as_bytes(),
+        )
+        .is_err());
+        let mut cleanup = Vec::new();
+        clear_received_kitty_graphics(&mut cleanup).unwrap();
+        assert!(
+            String::from_utf8(cleanup)
+                .unwrap()
+                .contains(&format!("i={id}")),
+            "write boundary {remaining}"
+        );
+    }
+    let upload = crate::kitty_graphics::GraphicsOutput::from_bytes(
+        b"\x1b_Ga=t,i=490002;AAAA\x1b\\".to_vec(),
+    );
+    assert!(super::frame_output::write_composed_frame(
+        Broken {
+            remaining: usize::MAX
+        },
+        b"frame",
+        &upload,
+        &mut super::image_files::FileTransport::default(),
+    )
+    .is_err());
+    let mut cleanup = Vec::new();
+    clear_received_kitty_graphics(&mut cleanup).unwrap();
+    assert!(String::from_utf8(cleanup).unwrap().contains("i=490002"));
+}
+
+#[test]
+fn sec_r2_transmit_and_display_upload_gets_targeted_cleanup() {
+    let mut output = Vec::new();
+    super::frame_output::write_encoded_frame_with_graphics(
+        &mut output,
+        b"frame",
+        b"\x1b_Ga=T,i=490003;AAAA\x1b\\",
+    )
+    .unwrap();
+    let mut cleanup = Vec::new();
+    clear_received_kitty_graphics(&mut cleanup).unwrap();
+    assert!(String::from_utf8(cleanup)
+        .unwrap()
+        .contains("a=d,d=I,i=490003"));
+}
+
+#[test]
+fn composed_graphics_flush_failure_keeps_cleanup_obligation() {
+    struct FlushBroken;
+    impl std::io::Write for FlushBroken {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }
+    }
+
+    let mut reset = Vec::new();
+    clear_received_kitty_graphics(&mut reset).unwrap();
+    let id = 424_242;
+    record_received_kitty_graphics(format!("\x1b_Ga=t,i={id};AAAA\x1b\\").as_bytes());
+    let deletion = crate::kitty_graphics::GraphicsOutput::from_bytes(
+        format!("\x1b_Ga=d,d=I,i={id};\x1b\\").into_bytes(),
+    );
+    let result = super::frame_output::write_composed_frame(
+        FlushBroken,
+        b"frame",
+        &deletion,
+        &mut super::image_files::FileTransport::default(),
+    );
+    assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::BrokenPipe);
+
+    let mut cleanup = Vec::new();
+    clear_received_kitty_graphics(&mut cleanup).unwrap();
+    assert!(String::from_utf8(cleanup)
+        .unwrap()
+        .contains(&format!("i={id}")));
+}
+
+#[test]
 fn kitty_graphics_cleanup_deletes_tracked_images_not_all_images() {
+    let mut reset = Vec::new();
+    clear_received_kitty_graphics(&mut reset).unwrap();
     record_received_kitty_graphics(b"\x1b_Ga=t,i=123,q=2;AAAA\x1b\\");
     let mut output = Vec::new();
     clear_received_kitty_graphics(&mut output).unwrap();
     let text = String::from_utf8(output).unwrap();
     assert!(text.contains("a=d,d=I,i=123"));
     assert!(!text.contains("d=A"));
+}
+
+#[test]
+fn kitty_graphics_ledger_tracks_outstanding_uploads_through_deletes() {
+    let mut reset = Vec::new();
+    clear_received_kitty_graphics(&mut reset).unwrap();
+    let old = 1u32 << 28;
+    let current = old + 1;
+    record_received_kitty_graphics(
+        format!("\x1b_Ga=t,i={old};AAAA\x1b\\\x1b_Ga=d,d=I,i={old};\x1b\\").as_bytes(),
+    );
+    record_received_kitty_graphics(format!("\x1b_Ga=t,i={current};AAAA\x1b\\").as_bytes());
+    let mut output = Vec::new();
+    clear_received_kitty_graphics(&mut output).unwrap();
+    let text = String::from_utf8(output).unwrap();
+    assert!(!text.contains(&format!("i={old}")));
+    assert!(text.contains(&format!("i={current}")));
 }
 
 #[test]
@@ -364,11 +502,6 @@ fn color_scheme_change_event_requests_host_theme_query() {
     assert!(crate::raw_input::events_require_host_terminal_theme_query(
         &events
     ));
-}
-
-#[test]
-fn host_terminal_theme_query_is_disabled_on_windows() {
-    assert_eq!(should_query_host_terminal_theme(), !cfg!(windows));
 }
 
 #[test]
@@ -810,6 +943,67 @@ fn terminal_control_resize_command_maps_to_client_resize() {
         (100, 30, 8, 16)
     );
     assert!(!pixel_mouse);
+}
+
+#[test]
+fn terminal_control_mouse_command_maps_to_attach_mouse() {
+    let action = terminal_control_command_from_json(
+        r#"{"type":"terminal.mouse","action":"down","column":12,"row":5}"#,
+    )
+    .unwrap();
+    let ClientMessage::AttachMouse {
+        kind,
+        position,
+        geometry,
+        modifiers,
+        lines,
+    } = action
+    else {
+        panic!("expected attach mouse command");
+    };
+    assert_eq!(
+        kind,
+        crate::protocol::ClientMouseKind::Down(crate::protocol::ClientMouseButton::Left)
+    );
+    assert_eq!(
+        position,
+        crate::protocol::ClientMousePosition::Cell { column: 12, row: 5 }
+    );
+    assert_eq!((geometry, modifiers, lines), (None, 0, 1));
+}
+
+#[test]
+fn terminal_control_mouse_command_maps_every_action_and_button() {
+    use crate::protocol::{ClientMouseButton as Button, ClientMouseKind as Kind};
+    for (json, expected) in [
+        (r#""action":"up","button":"right""#, Kind::Up(Button::Right)),
+        (
+            r#""action":"drag","button":"middle""#,
+            Kind::Drag(Button::Middle),
+        ),
+        (r#""action":"move""#, Kind::Moved),
+    ] {
+        let raw = format!(r#"{{"type":"terminal.mouse",{json},"column":0,"row":0,"modifiers":4}}"#);
+        let ClientMessage::AttachMouse {
+            kind, modifiers, ..
+        } = terminal_control_command_from_json(&raw).unwrap()
+        else {
+            panic!("expected attach mouse command");
+        };
+        assert_eq!((kind, modifiers), (expected, 4), "{raw}");
+    }
+}
+
+#[test]
+fn terminal_control_mouse_command_rejects_unknown_actions_and_missing_cells() {
+    assert!(terminal_control_command_from_json(
+        r#"{"type":"terminal.mouse","action":"click","column":1,"row":1}"#
+    )
+    .is_err());
+    assert!(terminal_control_command_from_json(
+        r#"{"type":"terminal.mouse","action":"down","column":1}"#
+    )
+    .is_err());
 }
 
 #[test]

@@ -18,7 +18,6 @@ mod custom_commands;
 mod git_refresh;
 mod git_watch;
 mod ids;
-pub(crate) mod pane_graphics;
 mod popup;
 mod runtime;
 mod session;
@@ -140,9 +139,6 @@ pub struct App {
     /// consumes this after dispatch to invalidate attribution in its sole pane tracker.
     /// Not persisted state and not an ownership/history tracker.
     pub(crate) accepted_api_inputs: Vec<crate::layout::PaneId>,
-    pub(crate) pane_graphics: pane_graphics::Runtime,
-    pub(crate) pane_graphics_files: Arc<crate::pane_graphics_files::FileStore>,
-    pub(crate) direct_graphics_available: bool,
     pub(crate) pixel_mouse_available: bool,
     pub(crate) terminal_runtimes: crate::terminal::TerminalRuntimeRegistry,
     pub event_tx: mpsc::Sender<AppEvent>,
@@ -405,7 +401,7 @@ impl App {
         api_rx: tokio::sync::mpsc::UnboundedReceiver<crate::api::ApiRequestMessage>,
         event_hub: crate::api::EventHub,
     ) -> Self {
-        let (prefix_code, prefix_mods) = config.prefix_key();
+        let prefix_keys = config.prefix_keys();
         crate::kitty_graphics::set_enabled(config.kitty_graphics_enabled());
         let (event_tx, event_rx) = mpsc::channel::<AppEvent>(APP_EVENT_CHANNEL_CAPACITY);
         let render_notify = Arc::new(Notify::new());
@@ -523,8 +519,7 @@ impl App {
             toast: None,
             pending_agent_notifications: std::collections::HashMap::new(),
             outer_terminal_focus: None,
-            prefix_code,
-            prefix_mods,
+            prefix_keys,
             headless_size: config.headless_size(),
             agent_panel_sort,
             agent_view_override: None,
@@ -626,9 +621,6 @@ impl App {
             toast_deadline: None,
             last_api_notification_at: None,
             state,
-            pane_graphics: pane_graphics::Runtime::default(),
-            pane_graphics_files: Arc::new(crate::pane_graphics_files::FileStore::default()),
-            direct_graphics_available: false,
             pixel_mouse_available: false,
             terminal_runtimes: restored_terminal_runtimes,
             event_tx,
@@ -861,8 +853,7 @@ impl App {
         if !invalid_section("keys") {
             match config.live_keybinds_with_diagnostics() {
                 Ok((live, keybind_diagnostics)) => {
-                    self.state.prefix_code = live.prefix.0;
-                    self.state.prefix_mods = live.prefix.1;
+                    self.state.prefix_keys = live.prefix;
                     self.state.keybinds = live.keybinds;
                     match config.local_keybindings_profile_toml() {
                         Ok(profile) => self.client_shell_keybindings_profile = Some(profile),
@@ -1846,8 +1837,10 @@ mod tests {
 
         assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
         assert_eq!(app.state.headless_size, (160, 50));
-        assert_eq!(app.state.prefix_code, KeyCode::Char('a'));
-        assert_eq!(app.state.prefix_mods, KeyModifiers::CONTROL);
+        assert_eq!(
+            app.state.prefix_keys,
+            vec![(KeyCode::Char('a'), KeyModifiers::CONTROL)]
+        );
         assert!(app
             .state
             .keybinds
@@ -1942,7 +1935,10 @@ mod tests {
         let report = app.reload_config();
 
         assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
-        assert_eq!(app.state.prefix_code, KeyCode::Char('a'));
+        assert_eq!(
+            app.state.prefix_keys,
+            vec![(KeyCode::Char('a'), KeyModifiers::CONTROL)]
+        );
         assert!(app.state.request_client_config_reload);
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
@@ -2093,17 +2089,14 @@ mod tests {
         env.set(crate::config::CONFIG_PATH_ENV_VAR, &path);
 
         let mut app = test_app();
-        let original_prefix = (app.state.prefix_code, app.state.prefix_mods);
+        let original_prefix = app.state.prefix_keys.clone();
         let report = app.reload_config();
 
         assert_eq!(report.status, crate::config::ConfigReloadStatus::Partial);
         assert!(report.diagnostics.iter().any(|diagnostic| {
             diagnostic.contains("keys.new_workspace") && diagnostic.contains("disabling binding")
         }));
-        assert_eq!(
-            (app.state.prefix_code, app.state.prefix_mods),
-            original_prefix
-        );
+        assert_eq!(app.state.prefix_keys, original_prefix);
         assert!(app.state.keybinds.new_workspace.bindings.is_empty());
         assert_eq!(
             app.state.toast_config.delivery,
@@ -2159,8 +2152,10 @@ mod tests {
         let report = app.reload_config();
 
         assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
-        assert_eq!(app.state.prefix_code, KeyCode::Char(' '));
-        assert_eq!(app.state.prefix_mods, KeyModifiers::CONTROL);
+        assert_eq!(
+            app.state.prefix_keys,
+            vec![(KeyCode::Char(' '), KeyModifiers::CONTROL)]
+        );
         assert!(app
             .state
             .keybinds
@@ -2246,16 +2241,13 @@ mod tests {
         env.set(crate::config::CONFIG_PATH_ENV_VAR, &path);
 
         let mut app = test_app();
-        let original_prefix = (app.state.prefix_code, app.state.prefix_mods);
+        let original_prefix = app.state.prefix_keys.clone();
         let original_keybinds = app.state.keybinds.new_workspace.clone();
         let original_toast_delivery = app.state.toast_config.delivery;
         let report = app.reload_config();
 
         assert_eq!(report.status, crate::config::ConfigReloadStatus::Failed);
-        assert_eq!(
-            (app.state.prefix_code, app.state.prefix_mods),
-            original_prefix
-        );
+        assert_eq!(app.state.prefix_keys, original_prefix);
         assert_eq!(app.state.keybinds.new_workspace, original_keybinds);
         assert_eq!(app.state.toast_config.delivery, original_toast_delivery);
         assert!(app
