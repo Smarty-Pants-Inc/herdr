@@ -115,6 +115,7 @@ impl App {
             }
             _ => return false,
         };
+        let guarded = expected_terminal.is_some();
         match self.queue_agent_prompt(request.id, params, expected_terminal.as_deref(), context) {
             Ok((id, agent, completion)) => {
                 std::thread::spawn(move || {
@@ -123,7 +124,7 @@ impl App {
                         Ok(Err(err)) if err.kind() == std::io::ErrorKind::TimedOut => {
                             encode_error(id, "timeout", err.to_string())
                         }
-                        Ok(Err(err)) => encode_error(id, "agent_prompt_failed", err.to_string()),
+                        Ok(Err(err)) => agent_prompt_io_error(id, guarded, err),
                         Err(_) => encode_error(id, "agent_prompt_failed", "pty actor closed"),
                     };
                     let _ = respond_to.send(response);
@@ -191,13 +192,26 @@ impl App {
         if terminal.managed_agent_launch_pending() {
             return Err(agent_not_ready(id, &params.target));
         }
-        // Hold synchronous receiver ownership and this exact checked terminal runtime
-        // through foreground validation, logging, focus and text-plus-Enter enqueue.
-        // Never look the public pane up again at the effect.
+        // Hold this exact checked terminal runtime through logging and enqueue.
+        // Guarded submissions additionally pin the live job before logging and
+        // carry a fresh instance check through the asynchronous writer boundaries.
+        let guarded = expected_terminal.is_some();
         let Some(runtime) = self.lookup_runtime_sender(resolved.ws_idx, resolved.pane_id) else {
             return Err(agent_not_found(id, &params.target));
         };
-        if !super::super::agents::runtime_hosts_agent(runtime, expected_agent) {
+        let submission_guard = if guarded {
+            Some(
+                super::super::agents::capture_agent_submission_guard(
+                    &terminal_id,
+                    runtime,
+                    expected_agent,
+                )
+                .map_err(|err| agent_prompt_io_error(id.clone(), true, err))?,
+            )
+        } else {
+            None
+        };
+        if !guarded && !super::super::agents::runtime_hosts_agent(runtime, expected_agent) {
             return Err(encode_error(
                 id,
                 "agent_not_ready",
@@ -227,6 +241,7 @@ impl App {
             .and_then(|wait| wait.submission_deadline);
         #[cfg(not(windows))]
         let submit_deadline = None;
+        let mut guarded_focus = None;
         if expected_agent == crate::detect::Agent::GithubCopilot {
             // Copilot ignores synthetic Enter after focus loss until it receives focus gained.
             let focus = match crate::ghostty::encode_focus(crate::ghostty::FocusEvent::Gained) {
@@ -235,7 +250,10 @@ impl App {
                     return Err(encode_error(id, "agent_prompt_failed", err.to_string()));
                 }
             };
-            if let Err(err) = runtime.try_send_bytes(Bytes::from(focus)) {
+            if guarded {
+                // The writer must validate before focus, not just before prompt text.
+                guarded_focus = Some(focus);
+            } else if let Err(err) = runtime.try_send_bytes(Bytes::from(focus)) {
                 return Err(encode_error(id, "agent_prompt_failed", err.to_string()));
             }
         }
@@ -249,17 +267,37 @@ impl App {
         } else {
             text
         };
+        let text = if let Some(mut focus) = guarded_focus {
+            focus.extend_from_slice(&text);
+            focus
+        } else {
+            text
+        };
         let Some(agent) = self.agent_info(resolved.ws_idx, resolved.pane_id) else {
             return Err(agent_not_found(id, &params.target));
         };
-        let completion = runtime
-            .queue_user_input_submission(
+        let completion = if let Some(guard) = submission_guard {
+            // Logging can block; this early recheck is useful, but writer checks
+            // remain mandatory after queueing and before delayed Enter.
+            guard
+                .check()
+                .map_err(|err| agent_prompt_io_error(id.clone(), true, err))?;
+            runtime.queue_guarded_user_input_submission(
+                Bytes::from(text),
+                Bytes::from(enter),
+                AGENT_PROMPT_SUBMIT_DELAY,
+                submit_deadline,
+                guard,
+            )
+        } else {
+            runtime.queue_user_input_submission(
                 Bytes::from(text),
                 Bytes::from(enter),
                 AGENT_PROMPT_SUBMIT_DELAY,
                 submit_deadline,
             )
-            .map_err(|err| encode_error(id.clone(), "agent_prompt_failed", err.to_string()))?;
+        }
+        .map_err(|err| agent_prompt_io_error(id.clone(), guarded, err))?;
         // Receipt is issued on enqueue, before the asynchronous submission completes.
         self.accepted_api_inputs.push(resolved.pane_id);
         Ok((id, agent, completion))
@@ -436,6 +474,15 @@ impl App {
 
         encode_success(id, ResponseResult::Ok {})
     }
+}
+
+fn agent_prompt_io_error(id: String, guarded: bool, err: std::io::Error) -> String {
+    let code = if guarded && err.kind() == std::io::ErrorKind::PermissionDenied {
+        "agent_not_ready"
+    } else {
+        "agent_prompt_failed"
+    };
+    encode_error(id, code, err.to_string())
 }
 
 fn agent_not_ready(id: String, target: &str) -> String {
@@ -924,6 +971,51 @@ mod tests {
         assert_eq!(rx.try_recv().unwrap(), Bytes::from("line one\nline two λ"));
         assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"\r"));
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn guarded_prompt_copilot_focus_is_part_of_checked_text_submission() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_agent_name("reviewer".into());
+        terminal.set_detected_state(Some(Agent::GithubCopilot), AgentState::Idle);
+        let (runtime, mut rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.state.insert_test_runtime(pane_id, runtime);
+        let response = run_guarded_agent_prompt(
+            &mut app,
+            "guard-focus",
+            AgentPromptParams {
+                target: "reviewer".into(),
+                text: "prompt".into(),
+                wait: None,
+                allow_cross_pane: true,
+            },
+            terminal_id.to_string(),
+        );
+        assert!(
+            serde_json::from_str::<SuccessResponse>(&response).is_ok(),
+            "{response}"
+        );
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"\x1b[Iprompt"));
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"\r"));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn guarded_prompt_permission_denial_maps_to_not_ready_only_for_guarded_method() {
+        for (guarded, expected) in [(true, "agent_not_ready"), (false, "agent_prompt_failed")] {
+            let response = agent_prompt_io_error(
+                "req".into(),
+                guarded,
+                std::io::Error::new(std::io::ErrorKind::PermissionDenied, "guard refused"),
+            );
+            let error: crate::api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();
+            assert_eq!(error.error.code, expected);
+        }
     }
 
     #[test]

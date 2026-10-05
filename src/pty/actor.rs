@@ -1,3 +1,7 @@
+mod submission_guard;
+
+pub(crate) use submission_guard::SubmissionGuard;
+
 #[cfg(unix)]
 mod unix;
 
@@ -6,6 +10,7 @@ pub(crate) use unix::*;
 
 #[cfg(windows)]
 mod windows {
+    use super::SubmissionGuard;
     use std::io::{Read, Write};
     use std::sync::{mpsc as std_mpsc, Arc, Mutex};
     use std::time::{Duration, Instant};
@@ -50,6 +55,7 @@ mod windows {
             enter: Bytes,
             delay: Duration,
             deadline: Option<Instant>,
+            guard: Option<SubmissionGuard>,
             reply: std_mpsc::Sender<std::io::Result<()>>,
         },
     }
@@ -59,6 +65,7 @@ mod windows {
         SubmissionPart {
             bytes: Bytes,
             deadline: Option<Instant>,
+            guard: Option<SubmissionGuard>,
             reply: std_mpsc::Sender<std::io::Result<()>>,
         },
     }
@@ -114,6 +121,28 @@ mod windows {
             delay: Duration,
             deadline: Option<Instant>,
         ) -> std::io::Result<std_mpsc::Receiver<std::io::Result<()>>> {
+            self.queue_submission(text, enter, delay, deadline, None)
+        }
+
+        pub(crate) fn queue_guarded_user_input_submission(
+            &self,
+            text: Bytes,
+            enter: Bytes,
+            delay: Duration,
+            deadline: Option<Instant>,
+            guard: SubmissionGuard,
+        ) -> std::io::Result<std_mpsc::Receiver<std::io::Result<()>>> {
+            self.queue_submission(text, enter, delay, deadline, Some(guard))
+        }
+
+        fn queue_submission(
+            &self,
+            text: Bytes,
+            enter: Bytes,
+            delay: Duration,
+            deadline: Option<Instant>,
+            guard: Option<SubmissionGuard>,
+        ) -> std::io::Result<std_mpsc::Receiver<std::io::Result<()>>> {
             let accepting = self
                 .accepting
                 .lock()
@@ -131,6 +160,7 @@ mod windows {
                     enter,
                     delay,
                     deadline,
+                    guard,
                     reply: reply_tx,
                 })
                 .map_err(|err| match err {
@@ -299,16 +329,25 @@ mod windows {
                 PtyIoWriteCommand::SubmissionPart {
                     bytes,
                     deadline,
+                    guard,
                     reply,
                 } => {
-                    let result = if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                        Err(input_submission_timed_out())
-                    } else {
-                        write_and_flush(writer, &bytes)
-                    };
-                    let failed = result
-                        .as_ref()
-                        .is_err_and(|err| err.kind() != std::io::ErrorKind::TimedOut);
+                    let (result, failed) =
+                        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                            (Err(input_submission_timed_out()), false)
+                        } else if let Some(guard) = guard {
+                            match write_guarded_and_flush(writer, &bytes, &guard) {
+                                Ok(()) => (Ok(()), false),
+                                Err(SubmissionWriteError::Guard(err)) => (Err(err), false),
+                                Err(SubmissionWriteError::Io(err)) => (Err(err), true),
+                            }
+                        } else {
+                            let result = write_and_flush(writer, &bytes);
+                            let failed = result
+                                .as_ref()
+                                .is_err_and(|err| err.kind() != std::io::ErrorKind::TimedOut);
+                            (result, failed)
+                        };
                     let _ = reply.send(result);
                     if failed {
                         break;
@@ -339,6 +378,7 @@ mod windows {
                     enter,
                     delay,
                     deadline,
+                    guard,
                     reply,
                 } => {
                     let result = if deadline.is_some_and(|deadline| {
@@ -348,22 +388,28 @@ mod windows {
                     } else {
                         let text_deadline =
                             deadline.and_then(|deadline| deadline.checked_sub(delay));
-                        write_submission_part(&write_tx, text, text_deadline).and_then(|()| {
-                            // A started text write is committed. Finish Enter even if the caller
-                            // stops waiting so a timeout cannot leave a partial prompt.
-                            std::thread::sleep(delay);
-                            let accepting = accepting
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner());
-                            if !*accepting {
-                                return Err(pty_actor_closed());
-                            }
-                            write_submission_part(&write_tx, enter, None)
-                        })
+                        write_submission_part(&write_tx, text, text_deadline, guard.clone())
+                            .and_then(|()| {
+                                // Legacy submissions finish Enter even if the caller stops
+                                // waiting. Guarded submissions still require authorization.
+                                std::thread::sleep(delay);
+                                let accepting = accepting
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                if !*accepting {
+                                    return Err(pty_actor_closed());
+                                }
+                                if let Some(guard) = &guard {
+                                    guard.check()?;
+                                }
+                                write_submission_part(&write_tx, enter, None, guard.clone())
+                            })
                     };
-                    let failed = result
-                        .as_ref()
-                        .is_err_and(|err| err.kind() != std::io::ErrorKind::TimedOut);
+                    let failed = result.as_ref().is_err_and(|err| {
+                        err.kind() != std::io::ErrorKind::TimedOut
+                            && !(guard.is_some()
+                                && err.kind() == std::io::ErrorKind::PermissionDenied)
+                    });
                     let _ = reply.send(result);
                     if failed {
                         break;
@@ -377,12 +423,14 @@ mod windows {
         write_tx: &std_mpsc::Sender<PtyIoWriteCommand>,
         bytes: Bytes,
         deadline: Option<Instant>,
+        guard: Option<SubmissionGuard>,
     ) -> std::io::Result<()> {
         let (reply, completion) = std_mpsc::channel();
         write_tx
             .send(PtyIoWriteCommand::SubmissionPart {
                 bytes,
                 deadline,
+                guard,
                 reply,
             })
             .map_err(|_| pty_actor_closed())?;
@@ -400,6 +448,41 @@ mod windows {
             std::io::ErrorKind::TimedOut,
             "agent prompt timed out before input submission",
         )
+    }
+
+    enum SubmissionWriteError {
+        Guard(std::io::Error),
+        Io(std::io::Error),
+    }
+
+    fn write_guarded_and_flush(
+        writer: &mut impl Write,
+        mut bytes: &[u8],
+        guard: &SubmissionGuard,
+    ) -> Result<(), SubmissionWriteError> {
+        if bytes.is_empty() {
+            guard.check().map_err(SubmissionWriteError::Guard)?;
+        }
+        while !bytes.is_empty() {
+            // write_all hides partial writes and Interrupted retries from the
+            // guard. Keep each actual Write operation inside this boundary.
+            guard.check().map_err(SubmissionWriteError::Guard)?;
+            match writer.write(bytes) {
+                Ok(0) => {
+                    return Err(SubmissionWriteError::Io(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "PTY actor write returned zero bytes",
+                    )))
+                }
+                Ok(written) => bytes = &bytes[written..],
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(err) => return Err(SubmissionWriteError::Io(err)),
+            }
+        }
+        writer.flush().map_err(SubmissionWriteError::Io)
     }
 
     fn write_and_flush(writer: &mut impl Write, bytes: &[u8]) -> std::io::Result<()> {
@@ -459,6 +542,7 @@ mod windows {
                     enter: Bytes::from_static(b"\r"),
                     delay,
                     deadline,
+                    guard: None,
                     reply: reply_tx,
                 })
                 .unwrap();
@@ -483,6 +567,196 @@ mod windows {
             input_thread.join().expect("input thread joins");
             drop(write_tx);
             (writer_thread.join().expect("writer thread joins"), result)
+        }
+
+        fn refusal() -> std::io::Error {
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, "target changed")
+        }
+
+        #[test]
+        fn guarded_writer_queue_invalidation_preserves_unrelated_and_legacy_writes() {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            let valid = Arc::new(AtomicBool::new(true));
+            let guard = SubmissionGuard::new({
+                let valid = Arc::clone(&valid);
+                move || {
+                    if valid.load(Ordering::SeqCst) {
+                        Ok(())
+                    } else {
+                        Err(refusal())
+                    }
+                }
+            });
+            let (write_tx, write_rx) = std_mpsc::channel();
+            let (reply_tx, reply_rx) = std_mpsc::channel();
+            let (legacy_tx, legacy_rx) = std_mpsc::channel();
+            write_tx
+                .send(PtyIoWriteCommand::SubmissionPart {
+                    bytes: Bytes::from_static(b"refused"),
+                    deadline: None,
+                    guard: Some(guard),
+                    reply: reply_tx,
+                })
+                .unwrap();
+            write_tx
+                .send(PtyIoWriteCommand::Write(Bytes::from_static(b"response")))
+                .unwrap();
+            write_tx
+                .send(PtyIoWriteCommand::SubmissionPart {
+                    bytes: Bytes::from_static(b"legacy"),
+                    deadline: None,
+                    guard: None,
+                    reply: legacy_tx,
+                })
+                .unwrap();
+            drop(write_tx);
+            valid.store(false, Ordering::SeqCst);
+            let mut writer = Vec::new();
+            run_writer(&mut writer, write_rx);
+            assert_eq!(
+                reply_rx.recv().unwrap().unwrap_err().kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+            legacy_rx.recv().unwrap().unwrap();
+            assert_eq!(writer, b"responselegacy");
+        }
+
+        fn run_guarded_sequence(guard: SubmissionGuard) -> (Vec<u8>, std::io::Result<()>) {
+            let (data_tx, mut data_rx) = mpsc::channel(3);
+            let (write_tx, write_rx) = std_mpsc::channel();
+            let (reply_tx, reply_rx) = std_mpsc::channel();
+            let (legacy_tx, legacy_rx) = std_mpsc::channel();
+            data_tx
+                .try_send(PtyIoDataCommand::SubmitUserInput {
+                    text: Bytes::from_static(b"prompt"),
+                    enter: Bytes::from_static(b"\r"),
+                    delay: Duration::from_millis(1),
+                    deadline: None,
+                    guard: Some(guard),
+                    reply: reply_tx,
+                })
+                .unwrap();
+            data_tx
+                .try_send(PtyIoDataCommand::SubmitUserInput {
+                    text: Bytes::from_static(b"legacy"),
+                    enter: Bytes::from_static(b"\r"),
+                    delay: Duration::ZERO,
+                    deadline: None,
+                    guard: None,
+                    reply: legacy_tx,
+                })
+                .unwrap();
+            data_tx
+                .try_send(PtyIoDataCommand::WriteUserInput(Bytes::from_static(
+                    b"user",
+                )))
+                .unwrap();
+            drop(data_tx);
+            let writer_thread = std::thread::spawn(move || {
+                let mut writer = Vec::new();
+                run_writer(&mut writer, write_rx);
+                writer
+            });
+            run_input_forwarder(&mut data_rx, write_tx, Arc::new(Mutex::new(true)));
+            let result = reply_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert!(matches!(
+                reply_rx.try_recv(),
+                Err(std_mpsc::TryRecvError::Disconnected)
+            ));
+            legacy_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .unwrap();
+            (writer_thread.join().unwrap(), result)
+        }
+
+        #[test]
+        fn guarded_forwarder_refusal_preserves_subsequent_inputs() {
+            let (bytes, result) = run_guarded_sequence(SubmissionGuard::new(|| Err(refusal())));
+            assert_eq!(
+                result.unwrap_err().kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+            assert_eq!(bytes, b"legacy\ruser");
+        }
+
+        #[test]
+        fn guarded_enter_rechecks_in_forwarder_and_actual_writer() {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            // Check 0 is text at the actual writer, 1 is delayed Enter at the
+            // forwarder, 2 is Enter after waiting in the actual writer queue.
+            for refuse_at in [1, 2] {
+                let checks = AtomicUsize::new(0);
+                let guard = SubmissionGuard::new(move || {
+                    if checks.fetch_add(1, Ordering::SeqCst) == refuse_at {
+                        Err(refusal())
+                    } else {
+                        Ok(())
+                    }
+                });
+                let (bytes, result) = run_guarded_sequence(guard);
+                assert_eq!(
+                    result.unwrap_err().kind(),
+                    std::io::ErrorKind::PermissionDenied
+                );
+                assert_eq!(bytes, b"promptlegacy\ruser");
+            }
+        }
+
+        #[test]
+        fn guarded_success_writes_once_and_completes_once() {
+            let (bytes, result) = run_guarded_sequence(SubmissionGuard::new(|| Ok(())));
+            result.unwrap();
+            assert_eq!(bytes, b"prompt\rlegacy\ruser");
+        }
+
+        #[test]
+        fn guarded_chunks_and_retries_recheck_before_each_write() {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            struct InvalidateWriter {
+                valid: Arc<AtomicBool>,
+                first: Option<std::io::Result<usize>>,
+                attempts: usize,
+            }
+            impl Write for InvalidateWriter {
+                fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                    self.attempts += 1;
+                    self.valid.store(false, Ordering::SeqCst);
+                    self.first.take().unwrap_or(Ok(bytes.len()))
+                }
+                fn flush(&mut self) -> std::io::Result<()> {
+                    Ok(())
+                }
+            }
+            for first in [
+                Ok(1),
+                Err(std::io::Error::from(std::io::ErrorKind::Interrupted)),
+                Err(std::io::Error::from(std::io::ErrorKind::WouldBlock)),
+            ] {
+                let valid = Arc::new(AtomicBool::new(true));
+                let guard = SubmissionGuard::new({
+                    let valid = Arc::clone(&valid);
+                    move || {
+                        if valid.load(Ordering::SeqCst) {
+                            Ok(())
+                        } else {
+                            Err(refusal())
+                        }
+                    }
+                });
+                let mut writer = InvalidateWriter {
+                    valid,
+                    first: Some(first),
+                    attempts: 0,
+                };
+                match write_guarded_and_flush(&mut writer, b"prompt", &guard) {
+                    Err(SubmissionWriteError::Guard(err)) => {
+                        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied)
+                    }
+                    _ => panic!("guard must refuse remaining chunk/retry"),
+                }
+                assert_eq!(writer.attempts, 1);
+            }
         }
 
         #[test]
@@ -549,6 +823,7 @@ mod windows {
                     enter: Bytes::from_static(b"\r"),
                     delay: Duration::from_millis(30),
                     deadline: None,
+                    guard: None,
                     reply: first_reply_tx,
                 })
                 .unwrap();
@@ -558,6 +833,7 @@ mod windows {
                     enter: Bytes::from_static(b"\r"),
                     delay: Duration::ZERO,
                     deadline: Some(Instant::now() + Duration::from_millis(10)),
+                    guard: None,
                     reply: expired_reply_tx,
                 })
                 .unwrap();

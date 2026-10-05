@@ -26,7 +26,7 @@ impl GuardServer {
         fs::write(
             &pi,
             format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$PROBE_ORIGIN\" >> '{}'\nexport HERDR_AGENT=pi\n'{}' pane report-agent \"$1\" --source custom:expected-terminal-test --agent pi --state idle >/dev/null\nprintf '\\033[?2004h'\nexec /bin/cat > '{}'\n",
+                "#!/bin/sh\nprintf '%s\\n' \"$PROBE_ORIGIN\" >> '{}'\nexport HERDR_AGENT=pi\n'{}' pane report-agent \"$1\" --source custom:expected-terminal-test --agent pi --state idle >/dev/null\nprintf '\\033[?2004h'\nexec /bin/bash -c 'exec -a pi /bin/cat' > '{}'\n",
                 base.join("pi-launch").display(),
                 env!("CARGO_BIN_EXE_herdr"),
                 pi_input.display(),
@@ -454,6 +454,495 @@ fn guarded_agent_prompt_refuses_after_foreground_loss_without_shell_effects() {
         fs::read(&server.pi_input).unwrap_or_default().is_empty(),
         "guarded prompt reached the old Pi"
     );
+}
+
+// Linux exposes the exact interprocess-lock waiter and the kernel's terminal
+// foreground group, so this interval is synchronized without sleep guesses.
+#[cfg(target_os = "linux")]
+#[test]
+fn guarded_agent_prompt_refuses_foreground_change_during_input_log_lock() {
+    use std::os::unix::fs::MetadataExt;
+
+    let server = GuardServer::new("0");
+    let prompts = server.base.join("shell-prompts");
+    // Count each actual shell prompt, including one caused by a bare Enter.
+    // This observes input without replacing the shell's native controlling PTY.
+    fs::write(
+        server.bin.join("delayed-shell"),
+        format!(
+            "#!/bin/sh\nPS1='$(printf x >> \"{}\")$ '\nexport PS1\nexec /bin/sh\n",
+            prompts.display()
+        ),
+    )
+    .unwrap();
+    let pane = server.pane("original");
+    server.barrier(&pane);
+    server.start_worker(&pane);
+    let expected = server.observed_worker_terminal();
+    assert!(wait_until(
+        Duration::from_secs(3),
+        Duration::from_millis(25),
+        || server.pi_input.exists()
+    ));
+    let info = server.request("pane.process_info", json!({"pane_id": pane["pane_id"]}));
+    let pgid = info["result"]["process_info"]["foreground_process_group_id"]
+        .as_i64()
+        .unwrap();
+    let shell_pid = info["result"]["process_info"]["shell_pid"]
+        .as_u64()
+        .unwrap();
+    assert!(pgid > 0 && pgid as u64 != shell_pid, "{info}");
+    let server_pid = server.server.as_ref().unwrap().id().to_string();
+    let log_path = server
+        .base
+        .join("state")
+        .join(app_dir_name())
+        .join("api-input.jsonl");
+    let log_before = fs::read(&log_path).unwrap();
+    let input_before = fs::read(&server.pi_input).unwrap();
+    assert!(input_before.is_empty());
+    let effect = server.base.join("guarded-shell-effect");
+    let token = "native_guard_unsent_assignment";
+    // A comment terminates bracketed-paste suffixes on shells that do not
+    // interpret them. The downstream barrier uses the same ordinary shell form.
+    let text = format!(
+        ":; NATIVE_GUARD_UNSENT={token}; printf escaped > '{}'; #",
+        effect.display()
+    );
+    let (response, prompts_at_resume) = thread::scope(|scope| {
+        // Lock ownership is inside the scope: an assertion panic drops it
+        // before scoped threads join, so a failed proof cannot deadlock cleanup.
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&log_path)
+            .unwrap();
+        lock.lock().unwrap();
+        let metadata = lock.metadata().unwrap();
+        let identity = format!(
+            "{:02x}:{:02x}:{}",
+            libc::major(metadata.dev()),
+            libc::minor(metadata.dev()),
+            metadata.ino()
+        );
+        let is_blocked = || {
+            fs::read_to_string("/proc/locks")
+                .unwrap()
+                .lines()
+                .any(|line| {
+                    let fields: Vec<_> = line.split_whitespace().collect();
+                    fields.contains(&"->")
+                        && fields.contains(&"FLOCK")
+                        && fields.contains(&"WRITE")
+                        && fields.contains(&server_pid.as_str())
+                        && fields.contains(&identity.as_str())
+                })
+        };
+        let writer = scope.spawn(|| native_guarded_request(&server.socket, &text, &expected));
+        assert!(
+            wait_until(
+                Duration::from_secs(3),
+                Duration::from_millis(25),
+                is_blocked
+            ),
+            "server {server_pid} never waited on exact input log inode {identity}"
+        );
+        assert_eq!(fs::read(&log_path).unwrap(), log_before);
+        assert!(!writer.is_finished());
+        let prompts_before = fs::read(&prompts).unwrap().len();
+        assert_eq!(
+            unsafe { libc::kill(-(pgid as libc::pid_t), libc::SIGTERM) },
+            0
+        );
+        assert!(wait_until(
+            Duration::from_secs(3),
+            Duration::from_millis(25),
+            || {
+                // /proc stat field 8 is tpgid. Read it without querying the
+                // App, which deliberately remains blocked on the input log.
+                let stat = fs::read_to_string(format!("/proc/{shell_pid}/stat"));
+                let tpgid = stat.ok().and_then(|stat| {
+                    stat.rsplit_once(')')
+                        .and_then(|(_, fields)| fields.split_whitespace().nth(5))
+                        .and_then(|field| field.parse::<u64>().ok())
+                });
+                tpgid == Some(shell_pid)
+                    && fs::read(&prompts).is_ok_and(|receipts| receipts.len() == prompts_before + 1)
+            }
+        ));
+        assert!(
+            is_blocked(),
+            "receiver resumed before foreground transition"
+        );
+        assert!(!writer.is_finished());
+        assert_eq!(fs::read(&server.pi_input).unwrap(), input_before);
+        let prompts_at_resume = fs::read(&prompts).unwrap().len();
+        eprintln!(
+            "native lock barrier: server={server_pid}, inode={identity}; shell tpgid={shell_pid}; terminal={expected}"
+        );
+        drop(lock);
+        (writer.join().unwrap(), prompts_at_resume)
+    });
+
+    let same = server.request("pane.get", json!({"pane_id": pane["pane_id"]}));
+    assert_eq!(same["result"]["pane"]["terminal_id"], expected);
+    let drained = server.base.join("guarded-downstream-barrier");
+    let barrier = format!(
+        ":; printf '%s' \"${{NATIVE_GUARD_UNSENT-unset}}\" > '{}'; #",
+        drained.display()
+    );
+    assert!(server
+        .cli(&["pane", "run", server.pane_id(&pane), &barrier])
+        .status
+        .success());
+    assert!(wait_until(
+        Duration::from_secs(5),
+        Duration::from_millis(25),
+        || drained.exists() && fs::read(&prompts).is_ok_and(|p| p.len() > prompts_at_resume)
+    ));
+    let screen = server.request(
+        "pane.read",
+        json!({"pane_id": pane["pane_id"], "source": "recent", "format": "text"}),
+    );
+    let log = fs::read_to_string(&log_path).unwrap();
+    let records: Vec<Value> = log
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|record| record["method"] == "agent.prompt_guarded")
+        .collect();
+    // The durable record describes an attempted input, not a success receipt.
+    assert_eq!(records.len(), 1, "{log}");
+    assert_eq!(records[0]["target_terminal"], expected);
+    assert_eq!(records[0]["bytes"], text.len());
+    assert!(!log.contains(token));
+    eprintln!(
+        "native downstream proof: response={response}; capture={:?}; shell sentinel={:?}; prompt receipts={}",
+        fs::read(&server.pi_input).unwrap(),
+        fs::read_to_string(&drained).unwrap(),
+        fs::read(&prompts).unwrap().len() - prompts_at_resume
+    );
+    assert!(
+        response.get("result").is_none(),
+        "must not report success: {response}"
+    );
+    assert!(
+        matches!(
+            response["error"]["code"].as_str(),
+            Some("agent_not_ready" | "agent_prompt_failed")
+        ),
+        "{response}"
+    );
+    assert!(!effect.exists(), "guarded input executed in the shell");
+    assert_eq!(fs::read_to_string(&drained).unwrap(), "unset");
+    assert_eq!(fs::read(&server.pi_input).unwrap(), input_before);
+    assert!(!screen["result"]["read"]["text"]
+        .as_str()
+        .unwrap()
+        .contains(token));
+    assert_eq!(
+        fs::read(&prompts).unwrap().len(),
+        prompts_at_resume + 1,
+        "only the downstream barrier may supply an Enter to the shell"
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn native_guarded_request(socket: &Path, text: &str, expected: &str) -> Value {
+    let mut stream = UnixStream::connect(socket).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .unwrap();
+    writeln!(
+        stream,
+        "{}",
+        json!({"id": "native-writer-guard", "method": "agent.prompt_guarded",
+            "params": {"target": "worker", "text": text, "expected_terminal": expected}})
+    )
+    .unwrap();
+    let mut response = String::new();
+    BufReader::new(stream).read_line(&mut response).unwrap();
+    serde_json::from_str(&response).unwrap()
+}
+
+#[cfg(target_os = "linux")]
+fn native_shell_foreground(shell_pid: u64) -> bool {
+    fs::read_to_string(format!("/proc/{shell_pid}/stat"))
+        .ok()
+        .and_then(|stat| {
+            stat.rsplit_once(')')
+                .and_then(|(_, fields)| fields.split_whitespace().nth(5))
+                .and_then(|field| field.parse::<u64>().ok())
+        })
+        == Some(shell_pid)
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn guarded_agent_prompt_refuses_foreground_change_while_native_writer_queued() {
+    let server = GuardServer::new("0");
+    let prompts = server.base.join("shell-prompts");
+    fs::write(
+        server.bin.join("delayed-shell"),
+        format!(
+            "#!/bin/sh\nPS1='$(/usr/bin/stty sane -echo; printf x >> \"{}\")$ '\nexport PS1\nexec /bin/sh\n",
+            prompts.display()
+        ),
+    )
+    .unwrap();
+    let probe = server.base.join("queued-reader.py");
+    fs::write(
+        &probe,
+        format!(
+            "import ctypes, pathlib, time\nctypes.CDLL(None).prctl(15, b'pi', 0, 0, 0)\npathlib.Path({:?}).write_text('blocked')\nwhile True: time.sleep(0.01)\n",
+            server.base.join("reader-blocked").to_str().unwrap(),
+        ),
+    )
+    .unwrap();
+    // Keep a live, foreground native reader behind a readiness barrier. SIGSTOP
+    // would return the interactive shell to foreground before the guarded request.
+    fs::write(
+        server.bin.join("pi"),
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$PROBE_ORIGIN\" >> '{}'\n/usr/bin/stty raw -echo\nexport HERDR_AGENT=pi\n'{}' pane report-agent \"$1\" --source custom:expected-terminal-test --agent pi --state idle >/dev/null\nprintf '\\033[?2004h'\nexec /bin/bash -c 'exec -a pi /usr/bin/python3 \"$1\"' -- '{}' > '{}'\n",
+            server.base.join("pi-launch").display(),
+            env!("CARGO_BIN_EXE_herdr"),
+            probe.display(),
+            server.pi_input.display()
+        ),
+    )
+    .unwrap();
+    let pane = server.pane("original");
+    server.barrier(&pane);
+    server.start_worker(&pane);
+    let expected = server.observed_worker_terminal();
+    assert!(wait_until(
+        Duration::from_secs(3),
+        Duration::from_millis(25),
+        || { server.pi_input.exists() }
+    ));
+    let info = server.request("pane.process_info", json!({"pane_id": pane["pane_id"]}));
+    let pgid = info["result"]["process_info"]["foreground_process_group_id"]
+        .as_i64()
+        .unwrap();
+    let shell_pid = info["result"]["process_info"]["shell_pid"]
+        .as_u64()
+        .unwrap();
+    assert!(pgid > 0 && pgid as u64 != shell_pid, "{info}");
+    assert!(wait_until(
+        Duration::from_secs(3),
+        Duration::from_millis(25),
+        || server.base.join("reader-blocked").exists(),
+    ));
+    // More than any native PTY input buffer, but well below the API frame limit.
+    // Legacy data is deliberately only spaces: never assignment text or Enter.
+    let filler = server.request(
+        "pane.send_text",
+        json!({
+            "pane_id": pane["pane_id"], "text": " ".repeat(512 * 1024)
+        }),
+    );
+    assert!(filler.get("result").is_some(), "{filler}");
+    // A deliberately paused native reader has no UI signals. Preserve the
+    // same explicit lifecycle authority a real Pi integration supplies.
+    let report = server.cli(&[
+        "pane",
+        "report-agent",
+        server.pane_id(&pane),
+        "--source",
+        "herdr:pi",
+        "--agent",
+        "pi",
+        "--state",
+        "idle",
+    ]);
+    assert!(
+        report.status.success(),
+        "{}",
+        String::from_utf8_lossy(&report.stderr)
+    );
+    let observed = server.request("agent.get", json!({"target": "worker"}));
+    let foreground = server.request("pane.process_info", json!({"pane_id": pane["pane_id"]}));
+    assert_eq!(
+        observed["result"]["agent"]["terminal_id"], expected,
+        "{observed}"
+    );
+    assert_eq!(
+        foreground["result"]["process_info"]["foreground_process_group_id"], pgid,
+        "{foreground}"
+    );
+    eprintln!("queued native input observation: {observed}; foreground: {foreground}");
+    let log_path = server
+        .base
+        .join("state")
+        .join(app_dir_name())
+        .join("api-input.jsonl");
+    let token = "native_guard_queued_unsent";
+    let effect = server.base.join("queued-shell-effect");
+    let text = format!(
+        ":; NATIVE_GUARD_UNSENT={token}; printf escaped > '{}'; #",
+        effect.display()
+    );
+    let response = thread::scope(|scope| {
+        let writer = scope.spawn(|| native_guarded_request(&server.socket, &text, &expected));
+        assert!(wait_until(
+            Duration::from_secs(3),
+            Duration::from_millis(25),
+            || {
+                writer.is_finished()
+                    || fs::read_to_string(&log_path).unwrap().lines().any(|line| {
+                        serde_json::from_str::<Value>(line).unwrap()["method"]
+                            == "agent.prompt_guarded"
+                    })
+            }
+        ));
+        if writer.is_finished() {
+            panic!(
+                "queued request refused before writer barrier: {}",
+                writer.join().unwrap()
+            );
+        }
+        // The log proves this handler started. A later App-dispatched lookup
+        // proves it finished enqueueing; the socket completion is still pending.
+        let barrier = server.request("pane.get", json!({"pane_id": pane["pane_id"]}));
+        assert_eq!(barrier["result"]["pane"]["terminal_id"], expected);
+        assert!(
+            !writer.is_finished(),
+            "submission completed while its reader was paused"
+        );
+        assert!(fs::read(&server.pi_input).unwrap().is_empty());
+        assert_eq!(
+            unsafe { libc::kill(-(pgid as libc::pid_t), libc::SIGKILL) },
+            0
+        );
+        assert!(wait_until(
+            Duration::from_secs(3),
+            Duration::from_millis(25),
+            || { native_shell_foreground(shell_pid) }
+        ));
+        eprintln!("native queued barrier: paused reader pgid={pgid}; App handler enqueued; same terminal={expected}; shell tpgid={shell_pid}");
+        writer.join().unwrap()
+    });
+    assert!(wait_until(
+        Duration::from_secs(3),
+        Duration::from_millis(25),
+        || { fs::read(&prompts).is_ok_and(|p| p.len() >= 3) }
+    ));
+    let prompts_at_resume = fs::read(&prompts).unwrap().len();
+    assert!(response.get("result").is_none(), "{response}");
+    assert_eq!(response["error"]["code"], "agent_not_ready", "{response}");
+    assert!(!effect.exists());
+    // Killing a raw reader does not restore its terminal modes. Restore only
+    // this fixture's owned PTY, then drain the deliberately harmless backlog.
+    let tty = format!("/proc/{shell_pid}/fd/0");
+    assert!(Command::new("/usr/bin/stty")
+        .args(["-F", &tty, "sane"])
+        .status()
+        .unwrap()
+        .success());
+    assert!(server
+        .cli(&["pane", "send-keys", server.pane_id(&pane), "enter"])
+        .status
+        .success());
+    assert!(wait_until(
+        Duration::from_secs(5),
+        Duration::from_millis(25),
+        || fs::read(&prompts).is_ok_and(|p| p.len() > prompts_at_resume),
+    ));
+    let prompts_after_drain = fs::read(&prompts).unwrap().len();
+    let drained = server.base.join("queued-downstream-barrier");
+    let barrier = format!(
+        ":; printf '%s' \"${{NATIVE_GUARD_UNSENT-unset}}\" > '{}'; #",
+        drained.display()
+    );
+    assert!(server
+        .cli(&["pane", "run", server.pane_id(&pane), &barrier])
+        .status
+        .success());
+    assert!(wait_until(
+        Duration::from_secs(5),
+        Duration::from_millis(25),
+        || { drained.exists() && fs::read(&prompts).is_ok_and(|p| p.len() > prompts_after_drain) }
+    ));
+    eprintln!(
+        "native queued proof: response={response}; capture={:?}; downstream sentinel={:?}",
+        fs::read(&server.pi_input).unwrap(),
+        fs::read_to_string(&drained).unwrap()
+    );
+    assert!(response.get("result").is_none(), "{response}");
+    assert_eq!(response["error"]["code"], "agent_not_ready", "{response}");
+    assert!(!effect.exists());
+    assert_eq!(fs::read_to_string(&drained).unwrap(), "unset");
+    assert!(fs::read(&server.pi_input).unwrap().is_empty());
+    assert_eq!(prompts_after_drain, prompts_at_resume + 1);
+    assert_eq!(fs::read(&prompts).unwrap().len(), prompts_at_resume + 2);
+    assert!(!fs::read_to_string(&log_path).unwrap().contains(token));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn guarded_agent_prompt_refuses_delayed_enter_after_native_probe_consumes_text() {
+    let server = GuardServer::new("0");
+    let prompts = server.base.join("shell-prompts");
+    fs::write(
+        server.bin.join("delayed-shell"),
+        format!(
+            "#!/bin/sh\nPS1='$(printf x >> \"{}\")$ '\nexport PS1\nexec /bin/sh\n",
+            prompts.display()
+        ),
+    )
+    .unwrap();
+    let text = "--assignment\nλ 日本語\nsecond line";
+    let payload = format!("\x1b[200~{text}\x1b[201~").into_bytes();
+    let ready = server.base.join("raw-reader-ready");
+    let probe = server.base.join("raw-reader.py");
+    fs::write(&probe, format!(
+        "import os, pathlib, termios, tty\nold=termios.tcgetattr(0)\ntty.setraw(0)\npathlib.Path({:?}).write_text('ready')\ndata=b''\nwhile len(data)<{}:\n data+=os.read(0, {}-len(data))\npathlib.Path({:?}).write_bytes(data)\ntermios.tcsetattr(0,termios.TCSANOW,old)\nos.write(1,b'\\x1b[?2004l')\n",
+        ready.to_str().unwrap(), payload.len(), payload.len(), server.pi_input.to_str().unwrap()
+    )).unwrap();
+    fs::write(server.bin.join("pi"), format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$PROBE_ORIGIN\" >> '{}'\nexport HERDR_AGENT=pi\n'{}' pane report-agent \"$1\" --source custom:expected-terminal-test --agent pi --state idle >/dev/null\nprintf '\\033[?2004h'\nexec /bin/bash -c 'exec -a pi /usr/bin/python3 \"$@\"' -- '{}'\n",
+        server.base.join("pi-launch").display(), env!("CARGO_BIN_EXE_herdr"), probe.display()
+    )).unwrap();
+    let pane = server.pane("original");
+    server.barrier(&pane);
+    server.start_worker(&pane);
+    let expected = server.observed_worker_terminal();
+    assert!(wait_until(
+        Duration::from_secs(3),
+        Duration::from_millis(25),
+        || ready.exists()
+    ));
+    let info = server.request("pane.process_info", json!({"pane_id": pane["pane_id"]}));
+    let shell_pid = info["result"]["process_info"]["shell_pid"]
+        .as_u64()
+        .unwrap();
+    let prompts_before = fs::read(&prompts).unwrap().len();
+    // The native reader exits itself only after consuming the entire text
+    // boundary. No parent sleep/kill guesses the deferred-Enter interval.
+    let response = native_guarded_request(&server.socket, text, &expected);
+    assert!(wait_until(
+        Duration::from_secs(3),
+        Duration::from_millis(25),
+        || {
+            native_shell_foreground(shell_pid)
+                && fs::read(&prompts).is_ok_and(|p| p.len() > prompts_before)
+        }
+    ));
+    let same = server.request("pane.get", json!({"pane_id": pane["pane_id"]}));
+    assert_eq!(same["result"]["pane"]["terminal_id"], expected);
+    eprintln!("native delayed Enter proof: response={response}; exact text capture={:?}; shell prompt delta={}", fs::read(&server.pi_input).unwrap(), fs::read(&prompts).unwrap().len() - prompts_before);
+    assert_eq!(fs::read(&server.pi_input).unwrap(), payload);
+    assert!(response.get("result").is_none(), "{response}");
+    assert_eq!(response["error"]["code"], "agent_not_ready", "{response}");
+    assert_eq!(
+        fs::read(&prompts).unwrap().len(),
+        prompts_before + 1,
+        "no blank Enter may follow the probe exit prompt"
+    );
+    // A downstream shell command also fences presentation/input after refusal.
+    server.barrier(&pane);
+    assert_eq!(fs::read(&prompts).unwrap().len(), prompts_before + 2);
+    assert_eq!(fs::read(&server.pi_input).unwrap(), payload);
 }
 
 #[test]

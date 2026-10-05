@@ -481,6 +481,18 @@ impl TerminalRuntime {
             .queue_user_input_submission(text, enter, delay, deadline)
     }
 
+    pub(crate) fn queue_guarded_user_input_submission(
+        &self,
+        text: Bytes,
+        enter: Bytes,
+        delay: std::time::Duration,
+        deadline: Option<std::time::Instant>,
+        guard: crate::pty::actor::SubmissionGuard,
+    ) -> std::io::Result<std::sync::mpsc::Receiver<std::io::Result<()>>> {
+        self.0
+            .queue_guarded_user_input_submission(text, enter, delay, deadline, guard)
+    }
+
     pub(crate) fn try_send_paste(
         &self,
         text: String,

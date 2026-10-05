@@ -83,6 +83,25 @@ pub(crate) struct ProcessIdentity {
     pub(crate) start_time: u64,
 }
 
+/// Uncached foreground evidence for guarded API submissions only. Detection keeps
+/// its existing cache/fallback policy; an unobservable native Unix group refuses.
+pub(crate) fn fresh_foreground_job(shell_pid: u32) -> Option<ForegroundJob> {
+    #[cfg(windows)]
+    return windows::fresh_foreground_job(shell_pid);
+    #[cfg(unix)]
+    {
+        let group = foreground_process_group_id(shell_pid)?;
+        let job = foreground_job(shell_pid)?;
+        (job.process_group_id == group && foreground_process_group_id(shell_pid) == Some(group))
+            .then_some(job)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = shell_pid;
+        None
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Signal {
     Hangup,

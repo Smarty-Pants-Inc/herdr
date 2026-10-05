@@ -1472,6 +1472,46 @@ impl PaneRuntimeIo {
         }
     }
 
+    fn queue_guarded_user_input_submission(
+        &self,
+        text: Bytes,
+        enter: Bytes,
+        delay: std::time::Duration,
+        deadline: Option<std::time::Instant>,
+        guard: crate::pty::actor::SubmissionGuard,
+    ) -> std::io::Result<std::sync::mpsc::Receiver<std::io::Result<()>>> {
+        match self {
+            PaneRuntimeIo::Actor(actor) => {
+                actor.queue_guarded_user_input_submission(text, enter, delay, deadline, guard)
+            }
+            #[cfg(test)]
+            PaneRuntimeIo::TestChannel { sender, .. } => {
+                let sender = sender.clone();
+                let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let check = || {
+                        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                "submission deadline expired",
+                            ));
+                        }
+                        guard.check()
+                    };
+                    let result = check()
+                        .and_then(|()| sender.try_send(text).map_err(std::io::Error::other))
+                        .and_then(|()| {
+                            std::thread::sleep(delay);
+                            check()?;
+                            sender.try_send(enter).map_err(std::io::Error::other)
+                        });
+                    let _ = reply_tx.send(result);
+                });
+                Ok(reply_rx)
+            }
+        }
+    }
+
     fn queue_user_input_submission(
         &self,
         text: Bytes,
@@ -3517,6 +3557,18 @@ impl PaneRuntime {
             .queue_user_input_submission(text, enter, delay, deadline)
     }
 
+    pub(crate) fn queue_guarded_user_input_submission(
+        &self,
+        text: Bytes,
+        enter: Bytes,
+        delay: std::time::Duration,
+        deadline: Option<std::time::Instant>,
+        guard: crate::pty::actor::SubmissionGuard,
+    ) -> std::io::Result<std::sync::mpsc::Receiver<std::io::Result<()>>> {
+        self.io
+            .queue_guarded_user_input_submission(text, enter, delay, deadline, guard)
+    }
+
     pub(crate) fn try_send_paste(
         &self,
         text: String,
@@ -3894,6 +3946,85 @@ impl PaneRuntime {
 mod tests {
     use super::*;
     use std::ffi::OsStr;
+
+    #[tokio::test]
+    async fn guarded_submission_wrapper_refuses_unknown_and_preserves_healthy_input() {
+        let (runtime, mut rx) = PaneRuntime::test_with_channel(80, 24);
+        let guard = crate::pty::actor::SubmissionGuard::new(|| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "unknown instance",
+            ))
+        });
+        let refused = runtime
+            .queue_guarded_user_input_submission(
+                Bytes::from_static(b"refused"),
+                Bytes::from_static(b"\r"),
+                std::time::Duration::ZERO,
+                None,
+                guard,
+            )
+            .unwrap();
+        assert_eq!(
+            refused
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap()
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert!(rx.try_recv().is_err());
+        let healthy = runtime
+            .queue_guarded_user_input_submission(
+                Bytes::from_static(b"healthy"),
+                Bytes::from_static(b"\r"),
+                std::time::Duration::ZERO,
+                None,
+                crate::pty::actor::SubmissionGuard::new(|| Ok(())),
+            )
+            .unwrap();
+        healthy
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"healthy"));
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"\r"));
+    }
+
+    #[tokio::test]
+    async fn guarded_submission_wrapper_rechecks_before_enter() {
+        let (runtime, mut rx) = PaneRuntime::test_with_channel(80, 24);
+        let checks = AtomicU32::new(0);
+        let guard = crate::pty::actor::SubmissionGuard::new(move || {
+            if checks.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "lost foreground",
+                ))
+            }
+        });
+        let completion = runtime
+            .queue_guarded_user_input_submission(
+                Bytes::from_static(b"text"),
+                Bytes::from_static(b"\r"),
+                std::time::Duration::ZERO,
+                None,
+                guard,
+            )
+            .unwrap();
+        assert_eq!(
+            completion
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap()
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"text"));
+        assert!(rx.try_recv().is_err(), "guard refused Enter");
+    }
 
     #[tokio::test]
     async fn clear_pane_preserves_wrapped_input_and_unfinished_vt_sequence() {
