@@ -2,7 +2,7 @@ use std::{
     collections::VecDeque,
     io::{Read, Write},
     os::fd::{AsRawFd, OwnedFd, RawFd},
-    sync::{mpsc as std_mpsc, Arc, Mutex},
+    sync::{mpsc as std_mpsc, Arc, Mutex, Weak},
     time::{Duration, Instant},
 };
 
@@ -98,6 +98,7 @@ pub(crate) struct PtyIoActorHandle {
     user_writes: Arc<Mutex<UserWriteGate>>,
     controls: Arc<Mutex<SharedPtyControls>>,
     response_order: Arc<Mutex<()>>,
+    foreground_fd: PtyForegroundObserver,
 }
 
 #[derive(Debug)]
@@ -299,6 +300,12 @@ impl PtyIoActorHandle {
         })?
     }
 
+    /// Scalar-only observation must hold this close-exclusion gate for the
+    /// ioctl. The gate never owns or duplicates the original master fd.
+    pub(crate) fn foreground_observer(&self) -> PtyForegroundObserver {
+        self.foreground_fd.clone()
+    }
+
     pub(crate) fn foreground_process_group_id(&self) -> Option<u32> {
         let (reply_tx, reply_rx) = std_mpsc::channel();
         self.control_tx
@@ -393,6 +400,7 @@ impl PtyIoActor {
         }));
         let controls = Arc::new(Mutex::new(SharedPtyControls::default()));
         let response_order = Arc::new(Mutex::new(()));
+        let file = ActorPtyFile::new(std::fs::File::from(config.master_fd));
         let handle = PtyIoActorHandle {
             data_tx,
             control_tx,
@@ -400,11 +408,12 @@ impl PtyIoActor {
             user_writes,
             controls: Arc::clone(&controls),
             response_order: Arc::clone(&response_order),
+            foreground_fd: PtyForegroundObserver(Arc::downgrade(&file.foreground)),
         };
 
         let mut runner = PtyIoActorRunner {
             pane_id: config.pane_id,
-            file: std::fs::File::from(config.master_fd),
+            file,
             data_rx,
             control_rx,
             state: if config.initially_quiesced {
@@ -440,9 +449,85 @@ impl PtyIoActor {
     }
 }
 
+/// Outer None means closed; inner None means a live fd with no foreground
+/// observation. Never let callers retain the fd or escape the close gate.
+#[derive(Clone, Default)]
+pub(crate) struct PtyForegroundObserver(Weak<Mutex<Option<RawFd>>>);
+
+impl PtyForegroundObserver {
+    pub(crate) fn observe(&self) -> Option<Option<u32>> {
+        let slot = self.0.upgrade()?;
+        let fd = slot.lock().ok()?;
+        Some(crate::platform::foreground_process_group_id_for_tty_fd(
+            (*fd)?,
+        ))
+    }
+}
+
+/// Owns exactly one master fd. The observer's gate excludes close only during
+/// its bounded ioctl; actor poll/read/callback paths never hold that mutex.
+struct ActorPtyFile {
+    file: Option<std::fs::File>,
+    foreground: Arc<Mutex<Option<RawFd>>>,
+}
+
+impl ActorPtyFile {
+    fn new(file: std::fs::File) -> Self {
+        let foreground = Arc::new(Mutex::new(Some(file.as_raw_fd())));
+        Self {
+            file: Some(file),
+            foreground,
+        }
+    }
+
+    fn close(&mut self) {
+        let mut foreground = self.foreground.lock().unwrap_or_else(|p| p.into_inner());
+        *foreground = None;
+        // Drop the fd under the gate, before observers can see its number reused.
+        drop(self.file.take());
+    }
+}
+
+impl Drop for ActorPtyFile {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+impl AsRawFd for ActorPtyFile {
+    fn as_raw_fd(&self) -> RawFd {
+        self.file.as_ref().map_or(-1, AsRawFd::as_raw_fd)
+    }
+}
+
+impl Read for ActorPtyFile {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        self.file
+            .as_mut()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "PTY actor closed"))?
+            .read(bytes)
+    }
+}
+
+impl Write for ActorPtyFile {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.file
+            .as_mut()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "PTY actor closed"))?
+            .write(bytes)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file
+            .as_mut()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "PTY actor closed"))?
+            .flush()
+    }
+}
+
 struct PtyIoActorRunner {
     pane_id: u32,
-    file: std::fs::File,
+    file: ActorPtyFile,
     data_rx: mpsc::Receiver<PtyIoDataCommand>,
     control_rx: std_mpsc::Receiver<PtyIoControlCommand>,
     state: ActorState,
@@ -570,6 +655,7 @@ impl PtyIoActorRunner {
             }
         }
 
+        self.file.close();
         self.close_input_queue();
         if let Some(on_reader_exit) = self.on_reader_exit.take() {
             on_reader_exit();
@@ -707,6 +793,7 @@ impl PtyIoActorRunner {
             PtyIoControlCommand::ReleaseAfterCommit(reply) => {
                 self.state = ActorState::Released;
                 self.pending_writes.clear();
+                self.file.close();
                 let _ = reply.send(Ok(()));
                 return true;
             }
@@ -1098,7 +1185,7 @@ mod tests {
         let wake_pipe = fd::create_wake_pipe().expect("wake pipe");
         let runner = PtyIoActorRunner {
             pane_id: 1,
-            file: std::fs::File::from(owned),
+            file: ActorPtyFile::new(std::fs::File::from(owned)),
             data_rx,
             control_rx,
             state: ActorState::Running,
@@ -1326,6 +1413,7 @@ mod tests {
         let owned = unsafe { OwnedFd::from_raw_fd(actor_socket.into_raw_fd()) };
         let handle_slot = Arc::new(Mutex::new(None::<PtyIoActorHandle>));
         let (attempt_tx, attempt_rx) = std_mpsc::channel();
+        let (callback_continue_tx, callback_continue_rx) = std_mpsc::channel();
         let config = PtyIoActorConfig {
             pane_id: 1,
             master_fd: owned,
@@ -1340,16 +1428,25 @@ mod tests {
                         .as_ref()
                         .expect("actor handle installed")
                         .clone();
+                    assert_eq!(
+                        handle.foreground_observer().observe(),
+                        None,
+                        "original fd must be closed before reader-exit callbacks"
+                    );
                     let attempt = handle.queue_user_input_submission(
                         Bytes::from_static(b"prompt"),
                         Bytes::from_static(b"\r"),
                         Duration::ZERO,
                     );
                     attempt_tx.send(attempt).expect("attempt receiver alive");
+                    callback_continue_rx
+                        .recv_timeout(Duration::from_secs(2))
+                        .expect("unblock reader-exit callback");
                 }
             })),
         };
         let handle = PtyIoActor::spawn(config).expect("actor spawn");
+        let observer = handle.foreground_observer();
         *handle_slot
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(handle);
@@ -1369,6 +1466,14 @@ mod tests {
         };
 
         assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+        assert_eq!(
+            observer.observe(),
+            None,
+            "closed fd cannot be retained by a blocked reader-exit callback"
+        );
+        callback_continue_tx
+            .send(())
+            .expect("allow actor callback to exit");
     }
 
     #[test]
@@ -1629,6 +1734,7 @@ mod tests {
             user_writes: Arc::new(Mutex::new(UserWriteGate { accepting: true })),
             controls: Arc::clone(&controls),
             response_order: Arc::new(Mutex::new(())),
+            foreground_fd: PtyForegroundObserver::default(),
         };
 
         handle.resize(20, 80, 8, 16, vec![Bytes::from_static(b"old")]);
@@ -1680,7 +1786,7 @@ mod tests {
         let query_light = Arc::clone(&light);
         let runner = PtyIoActorRunner {
             pane_id: 1,
-            file: std::fs::File::from(owned),
+            file: ActorPtyFile::new(std::fs::File::from(owned)),
             data_rx,
             control_rx,
             state: ActorState::Running,
@@ -1708,6 +1814,7 @@ mod tests {
             user_writes: Arc::new(Mutex::new(UserWriteGate { accepting: true })),
             controls,
             response_order,
+            foreground_fd: PtyForegroundObserver(Arc::downgrade(&runner.file.foreground)),
         };
         let (changed_tx, changed_rx) = std_mpsc::channel();
         let (continue_tx, continue_rx) = std_mpsc::channel();
@@ -1777,6 +1884,7 @@ mod tests {
             user_writes: Arc::new(Mutex::new(UserWriteGate { accepting: true })),
             controls: Arc::new(Mutex::new(SharedPtyControls::default())),
             response_order: Arc::new(Mutex::new(())),
+            foreground_fd: PtyForegroundObserver::default(),
         };
 
         let handoff = std::thread::spawn(move || handle.begin_handoff(Duration::from_secs(1)));
@@ -1813,7 +1921,9 @@ mod tests {
             .expect("queued write");
         let mut runner = PtyIoActorRunner {
             pane_id: 1,
-            file: std::fs::File::from(unsafe { OwnedFd::from_raw_fd(actor_socket.into_raw_fd()) }),
+            file: ActorPtyFile::new(std::fs::File::from(unsafe {
+                OwnedFd::from_raw_fd(actor_socket.into_raw_fd())
+            })),
             data_rx,
             control_rx,
             state: ActorState::Running,
@@ -1842,7 +1952,28 @@ mod tests {
     fn release_after_commit_prevents_further_io() {
         let (handle, mut peer, read_rx) = actor_with_socket_pair(false);
 
-        handle.release_after_commit().expect("actor released");
+        let observer = handle.foreground_observer();
+        assert_eq!(observer.observe(), Some(None), "live non-TTY is not closed");
+        let slot = observer.0.upgrade().expect("live observer gate");
+        let sample = slot.lock().expect("simulate in-flight scalar observation");
+        let release_handle = handle.clone();
+        let (release_tx, release_rx) = std_mpsc::channel();
+        let release_thread = std::thread::spawn(move || {
+            release_tx
+                .send(release_handle.release_after_commit())
+                .expect("release receiver");
+        });
+        assert!(
+            release_rx.recv_timeout(Duration::from_millis(20)).is_err(),
+            "release ACK must wait for an in-flight observer"
+        );
+        drop(sample);
+        release_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("release ACK")
+            .expect("actor released");
+        release_thread.join().expect("release thread");
+        assert_eq!(observer.observe(), None, "release ACK is a close barrier");
         assert!(handle
             .try_write_user_input(Bytes::from_static(b"blocked"))
             .is_err());

@@ -26,6 +26,7 @@ use crate::render_signal::RenderSignal;
 
 mod agent_detection;
 mod cursor;
+mod detection_wake;
 mod input;
 mod kitty_keyboard;
 mod osc;
@@ -38,8 +39,9 @@ use self::agent_detection::{
     detection_update_for_publish_with_osc, mark_detection_content_changed,
     observe_detection_content_change, DetectionPublishDecision, DetectionScreenReadDecision,
     DetectionScreenReadInput, PendingIdleConfirmation, ScreenDetectionPublishInput,
-    AGENT_PENDING_IDLE_RECHECK, AGENT_STARTUP_GRACE_WINDOW,
+    AGENT_STARTUP_GRACE_WINDOW,
 };
+use self::detection_wake::DetectionWake;
 #[cfg(unix)]
 pub use self::terminal::InputState;
 use self::terminal::{GhosttyPaneTerminal, PaneTerminal};
@@ -51,6 +53,8 @@ pub use self::{
     state::PaneState,
     terminal::{ScrollMetrics, TerminalCursorState},
 };
+#[cfg(unix)]
+use crate::pty::actor::PtyForegroundObserver as DetectionForeground;
 
 pub(crate) struct TerminalDirtyPatchSnapshot {
     pub patch: TerminalDirtyPatchOutcome,
@@ -779,6 +783,11 @@ fn probe_foreground_process_from_jobs(
 }
 
 fn probe_foreground_process(pid: u32, foreground_pgid: Option<u32>) -> ProcessProbeResult {
+    // Missing/unsupported ioctl observations retain the PID-based fallback,
+    // but only at actual process-probe deadlines, not on every shared tick.
+    #[cfg(unix)]
+    let foreground_pgid =
+        foreground_pgid.or_else(|| crate::detect::foreground_process_group_id(pid));
     probe_foreground_process_from_jobs(
         pid,
         foreground_pgid,
@@ -788,12 +797,67 @@ fn probe_foreground_process(pid: u32, foreground_pgid: Option<u32>) -> ProcessPr
     )
 }
 
+// These are state-specific transient/safety deadlines, not a pane fallback
+// interval. Stable panes wait only for parsed output/reset and the shared clock.
+#[allow(clippy::too_many_arguments)] // Scheduling mirrors existing independent detector state.
+fn detection_deadline(
+    pending_idle: &PendingIdleConfirmation,
+    startup_grace_until: Option<std::time::Instant>,
+    pending_release: &Mutex<Option<PendingAgentRelease>>,
+    transient_theme: bool,
+    acquisition_started_at: Option<std::time::Instant>,
+    last_process_check: std::time::Instant,
+    self_reported_active: bool,
+    last_self_reported_check: Option<std::time::Instant>,
+) -> Option<std::time::Instant> {
+    let now = std::time::Instant::now();
+    let mut deadline = pending_idle.next_recheck();
+    let mut include = |next: Option<std::time::Instant>| {
+        if let Some(next) = next {
+            deadline = Some(deadline.map_or(next, |current| current.min(next)));
+        }
+    };
+    // Expired grace/release is consumed on the next shared tick, even while
+    // hook authority skips screen work; never leave a past deadline spinning.
+    include(startup_grace_until.filter(|until| *until > now));
+    let release_until = pending_release
+        .lock()
+        .ok()
+        .and_then(|pending| pending.map(|p| p.until).filter(|until| *until > now));
+    include(release_until);
+    // Silent replacement by a different agent during suppression still needs
+    // the normal loop's original 50 ms transient observation cadence.
+    if transient_theme || release_until.is_some() {
+        include(Some(now + std::time::Duration::from_millis(50)));
+    }
+    if let Some(started) = acquisition_started_at {
+        let age = now.duration_since(started);
+        if age <= PROCESS_ACQUISITION_WINDOW {
+            let interval = if age <= PROCESS_ACQUISITION_FAST_WINDOW {
+                PROCESS_ACQUISITION_FAST_RECHECK
+            } else {
+                PROCESS_ACQUISITION_SLOW_RECHECK
+            };
+            include((last_process_check + interval > now).then_some(last_process_check + interval));
+        }
+    }
+    if self_reported_active {
+        include(Some(
+            last_self_reported_check.map_or(now, |last| last + SELF_REPORTED_AGENT_SHELL_RECHECK),
+        ));
+    }
+    deadline
+}
+
 #[cfg(unix)]
+#[allow(clippy::too_many_arguments)] // Imported panes share normal detector wake inputs.
 fn spawn_basic_detection_task(
     pane_id: PaneId,
     child_pid: Arc<AtomicU32>,
     terminal: Arc<PaneTerminal>,
     detection_content_seq: Arc<AtomicU64>,
+    detection_notify: Arc<Notify>,
+    detection_foreground: DetectionForeground,
     full_lifecycle_authority_active: Arc<AtomicBool>,
     self_reported_agent_active: Arc<AtomicBool>,
     state_events: mpsc::Sender<AppEvent>,
@@ -828,39 +892,49 @@ fn spawn_basic_detection_task(
         let mut pending_idle = PendingIdleConfirmation::default();
         let mut last_codex_prompt_ready = false;
         let mut last_self_reported_shell_check = None;
+        let mut wake = DetectionWake::new(detection_notify);
 
         loop {
-            let sleep_duration = if pending_idle.active() {
-                AGENT_PENDING_IDLE_RECHECK
-            } else {
-                std::time::Duration::from_millis(300)
-            };
-            tokio::select! {
-                _ = tokio::time::sleep(sleep_duration) => {}
-                _ = detect_reset.notified() => {
-                    publish_codex_prompt_observation(
-                        &state_events, pane_id, Some(Agent::Codex), "", None, false,
-                        &mut last_codex_prompt_ready,
-                    ).await;
-                    agent_presence = AgentDetectionPresence::from_agent(None);
-                    state = AgentState::Unknown;
-                    last_visible_idle = false;
-                    last_visible_blocker = false;
-                    last_visible_working = false;
-                    last_visible_signal_refresh = None;
-                    last_process_check = std::time::Instant::now();
-                    last_foreground_pgid = None;
-                    has_process_probe = false;
-                    acquisition_started_at = None;
-                    last_content_change_at = None;
-                    pending_foreground_shell_clear = false;
-                    foreground_shell_exit_reported = false;
-                    release_was_active = false;
-                    last_detection_text.clear();
-                    last_screen_scan_detection_content_seq = None;
-                    agent_startup_grace_until = None;
-                    pending_idle.clear();
-                }
+            let deadline = detection_deadline(
+                &pending_idle,
+                agent_startup_grace_until,
+                &pending_release_for_task,
+                false,
+                acquisition_started_at,
+                last_process_check,
+                child_pid.load(Ordering::Acquire) > 0
+                    && self_reported_agent_active.load(Ordering::Acquire),
+                last_self_reported_shell_check,
+            );
+            if wake.wait(&detect_reset, deadline).await {
+                publish_codex_prompt_observation(
+                    &state_events,
+                    pane_id,
+                    Some(Agent::Codex),
+                    "",
+                    None,
+                    false,
+                    &mut last_codex_prompt_ready,
+                )
+                .await;
+                agent_presence = AgentDetectionPresence::from_agent(None);
+                state = AgentState::Unknown;
+                last_visible_idle = false;
+                last_visible_blocker = false;
+                last_visible_working = false;
+                last_visible_signal_refresh = None;
+                last_process_check = std::time::Instant::now();
+                last_foreground_pgid = None;
+                has_process_probe = false;
+                acquisition_started_at = None;
+                last_content_change_at = None;
+                pending_foreground_shell_clear = false;
+                foreground_shell_exit_reported = false;
+                release_was_active = false;
+                last_detection_text.clear();
+                last_screen_scan_detection_content_seq = None;
+                agent_startup_grace_until = None;
+                pending_idle.clear();
             }
 
             let now = std::time::Instant::now();
@@ -876,6 +950,11 @@ fn spawn_basic_detection_task(
             let mut agent = agent_presence.current_agent();
             let lifecycle_authority_active =
                 full_lifecycle_authority_active.load(Ordering::Acquire);
+            let Some(foreground_pgid) = detection_foreground.observe() else {
+                // The actor has closed the fd; do not probe a stale child PID
+                // while shutdown/event delivery waits for this task to abort.
+                break;
+            };
             report_self_reported_agent_shell_return(
                 &self_reported_agent_active,
                 pid,
@@ -885,9 +964,6 @@ fn spawn_basic_detection_task(
                 pane_id,
             )
             .await;
-            let foreground_pgid = (pid > 0)
-                .then(|| crate::detect::foreground_process_group_id(pid))
-                .flatten();
             let process_group_changed =
                 foreground_group_changed(foreground_pgid, last_foreground_pgid);
             let should_check_process = pid > 0 && {
@@ -1010,16 +1086,12 @@ fn spawn_basic_detection_task(
                 }
             }
 
-            let current_detection_content_seq = if agent.is_some() {
-                Some(detection_content_seq.load(Ordering::Relaxed))
-            } else {
-                None
-            };
+            let current_detection_content_seq = Some(detection_content_seq.load(Ordering::Relaxed));
             match decide_detection_screen_read(DetectionScreenReadInput {
                 state,
                 agent,
                 pending_idle_active: pending_idle.active(),
-                agent_changed,
+                agent_changed: agent_changed || process_group_changed,
                 process_exited,
                 current_detection_content_seq,
                 last_screen_scan_detection_content_seq,
@@ -1369,6 +1441,7 @@ pub struct PaneRuntime {
     content_seq: Arc<AtomicU64>,
     content_write_lock: Arc<Mutex<()>>,
     detection_content_seq: Arc<AtomicU64>,
+    detection_notify: Arc<Notify>,
     full_lifecycle_authority_active: Arc<AtomicBool>,
     self_reported_agent_active: Arc<AtomicBool>,
     detect_reset_notify: Arc<Notify>,
@@ -1406,6 +1479,15 @@ impl PaneRuntimeIo {
             PaneRuntimeIo::TestChannel { .. } => {
                 Err(std::io::Error::other("test runtime has no PTY master fd"))
             }
+        }
+    }
+
+    #[cfg(unix)]
+    fn detection_foreground(&self) -> DetectionForeground {
+        match self {
+            PaneRuntimeIo::Actor(actor) => actor.foreground_observer(),
+            #[cfg(test)]
+            PaneRuntimeIo::TestChannel { .. } => DetectionForeground::default(),
         }
     }
 
@@ -2460,6 +2542,7 @@ impl PaneRuntime {
         let content_seq = Arc::new(AtomicU64::new(0));
         let content_write_lock = Arc::new(Mutex::new(()));
         let detection_content_seq = Arc::new(AtomicU64::new(0));
+        let detection_notify = Arc::new(Notify::new());
 
         let io = {
             let terminal = terminal.clone();
@@ -2469,6 +2552,7 @@ impl PaneRuntime {
             let content_seq = content_seq.clone();
             let content_write_lock = content_write_lock.clone();
             let detection_content_seq = detection_content_seq.clone();
+            let detection_notify = detection_notify.clone();
             let child_pid = child_pid.clone();
             let read_events = events.clone();
             let reported_cwd = reported_cwd.clone();
@@ -2489,6 +2573,9 @@ impl PaneRuntime {
                 compression_wake.wake();
                 publish_terminal_bells(pane_id, result.terminal_bells, &read_events);
                 observe_detection_content_change(bytes, &detection_content_seq);
+                if !bytes.is_empty() {
+                    detection_notify.notify_one();
+                }
                 let title_requested =
                     result.terminal_title_changed && render_dirty.request_terminal_title(pane_id);
                 let render_requested = result.request_render && render_dirty.request_pty(pane_id);
@@ -2549,6 +2636,8 @@ impl PaneRuntime {
             child_pid.clone(),
             terminal.clone(),
             detection_content_seq.clone(),
+            detection_notify.clone(),
+            io.detection_foreground(),
             full_lifecycle_authority_active.clone(),
             self_reported_agent_active.clone(),
             events,
@@ -2573,6 +2662,7 @@ impl PaneRuntime {
             content_seq,
             content_write_lock,
             detection_content_seq,
+            detection_notify,
             full_lifecycle_authority_active,
             self_reported_agent_active,
             detect_reset_notify,
@@ -2640,6 +2730,7 @@ impl PaneRuntime {
         let child_wait_completed = Arc::new(AtomicBool::new(false));
         let content_seq = Arc::new(AtomicU64::new(0));
         let detection_content_seq = Arc::new(AtomicU64::new(0));
+        let detection_notify = Arc::new(Notify::new());
         let full_lifecycle_authority_active = Arc::new(AtomicBool::new(false));
         let self_reported_agent_active = Arc::new(AtomicBool::new(false));
         {
@@ -2682,6 +2773,7 @@ impl PaneRuntime {
             let content_seq = content_seq.clone();
             let content_write_lock = content_write_lock.clone();
             let detection_content_seq = detection_content_seq.clone();
+            let detection_notify = detection_notify.clone();
             let child_pid = child_pid.clone();
             let events = events.clone();
             let reported_cwd = reported_cwd.clone();
@@ -2702,6 +2794,9 @@ impl PaneRuntime {
                 publish_terminal_bells(pane_id, result.terminal_bells, &events);
                 if agent_detection == AgentDetection::Enabled {
                     observe_detection_content_change(bytes, &detection_content_seq);
+                    if !bytes.is_empty() {
+                        detection_notify.notify_one();
+                    }
                 }
                 let title_requested =
                     result.terminal_title_changed && render_dirty.request_terminal_title(pane_id);
@@ -2751,17 +2846,20 @@ impl PaneRuntime {
         let (detect_handle, detect_reset_notify, pending_release) = if agent_detection
             == AgentDetection::Enabled
         {
+            #[cfg(windows)]
             use crate::detect;
             use std::time::{Duration, Instant};
 
-            const TICK_UNIDENTIFIED: Duration = Duration::from_millis(500);
+            #[cfg(windows)]
             const TICK_IDENTIFIED: Duration = Duration::from_millis(300);
-            const TICK_PENDING_RELEASE: Duration = Duration::from_millis(50);
 
             let child_pid = child_pid.clone();
             let terminal = terminal.clone();
             let state_events = events.clone();
             let detection_content_seq = detection_content_seq.clone();
+            let detection_notify = detection_notify.clone();
+            #[cfg(unix)]
+            let detection_foreground = io.detection_foreground();
             let full_lifecycle_authority_active_for_task = full_lifecycle_authority_active.clone();
             let self_reported_agent_active_for_task = self_reported_agent_active.clone();
             let render_notify = render_notify.clone();
@@ -2796,49 +2894,51 @@ impl PaneRuntime {
                 let mut pending_idle = PendingIdleConfirmation::default();
                 let mut last_codex_prompt_ready = false;
                 let mut last_self_reported_shell_check = None;
+                let mut wake = DetectionWake::new(detection_notify);
 
                 tokio::time::sleep(Duration::from_millis(50)).await;
 
                 loop {
-                    let now_for_tick = Instant::now();
-                    let tick = if active_pending_release(&pending_release_for_task, now_for_tick)
-                        .is_some()
-                        || terminal.has_transient_default_color_override()
-                    {
-                        TICK_PENDING_RELEASE
-                    } else if pending_idle.active() {
-                        AGENT_PENDING_IDLE_RECHECK
-                    } else if agent_presence.current_agent().is_none() {
-                        TICK_UNIDENTIFIED
-                    } else {
-                        TICK_IDENTIFIED
-                    };
-                    tokio::select! {
-                        _ = tokio::time::sleep(tick) => {}
-                        _ = detect_reset.notified() => {
-                            publish_codex_prompt_observation(
-                                &state_events, pane_id, Some(Agent::Codex), "", None, false,
-                                &mut last_codex_prompt_ready,
-                            ).await;
-                            agent_presence = AgentDetectionPresence::from_agent(None);
-                            state = AgentState::Unknown;
-                            last_visible_idle = false;
-                            last_foreground_pgid = None;
-                            has_process_probe = false;
-                            acquisition_started_at = None;
-                            last_content_change_at = None;
-                            pending_foreground_shell_clear = false;
-                            foreground_shell_exit_reported = false;
-                            release_was_active = false;
-                            pending_restore_probe = false;
-                            last_visible_blocker = false;
-                            last_visible_working = false;
-                            last_visible_signal_refresh = None;
-                            last_detection_text.clear();
-                            last_screen_scan_detection_content_seq = None;
-                            agent_startup_grace_until = None;
-                            pending_idle.clear();
-                        }
+                    let deadline = detection_deadline(
+                        &pending_idle,
+                        agent_startup_grace_until,
+                        &pending_release_for_task,
+                        terminal.has_transient_default_color_override(),
+                        acquisition_started_at,
+                        last_process_check,
+                        child_pid.load(Ordering::Acquire) > 0
+                            && self_reported_agent_active_for_task.load(Ordering::Acquire),
+                        last_self_reported_shell_check,
+                    );
+                    if wake.wait(&detect_reset, deadline).await {
+                        publish_codex_prompt_observation(
+                            &state_events,
+                            pane_id,
+                            Some(Agent::Codex),
+                            "",
+                            None,
+                            false,
+                            &mut last_codex_prompt_ready,
+                        )
+                        .await;
+                        agent_presence = AgentDetectionPresence::from_agent(None);
+                        state = AgentState::Unknown;
+                        last_visible_idle = false;
+                        last_foreground_pgid = None;
+                        has_process_probe = false;
+                        acquisition_started_at = None;
+                        last_content_change_at = None;
+                        pending_foreground_shell_clear = false;
+                        foreground_shell_exit_reported = false;
+                        release_was_active = false;
+                        pending_restore_probe = false;
+                        last_visible_blocker = false;
+                        last_visible_working = false;
+                        last_visible_signal_refresh = None;
+                        last_detection_text.clear();
+                        last_screen_scan_detection_content_seq = None;
+                        agent_startup_grace_until = None;
+                        pending_idle.clear();
                     }
 
                     let now = Instant::now();
@@ -2853,6 +2953,10 @@ impl PaneRuntime {
                     let mut agent = agent_presence.current_agent();
                     let lifecycle_authority_active =
                         full_lifecycle_authority_active_for_task.load(Ordering::Acquire);
+                    #[cfg(unix)]
+                    let Some(foreground_pgid) = detection_foreground.observe() else {
+                        break;
+                    };
                     report_self_reported_agent_shell_return(
                         &self_reported_agent_active_for_task,
                         pid,
@@ -2887,8 +2991,7 @@ impl PaneRuntime {
                         now.duration_since(last_observation.0),
                         process_probe_input,
                     );
-                    #[cfg(not(windows))]
-                    let foreground_observation_due = true;
+                    #[cfg(windows)]
                     let foreground_pgid = match (pid, foreground_observation_due) {
                         (0, _) => None,
                         (_, true) => detect::foreground_process_group_id(pid),
@@ -3058,16 +3161,13 @@ impl PaneRuntime {
                         }
                     }
 
-                    let current_detection_content_seq = if agent.is_some() {
-                        Some(detection_content_seq.load(Ordering::Relaxed))
-                    } else {
-                        None
-                    };
+                    let current_detection_content_seq =
+                        Some(detection_content_seq.load(Ordering::Relaxed));
                     match decide_detection_screen_read(DetectionScreenReadInput {
                         state,
                         agent,
                         pending_idle_active: pending_idle.active(),
-                        agent_changed,
+                        agent_changed: agent_changed || process_group_changed,
                         process_exited,
                         current_detection_content_seq,
                         last_screen_scan_detection_content_seq,
@@ -3182,6 +3282,7 @@ impl PaneRuntime {
             content_seq,
             content_write_lock,
             detection_content_seq,
+            detection_notify,
             full_lifecycle_authority_active,
             self_reported_agent_active,
             detect_reset_notify,
@@ -3212,8 +3313,12 @@ impl PaneRuntime {
     }
 
     pub fn set_self_reported_agent_active(&self, active: bool) {
-        self.self_reported_agent_active
-            .store(active, Ordering::Release);
+        let previous = self
+            .self_reported_agent_active
+            .swap(active, Ordering::AcqRel);
+        if previous != active {
+            self.detection_notify.notify_one();
+        }
     }
 
     pub fn set_full_lifecycle_authority_active(&self, active: bool) {
@@ -3222,6 +3327,11 @@ impl PaneRuntime {
             .swap(active, Ordering::AcqRel);
         if active && !previous {
             self.detect_reset_notify.notify_one();
+        } else if previous != active {
+            // Resume screen fallback on deactivation without discarding process
+            // identity. Invalidate an unchanged idle screen inherited from hooks.
+            mark_detection_content_changed(&self.detection_content_seq);
+            self.detection_notify.notify_one();
         }
     }
 
@@ -3255,6 +3365,7 @@ impl PaneRuntime {
         drop(_content_write_guard);
         self.compression.wake();
         mark_detection_content_changed(&self.detection_content_seq);
+        self.detection_notify.notify_one();
         self.io.resize(
             rows,
             cols,
@@ -3294,6 +3405,7 @@ impl PaneRuntime {
         drop(guard);
         self.compression.wake();
         mark_detection_content_changed(&self.detection_content_seq);
+        self.detection_notify.notify_one();
         result
     }
 
@@ -3951,6 +4063,7 @@ impl PaneRuntime {
                 content_seq: Arc::new(AtomicU64::new(0)),
                 content_write_lock: Arc::new(Mutex::new(())),
                 detection_content_seq: Arc::new(AtomicU64::new(0)),
+                detection_notify: Arc::new(Notify::new()),
                 full_lifecycle_authority_active: Arc::new(AtomicBool::new(false)),
                 self_reported_agent_active: Arc::new(AtomicBool::new(false)),
                 detect_reset_notify: Arc::new(Notify::new()),
@@ -5314,6 +5427,7 @@ mod tests {
             content_seq: Arc::new(AtomicU64::new(0)),
             content_write_lock: Arc::new(Mutex::new(())),
             detection_content_seq: Arc::new(AtomicU64::new(0)),
+            detection_notify: Arc::new(Notify::new()),
             full_lifecycle_authority_active: Arc::new(AtomicBool::new(false)),
             detect_reset_notify: Arc::new(Notify::new()),
             pending_release: Arc::new(Mutex::new(None)),
@@ -5356,6 +5470,7 @@ mod tests {
             content_seq: Arc::new(AtomicU64::new(0)),
             content_write_lock: Arc::new(Mutex::new(())),
             detection_content_seq: Arc::new(AtomicU64::new(0)),
+            detection_notify: Arc::new(Notify::new()),
             full_lifecycle_authority_active: Arc::new(AtomicBool::new(false)),
             detect_reset_notify: Arc::new(Notify::new()),
             pending_release: Arc::new(Mutex::new(None)),
@@ -6100,7 +6215,15 @@ mod tests {
             "repeated true-to-true sync should not notify detection reset"
         );
 
+        let before = runtime.detection_content_seq.load(Ordering::Relaxed);
         runtime.set_full_lifecycle_authority_active(false);
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            runtime.detection_notify.notified(),
+        )
+        .await
+        .expect("deactivation must wake fallback without resetting identity");
+        assert!(runtime.detection_content_seq.load(Ordering::Relaxed) > before);
         assert!(
             tokio::time::timeout(
                 std::time::Duration::from_millis(20),
@@ -6118,6 +6241,64 @@ mod tests {
         )
         .await
         .expect("re-entering active authority should notify detection reset");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn parsed_native_pty_output_and_local_mutations_wake_detection() {
+        let (events, _rx) = mpsc::channel(16);
+        let mut runtime = PaneRuntime::spawn_shell_command(
+            PaneId::from_raw(42),
+            24,
+            80,
+            std::env::temp_dir(),
+            "read line; printf '%s\\n' \"$line\"; sleep 30",
+            &PaneLaunchEnv::default(),
+            AgentDetection::Enabled,
+            0,
+            crate::terminal_theme::TerminalTheme::default(),
+            None,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        )
+        .unwrap();
+        // Failure path: omitting an internal Notify is masked by the mandatory
+        // fallback in socket E2E. Observe the actor callback directly, without
+        // competing with the detector for its permit or freezing agent screens.
+        if let Some(handle) = runtime.detect_handle.take() {
+            handle.abort();
+        }
+        tokio::task::yield_now().await;
+        runtime
+            .try_send_bytes(Bytes::from_static(b"parsed-wake-marker\n"))
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                runtime.detection_notify.notified().await;
+                if runtime.detection_text().contains("parsed-wake-marker") {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("nonempty parsed PTY output must wake detection");
+        assert!(runtime.detection_content_seq.load(Ordering::Relaxed) > 0);
+        runtime.resize(25, 81, 0, 0);
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            runtime.detection_notify.notified(),
+        )
+        .await
+        .expect("resize must wake detection");
+        runtime.clear_screen().unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            runtime.detection_notify.notified(),
+        )
+        .await
+        .expect("local clear must wake detection");
+        runtime.shutdown();
     }
 
     #[cfg(unix)]

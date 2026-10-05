@@ -24,6 +24,7 @@ pub(super) struct DetectionPublishState {
 pub(super) struct PendingIdleConfirmation {
     started_at: Option<std::time::Instant>,
     confirmations: u8,
+    last_confirmation_at: Option<std::time::Instant>,
 }
 
 impl PendingIdleConfirmation {
@@ -34,6 +35,12 @@ impl PendingIdleConfirmation {
     pub(super) fn clear(&mut self) {
         self.started_at = None;
         self.confirmations = 0;
+        self.last_confirmation_at = None;
+    }
+
+    pub(super) fn next_recheck(&self) -> Option<std::time::Instant> {
+        self.last_confirmation_at
+            .map(|last| last + AGENT_PENDING_IDLE_RECHECK)
     }
 
     pub(super) fn should_hold_working_to_idle(
@@ -59,6 +66,7 @@ impl PendingIdleConfirmation {
         let Some(started_at) = self.started_at else {
             self.started_at = Some(now);
             self.confirmations = 0;
+            self.last_confirmation_at = Some(now);
             return true;
         };
 
@@ -67,6 +75,15 @@ impl PendingIdleConfirmation {
             return false;
         }
 
+        // Parsed-output bursts may re-evaluate the candidate, but must not
+        // accelerate the original 100 ms confirmation cadence.
+        if self
+            .last_confirmation_at
+            .is_some_and(|last| now.duration_since(last) < AGENT_PENDING_IDLE_RECHECK)
+        {
+            return true;
+        }
+        self.last_confirmation_at = Some(now);
         self.confirmations = self.confirmations.saturating_add(1);
         if self.confirmations >= AGENT_PENDING_IDLE_CONFIRMATIONS {
             self.clear();
@@ -89,14 +106,10 @@ pub(super) struct IdleScreenScanSkipInput {
 }
 
 pub(super) fn should_skip_idle_screen_scan(input: IdleScreenScanSkipInput) -> bool {
-    let stable_state = input.state == AgentState::Idle
+    let stable_state = input.agent.is_none()
+        || input.state == AgentState::Idle
         || (input.state == AgentState::Unknown && input.agent == Some(Agent::Codex));
-    if !stable_state
-        || input.agent.is_none()
-        || input.pending_idle_active
-        || input.agent_changed
-        || input.process_exited
-    {
+    if !stable_state || input.pending_idle_active || input.agent_changed || input.process_exited {
         return false;
     }
 
@@ -474,6 +487,17 @@ mod tests {
         input.agent = None;
         assert_eq!(
             decide_detection_screen_read(input),
+            DetectionScreenReadDecision::Skip
+        );
+        input.last_screen_scan_detection_content_seq = None;
+        assert_eq!(
+            decide_detection_screen_read(input),
+            DetectionScreenReadDecision::Read
+        );
+        input.last_screen_scan_detection_content_seq = Some(10);
+        input.current_detection_content_seq = Some(11);
+        assert_eq!(
+            decide_detection_screen_read(input),
             DetectionScreenReadDecision::Read
         );
     }
@@ -507,6 +531,32 @@ mod tests {
             false,
             now + AGENT_PENDING_IDLE_RECHECK * 3
         ));
+    }
+
+    #[test]
+    fn output_bursts_cannot_accelerate_pending_idle_confirmations() {
+        let now = std::time::Instant::now();
+        let previous = publish_state(AgentState::Working);
+        let next = publish_state(AgentState::Idle);
+        let mut pending = PendingIdleConfirmation::default();
+        assert!(pending.should_hold_working_to_idle(previous, next, false, false, now));
+        for millis in 1..300 {
+            assert!(pending.should_hold_working_to_idle(
+                previous,
+                next,
+                false,
+                false,
+                now + std::time::Duration::from_millis(millis)
+            ));
+        }
+        assert!(!pending.should_hold_working_to_idle(
+            previous,
+            next,
+            false,
+            false,
+            now + AGENT_PENDING_IDLE_RECHECK * 3
+        ));
+        assert!(!pending.active());
     }
 
     #[test]
