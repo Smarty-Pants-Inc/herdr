@@ -48,6 +48,7 @@ pub(crate) fn request_changes_ui(request: &Request) -> bool {
             | Method::TabMoveProjectChecked(_)
             | Method::TabClose(_)
             | Method::LayoutApply(_)
+            | Method::LayoutApplyRestorable(_)
             | Method::LayoutApplyProjectChecked(_)
             | Method::LayoutSetSplitRatio(_)
             | Method::AgentRename(_)
@@ -101,7 +102,37 @@ pub(crate) fn request_changes_ui(request: &Request) -> bool {
 /// This is transport-local context, not part of the JSON request schema.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct ApiRequestContext {
-    pub(crate) local_peer_pid: Option<u32>,
+    pub(crate) local_peer_identity: Option<crate::platform::ProcessIdentity>,
+    /// Marker presence captured from the peer's initial OS environment.
+    ///
+    /// This is deliberately transport-local and never binds a public pane ID;
+    /// the app must still validate live pane ancestry before granting an agent
+    /// origin. A captured marker that loses that live relationship is unknown,
+    /// not ordinary.
+    pub(crate) local_peer_pane_origin: crate::platform::PeerPaneOrigin,
+}
+
+impl ApiRequestContext {
+    /// Build the immutable accept-time context for a local peer.
+    pub(crate) fn capture(local_peer_identity: Option<crate::platform::ProcessIdentity>) -> Self {
+        let local_peer_pane_origin = local_peer_identity
+            .map(crate::platform::process_initial_pane_origin)
+            .unwrap_or(crate::platform::PeerPaneOrigin::Unknown);
+        Self {
+            local_peer_identity,
+            local_peer_pane_origin,
+        }
+    }
+
+    /// Test constructor for a captured numeric peer PID.
+    #[cfg(test)]
+    pub(crate) fn for_local_peer_pid(pid: Option<u32>) -> Self {
+        Self::capture(pid.and_then(crate::platform::process_identity))
+    }
+
+    pub(crate) fn local_peer_pid(self) -> Option<u32> {
+        self.local_peer_identity.map(|identity| identity.pid)
+    }
 }
 
 pub struct ApiRequestMessage {
@@ -117,4 +148,68 @@ pub type ApiRequestSender = mpsc::UnboundedSender<ApiRequestMessage>;
 
 pub fn socket_path() -> PathBuf {
     crate::session::active_api_socket_path()
+}
+
+#[cfg(test)]
+mod context_tests {
+    use super::ApiRequestContext;
+
+    #[test]
+    fn queued_context_preserves_captured_marker_and_peer_pin() {
+        let peer = crate::platform::ProcessIdentity {
+            pid: 123,
+            start_time: 456,
+        };
+        let captured = ApiRequestContext {
+            local_peer_identity: Some(peer),
+            local_peer_pane_origin: crate::platform::PeerPaneOrigin::HasPane,
+        };
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        sender.send(captured).expect("queue captured context");
+        let queued = receiver.try_recv().expect("queued context");
+        assert_eq!(queued, captured);
+        assert_eq!(queued.local_peer_identity, Some(peer));
+        assert_eq!(
+            queued.local_peer_pane_origin,
+            crate::platform::PeerPaneOrigin::HasPane
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    #[test]
+    fn local_peer_context_pins_the_captured_instance() {
+        let identity = crate::platform::process_identity(std::process::id())
+            .expect("current process identity");
+        let context = ApiRequestContext::for_local_peer_pid(Some(identity.pid));
+        assert_eq!(context.local_peer_identity, Some(identity));
+        assert_eq!(context.local_peer_pid(), Some(identity.pid));
+        assert_eq!(
+            ApiRequestContext::for_local_peer_pid(None).local_peer_pane_origin,
+            crate::platform::PeerPaneOrigin::Unknown
+        );
+        assert_eq!(
+            ApiRequestContext::for_local_peer_pid(Some(0)).local_peer_pane_origin,
+            crate::platform::PeerPaneOrigin::Unknown
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn exited_peer_context_keeps_its_original_instance() {
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "read line"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .expect("peer child");
+        let context = ApiRequestContext::for_local_peer_pid(Some(child.id()));
+        let identity = context.local_peer_identity.expect("live peer identity");
+        drop(child.stdin.take());
+        child.wait().expect("peer reaped");
+        assert_ne!(
+            crate::platform::process_identity(identity.pid),
+            Some(identity)
+        );
+        assert_eq!(context.local_peer_identity, Some(identity));
+        assert_eq!(context.local_peer_pid(), Some(identity.pid));
+    }
 }

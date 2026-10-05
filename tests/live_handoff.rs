@@ -5,15 +5,17 @@ pub mod support;
 pub mod test_command;
 
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{mpsc, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use interprocess::local_socket::{ConnectOptions, GenericFilePath, ToFsName};
+use interprocess::ConnectWaitMode;
 use portable_pty::{native_pty_system, Child, MasterPty, PtySize};
 use support::{
     cleanup_test_base, client_shell_handshake, register_runtime_dir, register_spawned_herdr_pid,
@@ -255,6 +257,18 @@ fn try_request(
         retryable: true,
         message: format!("connect {}: {err}", socket_path.display()),
     })?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .map_err(|err| RequestError {
+            retryable: false,
+            message: format!("set API read deadline: {err}"),
+        })?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(30)))
+        .map_err(|err| RequestError {
+            retryable: false,
+            message: format!("set API write deadline: {err}"),
+        })?;
     let request_text = request.to_string();
     stream
         .write_all(request_text.as_bytes())
@@ -1052,6 +1066,542 @@ fn live_handoff_preserves_installed_plugins() {
         serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
     );
     cleanup_test_base(&base);
+}
+
+/// Argv startup is distinct from running a foreground command in a shell:
+/// live import must take the existing PTY, never the cold replay branch.
+// ponytail: real Unix scripts and PTY handoff require the Unix backend, not Windows.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn live_handoff_preserves_argv_process_without_relaunch() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // Bound API I/O in this regression without changing the older test helpers.
+    fn request(socket_path: &Path, value: serde_json::Value) -> serde_json::Value {
+        let mut stream = UnixStream::connect(socket_path).expect("connect scratch API");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        writeln!(stream, "{value}").expect("write scratch request");
+        let mut line = String::new();
+        BufReader::new(stream)
+            .read_line(&mut line)
+            .expect("read scratch response within deadline");
+        let response: serde_json::Value =
+            serde_json::from_str(&line).expect("scratch JSON response");
+        assert_eq!(response["id"], value["id"], "response must match request");
+        response
+    }
+
+    // Clean up the detached replacement on assertion failure as well as success.
+    struct ScratchCleanup(PathBuf);
+    impl Drop for ScratchCleanup {
+        fn drop(&mut self) {
+            cleanup_test_base(&self.0);
+        }
+    }
+
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let _cleanup = ScratchCleanup(base.clone());
+    fs::create_dir_all(&base).unwrap();
+    fs::set_permissions(&base, fs::Permissions::from_mode(0o700)).unwrap();
+    for directory in [
+        "home", "config", "state", "data", "cache", "runtime", "work",
+    ] {
+        fs::create_dir_all(base.join(directory)).unwrap();
+    }
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    fs::set_permissions(&runtime_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    let api_socket = runtime_dir.join("herdr.sock");
+    let app_dir = if cfg!(debug_assertions) {
+        "herdr-dev"
+    } else {
+        "herdr"
+    };
+    fs::create_dir_all(config_home.join(app_dir)).unwrap();
+    fs::write(
+        config_home.join(app_dir).join("config.toml"),
+        "onboarding = false\n[experimental]\npane_history = false\n",
+    )
+    .unwrap();
+
+    let script = base.join("argv-probe.sh");
+    let launches = base.join("launches");
+    let received = base.join("received");
+    let hups = base.join("hups");
+    fs::write(
+        &script,
+        r#"#!/bin/sh
+set -eu
+launches=$1
+received=$2
+hups=$3
+shift 3
+trap 'printf "HUP\n" >> "$hups"; exit 129' HUP
+record="START $$"
+for arg do record="$record <$arg>"; done
+printf '%s\n' "$record" >> "$launches"
+printf 'READY %s\n' "$$"
+while IFS= read -r line; do
+  printf 'got:%s:%s\n' "$$" "$line" >> "$received"
+  printf 'got:%s:%s\n' "$$" "$line"
+done
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+    let argv = serde_json::json!([
+        script,
+        launches,
+        received,
+        hups,
+        "two words",
+        "",
+        "$HOME",
+        ";touch SHOULD_NOT_EXIST"
+    ]);
+
+    // The helper removes all inherited HERDR_* and PI profile overrides first.
+    // Apply HOME/XDG only to the scratch server; its replacement inherits them.
+    let private_env = [
+        ("HOME", base.join("home").display().to_string()),
+        ("XDG_STATE_HOME", base.join("state").display().to_string()),
+        ("XDG_DATA_HOME", base.join("data").display().to_string()),
+        ("XDG_CACHE_HOME", base.join("cache").display().to_string()),
+        ("PATH", "/usr/bin:/bin".to_string()),
+        ("TERM", "xterm-256color".to_string()),
+    ];
+    let extra_env: Vec<_> = private_env
+        .iter()
+        .map(|(key, value)| (*key, value.as_str()))
+        .collect();
+    register_runtime_dir(&runtime_dir);
+    let mut spawned = spawn_server_with_env(&config_home, &runtime_dir, &api_socket, &extra_env);
+    let source_pid = spawned.child.process_id().expect("source server pid");
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    wait_for_api(&api_socket, Duration::from_secs(10));
+
+    let workspace = request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:argv:workspace", "method": "workspace.create",
+            "params": {"cwd": base.join("work"), "focus": true}
+        }),
+    );
+    assert_ok(workspace.clone());
+    let workspace_id = workspace["result"]["workspace"]["workspace_id"]
+        .as_str()
+        .expect("workspace id");
+    // Explicit cold-restore eligibility must not change live import: the
+    // replacement must adopt this process, never execute its argv again.
+    let applied = request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:argv:layout", "method": "layout.apply_restorable",
+            "params": {
+                "workspace_id": workspace_id, "tab_label": "argv-live", "focus": true,
+                "root": {"type": "pane", "cwd": base.join("work"), "command": argv}
+            }
+        }),
+    );
+    assert_ok(applied.clone());
+    let pane_id = applied["result"]["layout"]["root"]["pane_id"]
+        .as_str()
+        .expect("single argv pane id")
+        .to_string();
+    let startup = wait_for_file_contains(&launches, "\n", Duration::from_secs(5));
+    assert_eq!(
+        startup.lines().count(),
+        1,
+        "exactly one startup before import"
+    );
+    let child_pid: u32 = startup
+        .split_whitespace()
+        .nth(1)
+        .expect("startup PID")
+        .parse()
+        .expect("numeric startup PID");
+    assert!(child_pid > 0);
+    assert_eq!(
+        startup,
+        format!("START {child_pid} <two words> <> <$HOME> <;touch SHOULD_NOT_EXIST>\n"),
+        "argv boundaries and shell metacharacters must stay literal"
+    );
+    assert_eq!(unsafe { libc::kill(child_pid as libc::pid_t, 0) }, 0);
+
+    let exchange = |phase: &str| {
+        let text = format!("{phase}-argv-{source_pid}");
+        assert_ok(request(
+            &api_socket,
+            serde_json::json!({
+                "id": format!("test:argv:{phase}"), "method": "pane.send_input",
+                "params": {"pane_id": pane_id, "text": text, "keys": ["Enter"]}
+            }),
+        ));
+        // PID-tagged file acknowledgement cannot be terminal echo or history.
+        let acknowledgement = format!("got:{child_pid}:{text}");
+        wait_for_file_contains(
+            &received,
+            &format!("{acknowledgement}\n"),
+            Duration::from_secs(5),
+        );
+        wait_for_output(&api_socket, &pane_id, &acknowledgement);
+    };
+    exchange("before");
+
+    // Mutate only once: never retry handoff on an uncertain transport response.
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({"id":"test:argv:handoff","method":"server.live_handoff","params":{}}),
+    ));
+    let replacement_pid =
+        wait_for_replacement_server_pid(&runtime_dir, source_pid, Duration::from_secs(10));
+    register_spawned_herdr_pid(Some(replacement_pid));
+    assert_ne!(replacement_pid, source_pid);
+    let source_exited =
+        support::wait_until(Duration::from_secs(10), Duration::from_millis(25), || {
+            spawned.child.try_wait().unwrap().is_some()
+        });
+    assert!(source_exited, "source must exit after successful import");
+    drop(spawned);
+    wait_for_api(&api_socket, Duration::from_secs(10));
+    let panes = request(
+        &api_socket,
+        serde_json::json!({"id":"test:argv:restored","method":"pane.list","params":{}}),
+    );
+    assert_ok(panes.clone());
+    assert!(
+        panes["result"]["panes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|pane| { pane["pane_id"].as_str() == Some(pane_id.as_str()) }),
+        "import must preserve the canonical argv pane ID: {panes}"
+    );
+    assert_eq!(unsafe { libc::kill(replacement_pid as libc::pid_t, 0) }, 0);
+    assert_eq!(unsafe { libc::kill(child_pid as libc::pid_t, 0) }, 0);
+    assert_eq!(
+        fs::read_to_string(&launches).unwrap(),
+        startup,
+        "import must not replay argv"
+    );
+    assert!(!hups.exists(), "argv process received HUP during import");
+
+    exchange("after");
+    assert_eq!(unsafe { libc::kill(child_pid as libc::pid_t, 0) }, 0);
+    assert_eq!(
+        fs::read_to_string(&launches).unwrap(),
+        startup,
+        "fresh I/O must still come from the only launch"
+    );
+    assert!(!hups.exists(), "argv process received HUP after import");
+    assert!(!base.join("work/SHOULD_NOT_EXIST").exists());
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({"id":"test:argv:stop","method":"server.stop","params":{}}),
+    ));
+    assert!(
+        process_gone(replacement_pid, Duration::from_secs(10)),
+        "replacement did not stop"
+    );
+    unregister_spawned_herdr_pid(Some(replacement_pid));
+}
+
+/// A genuine failed cold restore has state but no exported runtime FD. Neither
+/// successful preparation nor a rejected preparation may retry that recipe.
+// ponytail: these cold-replay setup tests need Linux disk trust and /proc PTY
+// probes; macOS and Windows refuse disk argv marks in persist::io tests.
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn live_handoff_preserves_unavailable_argv_without_replay() {
+    exercise_unavailable_argv_handoff(false);
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn live_handoff_timeout_does_not_replay_unavailable_argv() {
+    exercise_unavailable_argv_handoff(true);
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+fn exercise_unavailable_argv_handoff(rollback: bool) {
+    use std::os::unix::fs::PermissionsExt;
+
+    struct ScratchCleanup(PathBuf);
+    impl Drop for ScratchCleanup {
+        fn drop(&mut self) {
+            cleanup_test_base(&self.0);
+        }
+    }
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let _cleanup = ScratchCleanup(base.clone());
+    fs::create_dir_all(&base).unwrap();
+    fs::set_permissions(&base, fs::Permissions::from_mode(0o700)).unwrap();
+    for directory in [
+        "home", "config", "state", "data", "cache", "runtime", "work",
+    ] {
+        fs::create_dir_all(base.join(directory)).unwrap();
+    }
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    fs::set_permissions(&runtime_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    let api_socket = runtime_dir.join("herdr.sock");
+    let snapshot_path = config_home.join("herdr-dev/session.json");
+    let script = base.join("failed-recipe.sh");
+    let hidden_script = base.join("removed-recipe.sh");
+    let control_script = base.join("control.sh");
+    let launches = base.join("failed-launches");
+    let received = base.join("failed-received");
+    let control_launches = base.join("control-launches");
+    let control_received = base.join("control-received");
+    let contents = r#"#!/bin/sh
+set -eu
+printf 'START %s\n' "$$" >> "$1"
+while IFS= read -r line; do
+  printf 'got:%s:%s\n' "$$" "$line" >> "$2"
+  printf 'got:%s:%s\n' "$$" "$line"
+done
+"#;
+    for path in [&script, &control_script] {
+        fs::write(path, contents).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let mut private_env = vec![
+        ("HOME", base.join("home").display().to_string()),
+        ("XDG_STATE_HOME", base.join("state").display().to_string()),
+        ("XDG_DATA_HOME", base.join("data").display().to_string()),
+        ("XDG_CACHE_HOME", base.join("cache").display().to_string()),
+        ("PATH", "/usr/bin:/bin".to_string()),
+        ("TERM", "xterm-256color".to_string()),
+    ];
+    if rollback {
+        private_env.push(("HERDR_TEST_HANDOFF_IMPORT_FAIL", "hang_before_ready".into()));
+        private_env.push(("HERDR_TEST_HANDOFF_READY_TIMEOUT_MS", "3000".into()));
+    }
+    let extra_env: Vec<_> = private_env
+        .iter()
+        .map(|(key, value)| (*key, value.as_str()))
+        .collect();
+    register_runtime_dir(&runtime_dir);
+    let start = || {
+        let server = spawn_server_with_env(&config_home, &runtime_dir, &api_socket, &extra_env);
+        wait_for_api(&api_socket, Duration::from_secs(10));
+        server
+    };
+    let stop = || {
+        assert_ok(request(
+            &api_socket,
+            serde_json::json!({"id":"r1:stop", "method":"server.stop", "params":{}}),
+        ));
+    };
+    let reap = |server: &mut SpawnedHerdr| {
+        assert!(
+            support::wait_until(Duration::from_secs(10), Duration::from_millis(25), || {
+                server.child.try_wait().unwrap().is_some()
+            }),
+            "direct child server must stop and be reaped before cold restart"
+        );
+    };
+    let mut original = start();
+    let created = request(
+        &api_socket,
+        serde_json::json!({"id":"r1:workspace", "method":"workspace.create", "params":{"cwd":base.join("work")}}),
+    );
+    assert_ok(created.clone());
+    let workspace_id = created["result"]["workspace"]["workspace_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let create_recipe = |label: &str, program: &Path, count: &Path, input: &Path| {
+        let applied = request(
+            &api_socket,
+            serde_json::json!({
+                "id":format!("r1:{label}"), "method":"layout.apply_restorable",
+                "params":{"workspace_id":workspace_id, "tab_label":label,
+                    "root":{"type":"pane", "cwd":base.join("work"), "command":[program, count, input]}}
+            }),
+        );
+        assert_ok(applied.clone());
+        applied["result"]["layout"]["root"]["pane_id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let pane_id = create_recipe("unavailable", &script, &launches, &received);
+    let first_pid = wait_for_pid_marker(&launches, Duration::from_secs(5));
+    stop();
+    reap(&mut original);
+    drop(original);
+    assert!(process_gone(first_pid, Duration::from_secs(5)));
+    let saved: serde_json::Value =
+        serde_json::from_slice(&fs::read(&snapshot_path).unwrap()).unwrap();
+    let saved_recipe = |snapshot: &serde_json::Value| {
+        snapshot["workspaces"][0]["tabs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tab| tab["custom_name"] == "unavailable")
+            .unwrap()["panes"]
+            .as_object()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap()
+            .clone()
+    };
+    let original_recipe = saved_recipe(&saved);
+    assert_eq!(original_recipe["cold_restore_argv"], true);
+    assert_eq!(
+        original_recipe["launch_argv"],
+        serde_json::json!([script, launches, received])
+    );
+    fs::rename(&script, &hidden_script).unwrap();
+    let mut source = start();
+    let source_pid = source.child.process_id().unwrap();
+    let pane_record = || {
+        let response = request(
+            &api_socket,
+            serde_json::json!({"id":"r1:get", "method":"pane.get", "params":{"pane_id":pane_id}}),
+        );
+        assert_ok(response.clone());
+        response["result"]["pane"].clone()
+    };
+    let failed = pane_record();
+    wait_for_server_ptmx_fd_count(source_pid, 1, Duration::from_secs(5));
+    assert!(failed["restore_error"]
+        .as_str()
+        .unwrap()
+        .contains("saved argv command"));
+    assert_eq!(fs::read_to_string(&launches).unwrap().lines().count(), 1);
+    // Make the recipe usable again without editing any persisted consent.
+    fs::rename(&hidden_script, &script).unwrap();
+    let control = create_recipe(
+        "imported-control",
+        &control_script,
+        &control_launches,
+        &control_received,
+    );
+    let control_pid = wait_for_pid_marker(&control_launches, Duration::from_secs(5));
+    let exchange_control = |phase| {
+        assert_ok(request(
+            &api_socket,
+            serde_json::json!({"id":"r1:io", "method":"pane.send_input", "params":{"pane_id":control, "text":phase, "keys":["Enter"]}}),
+        ));
+        let ack = format!("got:{control_pid}:{phase}");
+        wait_for_file_contains(
+            &control_received,
+            &format!("{ack}\n"),
+            Duration::from_secs(5),
+        );
+        wait_for_output(&api_socket, &control, &ack);
+    };
+    exchange_control("before-handoff");
+    wait_for_server_ptmx_fd_count(source_pid, 2, Duration::from_secs(5));
+    let response = request(
+        &api_socket,
+        serde_json::json!({"id":"r1:handoff", "method":"server.live_handoff", "params":{}}),
+    );
+    let owner_pid = if rollback {
+        assert_eq!(response["error"]["code"], "handoff_failed", "{response}");
+        assert!(response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("3000ms"));
+        assert_eq!(unsafe { libc::kill(source_pid as libc::pid_t, 0) }, 0);
+        source_pid
+    } else {
+        assert_ok(response);
+        let replacement =
+            wait_for_replacement_server_pid(&runtime_dir, source_pid, Duration::from_secs(10));
+        register_spawned_herdr_pid(Some(replacement));
+        reap(&mut source);
+        replacement
+    };
+    wait_for_api(&api_socket, Duration::from_secs(10));
+    let after = pane_record();
+    wait_for_server_ptmx_fd_count(owner_pid, 2, Duration::from_secs(5));
+    assert_eq!(after["pane_id"], failed["pane_id"]);
+    assert_eq!(after["cwd"], failed["cwd"]);
+    assert!(
+        after["restore_error"].as_str().is_some(),
+        "unavailable state must survive: {after}"
+    );
+    if rollback {
+        assert_eq!(after["restore_error"], failed["restore_error"]);
+    }
+    assert_eq!(
+        fs::read_to_string(&launches).unwrap().lines().count(),
+        1,
+        "preparation must never retry unavailable recipe"
+    );
+    assert_eq!(unsafe { libc::kill(control_pid as libc::pid_t, 0) }, 0);
+    exchange_control("after-handoff");
+    assert_eq!(
+        fs::read_to_string(&control_launches)
+            .unwrap()
+            .lines()
+            .count(),
+        1,
+        "import must adopt exact control PID without relaunch"
+    );
+    stop();
+    if rollback {
+        reap(&mut source);
+    } else {
+        assert!(process_gone(owner_pid, Duration::from_secs(10)));
+    }
+    drop(source);
+    unregister_spawned_herdr_pid(Some(owner_pid));
+    let saved: serde_json::Value =
+        serde_json::from_slice(&fs::read(&snapshot_path).unwrap()).unwrap();
+    let after_recipe = saved_recipe(&saved);
+    assert_eq!(after_recipe["cold_restore_argv"], true);
+    assert_eq!(after_recipe["launch_argv"], original_recipe["launch_argv"]);
+    assert_eq!(after_recipe["cwd"], original_recipe["cwd"]);
+    // Only a genuine subsequent cold restart may retry the now-usable recipe.
+    let mut cold = start();
+    wait_for_file_contains(&launches, "\nSTART ", Duration::from_secs(5));
+    let records = fs::read_to_string(&launches).unwrap();
+    assert_eq!(
+        records.lines().count(),
+        2,
+        "cold restart must replay exactly once"
+    );
+    let new_pid: u32 = records
+        .lines()
+        .last()
+        .unwrap()
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_ne!(new_pid, first_pid);
+    assert_eq!(unsafe { libc::kill(new_pid as libc::pid_t, 0) }, 0);
+    assert!(pane_record()["restore_error"].is_null());
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({"id":"r1:cold-io", "method":"pane.send_input", "params":{"pane_id":pane_id, "text":"cold-retry", "keys":["Enter"]}}),
+    ));
+    wait_for_file_contains(
+        &received,
+        &format!("got:{new_pid}:cold-retry\n"),
+        Duration::from_secs(5),
+    );
+    stop();
+    reap(&mut cold);
+    drop(cold);
+    assert!(process_gone(new_pid, Duration::from_secs(5)));
+    eprintln!(
+        "R1 rollback={rollback} scratch={} source={source_pid} owner={owner_pid} imported_pid={control_pid} imported_count=1 unavailable_count_during_handoff=1 cold_retry_pid={new_pid} cold_retry_count=2 fresh_io=confirmed",
+        base.display()
+    );
 }
 
 #[test]
@@ -2217,6 +2767,453 @@ fn write_import_stub(stub: &Path, import_pid_marker: &Path, helper_pid_marker: &
     fs::set_permissions(stub, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
+fn startup_log_tail(config_home: &Path) -> String {
+    let path = config_home.join("herdr-dev/herdr-server.log");
+    let mut tail = Vec::new();
+    let result = (|| -> std::io::Result<()> {
+        let mut file = fs::File::open(&path)?;
+        let len = file.metadata()?.len();
+        file.seek(SeekFrom::Start(len.saturating_sub(16 * 1024)))?;
+        file.take(16 * 1024).read_to_end(&mut tail)?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => format!("{}:\n{}", path.display(), String::from_utf8_lossy(&tail)),
+        Err(err) => format!("{}: {err}", path.display()),
+    }
+}
+
+/// Timeout mode makes the initial connect nonblocking, including on a full
+/// listener queue. interprocess treats EAGAIN as pending and can return an
+/// unconnected fd after POLLHUP with SO_ERROR=0; verify actual connection too.
+fn bootstrap_connect(path: &Path, timeout: Duration) -> std::io::Result<UnixStream> {
+    let stream = ConnectOptions::new()
+        .name(path.to_fs_name::<GenericFilePath>()?)
+        .wait_mode(ConnectWaitMode::Timeout(timeout))
+        .connect_sync_as::<interprocess::os::unix::uds_local_socket::Stream>()?;
+    stream.inner().peer_addr().map_err(|err| {
+        if err.kind() == std::io::ErrorKind::NotConnected {
+            std::io::Error::new(std::io::ErrorKind::WouldBlock, "connect is still pending")
+        } else {
+            err
+        }
+    })?;
+    stream.inner().try_clone()
+}
+
+fn bootstrap_connect_before(path: &Path, deadline: Instant) -> std::io::Result<UnixStream> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "startup deadline expired before socket connect",
+        ));
+    }
+    bootstrap_connect(path, remaining)
+}
+
+/// API bind (and even ping) precedes App initialization. Wait for the existing
+/// post-bind ready event, then a real client welcome + snapshot, not socket files.
+/// The deadline is shared by all stages: the old 10s + 5s allowance is unchanged.
+fn wait_for_server_bootstrap(
+    spawned: &mut SpawnedHerdr,
+    api_socket: &Path,
+    client_socket: &Path,
+    config_home: &Path,
+    timeout: Duration,
+) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    let mut output = Vec::new();
+    let mut phase = "waiting for post-bind ready event";
+    let result = (|| -> Result<(), String> {
+        let mut reader = spawned
+            ._master
+            .try_clone_reader()
+            .map_err(|err| err.to_string())?;
+        let fd = spawned
+            ._master
+            .as_raw_fd()
+            .ok_or("PTY has no pollable fd")?;
+        let mut output_closed = false;
+        let mut child_exit = None;
+        loop {
+            if let Some(status) = spawned.child.try_wait().map_err(|err| err.to_string())? {
+                child_exit = Some(format!("child exited: {status} ({status:?})"));
+            }
+            // Drain final stderr through EOF before reporting a child's exit.
+            if output_closed {
+                if let Some(error) = &child_exit {
+                    return Err(error.clone());
+                }
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(child_exit
+                    .unwrap_or_else(|| format!("startup deadline expired after {timeout:?}")));
+            }
+            let mut poll = libc::pollfd {
+                fd: if output_closed { -1 } else { fd },
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // The only reader, so readiness permits a nonblocking-in-practice
+            // read. A closed PTY uses fd=-1 to keep child-exit checks bounded.
+            let ready = unsafe { libc::poll(&mut poll, 1, remaining.as_millis().min(25) as i32) };
+            if ready < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(format!("poll startup PTY: {error}"));
+            }
+            if ready == 0 {
+                continue;
+            }
+            let mut buf = [0; 1024];
+            match reader.read(&mut buf) {
+                Ok(0) | Err(_) => output_closed = true,
+                Ok(n) => output.extend_from_slice(&buf[..n]),
+            }
+            if output.len() > 16 * 1024 {
+                output.drain(..output.len() - 16 * 1024);
+            }
+            if child_exit.is_none()
+                && String::from_utf8_lossy(&output).contains("herdr server running;")
+            {
+                bootstrap_connect_before(api_socket, deadline)
+                    .map_err(|err| format!("API unavailable after ready event: {err}"))?;
+                let stream = bootstrap_connect_before(client_socket, deadline)
+                    .map_err(|err| format!("client unavailable after ready event: {err}"))?;
+                phase = "waiting for client protocol welcome and bootstrap snapshot";
+                return client_bootstrap_before(stream, deadline);
+            }
+        }
+    })();
+    if result.is_ok() {
+        return result;
+    }
+    let failure = match spawned.child.try_wait() {
+        Ok(Some(status)) => format!(
+            "child exited: {status} ({status:?}); {}",
+            result.unwrap_err()
+        ),
+        _ => result.unwrap_err(),
+    };
+    // Diagnostics run even after expiry: attempt immediately, never grant a
+    // fresh waiting budget, and never call a pending unconnected fd success.
+    let probe = |path: &Path| match bootstrap_connect(path, Duration::ZERO) {
+        Ok(_) => "connect succeeds (not proof of protocol readiness)".to_string(),
+        Err(err) => format!("connect failed: {err}"),
+    };
+    Err(format!(
+        "server bootstrap failed: {failure}; phase: {phase}; pid: {:?}\nAPI {}: {}\nclient {}: {}\nPTY output:\n{}\n{}",
+        spawned.child.process_id(), api_socket.display(), probe(api_socket),
+        client_socket.display(), probe(client_socket), String::from_utf8_lossy(&output),
+        startup_log_tail(config_home),
+    ))
+}
+
+fn client_bootstrap_before(mut stream: UnixStream, deadline: Instant) -> Result<(), String> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err("startup deadline expired before client bootstrap".to_string());
+    }
+    stream
+        .set_write_timeout(Some(remaining))
+        .map_err(|err| err.to_string())?;
+    let cancel = stream.try_clone().map_err(|err| err.to_string())?;
+    // The shared handshake helper overwrites read_timeout with 5s. One scoped
+    // worker enforces our remaining aggregate budget without changing support.
+    // Shutdown interrupts all reads/writes, then scope joins it on every path.
+    thread::scope(|scope| {
+        let (tx, rx) = mpsc::channel();
+        scope.spawn(move || {
+            let result = (|| {
+                let generation = support::CURRENT_ENDPOINT_PROTOCOL_GENERATION;
+                let (actual, error) = client_shell_handshake(&mut stream, generation, 80, 24)?;
+                if actual != generation || error.is_some() {
+                    return Err(format!(
+                        "client welcome generation={actual}, error={error:?}"
+                    ));
+                }
+                wait_for_client_shell_bootstrap(
+                    &mut stream,
+                    deadline.saturating_duration_since(Instant::now()),
+                )
+            })();
+            let _ = tx.send(result);
+        });
+        let result = rx
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .map_err(|err| {
+                format!("startup deadline expired or client bootstrap worker failed: {err}")
+            })
+            .and_then(|result| result);
+        let _ = cancel.shutdown(std::net::Shutdown::Both);
+        result
+    })
+}
+
+fn spawn_bootstrap_fixture(base: &Path, output_command: &str) -> SpawnedHerdr {
+    let pair = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .unwrap();
+    let mut command = portable_pty::CommandBuilder::new("/bin/sh");
+    crate::test_command::sanitize_pty_command_env(&mut command);
+    let marker = base.join("fixture-ready");
+    command.args([
+        "-c",
+        &format!(
+            "{output_command}; printf 'ready\\n' > {}; exec /bin/sleep 60",
+            marker.display()
+        ),
+    ]);
+    let child = pair.slave.spawn_command(command).unwrap();
+    register_spawned_herdr_pid(child.process_id());
+    let spawned = SpawnedHerdr {
+        _master: pair.master,
+        child,
+    };
+    // Prime the PTY before starting the deliberately short deadline: scheduling
+    // the fixture shell is not part of the unavailable-listener counterexample.
+    wait_for_file_contains(&marker, "ready\n", Duration::from_secs(5));
+    spawned
+}
+
+#[test]
+fn server_bootstrap_reports_an_unavailable_client_listener() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    fs::create_dir_all(base.join("config/herdr-dev")).unwrap();
+    let api = base.join("herdr.sock");
+    let client = base.join("herdr-client.sock");
+    let _api_listener = std::os::unix::net::UnixListener::bind(&api).unwrap();
+    fs::write(
+        base.join("config/herdr-dev/herdr-server.log"),
+        "last checkpoint: App initialization\n",
+    )
+    .unwrap();
+    let mut spawned = spawn_bootstrap_fixture(&base, "printf 'waiting-for-client-bind\\n'");
+    let error = wait_for_server_bootstrap(
+        &mut spawned,
+        &api,
+        &client,
+        &base.join("config"),
+        Duration::from_millis(250),
+    )
+    .expect_err("an API listener must not conceal an unavailable client listener");
+    assert!(error.contains("startup deadline expired"), "{error}");
+    assert!(
+        error.contains("waiting for post-bind ready event"),
+        "{error}"
+    );
+    assert!(
+        error.contains(&format!("client {}: connect failed:", client.display())),
+        "{error}"
+    );
+    assert!(error.contains("waiting-for-client-bind"), "{error}");
+    assert!(
+        error.contains("last checkpoint: App initialization"),
+        "{error}"
+    );
+    assert!(spawned.child.try_wait().unwrap().is_none());
+    spawned.child.kill().unwrap();
+    spawned.child.wait().unwrap();
+    drop(spawned);
+    cleanup_test_base(&base);
+}
+
+#[test]
+fn server_bootstrap_requires_a_client_protocol_snapshot() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    fs::create_dir_all(&base).unwrap();
+    let api = base.join("herdr.sock");
+    let client = base.join("herdr-client.sock");
+    // Genuine listeners, deliberately no protocol service. The old helper's
+    // two connect probes accept these immediately (deterministic false GREEN).
+    let _api_listener = std::os::unix::net::UnixListener::bind(&api).unwrap();
+    let _client_listener = std::os::unix::net::UnixListener::bind(&client).unwrap();
+    let mut spawned = spawn_bootstrap_fixture(&base, "printf 'herdr server running;\\n'");
+    let error = wait_for_server_bootstrap(
+        &mut spawned,
+        &api,
+        &client,
+        &base.join("config"),
+        Duration::from_millis(250),
+    )
+    .expect_err("bound sockets and a ready event aren't a protocol bootstrap");
+    assert!(error.contains("startup deadline expired"), "{error}");
+    // Expiry can precede dispatch of the already-emitted ready event.
+    assert!(
+        error.contains("waiting for client protocol welcome and bootstrap snapshot")
+            || error.contains("waiting for post-bind ready event"),
+        "{error}"
+    );
+    assert!(
+        error.contains("connect succeeds (not proof of protocol readiness)"),
+        "{error}"
+    );
+    spawned.child.kill().unwrap();
+    spawned.child.wait().unwrap();
+    drop(spawned);
+    cleanup_test_base(&base);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn server_bootstrap_bounds_saturated_backlog_connects() {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixListener;
+
+    let _lock = test_lock();
+    for saturated_endpoint in ["API", "client"] {
+        // ZERO deterministically expires before reading the primed ready event.
+        for (ready_event, budget) in [
+            (false, Duration::from_millis(100)),
+            (true, Duration::from_millis(100)),
+            (true, Duration::ZERO),
+        ] {
+            let base = unique_test_dir();
+            fs::create_dir_all(&base).unwrap();
+            let api = base.join("herdr.sock");
+            let client = base.join("herdr-client.sock");
+            let api_listener = UnixListener::bind(&api).unwrap();
+            let client_listener = UnixListener::bind(&client).unwrap();
+            let (listener, saturated, healthy) = if saturated_endpoint == "API" {
+                (&api_listener, &api, &client)
+            } else {
+                (&client_listener, &client, &api)
+            };
+            let inode = socket_inode(saturated);
+            // Shrink a real listening queue, then fill it until a nonblocking
+            // attempt cannot connect. No acceptor, sleeps, or guessed capacity.
+            assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 1) }, 0);
+            let mut queued = Vec::new();
+            loop {
+                match bootstrap_connect(saturated, Duration::ZERO) {
+                    Ok(stream) => queued.push(stream),
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(err) => panic!("saturate {saturated_endpoint}: {err}"),
+                }
+                assert!(queued.len() < 16, "listener queue did not saturate");
+            }
+            assert!(!queued.is_empty(), "must retain real pending connections");
+            // Counterexample: a zero-budget probe can confirm an immediately
+            // connected healthy listener, but never an unconnected pending fd.
+            let healthy_probe = bootstrap_connect(healthy, Duration::ZERO).unwrap();
+            healthy_probe.peer_addr().unwrap();
+            assert_eq!(
+                bootstrap_connect_before(healthy, Instant::now())
+                    .unwrap_err()
+                    .kind(),
+                std::io::ErrorKind::TimedOut,
+                "readiness must not connect after its original deadline",
+            );
+            let started = Instant::now();
+            let error = bootstrap_connect(saturated, Duration::ZERO).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+            assert!(started.elapsed() < Duration::from_secs(1));
+            let mut spawned = spawn_bootstrap_fixture(
+                &base,
+                if ready_event {
+                    "printf 'herdr server running;\\n'"
+                } else {
+                    "printf 'waiting-for-client-bind\\n'"
+                },
+            );
+            eprintln!(
+                "saturated backlog: endpoint={saturated_endpoint}, ready={ready_event}, budget={budget:?}, queued={}, fixture_pid={:?}, base={}",
+                queued.len(), spawned.child.process_id(), base.display()
+            );
+            let started = Instant::now();
+            let error = wait_for_server_bootstrap(
+                &mut spawned,
+                &api,
+                &client,
+                &base.join("config"),
+                budget,
+            )
+            .expect_err("saturated listeners must fail, not hang or pass readiness");
+            assert!(started.elapsed() < Duration::from_secs(1), "{error}");
+            if error.contains("startup deadline expired") {
+                assert!(
+                    started.elapsed() >= budget,
+                    "deadline failed early: {error}"
+                );
+            } else {
+                assert!(ready_event, "unexpected non-expiry diagnostic: {error}");
+                assert!(
+                    error.contains(&format!(
+                        "{saturated_endpoint} unavailable after ready event"
+                    )),
+                    "{error}"
+                );
+            }
+            assert!(
+                error.contains(&format!(
+                    "{saturated_endpoint} {}: connect failed:",
+                    saturated.display()
+                )),
+                "{error}"
+            );
+            assert!(
+                error.contains("connect succeeds (not proof of protocol readiness)"),
+                "{error}"
+            );
+            assert_eq!(socket_inode(saturated), inode);
+            assert!(spawned.child.try_wait().unwrap().is_none());
+            spawned.child.kill().unwrap();
+            spawned.child.wait().unwrap();
+            drop(spawned);
+            drop((queued, healthy_probe, api_listener, client_listener));
+            cleanup_test_base(&base);
+        }
+    }
+}
+
+#[test]
+fn server_bootstrap_reports_a_real_client_bind_failure() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let runtime = base.join("runtime");
+    fs::create_dir_all(&runtime).unwrap();
+    let api = runtime.join("herdr.sock");
+    let client = runtime.join("herdr-client.sock");
+    let foreign = std::os::unix::net::UnixListener::bind(&client).unwrap();
+    let original_inode = socket_inode(&client);
+    let mut spawned = spawn_server(&base.join("config"), &runtime, &api);
+    let error = wait_for_server_bootstrap(
+        &mut spawned,
+        &api,
+        &client,
+        &base.join("config"),
+        Duration::from_secs(15),
+    )
+    .expect_err("a genuine client bind failure must not pass readiness");
+    assert!(
+        error.contains("child exited: Exited with code 1"),
+        "{error}"
+    );
+    assert!(!error.contains("startup deadline expired"), "{error}");
+    assert!(error.contains("already running"), "{error}");
+    assert!(
+        error.contains(&format!("client socket: {}", client.display())),
+        "{error}"
+    );
+    assert!(error.contains("api server listening"), "{error}");
+    assert_eq!(socket_inode(&client), original_inode);
+    assert!(UnixStream::connect(&client).is_ok());
+    drop(foreign);
+    drop(spawned);
+    cleanup_test_base(&base);
+}
+
 /// Starts a server with one pane running a line echo loop. Returns the server,
 /// the pane id, the pane process id and the file the pane appends input to.
 fn spawn_server_with_echo_pane(
@@ -2228,25 +3225,27 @@ fn spawn_server_with_echo_pane(
     let api_socket = runtime_dir.join("herdr.sock");
     let marker = base.join("child.pid");
     let received_marker = base.join("received");
-    let spawned = spawn_server_with_env(&config_home, &runtime_dir, &api_socket, extra_env);
-    wait_for_socket(&api_socket, Duration::from_secs(10));
-    wait_for_socket(
-        &runtime_dir.join("herdr-client.sock"),
-        Duration::from_secs(5),
-    );
-    register_runtime_dir(&runtime_dir);
-    let created = request(
+    let mut spawned = spawn_server_with_env(&config_home, &runtime_dir, &api_socket, extra_env);
+    wait_for_server_bootstrap(
+        &mut spawned,
         &api_socket,
-        serde_json::json!({
-            "id": "test:workspace:create",
-            "method": "workspace.create",
-            "params": {"cwd": "/tmp", "focus": true}
-        }),
+        &runtime_dir.join("herdr-client.sock"),
+        &config_home,
+        Duration::from_secs(15),
+    )
+    .unwrap_or_else(|err| panic!("{err}"));
+    register_runtime_dir(&runtime_dir);
+    // A real client bootstrap creates the default workspace. Reuse its pane
+    // rather than creating a second one and weakening the handoff fd counts.
+    let listed = request(
+        &api_socket,
+        serde_json::json!({"id":"test:bootstrap-panes","method":"pane.list","params":{}}),
     );
-    let pane_id = created["result"]["root_pane"]["pane_id"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    let panes = listed["result"]["panes"]
+        .as_array()
+        .expect("bootstrap panes");
+    assert_eq!(panes.len(), 1, "echo fixture must have one pane: {listed}");
+    let pane_id = panes[0]["pane_id"].as_str().unwrap().to_string();
     let command = format!(
         "sh -c 'echo READY $$ > {}; while read line; do echo got:$line; echo got:$line >> {}; done'",
         marker.display(),

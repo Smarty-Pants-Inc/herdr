@@ -229,6 +229,7 @@ impl HeadlessServer {
             method,
             Method::CommandInvoke(_)
                 | Method::LayoutApply(_)
+                | Method::LayoutApplyRestorable(_)
                 | Method::LayoutApplyProjectChecked(_)
                 | Method::PaneClose(_)
                 | Method::PaneEditScrollback(_)
@@ -254,6 +255,7 @@ impl HeadlessServer {
             Method::AgentFocus(_)
                 | Method::CommandInvoke(_)
                 | Method::LayoutApply(_)
+                | Method::LayoutApplyRestorable(_)
                 | Method::LayoutApplyProjectChecked(_)
                 | Method::LayoutSetSplitRatio(_)
                 | Method::PaneClose(_)
@@ -301,6 +303,7 @@ impl HeadlessServer {
             Method::AgentFocus(_)
                 | Method::CommandInvoke(_)
                 | Method::LayoutApply(_)
+                | Method::LayoutApplyRestorable(_)
                 | Method::LayoutApplyProjectChecked(_)
                 | Method::LayoutSetSplitRatio(_)
                 | Method::PaneClose(_)
@@ -1002,6 +1005,13 @@ mod tests {
                 "layout.apply",
                 "layout.apply_project_checked",
                 json!({"root": {"type": "pane"}}),
+                [true, true, true],
+                [true, true, true],
+            ),
+            (
+                "layout.apply",
+                "layout.apply_restorable",
+                json!({"root": {"type": "pane", "command": [crate::app::exiting_test_command()]}}),
                 [true, true, true],
                 [true, true, true],
             ),

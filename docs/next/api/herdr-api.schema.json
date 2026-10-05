@@ -6029,6 +6029,22 @@
           "type": "object"
         },
         {
+          "properties": {
+            "method": {
+              "const": "layout.apply_restorable",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/LayoutApplyParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
           "description": "Project-checked apply; its distinct name prevents unsafe old-server fallback.",
           "properties": {
             "method": {

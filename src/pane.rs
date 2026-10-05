@@ -1319,6 +1319,8 @@ pub struct PaneRuntime {
     io: PaneRuntimeIo,
     current_size: Cell<(u16, u16, u32, u32)>,
     child_pid: Arc<AtomicU32>,
+    // Written only at construction in production. Cell permits test fixture initialization.
+    child_process_identity: Cell<Option<crate::platform::ProcessIdentity>>,
     reported_cwd: Arc<Mutex<Option<std::path::PathBuf>>>,
     persistence_cwd: Mutex<Option<std::path::PathBuf>>,
     cwd_process_exited: Arc<AtomicBool>,
@@ -2124,6 +2126,11 @@ impl PaneRuntime {
         crate::handoff_runtime::HandoffRuntimeState {
             pane_id,
             child_pid,
+            child_start_time: self
+                .child_process_identity
+                .get()
+                .filter(|identity| identity.pid == child_pid)
+                .map(|identity| identity.start_time),
             rows,
             cols,
             cell_width_px,
@@ -2335,9 +2342,32 @@ impl PaneRuntime {
         render_dirty: Arc<RenderSignal>,
     ) -> std::io::Result<Self> {
         let crate::handoff_runtime::ImportedHandoffRuntime { master_fd, state } = import;
+        // Keep an explicit manifest pin even when it is currently unusable.  The
+        // public getter below still validates it before attribution, while export
+        // must distinguish a rejected pin from a legacy manifest on later handoffs.
+        let supplied_child_process_identity =
+            state
+                .child_start_time
+                .map(|start_time| crate::platform::ProcessIdentity {
+                    pid: state.child_pid,
+                    start_time,
+                });
+        let validated_child_process_identity = if supplied_child_process_identity.is_some() {
+            state.child_process_identity()
+        } else {
+            crate::platform::process_identity_for_pty(state.child_pid, master_fd)
+        };
+        if validated_child_process_identity.is_none() {
+            warn!(
+                pane = state.pane_id,
+                child_pid = state.child_pid,
+                "handoff root identity unavailable; origin attribution disabled until agent restart"
+            );
+        }
         let crate::handoff_runtime::HandoffRuntimeState {
             pane_id,
             child_pid,
+            child_start_time: _,
             rows,
             cols,
             cell_width_px,
@@ -2487,6 +2517,11 @@ impl PaneRuntime {
             io,
             current_size: Cell::new((rows, cols, cell_width_px, cell_height_px)),
             child_pid,
+            // Preserve an explicit original pin even when validation rejected it;
+            // the getter revalidates before attribution and export retains provenance.
+            child_process_identity: Cell::new(
+                supplied_child_process_identity.or(validated_child_process_identity),
+            ),
             reported_cwd,
             persistence_cwd: Mutex::new(None),
             cwd_process_exited,
@@ -2545,24 +2580,29 @@ impl PaneRuntime {
         let kitty_keyboard_flags = Arc::new(AtomicU16::new(0));
         let content_write_lock = Arc::new(Mutex::new(()));
 
-        let spawned = crate::pty::backend::spawn_with_portable_pty(rows, cols, cmd)
-            .inspect_err(|err| error!(pane = pane_id.raw(), err = %err, "{spawn_error_message}"))?;
+        // Backend diagnostics can contain executable paths or other launch recipe values.
+        // Keep those details in the returned error for the caller, not in server logs.
+        let spawned = crate::pty::backend::spawn_with_portable_pty(rows, cols, cmd).inspect_err(
+            |err| error!(pane = pane_id.raw(), kind = ?err.kind(), "{spawn_error_message}"),
+        )?;
+
+        // Pin the spawned instance before giving the child to a watcher that can reap it.
+        let spawned_pid = spawned.child.process_id();
+        let child_process_identity = spawned_pid.and_then(crate::platform::process_identity);
 
         // --- Child watcher task ---
-        let child_pid = Arc::new(AtomicU32::new(0));
+        let child_pid = Arc::new(AtomicU32::new(spawned_pid.unwrap_or_default()));
         let reported_cwd = Arc::new(Mutex::new(None));
         let child_wait_completed = Arc::new(AtomicBool::new(false));
         let content_seq = Arc::new(AtomicU64::new(0));
         let detection_content_seq = Arc::new(AtomicU64::new(0));
         let full_lifecycle_authority_active = Arc::new(AtomicBool::new(false));
         {
-            let child_pid = child_pid.clone();
             let child_wait_completed = child_wait_completed.clone();
             let events = events.clone();
             let rt = tokio::runtime::Handle::current();
             let mut child = spawned.child;
-            if let Some(pid) = child.process_id() {
-                child_pid.store(pid, Ordering::Release);
+            if let Some(pid) = spawned_pid {
                 crate::logging::pane_spawned(pane_id.raw(), pid);
             }
             tokio::task::spawn_blocking(move || {
@@ -3077,6 +3117,7 @@ impl PaneRuntime {
             io,
             current_size: Cell::new((rows, cols, 0, 0)),
             child_pid,
+            child_process_identity: Cell::new(child_process_identity),
             reported_cwd,
             persistence_cwd: Mutex::new(None),
             cwd_process_exited: child_wait_completed.clone(),
@@ -3628,6 +3669,18 @@ impl PaneRuntime {
         (pid > 0).then_some(pid)
     }
 
+    /// Return only the originally pinned, still-current root instance.
+    /// Missing identities are never filled by reopening a numeric PID.
+    pub(crate) fn child_process_identity(&self) -> Option<crate::platform::ProcessIdentity> {
+        if self.cwd_process_exited.load(Ordering::Acquire) {
+            return None;
+        }
+        let identity = self.child_process_identity.get()?;
+        (self.child_pid() == Some(identity.pid)
+            && crate::platform::process_identity(identity.pid) == Some(identity))
+        .then_some(identity)
+    }
+
     pub fn follow_cwd(&self) -> Option<std::path::PathBuf> {
         #[cfg(unix)]
         {
@@ -3685,6 +3738,8 @@ impl PaneRuntime {
 #[cfg(test)]
 impl PaneRuntime {
     pub(crate) fn test_set_child_pid(&self, pid: u32) {
+        self.child_process_identity
+            .set(crate::platform::process_identity(pid));
         self.child_pid.store(pid, Ordering::Release);
     }
 
@@ -3814,6 +3869,7 @@ impl PaneRuntime {
                 },
                 current_size: Cell::new((rows, cols, 0, 0)),
                 child_pid: Arc::new(AtomicU32::new(0)),
+                child_process_identity: Cell::new(None),
                 reported_cwd: Arc::new(Mutex::new(None)),
                 persistence_cwd: Mutex::new(None),
                 cwd_process_exited: Arc::new(AtomicBool::new(false)),
@@ -4937,6 +4993,60 @@ mod tests {
         assert!(runtime.handoff_history_ansi().is_none());
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn root_identity_rejects_changed_missing_and_exited_instances() {
+        let (runtime, _rx) = PaneRuntime::test_with_channel(80, 24);
+        let identity =
+            crate::platform::process_identity(std::process::id()).expect("live process identity");
+        runtime.test_set_child_pid(identity.pid);
+        assert_eq!(runtime.child_process_identity(), Some(identity));
+
+        // A live process occupies the numeric PID but has a different original pin.
+        // A bare-PID recapture would accept it; the runtime must not.
+        let stale = crate::platform::ProcessIdentity {
+            start_time: identity.start_time.wrapping_add(1),
+            ..identity
+        };
+        runtime.child_process_identity.set(Some(stale));
+        assert_eq!(
+            crate::platform::process_identity(identity.pid),
+            Some(identity)
+        );
+        assert_eq!(runtime.child_process_identity(), None);
+        assert_eq!(runtime.child_process_identity.get(), Some(stale));
+
+        runtime.child_process_identity.set(None);
+        assert_eq!(runtime.child_process_identity(), None);
+        runtime.child_process_identity.set(Some(identity));
+        runtime.child_pid.store(0, Ordering::Release);
+        assert_eq!(runtime.child_process_identity(), None);
+        runtime.child_pid.store(identity.pid, Ordering::Release);
+        runtime.cwd_process_exited.store(true, Ordering::Release);
+        assert_eq!(runtime.child_process_identity(), None);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn reaped_root_identity_is_not_recaptured() {
+        let (runtime, _rx) = PaneRuntime::test_with_channel(80, 24);
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "read line"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .expect("root child");
+        runtime.test_set_child_pid(child.id());
+        let identity = runtime.child_process_identity().expect("live root pin");
+        drop(child.stdin.take());
+        child.wait().expect("root reaped");
+        assert_eq!(runtime.child_process_identity(), None);
+        assert_eq!(runtime.child_process_identity.get(), Some(identity));
+        // Export the original pin even after exit, never a replacement timestamp.
+        let state = runtime.handoff_runtime_state(12);
+        assert_eq!(state.child_start_time, Some(identity.start_time));
+        assert_eq!(state.child_process_identity(), None);
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn ended_handoff_keeps_persistence_cwd_when_pid_is_reused() {
@@ -5122,6 +5232,7 @@ mod tests {
             },
             current_size: Cell::new((80, 24, 0, 0)),
             child_pid: Arc::new(AtomicU32::new(0)),
+            child_process_identity: Cell::new(None),
             reported_cwd: Arc::new(Mutex::new(None)),
             child_wait_completed: None,
             kitty_keyboard_flags: Arc::new(AtomicU16::new(0)),
@@ -5162,6 +5273,7 @@ mod tests {
             },
             current_size: Cell::new((80, 24, 0, 0)),
             child_pid: Arc::new(AtomicU32::new(0)),
+            child_process_identity: Cell::new(None),
             reported_cwd: Arc::new(Mutex::new(None)),
             child_wait_completed: None,
             kitty_keyboard_flags: Arc::new(AtomicU16::new(0)),
@@ -5930,6 +6042,42 @@ mod tests {
         )
         .await
         .expect("re-entering active authority should notify detection reset");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_argv_spawn_preserves_backend_error_for_caller() {
+        let root = std::env::temp_dir().join(format!(
+            "herdr-missing-argv-{}-{}",
+            std::process::id(),
+            PaneId::from_raw(42).raw()
+        ));
+        // A nonexistent parent makes the failure deterministic without touching global env.
+        assert!(!root.exists());
+        let program = root
+            .join("ARGV0_CALLER_SENTINEL")
+            .to_string_lossy()
+            .into_owned();
+        let (events, _event_rx) = mpsc::channel(8);
+        let result = PaneRuntime::spawn_argv_command(
+            PaneId::from_raw(42),
+            24,
+            80,
+            std::env::temp_dir(),
+            &[program.clone(), "ARGV1_CALLER_SENTINEL".into()],
+            &PaneLaunchEnv::default(),
+            AgentDetection::Disabled,
+            0,
+            crate::terminal_theme::TerminalTheme::default(),
+            None,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        );
+        let error = result.err().expect("missing executable must fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert!(error.to_string().contains(&program), "{error}");
+        assert!(error.to_string().contains("Unable to spawn"), "{error}");
     }
 
     #[cfg(unix)]

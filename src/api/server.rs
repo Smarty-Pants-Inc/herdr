@@ -22,7 +22,7 @@ use crate::api::{
 };
 use crate::ipc::{
     bind_local_listener, is_connection_closed_error, local_stream_peer_closed,
-    local_stream_peer_pid, poll_local_stream_read, remove_socket_file_if_owned,
+    local_stream_peer_identity, poll_local_stream_read, remove_socket_file_if_owned,
     set_local_stream_polling, socket_file_identity, LocalStream, LocalStreamRead,
     SocketFileIdentity,
 };
@@ -214,6 +214,9 @@ fn start_server_inner(
                     }
                     retry_delay = ACCEPT_RETRY_INITIAL_DELAY;
                     retrying = false;
+                    // Pin once while accepting; queued/handler dispatch must not recapture
+                    // a later numeric owner, including the older-kernel credential fallback.
+                    let context = ApiRequestContext::capture(local_stream_peer_identity(&stream));
                     let api_tx = api_tx.clone();
                     let event_hub = event_hub.clone();
                     let capabilities = capabilities.clone();
@@ -224,6 +227,7 @@ fn start_server_inner(
                     std::thread::spawn(move || {
                         if let Err(err) = handle_connection_with_stop(
                             stream,
+                            context,
                             &api_tx,
                             &event_hub,
                             &connection_running,
@@ -292,8 +296,10 @@ fn handle_connection(
     running: &Arc<AtomicBool>,
     capabilities: Option<ServerCapabilities>,
 ) -> std::io::Result<()> {
+    let context = ApiRequestContext::capture(local_stream_peer_identity(&stream));
     handle_connection_with_stop(
         stream,
+        context,
         api_tx,
         event_hub,
         running,
@@ -306,6 +312,7 @@ fn handle_connection(
 
 fn handle_connection_with_stop(
     mut stream: LocalStream,
+    context: ApiRequestContext,
     api_tx: &ApiRequestSender,
     event_hub: &EventHub,
     running: &Arc<AtomicBool>,
@@ -316,10 +323,6 @@ fn handle_connection_with_stop(
     if let Err(err) = stream.set_send_timeout(Some(STREAM_WRITE_TIMEOUT)) {
         debug!(err = %err, "api connection write timeout unavailable");
     }
-
-    let context = ApiRequestContext {
-        local_peer_pid: local_stream_peer_pid(&stream),
-    };
 
     let Some(line) = read_initial_request_line(&mut stream)? else {
         return Ok(());
@@ -604,11 +607,24 @@ fn handle_request_with_context(
     if matches!(&request.method, Method::ServerStop(_)) {
         if let Some(server_stop) = server_stop {
             server_stop.store(true, Ordering::Release);
-            return serde_json::to_string(&SuccessResponse {
-                id: request.id,
+            let response = serde_json::to_string(&SuccessResponse {
+                id: request.id.clone(),
                 result: ResponseResult::Ok {},
             })
             .unwrap_or_else(|_| "{}".to_string());
+            // Changing the flag alone cannot wake an idle, deadline-free App
+            // loop. Enqueue the actual stop request, but never wait for its
+            // response: stop control must remain responsive even with a busy
+            // App or a receiver that has already shut down.
+            let (respond_to, _response_rx) = std::sync::mpsc::channel();
+            let _ = api_tx.send(ApiRequestMessage {
+                request,
+                context,
+                respond_to,
+                response_write_complete: None,
+                stream_active: None,
+            });
+            return response;
         }
     } else if server_stop.is_some_and(|stop| stop.load(Ordering::Acquire)) {
         return error_response_json(
@@ -694,6 +710,7 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::PaneProcessInfo(_) => "pane.process_info",
         Method::LayoutExport(_) => "layout.export",
         Method::LayoutApply(_) => "layout.apply",
+        Method::LayoutApplyRestorable(_) => "layout.apply_restorable",
         Method::LayoutApplyProjectChecked(_) => "layout.apply_project_checked",
         Method::LayoutSetSplitRatio(_) => "layout.set_split_ratio",
         Method::PaneNeighbor(_) => "pane.neighbor",
@@ -978,7 +995,11 @@ mod windows_tests {
         });
 
         let msg = api_rx.blocking_recv().expect("API request dispatch");
-        assert_eq!(msg.context.local_peer_pid, Some(std::process::id()));
+        assert_eq!(msg.context.local_peer_pid(), Some(std::process::id()));
+        assert_eq!(
+            msg.context.local_peer_identity,
+            crate::platform::process_identity(std::process::id())
+        );
         msg.respond_to
             .send(
                 serde_json::to_string(&SuccessResponse {
@@ -1642,8 +1663,10 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         let worker_registry = registry.clone();
         let worker = std::thread::spawn(move || {
+            let context = ApiRequestContext::capture(local_stream_peer_identity(&server));
             handle_connection_with_stop(
                 server,
+                context,
                 &tx,
                 &EventHub::default(),
                 &Arc::new(AtomicBool::new(true)),
@@ -1851,7 +1874,7 @@ mod tests {
     }
 
     #[test]
-    fn server_stop_control_bypasses_app_channel() {
+    fn server_stop_control_wakes_app_without_waiting_for_app_response() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let stop = Arc::new(AtomicBool::new(false));
         let response = handle_request(
@@ -1869,6 +1892,12 @@ mod tests {
         assert_eq!(response["id"], "priority_stop");
         assert_eq!(response["result"]["type"], "ok");
         assert!(stop.load(Ordering::Acquire));
+        // No App consumed or answered the request before the immediate reply.
+        // The queued request also wakes a receiver parked in the headless select.
+        let wake = rx.try_recv().expect("stop must wake the App receiver");
+        assert_eq!(wake.request.id, "priority_stop");
+        assert!(matches!(wake.request.method, Method::ServerStop(_)));
+        assert!(wake.respond_to.send("unused".into()).is_err());
 
         let rejected = handle_request(
             Request {
@@ -1883,6 +1912,27 @@ mod tests {
         let rejected: serde_json::Value = serde_json::from_str(&rejected).unwrap();
         assert_eq!(rejected["error"]["code"], "server_unavailable");
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn server_stop_control_replies_even_after_app_receiver_closes() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        drop(rx);
+        let stop = Arc::new(AtomicBool::new(false));
+        let response = handle_request(
+            Request {
+                id: "closed_app_stop".into(),
+                method: Method::ServerStop(crate::api::schema::EmptyParams::default()),
+            },
+            &tx,
+            None,
+            Some(&stop),
+            None,
+        );
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["id"], "closed_app_stop");
+        assert_eq!(response["result"]["type"], "ok");
+        assert!(stop.load(Ordering::Acquire));
     }
 
     #[test]
@@ -2405,9 +2455,14 @@ mod tests {
         }
         let prompt = api_rx.blocking_recv().expect("agent prompt dispatch");
         assert_eq!(
-            prompt.context.local_peer_pid,
+            prompt.context.local_peer_pid(),
             Some(std::process::id()),
             "wait-mode prompt must retain the socket origin"
+        );
+        assert_eq!(
+            prompt.context.local_peer_identity,
+            crate::platform::process_identity(std::process::id()),
+            "wait-mode prompt must retain the captured socket process instance"
         );
         assert_eq!(api_method_name(&prompt.request.method), method);
         let prompt_params = match &prompt.request.method {

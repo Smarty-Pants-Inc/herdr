@@ -6,7 +6,7 @@ mod status;
 #[cfg(test)]
 pub(super) mod test_support;
 
-pub(crate) use self::discovery::automatic_workspace_label;
+pub(crate) use self::discovery::{automatic_workspace_label, git_worktree_info, GitWorktreeInfo};
 
 pub use self::{
     discovery::{

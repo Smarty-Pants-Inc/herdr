@@ -585,6 +585,10 @@ impl TerminalRuntime {
         self.0.child_pid()
     }
 
+    pub(crate) fn child_process_identity(&self) -> Option<crate::platform::ProcessIdentity> {
+        self.0.child_process_identity()
+    }
+
     pub(crate) fn current_size(&self) -> (u16, u16) {
         self.0.current_size()
     }

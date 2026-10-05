@@ -172,6 +172,8 @@ pub enum AppEvent {
         pane_id: PaneId,
         cwd: std::path::PathBuf,
     },
+    /// Coalesced native git metadata change; debounced by the app refresh scheduler.
+    GitFilesChanged,
     /// Background git status refresh completed for workspaces.
     GitStatusRefreshed {
         results: Vec<WorkspaceGitStatus>,

@@ -7,6 +7,8 @@ use std::{
     sync::OnceLock,
 };
 
+pub(crate) use super::unix_common::read_session_snapshot_with_trust;
+
 pub(super) const REMOTE_BRIDGE_CLOCK: libc::clockid_t = libc::CLOCK_BOOTTIME;
 
 use super::{
@@ -51,6 +53,79 @@ pub(super) fn local_socket_peer_pid_platform(fd: RawFd) -> Option<u32> {
     // SAFETY: SO_PEERCRED populated the exact-size output buffer above.
     let pid = unsafe { credentials.assume_init().pid };
     u32::try_from(pid).ok().filter(|pid| *pid > 0)
+}
+
+/// Prefer the socket-bound pidfd. Older kernels use SO_PEERCRED plus an
+/// accept-time start pin, guarded by connection liveness and repeated reads.
+/// pidfd_open(SO_PEERCRED.pid) is not a socket-bound identity primitive.
+pub(super) fn local_socket_peer_identity_platform(fd: RawFd) -> Option<super::ProcessIdentity> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    let mut raw: libc::c_int = -1;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: getsockopt writes one descriptor into the sized integer buffer.
+    let status = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERPIDFD,
+            (&mut raw as *mut libc::c_int).cast(),
+            &mut len,
+        )
+    };
+    if status != 0 {
+        let error = std::io::Error::last_os_error().raw_os_error();
+        return match error {
+            Some(libc::ENOPROTOOPT | libc::EINVAL | libc::ENOSYS) => {
+                local_socket_peer_identity_without_pidfd(fd)
+            }
+            _ => None,
+        };
+    }
+    if raw < 0 {
+        return None;
+    }
+    // SAFETY: successful SO_PEERPIDFD returns a new owned descriptor.
+    let pidfd = unsafe { OwnedFd::from_raw_fd(raw) };
+    if len != std::mem::size_of::<libc::c_int>() as libc::socklen_t {
+        return None;
+    }
+    let alive = || {
+        let mut event = libc::pollfd {
+            fd: pidfd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: poll borrows this initialized descriptor for a zero-time query.
+        unsafe { libc::poll(&mut event, 1, 0) == 0 }
+    };
+    // A live original pidfd prevents numeric reuse across the start-time read.
+    super::capture_bound_peer_identity(alive, || {
+        process_identity(local_socket_peer_pid_platform(fd)?)
+    })
+}
+
+/// Older-kernel fallback. Capture once at accept, never repin a queued request.
+/// A hung-up/invalid transport or changing process observation is unknown.
+pub(crate) fn local_socket_peer_identity_without_pidfd(
+    fd: RawFd,
+) -> Option<super::ProcessIdentity> {
+    let connected = || {
+        let mut event = libc::pollfd {
+            fd,
+            events: libc::POLLRDHUP,
+            revents: 0,
+        };
+        // SAFETY: zero-time poll only borrows the caller's socket.
+        (unsafe { libc::poll(&mut event, 1, 0) >= 0 })
+            && event.revents & (libc::POLLRDHUP | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)
+                == 0
+    };
+    super::capture_bound_peer_identity(connected, || {
+        let pid = local_socket_peer_pid_platform(fd)?;
+        let identity = process_identity(pid)?;
+        (local_socket_peer_pid_platform(fd) == Some(pid) && process_identity(pid) == Some(identity))
+            .then_some(identity)
+    })
 }
 
 /// A pidfd on the process connected to a Unix-domain socket. Signalling it
@@ -795,6 +870,46 @@ pub fn process_cwd(pid: u32) -> Option<PathBuf> {
     std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
 }
 
+/// Capture the peer's initial environment while its process instance remains pinned.
+/// A failed or malformed environment is unknown; an empty readable environment is absence.
+pub(crate) fn process_initial_environment(
+    peer: super::ProcessIdentity,
+) -> Option<Vec<(String, String)>> {
+    if peer.pid == 0 || super::process_identity(peer.pid) != Some(peer) {
+        return None;
+    }
+    let environ = std::fs::read(format!("/proc/{}/environ", peer.pid)).ok()?;
+    if super::process_identity(peer.pid) != Some(peer) {
+        return None;
+    }
+    parse_initial_environment(&environ)
+}
+
+fn parse_initial_environment(bytes: &[u8]) -> Option<Vec<(String, String)>> {
+    if !bytes.is_empty() && bytes.last() != Some(&0) {
+        return None;
+    }
+    let mut pairs = Vec::new();
+    let mut trailing_empty = false;
+    for record in bytes.split(|&byte| byte == 0) {
+        if record.is_empty() {
+            trailing_empty = true;
+            continue;
+        }
+        if trailing_empty {
+            return None;
+        }
+        let separator = record.iter().position(|&byte| byte == b'=')?;
+        if separator == 0 {
+            return None;
+        }
+        let key = std::str::from_utf8(&record[..separator]).ok()?;
+        let value = std::str::from_utf8(&record[separator + 1..]).ok()?;
+        pairs.push((key.to_string(), value.to_string()));
+    }
+    Some(pairs)
+}
+
 /// Read a Herdr agent identity hint from a process environment.
 pub fn process_agent_hint(pid: u32) -> Option<crate::detect::Agent> {
     if pid == 0 {
@@ -1270,12 +1385,52 @@ fn detach_clipboard_owner(child: std::process::Child) -> bool {
     true
 }
 
-/// The parent of `pid`, from `/proc/<pid>/stat`. A process gone or unreadable has none.
-pub fn parent_process_id(pid: u32) -> Option<u32> {
+pub(crate) fn process_identity(pid: u32) -> Option<crate::platform::ProcessIdentity> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let rest = stat.get(stat.rfind(')')? + 2..)?;
-    // After (comm): state(0) ppid(1)
-    rest.split_whitespace().nth(1)?.parse().ok()
+    // After (comm): state(0), ppid(1), ..., starttime(19).
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    if matches!(fields.first().copied(), Some("Z" | "X" | "x")) {
+        return None;
+    }
+    Some(crate::platform::ProcessIdentity {
+        pid,
+        start_time: fields.get(19)?.parse().ok()?,
+    })
+}
+
+pub(crate) fn parent_process_identity(
+    identity: crate::platform::ProcessIdentity,
+) -> Option<crate::platform::ProcessIdentity> {
+    let stat = std::fs::read_to_string(format!("/proc/{}/stat", identity.pid)).ok()?;
+    let rest = stat.get(stat.rfind(')')? + 2..)?;
+    let mut fields = rest.split_whitespace();
+    let ppid = fields.nth(1)?.parse().ok()?;
+    let start_time = fields.nth(17)?.parse().ok()?;
+    crate::platform::checked_parent_process_identity(
+        identity,
+        crate::platform::ProcessIdentity {
+            pid: identity.pid,
+            start_time,
+        },
+        ppid,
+    )
+}
+
+/// Linux uses the shared generation-checked chronology walker: a live peer is
+/// outside this server only when its ancestry reaches a strictly older process
+/// before reaching the current server. Missing, reused, exited, or newer
+/// evidence remains unknown; pane markers are enforced by the caller.
+pub(crate) fn process_identity_outside_server_ancestry(
+    peer: crate::platform::ProcessIdentity,
+) -> Option<bool> {
+    let server = process_identity(std::process::id())?;
+    crate::platform::observe_outside_server_ancestry(
+        peer,
+        server,
+        process_identity,
+        parent_process_identity,
+    )
 }
 
 fn process_session_id(pid: u32) -> Option<i32> {
@@ -1289,6 +1444,25 @@ fn process_session_id(pid: u32) -> Option<i32> {
 mod tests {
     use super::*;
     use std::{cell::RefCell, collections::HashMap};
+
+    #[test]
+    fn initial_environment_parser_distinguishes_absence_and_malformed_data() {
+        assert_eq!(
+            parse_initial_environment(b"PATH=/bin\0TERM=xterm\0\0"),
+            Some(vec![
+                ("PATH".to_string(), "/bin".to_string()),
+                ("TERM".to_string(), "xterm".to_string()),
+            ])
+        );
+        assert_eq!(parse_initial_environment(b""), Some(Vec::new()));
+        assert_eq!(parse_initial_environment(b"PATH=/bin"), None);
+        assert_eq!(
+            parse_initial_environment(b"PATH=/bin\0\0TERM=xterm\0"),
+            None
+        );
+        assert_eq!(parse_initial_environment(b"BAD\0"), None);
+        assert_eq!(parse_initial_environment(b"\xff=bad\0"), None);
+    }
 
     fn desktop_environment() -> [Option<std::ffi::OsString>; 8] {
         [
@@ -1458,6 +1632,88 @@ mod tests {
         assert!(!peer.kill().unwrap());
         assert!(local_socket_peer_process_platform(stream.as_raw_fd()).is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn socket_peer_identity_captures_live_original_and_rejects_exited_peer() {
+        use std::os::{fd::AsRawFd, unix::ffi::OsStrExt};
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-peer-pin-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("s");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        for (dst, src) in addr.sun_path.iter_mut().zip(path.as_os_str().as_bytes()) {
+            *dst = *src as libc::c_char;
+        }
+        // Only async-signal-safe calls run in the forked socket peer.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0);
+        if child == 0 {
+            unsafe {
+                let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+                if libc::connect(
+                    fd,
+                    (&addr as *const libc::sockaddr_un).cast(),
+                    std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+                ) != 0
+                {
+                    libc::_exit(1);
+                }
+                let mut byte = 0u8;
+                libc::read(fd, (&mut byte as *mut u8).cast(), 1);
+                libc::_exit(0);
+            }
+        }
+        let (mut stream, _) = listener.accept().unwrap();
+        // Probe feature support independently: older kernels retain the live credential fallback.
+        let mut raw: libc::c_int = -1;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        let status = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERPIDFD,
+                (&mut raw as *mut libc::c_int).cast(),
+                &mut len,
+            )
+        };
+        if status == 0 {
+            unsafe {
+                libc::close(raw);
+            }
+            let original = process_identity(child as u32).expect("live original peer");
+            assert_eq!(
+                local_socket_peer_identity_platform(stream.as_raw_fd()),
+                Some(original)
+            );
+        } else {
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ENOPROTOOPT)
+            );
+            let original = process_identity(child as u32).expect("live original peer");
+            assert_eq!(
+                local_socket_peer_identity_platform(stream.as_raw_fd()),
+                Some(original)
+            );
+        }
+        stream.write_all(b"x").expect("release owned socket peer");
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(
+            local_socket_peer_identity_platform(stream.as_raw_fd()),
+            None
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

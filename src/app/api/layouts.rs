@@ -16,6 +16,23 @@ use super::responses::{encode_error, encode_success};
 const MAX_LAYOUT_PANES: usize = 24;
 const MAX_LAYOUT_DEPTH: usize = 16;
 
+fn validate_restorable_layout(params: &LayoutApplyParams) -> Result<(), &'static str> {
+    if params.tab_id.is_some() {
+        return Err("restorable layout requires a new tab (no tab_id)");
+    }
+    let LayoutNode::Pane { pane } = &params.root else {
+        return Err("restorable layout requires a single argv pane");
+    };
+    if !pane.env.is_empty() {
+        return Err("restorable layout does not support custom environment");
+    }
+    let argv = pane
+        .command
+        .as_deref()
+        .ok_or("restorable layout requires argv")?;
+    crate::terminal::TerminalState::validate_cold_restore_argv(argv)
+}
+
 impl App {
     pub(super) fn handle_layout_export(
         &mut self,
@@ -33,7 +50,18 @@ impl App {
     }
 
     pub(super) fn handle_layout_apply(&mut self, id: String, params: LayoutApplyParams) -> String {
-        self.handle_layout_apply_checked(id, params, false)
+        self.handle_layout_apply_inner(id, params, false, false)
+    }
+
+    pub(super) fn handle_layout_apply_restorable(
+        &mut self,
+        id: String,
+        params: LayoutApplyParams,
+    ) -> String {
+        if let Err(message) = validate_restorable_layout(&params) {
+            return encode_error(id, "invalid_layout", message);
+        }
+        self.handle_layout_apply_inner(id, params, true, false)
     }
 
     pub(super) fn handle_layout_apply_project_checked(
@@ -41,13 +69,14 @@ impl App {
         id: String,
         params: LayoutApplyProjectCheckedParams,
     ) -> String {
-        self.handle_layout_apply_checked(id, params.params, params.allow_project_change)
+        self.handle_layout_apply_inner(id, params.params, false, params.allow_project_change)
     }
 
-    fn handle_layout_apply_checked(
+    fn handle_layout_apply_inner(
         &mut self,
         id: String,
         params: LayoutApplyParams,
+        cold_restore_argv: bool,
         allow_project_change: bool,
     ) -> String {
         let replace_target = match params.tab_id.as_deref() {
@@ -166,10 +195,12 @@ impl App {
             }
         };
 
-        let (new_tab_idx, terminal, runtime) = match created {
+        let (new_tab_idx, mut terminal, runtime) = match created {
             Ok(result) => result,
             Err(err) => return encode_error(id, "layout_apply_failed", err.to_string()),
         };
+        // Mark the actual newly created terminal, never a resolved existing pane.
+        terminal.cold_restore_argv = cold_restore_argv;
         let new_root_pane = self.state.workspaces[ws_idx].tabs[new_tab_idx].root_pane;
         self.terminal_runtimes.insert(terminal.id.clone(), runtime);
         self.state.remove_alias_shadowed_by_new_pane(new_root_pane);
@@ -756,6 +787,123 @@ mod tests {
 
         let error: ErrorResponse = serde_json::from_str(&response).unwrap();
         assert_eq!(error.error.code, "split_not_found");
+    }
+
+    fn restorable_params() -> LayoutApplyParams {
+        LayoutApplyParams {
+            workspace_id: None,
+            tab_id: None,
+            tab_label: Some("restorable".into()),
+            focus: false,
+            root: LayoutNode::Pane {
+                pane: LayoutPane {
+                    command: Some(vec![exiting_test_command().into()]),
+                    ..Default::default()
+                },
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn layout_apply_restorable_dispatch_marks_only_new_terminal() {
+        use crate::api::schema::{Method, Request};
+        let mut app = app_with_workspace();
+        for restorable in [true, false] {
+            let params = restorable_params();
+            let response = app.handle_api_request(Request {
+                id: "create".into(),
+                method: if restorable {
+                    Method::LayoutApplyRestorable(params)
+                } else {
+                    Method::LayoutApply(params)
+                },
+            });
+            let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+            assert!(matches!(success.result, ResponseResult::LayoutApply { .. }));
+            let tab = app.state.workspaces[0].tabs.last().unwrap();
+            let terminal = app
+                .state
+                .terminals
+                .get(tab.terminal_id(tab.root_pane).unwrap())
+                .unwrap();
+            assert_eq!(terminal.cold_restore_argv, restorable);
+            assert_eq!(
+                terminal.launch_argv.as_ref().unwrap(),
+                &vec![exiting_test_command().to_string()]
+            );
+        }
+        let snapshot = crate::persist::capture(
+            &app.state.workspaces,
+            &app.state.terminals,
+            &app.terminal_runtimes,
+            Some(0),
+            0,
+        );
+        assert!(snapshot.workspaces[0].tabs[1]
+            .panes
+            .values()
+            .all(|pane| pane.cold_restore_argv));
+        assert!(snapshot.workspaces[0].tabs[2]
+            .panes
+            .values()
+            .all(|pane| !pane.cold_restore_argv));
+        shutdown_test_runtimes(&mut app);
+    }
+
+    #[tokio::test]
+    async fn layout_apply_restorable_rejects_unsupported_shapes_without_mutation() {
+        let base = restorable_params();
+        let mut invalid = Vec::new();
+        let mut replacement = base.clone();
+        replacement.tab_id = Some("any".into());
+        invalid.push(replacement);
+        let mut split = base.clone();
+        split.root = LayoutNode::Split {
+            direction: SplitDirection::Right,
+            ratio: 0.5,
+            first: Box::new(base.root.clone()),
+            second: Box::new(base.root.clone()),
+        };
+        invalid.push(split);
+        for command in [
+            None,
+            Some(vec![]),
+            Some(vec!["".into()]),
+            Some(vec!["relative".into()]),
+            Some(vec![exiting_test_command().into(), "bad\0arg".into()]),
+        ] {
+            let mut params = base.clone();
+            let LayoutNode::Pane { pane } = &mut params.root else {
+                unreachable!()
+            };
+            pane.command = command;
+            invalid.push(params);
+        }
+        let mut env = base;
+        let LayoutNode::Pane { pane } = &mut env.root else {
+            unreachable!()
+        };
+        pane.env.insert("CUSTOM".into(), String::new());
+        invalid.push(env);
+        let mut app = app_with_workspace();
+        let before = (
+            app.state.workspaces[0].tabs.len(),
+            app.state.terminals.len(),
+            app.terminal_runtimes.len(),
+        );
+        for params in invalid {
+            let response = app.handle_layout_apply_restorable("reject".into(), params);
+            let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+            assert_eq!(error.error.code, "invalid_layout");
+            assert_eq!(
+                (
+                    app.state.workspaces[0].tabs.len(),
+                    app.state.terminals.len(),
+                    app.terminal_runtimes.len()
+                ),
+                before
+            );
+        }
     }
 
     #[tokio::test]

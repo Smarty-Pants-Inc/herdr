@@ -10,39 +10,84 @@ use interprocess::local_socket::traits::Stream as _;
 pub(crate) type LocalListener = interprocess::local_socket::Listener;
 pub(crate) type LocalStream = interprocess::local_socket::Stream;
 
-/// Best-effort PID attribution for a connected local transport peer.
+/// Capture the process instance associated with a connected local transport.
 ///
-/// Unsupported transports intentionally return `None` so callers retain their
-/// normal compatibility path when attribution is absent.
-#[cfg(unix)]
-pub(crate) fn local_stream_peer_pid(stream: &LocalStream) -> Option<u32> {
-    use std::os::fd::AsRawFd as _;
+/// Unix uses the platform's socket-native identity primitive. Windows has no
+/// equivalent socket identity, so it combines the named-pipe peer PID with the
+/// existing process-instance query. Unsupported transports return `None`.
+pub(crate) fn local_stream_peer_identity(
+    stream: &LocalStream,
+) -> Option<crate::platform::ProcessIdentity> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd as _;
 
-    match stream {
-        LocalStream::UdSocket(stream) => {
-            crate::platform::local_socket_peer_pid(stream.inner().as_raw_fd())
+        match stream {
+            LocalStream::UdSocket(stream) => {
+                crate::platform::local_socket_peer_identity(stream.inner().as_raw_fd())
+            }
         }
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::{AsHandle, AsRawHandle};
+
+        let LocalStream::NamedPipe(pipe) = stream;
+        let mut pid = 0;
+        let ok = unsafe {
+            windows_sys::Win32::System::Pipes::GetNamedPipeClientProcessId(
+                pipe.as_handle().as_raw_handle(),
+                &mut pid,
+            )
+        };
+        (ok != 0 && pid != 0)
+            .then(|| crate::platform::process_identity(pid))
+            .flatten()
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = stream;
+        None
     }
 }
 
-#[cfg(windows)]
+/// Numeric peer lookup retained only for transport tests; production request
+/// attribution uses the instance identity above.
+#[cfg(test)]
 pub(crate) fn local_stream_peer_pid(stream: &LocalStream) -> Option<u32> {
-    use std::os::windows::io::{AsHandle, AsRawHandle};
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd as _;
 
-    let LocalStream::NamedPipe(pipe) = stream;
-    let mut pid = 0;
-    let ok = unsafe {
-        windows_sys::Win32::System::Pipes::GetNamedPipeClientProcessId(
-            pipe.as_handle().as_raw_handle(),
-            &mut pid,
-        )
-    };
-    (ok != 0 && pid != 0).then_some(pid)
-}
+        match stream {
+            LocalStream::UdSocket(stream) => {
+                crate::platform::local_socket_peer_pid(stream.inner().as_raw_fd())
+            }
+        }
+    }
 
-#[cfg(not(any(unix, windows)))]
-pub(crate) fn local_stream_peer_pid(_stream: &LocalStream) -> Option<u32> {
-    None
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::{AsHandle, AsRawHandle};
+
+        let LocalStream::NamedPipe(pipe) = stream;
+        let mut pid = 0;
+        let ok = unsafe {
+            windows_sys::Win32::System::Pipes::GetNamedPipeClientProcessId(
+                pipe.as_handle().as_raw_handle(),
+                &mut pid,
+            )
+        };
+        (ok != 0 && pid != 0).then_some(pid)
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = stream;
+        None
+    }
 }
 
 pub(crate) enum LocalStreamRead {
@@ -408,7 +453,7 @@ mod tests {
 
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     #[test]
-    fn local_stream_peer_pid_reports_connected_client() {
+    fn local_stream_peer_identity_reports_connected_client() {
         use interprocess::local_socket::traits::Listener as _;
 
         let path = std::env::temp_dir().join(format!(
@@ -424,6 +469,11 @@ mod tests {
         let server = listener.accept().expect("accept local client");
 
         assert_eq!(local_stream_peer_pid(&server), Some(std::process::id()));
+        #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+        assert_eq!(
+            local_stream_peer_identity(&server),
+            crate::platform::process_identity(std::process::id())
+        );
 
         drop(client);
         drop(server);

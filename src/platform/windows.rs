@@ -13,6 +13,28 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+/// Fail closed until a non-mutating, same-handle owner/DACL validator exists.
+pub(crate) fn read_session_snapshot_with_trust(
+    path: &std::path::Path,
+) -> std::io::Result<(String, super::SnapshotFileTrust)> {
+    use std::io::Read as _;
+    let mut file = std::fs::File::open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "snapshot is not a regular file",
+        ));
+    }
+    let mut content = String::new();
+    file.read_to_string(&mut content)?;
+    Ok((
+        content,
+        super::SnapshotFileTrust::Untrusted(
+            "snapshot owner/DACL verification unavailable on Windows",
+        ),
+    ))
+}
+
 mod clipboard_image;
 mod config_backup;
 mod diagnostics;
@@ -2126,6 +2148,10 @@ fn process_runtime_marker(pid: u32) -> Option<String> {
 }
 
 fn process_creation_time(process: HANDLE) -> Option<u64> {
+    process_creation_time_checked(process, false)
+}
+
+fn process_creation_time_checked(process: HANDLE, require_running: bool) -> Option<u64> {
     let mut creation_time = FILETIME::default();
     let mut exit_time = FILETIME::default();
     let mut kernel_time = FILETIME::default();
@@ -2140,6 +2166,9 @@ fn process_creation_time(process: HANDLE) -> Option<u64> {
         )
     } == 0
     {
+        return None;
+    }
+    if require_running && (exit_time.dwHighDateTime != 0 || exit_time.dwLowDateTime != 0) {
         return None;
     }
     Some((u64::from(creation_time.dwHighDateTime) << 32) | u64::from(creation_time.dwLowDateTime))
@@ -2310,9 +2339,216 @@ fn nul_terminated_utf16_to_string(buffer: &[u16]) -> String {
     String::from_utf16_lossy(&buffer[..len])
 }
 
-/// Not needed on Windows: pane attribution there already covers every descendant of the pane
-/// child (`session_processes`), so the ancestor walk finds nothing more.
-pub fn parent_process_id(_pid: u32) -> Option<u32> {
+pub(crate) fn process_identity(pid: u32) -> Option<crate::platform::ProcessIdentity> {
+    if pid == 0 {
+        return None;
+    }
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return None;
+    }
+    let handle = unsafe { OwnedHandle::from_raw_handle(handle.cast()) };
+    let process = handle.as_raw_handle().cast();
+    let start_time = process_creation_time_checked(process, true)?;
+    // GetProcessTimes remains readable after exit. An exited process is not
+    // authoritative ancestry evidence, even while its handle still exists.
+    let mut exit_code = 0;
+    if unsafe { GetExitCodeProcess(process, &mut exit_code) } == 0 || exit_code != STILL_ACTIVE {
+        return None;
+    }
+    Some(crate::platform::ProcessIdentity { pid, start_time })
+}
+
+/// Observe a complete environment block from the pinned process, not request
+/// parameters or the server's own environment. Windows exposes the current PEB
+/// block, not an immutable historical launch block; this is inherited-marker
+/// evidence under the non-hostile same-account attribution threat model.
+/// `None` means unobservable/invalid; readable absence is `Some` without markers.
+pub(crate) fn process_initial_environment(
+    identity: crate::platform::ProcessIdentity,
+) -> Option<Vec<(String, String)>> {
+    if process_identity(identity.pid) != Some(identity) {
+        return None;
+    }
+    let process = ProcessHandle::open(identity.pid, PROCESS_QUERY_INFORMATION | PROCESS_VM_READ)?;
+    if process_creation_time_checked(process.0, true)? != identity.start_time {
+        return None;
+    }
+    let parameters = read_process_parameters(process.0)?;
+    let environment = read_process_environment(process.0, parameters.environment)?;
+    let environment = environment_pairs_from_utf16(&environment)?;
+    if process_creation_time_checked(process.0, true)? != identity.start_time
+        || process_identity(identity.pid) != Some(identity)
+    {
+        return None;
+    }
+    Some(environment)
+}
+
+fn environment_pairs_from_utf16(environment: &[u16]) -> Option<Vec<(String, String)>> {
+    if !environment.ends_with(&[0, 0]) {
+        return None;
+    }
+    let mut pairs = Vec::new();
+    for variable in environment.split(|unit| *unit == 0) {
+        if variable.is_empty() {
+            break;
+        }
+        let variable = String::from_utf16(variable).ok()?;
+        // Windows also uses hidden drive-current-directory entries like =C:=...;
+        // the separator for those entries is the second equals sign.
+        let separator = variable
+            .char_indices()
+            .find_map(|(index, ch)| (index > 0 && ch == '=').then_some(index))?;
+        let (name, value) = variable.split_at(separator);
+        pairs.push((name.to_ascii_uppercase(), value[1..].to_owned()));
+    }
+    Some(pairs)
+}
+
+/// Checked Windows ancestry membership for the identity-aware attribution path.
+///
+/// `Toolhelp32` reports numeric parent PIDs, so every edge is checked against the
+/// process creation times captured from the same snapshot and against live process
+/// identities before the walk advances. An exited, reused, younger, or otherwise
+/// unobservable intermediate process is `None` (unknown), never a negative match.
+pub(crate) fn process_identity_in_pane_session_checked(
+    root: crate::platform::ProcessIdentity,
+    peer: crate::platform::ProcessIdentity,
+) -> Option<bool> {
+    let snapshot = ProcessSnapshot::new(snapshot_processes());
+    checked_membership_from_snapshot(&snapshot, root, peer, process_identity)
+}
+
+#[cfg(test)]
+pub(crate) fn test_reused_intermediate_parent_membership() -> Option<bool> {
+    tests::reused_intermediate_parent_membership()
+}
+
+/// Prove that a caller is outside all server-created pane ancestry, or defer to
+/// pane attribution when it reaches the server. No environment marker is used;
+/// the caller must enforce captured inherited-marker restrictions separately
+/// before treating an outside result as ordinary.
+/// A validated live ancestor strictly older than the actual server cannot be a
+/// descendant of that server. An invalid edge before that witness is unknown.
+pub(crate) fn process_identity_outside_server_ancestry(
+    peer: crate::platform::ProcessIdentity,
+) -> Option<bool> {
+    let server = process_identity(std::process::id())?;
+    let snapshot = ProcessSnapshot::new(snapshot_processes());
+    checked_ancestry_from_snapshot(
+        &snapshot,
+        server,
+        peer,
+        CheckedAncestryGoal::OutsideServer,
+        process_identity,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn test_outside_server_ancestry_sequence(sequence: u8) -> Option<bool> {
+    tests::outside_server_ancestry_sequence(sequence)
+}
+
+#[derive(Clone, Copy)]
+enum CheckedAncestryGoal {
+    PaneMembership,
+    OutsideServer,
+}
+
+fn checked_membership_from_snapshot(
+    snapshot: &ProcessSnapshot,
+    root: crate::platform::ProcessIdentity,
+    peer: crate::platform::ProcessIdentity,
+    identity_of: impl Fn(u32) -> Option<crate::platform::ProcessIdentity>,
+) -> Option<bool> {
+    checked_ancestry_from_snapshot(
+        snapshot,
+        root,
+        peer,
+        CheckedAncestryGoal::PaneMembership,
+        identity_of,
+    )
+}
+
+fn checked_snapshot_identity(
+    snapshot: &ProcessSnapshot,
+    identity: crate::platform::ProcessIdentity,
+    identity_of: &impl Fn(u32) -> Option<crate::platform::ProcessIdentity>,
+) -> Option<()> {
+    if snapshot.entry(identity.pid)?.command().creation_time? != identity.start_time
+        || identity_of(identity.pid) != Some(identity)
+    {
+        return None;
+    }
+    Some(())
+}
+
+/// Validate both ends of a Toolhelp parent edge before advancing either walk.
+fn checked_parent_from_snapshot(
+    snapshot: &ProcessSnapshot,
+    child: crate::platform::ProcessIdentity,
+    identity_of: &impl Fn(u32) -> Option<crate::platform::ProcessIdentity>,
+) -> Option<crate::platform::ProcessIdentity> {
+    let parent_pid = snapshot.entry(child.pid)?.parent_pid;
+    let parent_start = snapshot.entry(parent_pid)?.command().creation_time?;
+    if parent_start > child.start_time {
+        return None;
+    }
+    let parent = crate::platform::ProcessIdentity {
+        pid: parent_pid,
+        start_time: parent_start,
+    };
+    checked_snapshot_identity(snapshot, child, identity_of)?;
+    checked_snapshot_identity(snapshot, parent, identity_of)?;
+    checked_snapshot_identity(snapshot, child, identity_of)?;
+    checked_snapshot_identity(snapshot, parent, identity_of)?;
+    Some(parent)
+}
+
+fn checked_ancestry_from_snapshot(
+    snapshot: &ProcessSnapshot,
+    root: crate::platform::ProcessIdentity,
+    peer: crate::platform::ProcessIdentity,
+    goal: CheckedAncestryGoal,
+    identity_of: impl Fn(u32) -> Option<crate::platform::ProcessIdentity>,
+) -> Option<bool> {
+    checked_snapshot_identity(snapshot, root, &identity_of)?;
+    checked_snapshot_identity(snapshot, peer, &identity_of)?;
+    let mut current = peer;
+    let mut visited = HashSet::new();
+    while visited.insert(current.pid) {
+        checked_snapshot_identity(snapshot, current, &identity_of)?;
+        let result = if current == root {
+            Some(matches!(goal, CheckedAncestryGoal::PaneMembership))
+        } else if current.start_time < root.start_time {
+            match goal {
+                // A validated ancestor older than the pinned pane root cannot be a
+                // descendant of that root: parent creation times never increase.
+                CheckedAncestryGoal::PaneMembership => Some(false),
+                CheckedAncestryGoal::OutsideServer => Some(true),
+            }
+        } else if snapshot.entry(current.pid)?.parent_pid == 0 {
+            match goal {
+                CheckedAncestryGoal::PaneMembership => Some(false),
+                CheckedAncestryGoal::OutsideServer => None,
+            }
+        } else {
+            current = checked_parent_from_snapshot(snapshot, current, &identity_of)?;
+            continue;
+        };
+        // Never bless an observation after an endpoint was replaced or exited.
+        checked_snapshot_identity(snapshot, current, &identity_of)?;
+        checked_snapshot_identity(snapshot, peer, &identity_of)?;
+        checked_snapshot_identity(snapshot, root, &identity_of)?;
+        return result;
+    }
+    None
+}
+
+pub(crate) fn parent_process_identity(
+    _identity: crate::platform::ProcessIdentity,
+) -> Option<crate::platform::ProcessIdentity> {
     None
 }
 
@@ -3035,6 +3271,7 @@ impl Drop for InputSourceRestore {
 #[cfg(test)]
 mod tests {
     use std::{
+        cell::Cell,
         fs,
         process::{Command, Stdio},
         sync::Arc,
@@ -3045,6 +3282,468 @@ mod tests {
     use windows_sys::Win32::System::Console::{
         AllocConsole, FreeConsole, GetConsoleProcessList, GetConsoleWindow,
     };
+
+    pub(super) fn reused_intermediate_parent_membership() -> Option<bool> {
+        let snapshot = super::ProcessSnapshot::new(vec![
+            test_entry_with_creation_time(10, 0, "shell.exe", &["shell.exe"], Some(10)),
+            test_entry_with_creation_time(20, 10, "helper.exe", &["helper.exe"], Some(20)),
+            test_entry_with_creation_time(30, 20, "agent.exe", &["agent.exe"], Some(30)),
+        ]);
+        let root = crate::platform::ProcessIdentity {
+            pid: 10,
+            start_time: 10,
+        };
+        let peer = crate::platform::ProcessIdentity {
+            pid: 30,
+            start_time: 30,
+        };
+        let parent_reads = Cell::new(0);
+        super::checked_membership_from_snapshot(&snapshot, root, peer, |pid| match pid {
+            10 => Some(root),
+            30 => Some(peer),
+            20 => {
+                let reads = parent_reads.get();
+                parent_reads.set(reads + 1);
+                Some(crate::platform::ProcessIdentity {
+                    pid,
+                    start_time: if reads == 0 { 20 } else { 40 },
+                })
+            }
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn checked_windows_membership_rejects_reused_intermediate_parent() {
+        assert_eq!(
+            reused_intermediate_parent_membership(),
+            None,
+            "a reused intermediate PID is unknown"
+        );
+        let snapshot = super::ProcessSnapshot::new(vec![
+            test_entry_with_creation_time(10, 0, "shell.exe", &["shell.exe"], Some(10)),
+            test_entry_with_creation_time(20, 10, "helper.exe", &["helper.exe"], Some(20)),
+            test_entry_with_creation_time(30, 20, "agent.exe", &["agent.exe"], Some(30)),
+        ]);
+        let root = crate::platform::ProcessIdentity {
+            pid: 10,
+            start_time: 10,
+        };
+        let peer = crate::platform::ProcessIdentity {
+            pid: 30,
+            start_time: 30,
+        };
+        let valid = super::checked_membership_from_snapshot(&snapshot, root, peer, |pid| {
+            Some(crate::platform::ProcessIdentity {
+                pid,
+                start_time: u64::from(pid),
+            })
+        });
+        assert_eq!(valid, Some(true));
+        let younger_parent = super::ProcessSnapshot::new(vec![
+            test_entry_with_creation_time(10, 0, "shell.exe", &["shell.exe"], Some(10)),
+            test_entry_with_creation_time(
+                20,
+                10,
+                "replacement.exe",
+                &["replacement.exe"],
+                Some(40),
+            ),
+            test_entry_with_creation_time(30, 20, "agent.exe", &["agent.exe"], Some(30)),
+        ]);
+        assert_eq!(
+            super::checked_membership_from_snapshot(&younger_parent, root, peer, |pid| {
+                Some(crate::platform::ProcessIdentity {
+                    pid,
+                    start_time: if pid == 20 { 40 } else { u64::from(pid) },
+                })
+            }),
+            None,
+            "a parent created after its child is unknown"
+        );
+    }
+
+    #[test]
+    fn checked_windows_negative_membership_uses_older_ancestor_witness() {
+        let identity = |pid| {
+            Some(crate::platform::ProcessIdentity {
+                pid,
+                start_time: match pid {
+                    10 => 40,
+                    30 => 30,
+                    _ => u64::from(pid),
+                },
+            })
+        };
+        let root = crate::platform::ProcessIdentity {
+            pid: 10,
+            start_time: 40,
+        };
+        let peer = crate::platform::ProcessIdentity {
+            pid: 30,
+            start_time: 30,
+        };
+        let incomplete = super::ProcessSnapshot::new(vec![
+            test_entry_with_creation_time(10, 0, "pane.exe", &["pane.exe"], Some(40)),
+            test_entry_with_creation_time(30, 20, "shell.exe", &["shell.exe"], Some(30)),
+        ]);
+        assert_eq!(
+            super::checked_membership_from_snapshot(&incomplete, root, peer, identity),
+            Some(false),
+            "a validated ancestor older than the pane root proves non-membership"
+        );
+
+        let equal_age = super::ProcessSnapshot::new(vec![
+            test_entry_with_creation_time(10, 0, "pane.exe", &["pane.exe"], Some(30)),
+            test_entry_with_creation_time(30, 20, "shell.exe", &["shell.exe"], Some(30)),
+        ]);
+        let equal_identity = |pid| Some(ancestry_identity(pid, 30));
+        assert_eq!(
+            super::checked_membership_from_snapshot(
+                &equal_age,
+                crate::platform::ProcessIdentity {
+                    pid: 10,
+                    start_time: 30,
+                },
+                peer,
+                equal_identity
+            ),
+            None,
+            "equal timestamps do not prove non-membership"
+        );
+
+        let newer = super::ProcessSnapshot::new(vec![
+            test_entry_with_creation_time(10, 0, "pane.exe", &["pane.exe"], Some(20)),
+            test_entry_with_creation_time(30, 20, "shell.exe", &["shell.exe"], Some(30)),
+        ]);
+        let newer_identity = |pid| Some(ancestry_identity(pid, if pid == 10 { 20 } else { 30 }));
+        assert_eq!(
+            super::checked_membership_from_snapshot(
+                &newer,
+                crate::platform::ProcessIdentity {
+                    pid: 10,
+                    start_time: 20,
+                },
+                peer,
+                newer_identity
+            ),
+            None,
+            "a younger peer still needs a complete ancestry walk"
+        );
+    }
+
+    #[test]
+    fn checked_windows_environment_distinguishes_absence_from_invalid_observation() {
+        let block = |text: &str| text.encode_utf16().collect::<Vec<_>>();
+        assert_eq!(
+            super::environment_pairs_from_utf16(&[0, 0]),
+            Some(Vec::new())
+        );
+        assert_eq!(
+            super::environment_pairs_from_utf16(&block(
+                "Path=C:\\bin\0herdr_env=1\0Herdr_Pane_Id=42\0=C:=C:\\work\0\0"
+            )),
+            Some(vec![
+                ("PATH".to_owned(), "C:\\bin".to_owned()),
+                ("HERDR_ENV".to_owned(), "1".to_owned()),
+                ("HERDR_PANE_ID".to_owned(), "42".to_owned()),
+                ("=C:".to_owned(), "C:\\work".to_owned()),
+            ])
+        );
+        assert_eq!(
+            super::environment_pairs_from_utf16(&block("PATH=x\0")),
+            None
+        );
+        assert_eq!(
+            super::environment_pairs_from_utf16(&block("malformed\0\0")),
+            None
+        );
+        assert_eq!(
+            super::environment_pairs_from_utf16(&[0xd800, b'=' as u16, b'1' as u16, 0, 0]),
+            None
+        );
+        assert_eq!(
+            super::environment_pairs_from_utf16(&block("é=value\0\0")),
+            Some(vec![("é".to_owned(), "value".to_owned())])
+        );
+    }
+
+    fn ancestry_identity(pid: u32, start_time: u64) -> crate::platform::ProcessIdentity {
+        crate::platform::ProcessIdentity { pid, start_time }
+    }
+
+    fn ancestry_snapshot(entries: &[(u32, u32, u64)]) -> super::ProcessSnapshot {
+        super::ProcessSnapshot::new(
+            entries
+                .iter()
+                .map(|&(pid, parent, start)| {
+                    test_entry_with_creation_time(
+                        pid,
+                        parent,
+                        "process.exe",
+                        &["process.exe"],
+                        Some(start),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    fn outside_sequence(
+        entries: &[(u32, u32, u64)],
+        identity_of: impl Fn(u32) -> Option<crate::platform::ProcessIdentity>,
+    ) -> Option<bool> {
+        super::checked_ancestry_from_snapshot(
+            &ancestry_snapshot(entries),
+            ancestry_identity(100, 100),
+            ancestry_identity(300, 300),
+            super::CheckedAncestryGoal::OutsideServer,
+            identity_of,
+        )
+    }
+
+    fn outside_server_ancestry_sequences() -> [Option<bool>; 4] {
+        let outside = [(100, 50, 100), (300, 200, 300), (200, 50, 200), (50, 1, 50)];
+        let descendant = [
+            (100, 50, 100),
+            (300, 200, 300),
+            (200, 100, 200),
+            (50, 1, 50),
+        ];
+        let stable = |pid| Some(ancestry_identity(pid, u64::from(pid)));
+        [
+            outside_sequence(&outside, |pid| if pid == 1 { None } else { stable(pid) }),
+            outside_sequence(&descendant, stable),
+            outside_sequence(&outside, |pid| if pid == 200 { None } else { stable(pid) }),
+            outside_sequence(&outside[..3], stable),
+        ]
+    }
+
+    pub(super) fn outside_server_ancestry_sequence(sequence: u8) -> Option<bool> {
+        let sequences = outside_server_ancestry_sequences();
+        match sequence {
+            0 => sequences[0],
+            1 => sequences[2],
+            2 => {
+                let reads = Cell::new(0);
+                outside_sequence(
+                    &[(100, 50, 100), (300, 200, 300), (200, 50, 200), (50, 1, 50)],
+                    |pid| {
+                        if pid == 200 {
+                            let count = reads.get();
+                            reads.set(count + 1);
+                            Some(ancestry_identity(pid, if count == 0 { 200 } else { 400 }))
+                        } else {
+                            Some(ancestry_identity(pid, u64::from(pid)))
+                        }
+                    },
+                )
+            }
+            3 => sequences[1],
+            4 => outside_sequence(
+                &[
+                    (100, 50, 100),
+                    (300, 200, 300),
+                    (200, 50, 200),
+                    (50, 0, 100),
+                ],
+                |pid| {
+                    Some(ancestry_identity(
+                        pid,
+                        if pid == 50 { 100 } else { u64::from(pid) },
+                    ))
+                },
+            ),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn checked_windows_outside_server_requires_older_live_witness_before_server() {
+        assert_eq!(
+            std::array::from_fn::<_, 5, _>(|index| outside_server_ancestry_sequence(index as u8)),
+            [Some(true), None, None, Some(false), None]
+        );
+        assert_eq!(
+            outside_server_ancestry_sequences(),
+            [Some(true), Some(false), None, None]
+        );
+        // The server endpoint wins even though its own parent is an older witness.
+        let descendant = ancestry_snapshot(&[
+            (100, 50, 100),
+            (300, 200, 300),
+            (200, 100, 200),
+            (50, 1, 50),
+        ]);
+        let stable = |pid| Some(ancestry_identity(pid, u64::from(pid)));
+        assert_eq!(
+            super::checked_membership_from_snapshot(
+                &descendant,
+                ancestry_identity(100, 100),
+                ancestry_identity(300, 300),
+                stable
+            ),
+            Some(true),
+            "server descendants still preserve positive pane membership"
+        );
+        assert_eq!(
+            super::checked_membership_from_snapshot(
+                &descendant,
+                ancestry_identity(200, 200),
+                ancestry_identity(300, 300),
+                stable
+            ),
+            Some(true),
+            "pane attribution still finds an intermediate pane root"
+        );
+
+        // A source pane and a sibling pane can both sit below the server while the
+        // system ancestor is absent. Once the walk reaches the source root, its
+        // older-than-sibling timestamp proves the sibling result without touching
+        // that inaccessible system edge.
+        let panes = ancestry_snapshot(&[
+            (100, 4, 100),
+            (500, 100, 500),
+            (600, 100, 600),
+            (700, 500, 700),
+        ]);
+        let source = ancestry_identity(500, 500);
+        let sibling = ancestry_identity(600, 600);
+        let peer = ancestry_identity(700, 700);
+        let pane_identity = |pid| Some(ancestry_identity(pid, u64::from(pid)));
+        assert_eq!(
+            super::checked_membership_from_snapshot(&panes, source, peer, pane_identity),
+            Some(true)
+        );
+        assert_eq!(
+            super::checked_membership_from_snapshot(&panes, sibling, peer, pane_identity),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn checked_windows_outside_server_rejects_newer_reused_and_equal_ancestors() {
+        let stable = |pid| Some(ancestry_identity(pid, u64::from(pid)));
+        let outside = [(100, 50, 100), (300, 200, 300), (200, 50, 200), (50, 1, 50)];
+        let reads = Cell::new(0);
+        assert_eq!(
+            outside_sequence(&outside, |pid| {
+                if pid == 200 {
+                    let count = reads.get();
+                    reads.set(count + 1);
+                    Some(ancestry_identity(pid, if count == 0 { 200 } else { 400 }))
+                } else {
+                    stable(pid)
+                }
+            }),
+            None,
+            "reused intermediate cannot lead to an older witness"
+        );
+        assert_eq!(
+            outside_sequence(
+                &[(100, 50, 100), (300, 200, 300), (200, 50, 400), (50, 1, 50)],
+                |pid| {
+                    Some(ancestry_identity(
+                        pid,
+                        if pid == 200 { 400 } else { u64::from(pid) },
+                    ))
+                }
+            ),
+            None,
+            "newer parent violates the validated edge"
+        );
+        assert_eq!(
+            outside_sequence(
+                &[
+                    (100, 50, 100),
+                    (300, 200, 300),
+                    (200, 50, 200),
+                    (50, 0, 100)
+                ],
+                |pid| {
+                    Some(ancestry_identity(
+                        pid,
+                        if pid == 50 { 100 } else { u64::from(pid) },
+                    ))
+                }
+            ),
+            None,
+            "equal timestamp is not strictly older, even at parent zero"
+        );
+    }
+
+    #[test]
+    fn checked_windows_ancestry_revalidates_root_and_peer_endpoints() {
+        let entries = [(100, 50, 100), (300, 200, 300), (200, 50, 200), (50, 1, 50)];
+        for goal in [
+            super::CheckedAncestryGoal::PaneMembership,
+            super::CheckedAncestryGoal::OutsideServer,
+        ] {
+            for replaced_pid in [100, 300] {
+                let reads = Cell::new(0);
+                assert_eq!(
+                    super::checked_ancestry_from_snapshot(
+                        &ancestry_snapshot(&entries),
+                        ancestry_identity(100, 100),
+                        ancestry_identity(300, 300),
+                        goal,
+                        |pid| {
+                            if pid == replaced_pid {
+                                let count = reads.get();
+                                reads.set(count + 1);
+                                Some(ancestry_identity(
+                                    pid,
+                                    if count == 0 { u64::from(pid) } else { 999 },
+                                ))
+                            } else {
+                                Some(ancestry_identity(pid, u64::from(pid)))
+                            }
+                        }
+                    ),
+                    None,
+                    "endpoint replacement is unknown for either traversal"
+                );
+            }
+        }
+        let witness_reads = Cell::new(0);
+        assert_eq!(
+            outside_sequence(&entries, |pid| {
+                if pid == 50 {
+                    let count = witness_reads.get();
+                    witness_reads.set(count + 1);
+                    if count >= 2 {
+                        return None;
+                    }
+                }
+                Some(ancestry_identity(pid, u64::from(pid)))
+            }),
+            None,
+            "an older witness that exits before the conclusion is unknown"
+        );
+        let root_reads = Cell::new(0);
+        assert_eq!(
+            outside_sequence(&entries, |pid| {
+                if pid == 100 {
+                    let count = root_reads.get();
+                    root_reads.set(count + 1);
+                    if count > 0 {
+                        return None;
+                    }
+                }
+                Some(ancestry_identity(pid, u64::from(pid)))
+            }),
+            None,
+            "server exit after initial validation cannot bless outside"
+        );
+        assert_eq!(
+            outside_sequence(
+                &[(100, 50, 101), (300, 200, 300), (200, 50, 200), (50, 1, 50)],
+                |pid| { Some(ancestry_identity(pid, u64::from(pid))) }
+            ),
+            None,
+            "snapshot must match pinned server endpoint"
+        );
+    }
 
     #[test]
     fn windows_standard_plugin_runtime_paths_drop_only_disk_and_unc_verbatim_prefixes() {
@@ -4237,7 +4936,9 @@ mod tests {
                 30,
                 20,
                 "codex.exe",
-                &["C:\\Users\\herdr\\AppData\\Roaming\\npm\\node_modules\\@openai\\codex\\node_modules\\@openai\\codex-win32-x64\\vendor\\x86_64-pc-windows-msvc\\bin\\codex.exe"],
+                &[
+                    "C:\\Users\\herdr\\AppData\\Roaming\\npm\\node_modules\\@openai\\codex\\node_modules\\@openai\\codex-win32-x64\\vendor\\x86_64-pc-windows-msvc\\bin\\codex.exe",
+                ],
             ),
             test_entry(40, 30, "node_repl.exe", &["node_repl.exe"]),
             test_entry(

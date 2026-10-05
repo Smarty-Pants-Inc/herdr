@@ -35,6 +35,10 @@ enum RuntimeExitAction {
 impl App {
     pub(crate) fn handle_internal_event_with_render_impact(&mut self, ev: AppEvent) -> bool {
         match ev {
+            AppEvent::GitFilesChanged => {
+                self.handle_git_files_changed(Instant::now());
+                false
+            }
             AppEvent::GitStatusRefreshed {
                 results,
                 cache_updates,
@@ -81,6 +85,8 @@ impl App {
         let changed = self
             .state
             .apply_workspace_git_statuses(&self.terminal_runtimes, results);
+        self.reconcile_git_config_watches();
+        self.sync_git_watches();
         if changed {
             self.render_dirty.request_generic();
             self.render_notify.notify_one();
@@ -117,6 +123,11 @@ impl App {
             &ev,
             AppEvent::TerminalBell { .. } | AppEvent::ClipboardWrite { .. }
         ) {
+            return Vec::new();
+        }
+
+        if matches!(ev, AppEvent::GitFilesChanged) {
+            self.handle_git_files_changed(Instant::now());
             return Vec::new();
         }
 
@@ -1174,6 +1185,9 @@ impl App {
             }
             Method::LayoutExport(params) => return self.handle_layout_export(request.id, params),
             Method::LayoutApply(params) => return self.handle_layout_apply(request.id, params),
+            Method::LayoutApplyRestorable(params) => {
+                return self.handle_layout_apply_restorable(request.id, params);
+            }
             Method::LayoutApplyProjectChecked(params) => {
                 return self.handle_layout_apply_project_checked(request.id, params)
             }

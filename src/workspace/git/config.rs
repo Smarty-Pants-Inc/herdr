@@ -130,12 +130,12 @@ pub(super) fn read_config_with_user_paths(
 
 fn git_user_config_paths() -> Vec<PathBuf> {
     let mut paths = Vec::new();
-    if let Some(xdg_config_home) = std::env::var_os("XDG_CONFIG_HOME") {
+    if let Some(xdg_config_home) = crate::environment::var_os("XDG_CONFIG_HOME") {
         paths.push(PathBuf::from(xdg_config_home).join("git/config"));
-    } else if let Some(home) = std::env::var_os("HOME") {
+    } else if let Some(home) = crate::environment::var_os("HOME") {
         paths.push(PathBuf::from(home).join(".config/git/config"));
     }
-    if let Some(home) = std::env::var_os("HOME") {
+    if let Some(home) = crate::environment::var_os("HOME") {
         paths.push(PathBuf::from(home).join(".gitconfig"));
     }
     paths
@@ -562,7 +562,7 @@ fn normalize_branch_include_pattern(pattern: &str) -> String {
 
 fn normalize_gitdir_include_pattern(pattern: &str, config_path: &Path) -> String {
     let mut pattern = if let Some(rest) = pattern.strip_prefix("~/") {
-        std::env::var_os("HOME")
+        crate::environment::var_os("HOME")
             .map(PathBuf::from)
             .unwrap_or_default()
             .join(rest)
@@ -629,7 +629,7 @@ fn resolve_include_path(config_path: &Path, include_path: &str) -> PathBuf {
     let include_path = include_path.strip_prefix("~/").map_or_else(
         || PathBuf::from(include_path),
         |rest| {
-            std::env::var_os("HOME")
+            crate::environment::var_os("HOME")
                 .map(PathBuf::from)
                 .unwrap_or_default()
                 .join(rest)
