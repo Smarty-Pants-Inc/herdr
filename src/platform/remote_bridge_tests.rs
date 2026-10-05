@@ -5,7 +5,10 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-const TIMEOUT: Duration = Duration::from_millis(300);
+// Leave scheduling headroom for the child and EOF handoff on loaded CI hosts.
+// Progress below still lasts longer than this deadline, so renewal is exercised.
+const TIMEOUT: Duration = Duration::from_secs(2);
+const WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[test]
 fn bridge_child() {
@@ -49,7 +52,7 @@ impl Bridge {
             command.env("HERDR_BRIDGE_TEST_LEGACY", "1");
         }
         let mut child = command.spawn().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now() + WAIT_TIMEOUT;
         let stream = loop {
             match listener.accept() {
                 Ok((stream, _)) => break stream,
@@ -68,12 +71,8 @@ impl Bridge {
             }
         };
         stream.set_nonblocking(false).unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(3)))
-            .unwrap();
-        stream
-            .set_write_timeout(Some(Duration::from_millis(100)))
-            .unwrap();
+        stream.set_read_timeout(Some(WAIT_TIMEOUT)).unwrap();
+        stream.set_write_timeout(Some(WAIT_TIMEOUT)).unwrap();
         Self {
             child,
             stream,
@@ -82,7 +81,7 @@ impl Bridge {
     }
 
     fn wait(&mut self) -> ExitStatus {
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now() + WAIT_TIMEOUT;
         loop {
             if let Some(status) = self.child.try_wait().unwrap() {
                 return status;
@@ -125,8 +124,13 @@ fn bridge_expires_when_silent_or_stdout_is_blocked() {
     for blocked in [false, true] {
         let mut bridge = Bridge::start(false);
         if blocked {
+            // Stop filling promptly once the peer blocks; this is not an idle wait.
+            bridge
+                .stream
+                .set_write_timeout(Some(Duration::from_millis(100)))
+                .unwrap();
             let buffer = vec![b'x'; 64 * 1024];
-            let deadline = Instant::now() + Duration::from_secs(2);
+            let deadline = Instant::now() + WAIT_TIMEOUT;
             while bridge.stream.write_all(&buffer).is_ok() {
                 assert!(Instant::now() < deadline, "failed to fill bridge stdout");
             }
@@ -139,6 +143,7 @@ fn bridge_expires_when_silent_or_stdout_is_blocked() {
 fn bridge_preserves_one_way_progress_and_drains_after_stdin_eof() {
     for upload in [false, true] {
         let mut bridge = Bridge::start(false);
+        let started = Instant::now();
         for _ in 0..12 {
             if upload {
                 bridge
@@ -152,9 +157,10 @@ fn bridge_preserves_one_way_progress_and_drains_after_stdin_eof() {
             } else {
                 bridge.stream.write_all(b"output").unwrap();
             }
-            std::thread::sleep(Duration::from_millis(60));
+            std::thread::sleep(Duration::from_millis(250));
             assert!(bridge.child.try_wait().unwrap().is_none());
         }
+        assert!(started.elapsed() > TIMEOUT);
         assert!(bridge.finish().contains("final-output-after-stdin-eof"));
     }
 }

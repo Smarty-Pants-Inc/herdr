@@ -691,6 +691,32 @@ mod tests {
         }
     }
 
+    // Parallel fork-to-exec tests can briefly inherit the directory's flock.
+    // Wait only for OS lock contention, never synthetic reclamation WouldBlock:
+    // each incomplete reclamation batch must still count toward the test's bound.
+    fn wait_for_os_lock_contention(
+        publisher: &MachineStatusPublisher,
+        snapshot: &Snapshot,
+    ) -> io::Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            match publisher.write(snapshot) {
+                Err(error)
+                    if error.kind() == io::ErrorKind::WouldBlock
+                        && error.raw_os_error().is_some() =>
+                {
+                    assert!(
+                        Instant::now() < deadline,
+                        "OS lock contention persisted for {}: {error}",
+                        publisher.path.display()
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                result => return result,
+            }
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn unsafe_directory_is_rejected_by_reader_and_publisher() {
@@ -698,7 +724,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("herdr-diagnostic-{}", ProfileId::generate()));
         let publisher = MachineStatusPublisher::new(&root.join("client.sock"));
         let sample = storage_sample(&publisher.client_id, std::process::id());
-        publisher.write(&sample).unwrap();
+        wait_for_os_lock_contention(&publisher, &sample).unwrap();
         let directory = publisher.path.parent().unwrap();
         std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(
@@ -713,7 +739,7 @@ mod tests {
             "invalid"
         );
         assert!(
-            publisher.write(&sample).is_err(),
+            wait_for_os_lock_contention(&publisher, &sample).is_err(),
             "must not adopt a public directory"
         );
         std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -733,7 +759,7 @@ mod tests {
         let mut redirected = MachineStatusPublisher::new(&root.join("alias.sock"));
         redirected.path = alias.join(publisher.path.file_name().unwrap());
         assert!(
-            redirected.write(&sample).is_err(),
+            wait_for_os_lock_contention(&redirected, &sample).is_err(),
             "must not follow a diagnostic directory symlink"
         );
         drop(redirected);
@@ -748,7 +774,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("herdr-diagnostic-{}", ProfileId::generate()));
         let publisher = MachineStatusPublisher::new(&root.join("client.sock"));
         let sample = storage_sample(&publisher.client_id, std::process::id());
-        publisher.write(&sample).unwrap();
+        wait_for_os_lock_contention(&publisher, &sample).unwrap();
         std::fs::set_permissions(&publisher.path, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert_eq!(
             read_from_directory(
@@ -762,14 +788,14 @@ mod tests {
             "invalid"
         );
         assert!(
-            publisher.write(&sample).is_err(),
+            wait_for_os_lock_contention(&publisher, &sample).is_err(),
             "must not replace an untrusted diagnostic file"
         );
         std::fs::remove_file(&publisher.path).unwrap();
         let target = root.join("target");
         std::fs::write(&target, b"untouched").unwrap();
         symlink(&target, &publisher.path).unwrap();
-        assert!(publisher.write(&sample).is_err());
+        assert!(wait_for_os_lock_contention(&publisher, &sample).is_err());
         assert_eq!(std::fs::read(&target).unwrap(), b"untouched");
         drop(publisher);
         std::fs::remove_dir_all(root).unwrap();
@@ -842,9 +868,11 @@ mod tests {
             .status,
             "unavailable"
         );
-        healthy
-            .write(&storage_sample(&healthy.client_id, std::process::id()))
-            .unwrap();
+        wait_for_os_lock_contention(
+            &healthy,
+            &storage_sample(&healthy.client_id, std::process::id()),
+        )
+        .unwrap();
         assert!(
             !directory.join(name).exists(),
             "PID reuse orphan must be reclaimed"
@@ -853,10 +881,12 @@ mod tests {
         let other = MachineStatusPublisher::new(&root.join("client.sock"));
         let mut stale = storage_sample(&other.client_id, std::process::id());
         stale.updated_at_ms = 1;
-        other.write(&stale).unwrap();
-        healthy
-            .write(&storage_sample(&healthy.client_id, std::process::id()))
-            .unwrap();
+        wait_for_os_lock_contention(&other, &stale).unwrap();
+        wait_for_os_lock_contention(
+            &healthy,
+            &storage_sample(&healthy.client_id, std::process::id()),
+        )
+        .unwrap();
         assert!(other.path.exists());
         assert_eq!(
             read_from_directory(
@@ -901,9 +931,7 @@ mod tests {
                 .write_all(b"{")
                 .unwrap();
         }
-        healthy
-            .write(&storage_sample(&healthy.client_id, pid))
-            .unwrap();
+        wait_for_os_lock_contention(&healthy, &storage_sample(&healthy.client_id, pid)).unwrap();
         assert!(directory.join(&live).exists());
         assert_eq!(storage.names(MAX_FILES).unwrap().len(), 2);
         assert!(
@@ -958,9 +986,11 @@ mod tests {
             .unwrap()
             .write_all(b"{")
             .unwrap();
-        healthy
-            .write(&storage_sample(&healthy.client_id, std::process::id()))
-            .unwrap();
+        wait_for_os_lock_contention(
+            &healthy,
+            &storage_sample(&healthy.client_id, std::process::id()),
+        )
+        .unwrap();
         for selector in [None, Some(healthy.client_id.as_str())] {
             assert!(
                 read_from_directory(
@@ -986,13 +1016,17 @@ mod tests {
                 .write_all(&serde_json::to_vec(&storage_sample(&id, std::process::id())).unwrap())
                 .unwrap();
         }
-        healthy
-            .write(&storage_sample(&healthy.client_id, std::process::id()))
-            .unwrap();
+        wait_for_os_lock_contention(
+            &healthy,
+            &storage_sample(&healthy.client_id, std::process::id()),
+        )
+        .unwrap();
         let excess = MachineStatusPublisher::new(&root.join("client.sock"));
-        assert!(excess
-            .write(&storage_sample(&excess.client_id, std::process::id()))
-            .is_err());
+        assert!(wait_for_os_lock_contention(
+            &excess,
+            &storage_sample(&excess.client_id, std::process::id()),
+        )
+        .is_err());
         assert!(!excess.path.exists());
         // Unknown partial files remain untouched and never consume current quota.
         let overflow = format!("{}.tmp", ProfileId::generate());
@@ -1001,9 +1035,11 @@ mod tests {
             .unwrap()
             .write_all(b"{")
             .unwrap();
-        healthy
-            .write(&storage_sample(&healthy.client_id, std::process::id()))
-            .unwrap();
+        wait_for_os_lock_contention(
+            &healthy,
+            &storage_sample(&healthy.client_id, std::process::id()),
+        )
+        .unwrap();
         assert!(legacy_names
             .iter()
             .all(|name| directory.join(name).exists()));
@@ -1039,9 +1075,7 @@ mod tests {
                 .write_all(&bytes)
                 .unwrap();
         }
-        healthy
-            .write(&storage_sample(&healthy.client_id, pid))
-            .unwrap();
+        wait_for_os_lock_contention(&healthy, &storage_sample(&healthy.client_id, pid)).unwrap();
         assert!(
             read_from_directory(
                 directory,
@@ -1112,9 +1146,11 @@ mod tests {
                 .write_all(b"{")
                 .unwrap();
         }
-        healthy
-            .write(&storage_sample(&healthy.client_id, std::process::id()))
-            .unwrap();
+        wait_for_os_lock_contention(
+            &healthy,
+            &storage_sample(&healthy.client_id, std::process::id()),
+        )
+        .unwrap();
         assert_eq!(storage.names(MAX_FILES).unwrap().len(), 1);
         assert!(
             read_from_directory(
@@ -1180,12 +1216,16 @@ mod tests {
             );
         }
         let other = MachineStatusPublisher::new(&root.join("client.sock"));
-        other
-            .write(&storage_sample(&other.client_id, std::process::id()))
-            .unwrap();
-        healthy
-            .write(&storage_sample(&healthy.client_id, std::process::id()))
-            .unwrap();
+        wait_for_os_lock_contention(
+            &other,
+            &storage_sample(&other.client_id, std::process::id()),
+        )
+        .unwrap();
+        wait_for_os_lock_contention(
+            &healthy,
+            &storage_sample(&healthy.client_id, std::process::id()),
+        )
+        .unwrap();
         assert!(
             other.path.exists(),
             "reclamation must preserve another live client"
@@ -1292,7 +1332,10 @@ mod tests {
         let mut attempts = 0;
         loop {
             attempts += 1;
-            match healthy.write(&storage_sample(&healthy.client_id, std::process::id())) {
+            match wait_for_os_lock_contention(
+                &healthy,
+                &storage_sample(&healthy.client_id, std::process::id()),
+            ) {
                 Ok(()) => break,
                 Err(error) => {
                     assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
@@ -1353,17 +1396,18 @@ mod tests {
                 .unwrap();
             existing_id = id;
         }
-        assert!(publisher
-            .write(&storage_sample(&publisher.client_id, std::process::id()))
-            .is_err());
+        assert!(wait_for_os_lock_contention(
+            &publisher,
+            &storage_sample(&publisher.client_id, std::process::id()),
+        )
+        .is_err());
         assert_eq!(storage.names(MAX_FILES).unwrap().len(), MAX_FILES);
         assert!(!publisher.path.exists());
         // At the same quota an existing live client can still refresh atomically.
         let mut existing = MachineStatusPublisher::new(&root.join("client.sock"));
         existing.client_id = existing_id.clone();
         existing.path = directory.join(diagnostic_snapshot_name(&existing_id));
-        existing
-            .write(&storage_sample(&existing_id, std::process::id()))
+        wait_for_os_lock_contention(&existing, &storage_sample(&existing_id, std::process::id()))
             .unwrap();
         assert_eq!(storage.names(MAX_FILES).unwrap().len(), MAX_FILES);
         drop(existing);
@@ -1500,9 +1544,7 @@ mod tests {
                 ready: true,
             }],
         };
-        first
-            .write(&sample(first.client_id.clone(), 20_000))
-            .unwrap();
+        wait_for_os_lock_contention(&first, &sample(first.client_id.clone(), 20_000)).unwrap();
         let live = read(20_000, true);
         assert!(live.running && live.readout.available && live.readout.fresh);
         assert_eq!(live.endpoints.len(), 1);
@@ -1513,9 +1555,7 @@ mod tests {
             assert!(stale.running && !stale.readout.available && stale.endpoints.is_empty());
             assert_eq!(stale.readout.status, "stale");
         }
-        second
-            .write(&sample(second.client_id.clone(), 20_000))
-            .unwrap();
+        wait_for_os_lock_contention(&second, &sample(second.client_id.clone(), 20_000)).unwrap();
         let ambiguous = read(20_000, true);
         assert!(ambiguous.running && !ambiguous.readout.fresh && ambiguous.endpoints.is_empty());
         assert_eq!(ambiguous.readout.status, "ambiguous");
@@ -1559,7 +1599,7 @@ mod tests {
             version: "future".into(),
             endpoints: Vec::new(),
         };
-        publisher.write(&sample).unwrap();
+        wait_for_os_lock_contention(&publisher, &sample).unwrap();
         let assert_invalid = || {
             let readout = read_from_directory(
                 publisher.path.parent().unwrap(),
@@ -1588,7 +1628,7 @@ mod tests {
             };
             2
         ];
-        publisher.write(&sample).unwrap();
+        wait_for_os_lock_contention(&publisher, &sample).unwrap();
         assert_invalid();
         drop(publisher);
         std::fs::remove_dir_all(dir).unwrap();
