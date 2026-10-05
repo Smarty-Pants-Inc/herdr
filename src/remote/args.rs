@@ -47,14 +47,14 @@ pub(crate) fn extract_remote_args(
     let mut index = 1;
     while index < args.len() {
         let arg = &args[index];
-        if arg == "--" {
-            cleaned.extend_from_slice(&args[index..]);
-            break;
-        }
         if payload_slots.contains(&index) {
             cleaned.push(arg.clone());
             index += 1;
             continue;
+        }
+        if arg == "--" {
+            cleaned.extend_from_slice(&args[index..]);
+            break;
         }
         if arg == "--handoff" {
             live_handoff = true;

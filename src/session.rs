@@ -101,14 +101,14 @@ pub fn configure_from_args(args: &[String]) -> Result<Vec<String>, String> {
     let mut index = 1;
     while index < args.len() {
         let arg = &args[index];
-        if arg == "--" {
-            cleaned.extend_from_slice(&args[index..]);
-            break;
-        }
         if payload_slots.contains(&index) {
             cleaned.push(arg.clone());
             index += 1;
             continue;
+        }
+        if arg == "--" {
+            cleaned.extend_from_slice(&args[index..]);
+            break;
         }
         if arg == "--session" {
             let Some(value) = args.get(index + 1) else {

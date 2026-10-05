@@ -609,6 +609,49 @@ fn prompt_globals_authentic_session_still_selects_named_receiver() {
 }
 
 #[test]
+fn prompt_globals_literal_separator_slots_still_select_named_receiver() {
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let named_socket = named_session_socket(&config_home, "selected");
+    let decoy_socket = base.join("inherited.sock");
+    for (target, text) in [("worker", "--"), ("--", "hello"), ("--", "--")] {
+        let args = [
+            "agent",
+            "prompt",
+            target,
+            text,
+            "--session",
+            "selected",
+            "--expected-terminal",
+            "term_1",
+        ];
+        let (output, operations) = record_prompt_cli(&named_socket, || {
+            run_named_cli_with_socket_override(
+                &config_home,
+                &runtime_dir,
+                &args,
+                Some(&decoy_socket),
+            )
+        });
+        fs::remove_file(&named_socket).unwrap();
+        assert!(
+            output.status.success(),
+            "{args:?}: status {:?}, operations {operations:?}, stderr: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stderr.is_empty());
+        assert_eq!(operations.len(), 1, "{args:?}: {operations:?}");
+        assert_eq!(operations[0]["method"], "agent.prompt_guarded");
+        assert_eq!(operations[0]["params"]["target"], target);
+        assert_eq!(operations[0]["params"]["text"], text);
+        assert_eq!(operations[0]["params"]["expected_terminal"], "term_1");
+    }
+    cleanup_test_base(&base);
+}
+
+#[test]
 fn prompt_globals_other_commands_keep_full_global_scans() {
     let base = unique_test_dir();
     let config_home = base.join("config");
@@ -636,6 +679,8 @@ fn prompt_globals_other_commands_keep_full_global_scans() {
         vec!["server", "--remote=host", "reload-config"],
         vec!["server", "reload-config", "--remote", "host"],
         vec!["agent", "prompt", "worker", "text", "--remote=host"],
+        vec!["agent", "prompt", "worker", "--", "--remote=host"],
+        vec!["agent", "prompt", "--", "text", "--remote=host"],
         vec![
             "--remote=host",
             "agent",
