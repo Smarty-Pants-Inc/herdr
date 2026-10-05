@@ -23,7 +23,7 @@ budget; --last 10 shares 600 seconds.
 --compare-log-fetch requires --dry-run and adds bounded gh/curl diagnostics;
 legacy probe results never change curl eligibility or extend the shared budget.
 The gh probe uses output-only --include for HTTP status; headers are never emitted.
-All three matrix job checkout logs must identify the same immutable commit
+All selected build job checkout logs must identify the same immutable commit
 whose tree equals AFTER; run.head_sha alone
 is not checkout proof. Log reads are capped at 8 MiB and never printed.
 JSON goes to stdout. Unless --dry-run or
@@ -44,12 +44,16 @@ import time
 import threading
 from urllib.parse import urlencode
 
+if __package__:
+    from .ci_plan import check_matrix
+else:
+    from ci_plan import check_matrix
+
 MERGIFY_ID = 37929162
 WORKFLOW = ".github/workflows/ci.yml"
-REQUIRED_JOBS = {
-    "smarty-ci", "check (ubuntu-latest)", "check (macos-latest)",
-    "check (windows-latest)", "conventional-commits",
-}
+MATRIX_JOBS = {f"check ({lane['os']})" for lane in check_matrix("pull_request", {})["include"]}
+REQUIRED_JOBS = {"smarty-ci", "conventional-commits"} | MATRIX_JOBS
+CONPTY_JOB = "windows-conpty-package"
 SUBJECT = re.compile(
     r"^(?:feat|fix|perf|docs|ci|test|refactor|chore|release)"
     r"(?:\([^)\r\n]+\))?!?:\s+\S.* \(#([1-9][0-9]*)\)$"
@@ -385,7 +389,16 @@ class Inspector:
         require(all(j["status"] == "completed"
                     and j["conclusion"] in {"success", "skipped", "neutral"} for j in jobs),
                 "conflicting unsuccessful or incomplete workflow job")
-        for name in sorted(REQUIRED_JOBS):
+        # GitHub includes the conditionally skipped job in the latest attempt.
+        # A successful aggregate plus an explicit skip proves it was not selected;
+        # missing package evidence must never masquerade as a docs-only plan.
+        packages = [j for j in jobs if j["name"] == CONPTY_JOB]
+        require(len(packages) == 1, "missing or duplicate required job: " + CONPTY_JOB)
+        require(packages[0]["conclusion"] in {"success", "skipped"},
+                "ConPTY package job is neither successful nor explicitly skipped")
+        checkout_jobs = MATRIX_JOBS | ({CONPTY_JOB} if packages[0]["conclusion"] == "success" else set())
+        required_jobs = REQUIRED_JOBS | (checkout_jobs - MATRIX_JOBS)
+        for name in sorted(required_jobs):
             matches = [j for j in jobs if j["name"] == name]
             require(len(matches) == 1, "missing or duplicate required job: " + name)
             job = matches[0]
@@ -396,7 +409,7 @@ class Inspector:
         require(isinstance(snapshots, list), "missing run PR snapshot list")
         if snapshots:
             self.snapshot_proof(pr, snapshots, entry)
-        self.log_proof(pr, jobs, entry)
+        self.log_proof(pr, jobs, entry, checkout_jobs)
         entry["reason"] = "verified queue tree and latest CI attempt"
         return {"queue_pr": pr["number"], "queue_head_sha": head["sha"],
                 "tree": entry["head_tree"], "run_id": run["id"], "run_attempt": attempt,
@@ -414,13 +427,13 @@ class Inspector:
                 and snapshot["base"]["repo"]["id"] == pr["base"]["repo"]["id"],
                 "queue PR snapshot head/base mismatch")
 
-    def log_proof(self, pr, jobs, entry):
+    def log_proof(self, pr, jobs, entry, checkout_jobs):
         if getattr(self.api, "compare_log_fetch", False):
-            # Inspection collects both methods for all matrix logs even when an
+            # Inspection collects both methods for all selected logs even when an
             # early curl read fails. Fail closed after collecting the probes.
             failures = []
             for job in jobs:
-                if job["name"] not in REQUIRED_JOBS or not job["name"].startswith("check ("):
+                if job["name"] not in checkout_jobs:
                     continue
                 require(type(job["id"]) is int and job["id"] > 0, "invalid workflow job ID")
                 endpoint = self.root + f"/actions/jobs/{job['id']}/logs"
@@ -433,7 +446,7 @@ class Inspector:
                 raise Unavailable(str(failures[0])) from failures[0]
         entry["checkouts"] = []
         for job in jobs:
-            if job["name"] not in REQUIRED_JOBS or not job["name"].startswith("check ("):
+            if job["name"] not in checkout_jobs:
                 continue
             require(type(job["id"]) is int and job["id"] > 0, "invalid workflow job ID")
             endpoint = self.root + f"/actions/jobs/{job['id']}/logs"
@@ -452,9 +465,10 @@ class Inspector:
             entry["checkouts"].append({"job": job["name"], "job_id": job["id"],
                                        "sha": sha, "tree": tree})
             require(tree == entry["head_tree"], "tested checkout tree mismatch")
-        require(len(entry["checkouts"]) == 3 and len({c["sha"] for c in entry["checkouts"]}) == 1,
-                "matrix jobs did not check out the same exact commit")
-        entry["checkout_evidence"] = "three matrix checkout logs"
+        require(len(entry["checkouts"]) == len(checkout_jobs)
+                and len({c["sha"] for c in entry["checkouts"]}) == 1,
+                "selected build jobs did not check out the same exact commit")
+        entry["checkout_evidence"] = f"{len(checkout_jobs)} selected build checkout logs"
 
     def inspect(self, sha, before=None):
         result = {"dedupe": False, "target_url": "", "sha": sha, "before": before,
