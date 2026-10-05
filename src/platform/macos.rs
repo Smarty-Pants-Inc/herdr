@@ -1060,9 +1060,9 @@ pub(crate) fn process_caller_metadata_platform(
     (process_identity(peer.pid) == Some(peer)).then_some(metadata)
 }
 
-/// Best-effort diagnostic path lookup; the caller pins the process generation
-/// before and after this numeric-PID query, independently of its success.
-fn process_executable_basename(pid: u32) -> Option<String> {
+/// OS path lookup; callers pin the process generation before and after this
+/// numeric-PID query, independently of its success.
+pub(super) fn process_executable_basename(pid: u32) -> Option<String> {
     let pid = libc::c_int::try_from(pid).ok()?;
     let mut buffer = [0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
     // SAFETY: libproc receives a valid writable buffer and its exact capacity.

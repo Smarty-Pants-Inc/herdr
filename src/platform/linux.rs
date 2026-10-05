@@ -1399,6 +1399,16 @@ pub(crate) fn process_identity(pid: u32) -> Option<crate::platform::ProcessIdent
     })
 }
 
+/// Numeric OS lookup; platform::process_executable_basename brackets it with
+/// checks of the exact process generation before using it as authorization.
+pub(super) fn process_executable_basename(pid: u32) -> Option<String> {
+    std::fs::read_link(format!("/proc/{pid}/exe"))
+        .ok()?
+        .file_name()?
+        .to_str()
+        .map(str::to_owned)
+}
+
 pub(crate) fn process_caller_metadata_platform(
     peer: super::ProcessIdentity,
 ) -> Option<super::CallerMetadata> {
@@ -1410,9 +1420,7 @@ pub(crate) fn process_caller_metadata_platform(
     if observed != peer {
         return None;
     }
-    let exe = std::fs::read_link(format!("/proc/{}/exe", peer.pid))
-        .ok()
-        .and_then(|path| path.file_name()?.to_str().map(str::to_owned));
+    let exe = process_executable_basename(peer.pid);
     let unit = std::fs::read_to_string(format!("/proc/{}/cgroup", peer.pid))
         .ok()
         .and_then(|cgroup| {

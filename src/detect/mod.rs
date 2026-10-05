@@ -281,6 +281,45 @@ pub fn identify_agent_in_job(job: &crate::platform::ForegroundJob) -> Option<(Ag
     best.map(|(_, agent, name)| (agent, name))
 }
 
+/// Strict guarded-input identity, deliberately separate from display detection.
+/// `executable_basename` must come from the generation-pinned OS executable
+/// accessor, never a process title, argv[0], environment, or launcher path.
+/// Unsupported interpreter/shell wrappers fail closed. Pi requires both its
+/// actual node/bun runtime and a recognized package CLI entry, even if the title
+/// has changed to `pi`; title-only argv cannot establish that entry.
+pub(crate) fn identify_guarded_agent_process(
+    process: &crate::platform::ForegroundProcess,
+    executable_basename: &str,
+) -> Option<Agent> {
+    let executable = executable_basename.to_ascii_lowercase();
+    let executable = executable.strip_suffix(".exe").unwrap_or(&executable);
+    if matches!(executable, "node" | "bun") {
+        let entry = guarded_runtime_entry(process.argv.as_deref()?)?;
+        let package_agent = agent_name_from_known_package_path(entry).or_else(|| {
+            // Global npm/bun CLI symlinks may name `pi`, but only their resolved
+            // package entry is evidence. A script merely named pi is not enough.
+            let resolved = std::fs::canonicalize(entry).ok()?;
+            agent_name_from_known_package_path(resolved.to_str()?)
+        })?;
+        return (package_agent == agent_label(Agent::Pi)).then_some(Agent::Pi);
+    }
+    // Native agents identify through the actual executable only; do not strip
+    // script extensions or borrow a recognized argv[0] from a generic binary.
+    let agent = lookup_agent(executable)?;
+    if agent == Agent::Pi || (agent == Agent::Letta && !is_interactive_letta_process(process)) {
+        return None;
+    }
+    Some(agent)
+}
+
+fn guarded_runtime_entry(argv: &[String]) -> Option<&str> {
+    // Support the direct CLI entry (optionally after the standard separator),
+    // not eval, run subcommands, or guessed runtime-option value positions.
+    let first = argv.get(1)?;
+    let entry = if first == "--" { argv.get(2)? } else { first };
+    (!entry.is_empty() && !entry.starts_with('-')).then_some(entry.as_str())
+}
+
 /// Detect the state of an agent from the live terminal tail snapshot.
 /// If `agent` is `None`, returns `Unknown`.
 #[cfg(test)]
@@ -901,6 +940,125 @@ mod tests {
                 .as_nanos()
         );
         std::env::temp_dir().join(unique)
+    }
+
+    #[test]
+    fn guarded_identity_accepts_only_node_or_bun_with_pi_package_cli_entry() {
+        for runtime in ["node", "bun", "node.exe", "bun.exe"] {
+            for entry in [
+                "/opt/node_modules/@earendil-works/pi-coding-agent/dist/cli.js",
+                "/opt/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js",
+                r"C:\npm\node_modules\@earendil-works\pi-coding-agent\dist\cli.js",
+            ] {
+                // The title may be pi, but the entry must still be observable.
+                let mut process = foreground_process(1, "pi", &[runtime, entry]);
+                process.argv0 = Some("pi".into());
+                assert_eq!(
+                    identify_guarded_agent_process(&process, runtime),
+                    Some(Agent::Pi)
+                );
+            }
+        }
+        let process = foreground_process(
+            1,
+            "node",
+            &[
+                "node",
+                "--",
+                "/opt/node_modules/@earendil-works/pi-coding-agent/dist/cli.js",
+            ],
+        );
+        assert_eq!(
+            identify_guarded_agent_process(&process, "node"),
+            Some(Agent::Pi)
+        );
+    }
+
+    #[test]
+    fn guarded_identity_refuses_shell_scripts_interpreters_and_rebranded_native_tools() {
+        let entry = "/opt/node_modules/@earendil-works/pi-coding-agent/dist/cli.js";
+        for executable in [
+            "sh",
+            "bash",
+            "zsh",
+            "fish",
+            "env",
+            "python",
+            "python3",
+            "cat",
+            "pi",
+            "pi.js",
+            "claude.cmd",
+        ] {
+            let mut process = foreground_process(1, "pi", &["pi", entry]);
+            process.argv0 = Some("pi".into());
+            assert_eq!(
+                identify_guarded_agent_process(&process, executable),
+                None,
+                "{executable}"
+            );
+        }
+        let shell = foreground_process(1, "sh", &["/bin/sh", "/tmp/test-bin/pi"]);
+        assert_eq!(identify_guarded_agent_process(&shell, "sh"), None);
+        // Display stays permissive and unchanged.
+        assert_eq!(
+            identify_agent_in_job(&crate::platform::ForegroundJob {
+                process_group_id: 1,
+                processes: vec![shell],
+            })
+            .map(|(agent, _)| agent),
+            Some(Agent::Pi)
+        );
+    }
+
+    #[test]
+    fn guarded_identity_missing_or_non_cli_runtime_entry_refuses() {
+        let entry = "/opt/node_modules/@earendil-works/pi-coding-agent/dist/cli.js";
+        for argv in [
+            vec!["pi"],
+            vec!["node", "/tmp/pi"],
+            vec!["node", "/tmp/pi.js"],
+            vec![
+                "node",
+                "/opt/node_modules/@earendil-works/pi-coding-agent/dist/setup.js",
+            ],
+            vec!["node", "-e", entry],
+            vec!["node", "--eval=void 0", entry],
+            vec!["node", "-p", entry],
+            vec!["bun", "run", entry],
+            vec!["node", "--unknown-option", entry],
+            vec!["node", "--no-warnings", entry],
+            vec!["node", "--require", "setup.js", entry],
+        ] {
+            let process = foreground_process(1, "pi", &argv);
+            assert_eq!(
+                identify_guarded_agent_process(&process, "node"),
+                None,
+                "{argv:?}"
+            );
+        }
+        let mut process = foreground_process(1, "pi", &["pi"]);
+        process.argv = None;
+        process.cmdline = Some(format!("node {entry}"));
+        assert_eq!(identify_guarded_agent_process(&process, "node"), None);
+        assert_eq!(identify_guarded_agent_process(&process, ""), None);
+    }
+
+    #[test]
+    fn guarded_identity_native_agents_use_only_the_os_executable() {
+        let process = foreground_process(1, "pi", &["pi"]);
+        for (executable, agent) in [
+            ("claude", Agent::Claude),
+            ("codex", Agent::Codex),
+            ("opencode", Agent::OpenCode),
+            ("kiro-cli", Agent::Kiro),
+            ("muse-bin-0.1.0-R708.1", Agent::Muse),
+        ] {
+            assert_eq!(
+                identify_guarded_agent_process(&process, executable),
+                Some(agent)
+            );
+        }
     }
 
     // ---- Agent identification ----

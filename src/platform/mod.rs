@@ -115,6 +115,26 @@ pub(crate) struct CallerMetadata {
     pub(crate) unit: Option<String>,
 }
 
+/// OS executable evidence for exactly this live process generation, never comm,
+/// argv[0], an environment hint, or a launcher script name. Missing evidence fails
+/// closed. Keep this narrow: guarded write callbacks do not need diagnostic cgroups.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn process_executable_basename(process: ProcessIdentity) -> Option<String> {
+    if process.pid == 0 || process_identity(process.pid) != Some(process) {
+        return None;
+    }
+    #[cfg(target_os = "linux")]
+    let executable = linux::process_executable_basename(process.pid)?;
+    #[cfg(target_os = "macos")]
+    let executable = macos::process_executable_basename(process.pid)?;
+    (process_identity(process.pid) == Some(process)).then_some(executable)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn process_executable_basename(_process: ProcessIdentity) -> Option<String> {
+    None
+}
+
 /// Snapshot only the transport-pinned process instance; unsupported platforms
 /// deliberately preserve the input log's original caller shape.
 pub(crate) fn process_caller_metadata(peer: ProcessIdentity) -> Option<CallerMetadata> {
@@ -139,6 +159,13 @@ fn caller_metadata_rejects_a_stale_process_generation() {
         ..live
     };
     assert!(process_caller_metadata(stale).is_none());
+    assert!(process_executable_basename(live).is_some());
+    assert!(process_executable_basename(stale).is_none());
+    assert!(process_executable_basename(ProcessIdentity {
+        pid: 0,
+        start_time: 0,
+    })
+    .is_none());
     assert!(process_caller_metadata(ProcessIdentity {
         pid: 0,
         start_time: 0,

@@ -441,32 +441,49 @@ pub(super) fn runtime_hosts_agent(
 fn submission_not_ready() -> std::io::Error {
     std::io::Error::new(
         std::io::ErrorKind::PermissionDenied,
-        "pinned agent is no longer the terminal foreground process",
+        "pinned agent is not a verified foreground runtime: unsupported launcher or missing/changed executable or runtime CLI entry evidence",
     )
 }
 
-/// A job label is not an instance identity. Identify a concrete member using the
-/// existing detector on a one-member job, retaining its PID rather than its label.
+/// A display/job label is not input authorization. Pin only the member whose
+/// own generation-checked OS executable and runtime entry identify the agent.
 fn identified_agent_process(
     job: &crate::platform::ForegroundJob,
     expected: crate::detect::Agent,
-) -> Option<u32> {
-    let identifies = |process: &&crate::platform::ForegroundProcess| {
-        let member_job = crate::platform::ForegroundJob {
-            process_group_id: job.process_group_id,
-            processes: vec![(*process).clone()],
-        };
-        crate::detect::identify_agent_in_job(&member_job)
-            .is_some_and(|(agent, _)| agent == expected)
+) -> Option<crate::platform::ProcessIdentity> {
+    identified_agent_process_observed(
+        job,
+        expected,
+        crate::platform::process_identity,
+        crate::platform::process_executable_basename,
+    )
+}
+
+fn identified_agent_process_observed(
+    job: &crate::platform::ForegroundJob,
+    expected: crate::detect::Agent,
+    identity_of: impl Fn(u32) -> Option<crate::platform::ProcessIdentity>,
+    executable_of: impl Fn(crate::platform::ProcessIdentity) -> Option<String>,
+) -> Option<crate::platform::ProcessIdentity> {
+    let identifies = |process: &crate::platform::ForegroundProcess| {
+        let identity = identity_of(process.pid)?;
+        let executable = executable_of(identity)?;
+        (crate::detect::identify_guarded_agent_process(process, &executable) == Some(expected)
+            && identity_of(process.pid) == Some(identity))
+        .then_some(identity)
     };
-    // Preserve leader preference, but never mistake an unrecognized wrapper's
-    // group ID for the actual recognized agent process.
+    // A recognized non-exec launcher never qualifies. If its actual runtime
+    // child does, that child's generation (not the surviving leader) is pinned.
     job.processes
         .iter()
-        .filter(|process| process.pid == job.process_group_id)
-        .find(identifies)
-        .or_else(|| job.processes.iter().find(identifies))
-        .map(|process| process.pid)
+        .find(|process| process.pid == job.process_group_id)
+        .and_then(identifies)
+        .or_else(|| {
+            job.processes
+                .iter()
+                .filter(|process| process.pid != job.process_group_id)
+                .find_map(identifies)
+        })
 }
 
 #[derive(Clone)]
@@ -481,9 +498,11 @@ struct AgentSubmissionPin {
 
 impl AgentSubmissionPin {
     fn check(&self) -> std::io::Result<()> {
-        self.check_observed(crate::platform::process_identity, || {
-            crate::platform::fresh_foreground_job(self.shell.pid)
-        })
+        self.check_observed(
+            crate::platform::process_identity,
+            crate::platform::process_executable_basename,
+            || crate::platform::fresh_foreground_job(self.shell.pid),
+        )
         .map_err(|err| {
             std::io::Error::new(err.kind(), format!("terminal {}: {err}", self.terminal_id))
         })
@@ -492,6 +511,7 @@ impl AgentSubmissionPin {
     fn check_observed(
         &self,
         identity_of: impl Fn(u32) -> Option<crate::platform::ProcessIdentity>,
+        executable_of: impl Fn(crate::platform::ProcessIdentity) -> Option<String>,
         job_now: impl FnOnce() -> Option<crate::platform::ForegroundJob>,
     ) -> std::io::Result<()> {
         let instances_live = || {
@@ -502,20 +522,16 @@ impl AgentSubmissionPin {
             return Err(submission_not_ready());
         }
         let job = job_now().ok_or_else(submission_not_ready)?;
-        let member = job
+        let recognized_member = job
             .processes
             .iter()
             .find(|process| process.pid == self.agent.pid)
-            .cloned();
-        let recognized_member = member.is_some_and(|member| {
-            identified_agent_process(
-                &crate::platform::ForegroundJob {
-                    process_group_id: job.process_group_id,
-                    processes: vec![member],
-                },
-                self.expected,
-            ) == Some(self.agent.pid)
-        });
+            .is_some_and(|member| {
+                executable_of(self.agent).is_some_and(|executable| {
+                    crate::detect::identify_guarded_agent_process(member, &executable)
+                        == Some(self.expected)
+                })
+            });
         // Recheck both generations after numeric OS reads: an exited or reused
         // endpoint must not lend its evidence to a replacement process.
         if job.process_group_id != self.process_group_id || !recognized_member || !instances_live()
@@ -540,11 +556,7 @@ pub(super) fn capture_agent_submission_guard(
         .child_process_identity()
         .ok_or_else(submission_not_ready)?;
     let job = crate::platform::fresh_foreground_job(shell.pid).ok_or_else(submission_not_ready)?;
-    if crate::detect::identify_agent_in_job(&job).map(|(agent, _)| agent) != Some(expected) {
-        return Err(submission_not_ready());
-    }
-    let agent_pid = identified_agent_process(&job, expected).ok_or_else(submission_not_ready)?;
-    let agent = crate::platform::process_identity(agent_pid).ok_or_else(submission_not_ready)?;
+    let agent = identified_agent_process(&job, expected).ok_or_else(submission_not_ready)?;
     let pin = AgentSubmissionPin {
         terminal_id: terminal_id.clone(),
         shell,
@@ -616,21 +628,57 @@ mod tests {
         };
         let job = crate::platform::ForegroundJob {
             process_group_id: 20,
-            processes: vec![crate::platform::ForegroundProcess {
-                pid: 21,
-                name: "pi".into(),
-                argv0: None,
-                argv: None,
-                cmdline: None,
-            }],
+            processes: vec![
+                crate::platform::ForegroundProcess {
+                    pid: 20,
+                    name: "sh".into(),
+                    argv0: None,
+                    argv: Some(vec!["/bin/sh".into(), "/tmp/test-bin/pi".into()]),
+                    cmdline: None,
+                },
+                crate::platform::ForegroundProcess {
+                    pid: 21,
+                    name: "pi".into(),
+                    argv0: Some("pi".into()),
+                    argv: Some(vec![
+                        "node".into(),
+                        "/opt/node_modules/@earendil-works/pi-coding-agent/dist/cli.js".into(),
+                    ]),
+                    cmdline: None,
+                },
+            ],
         };
         (pin, job)
+    }
+
+    fn fixture_executable(identity: crate::platform::ProcessIdentity) -> Option<String> {
+        Some(
+            match identity.pid {
+                20 => "sh",
+                22 => "cat",
+                _ => "node",
+            }
+            .into(),
+        )
     }
 
     #[test]
     fn guarded_submission_pins_recognized_member_not_wrapper_group() {
         let (pin, job) = submission_pin_fixture();
-        assert_eq!(identified_agent_process(&job, pin.expected), Some(21));
+        // Display deliberately recognizes the shell leader; authorization must not.
+        assert_eq!(
+            crate::detect::identify_agent_in_job(&job).map(|(agent, _)| agent),
+            Some(pin.expected)
+        );
+        assert_eq!(
+            identified_agent_process_observed(
+                &job,
+                pin.expected,
+                |pid| Some(crate::platform::ProcessIdentity { pid, start_time: 2 }),
+                fixture_executable,
+            ),
+            Some(pin.agent),
+        );
         assert!(pin
             .check_observed(
                 |pid| Some(if pid == pin.shell.pid {
@@ -638,9 +686,44 @@ mod tests {
                 } else {
                     pin.agent
                 }),
+                fixture_executable,
                 || Some(job),
             )
             .is_ok());
+    }
+
+    #[test]
+    fn guarded_submission_capture_rejects_generation_loss_during_executable_read() {
+        let (pin, job) = submission_pin_fixture();
+        for replacement in [
+            None,
+            Some(crate::platform::ProcessIdentity {
+                start_time: pin.agent.start_time + 1,
+                ..pin.agent
+            }),
+        ] {
+            let changed = std::cell::Cell::new(false);
+            assert_eq!(
+                identified_agent_process_observed(
+                    &job,
+                    pin.expected,
+                    |pid| {
+                        if pid == pin.agent.pid && changed.get() {
+                            replacement
+                        } else {
+                            Some(crate::platform::ProcessIdentity { pid, start_time: 2 })
+                        }
+                    },
+                    |identity| {
+                        if identity == pin.agent {
+                            changed.set(true);
+                        }
+                        fixture_executable(identity)
+                    },
+                ),
+                None
+            );
+        }
     }
 
     #[test]
@@ -676,6 +759,7 @@ mod tests {
                                 })
                             }
                         },
+                        fixture_executable,
                         || Some(job.clone()),
                     )
                     .unwrap_err();
@@ -701,17 +785,47 @@ mod tests {
             }),
         ] {
             assert_eq!(
-                pin.check_observed(live, || observation).unwrap_err().kind(),
+                pin.check_observed(live, fixture_executable, || observation)
+                    .unwrap_err()
+                    .kind(),
                 std::io::ErrorKind::PermissionDenied
             );
         }
-        let mut shell_job = job.clone();
-        shell_job.processes[0].name = "sh".into();
-        assert!(pin.check_observed(live, || Some(shell_job)).is_err());
+        let mut launcher_only = job.clone();
+        launcher_only
+            .processes
+            .retain(|member| member.pid != pin.agent.pid);
+        launcher_only
+            .processes
+            .push(crate::platform::ForegroundProcess {
+                pid: 22,
+                name: "pi".into(),
+                argv0: Some("pi".into()),
+                argv: Some(vec!["pi".into()]),
+                cmdline: Some("pi".into()),
+            });
+        // The recognized launcher, rebranded native follow-on reader and same
+        // foreground group survive child loss. None may inherit the child's pin.
+        assert_eq!(
+            crate::detect::identify_agent_in_job(&launcher_only).map(|(agent, _)| agent),
+            Some(pin.expected)
+        );
+        assert!(pin
+            .check_observed(live, fixture_executable, || Some(launcher_only.clone()))
+            .is_err());
+        assert_eq!(
+            identified_agent_process_observed(
+                &launcher_only,
+                pin.expected,
+                |pid| Some(crate::platform::ProcessIdentity { pid, start_time: 2 }),
+                fixture_executable,
+            ),
+            None
+        );
     }
 
     #[test]
-    fn guarded_submission_preserves_argv_wrappers_and_rejects_in_place_shell_exec() {
+    fn guarded_submission_rechecks_own_executable_and_entry_not_mutable_titles() {
         let (pin, mut job) = submission_pin_fixture();
         let live = |pid| {
             Some(if pid == pin.shell.pid {
@@ -720,21 +834,31 @@ mod tests {
                 pin.agent
             })
         };
-        let process = &mut job.processes[0];
-        process.name = "node".into();
-        process.argv = Some(vec![
-            "node".into(),
-            "/opt/node_modules/@earendil-works/pi-coding-agent/dist/cli.js".into(),
-        ]);
-        assert!(pin.check_observed(live, || Some(job.clone())).is_ok());
-        // Exec does not change start time; fresh expected-agent classification is
-        // essential even when all numeric identities and groups still match.
-        job.processes[0].name = "sh".into();
-        job.processes[0].argv = Some(vec!["/bin/sh".into()]);
-        assert_eq!(
-            pin.check_observed(live, || Some(job)).unwrap_err().kind(),
-            std::io::ErrorKind::PermissionDenied
-        );
+        assert!(pin
+            .check_observed(live, fixture_executable, || Some(job.clone()))
+            .is_ok());
+        // Exec keeps the start time. Neither surviving argv/title nor the same
+        // PID/group may lend identity to a shell or rebranded generic binary.
+        for executable in [None, Some("sh"), Some("python3"), Some("cat"), Some("pi")] {
+            assert!(pin
+                .check_observed(
+                    live,
+                    |_| executable.map(str::to_owned),
+                    || Some(job.clone())
+                )
+                .is_err());
+        }
+        for argv in [
+            None,
+            Some(vec!["pi".into()]),
+            Some(vec!["node".into(), "/tmp/pi.js".into()]),
+            Some(vec!["/bin/sh".into()]),
+        ] {
+            job.processes[1].argv = argv;
+            assert!(pin
+                .check_observed(live, fixture_executable, || Some(job.clone()))
+                .is_err());
+        }
     }
 
     #[test]
@@ -755,6 +879,7 @@ mod tests {
                         }
                         Some(identity)
                     },
+                    fixture_executable,
                     || {
                         replaced.set(true);
                         Some(job.clone())

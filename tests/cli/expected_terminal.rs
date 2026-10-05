@@ -19,17 +19,28 @@ impl GuardServer {
         fs::set_permissions(&base, fs::Permissions::from_mode(0o700)).unwrap();
         let bin = base.join("bin");
         fs::create_dir_all(&bin).unwrap();
-        // This executable is only a small PTY probe with Pi's process hint; the
-        // installed Pi live proof is kept separate from this deterministic test.
+        // A deterministic Node PTY fixture, NOT installed Pi. The actual OS
+        // executable is node and argv retains the recognized package CLI path.
+        // Never rewrite process.title: installed Pi does, a separate limitation.
         let pi = bin.join("pi");
         let pi_input = base.join("pi-input");
+        let node_cli = base.join("node_modules/@earendil-works/pi-coding-agent/dist/cli.js");
+        fs::create_dir_all(node_cli.parent().unwrap()).unwrap();
+        fs::write(
+            &node_cli,
+            format!(
+                "const fs=require('fs'); fs.writeFileSync({:?},''); process.stdout.write('\\x1b[?2004h'); process.stdin.on('data', b=>fs.appendFileSync({:?},b));\n",
+                pi_input, pi_input
+            ),
+        )
+        .unwrap();
         fs::write(
             &pi,
             format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$PROBE_ORIGIN\" >> '{}'\nexport HERDR_AGENT=pi\n'{}' pane report-agent \"$1\" --source custom:expected-terminal-test --agent pi --state idle >/dev/null\nprintf '\\033[?2004h'\nexec /bin/bash -c 'exec -a pi /bin/cat' > '{}'\n",
+                "#!/bin/sh\nprintf '%s\\n' \"$PROBE_ORIGIN\" >> '{}'\n'{}' pane report-agent \"$1\" --source custom:expected-terminal-test --agent pi --state idle >/dev/null\nexec /usr/local/bin/node '{}' \"$1\"\n",
                 base.join("pi-launch").display(),
                 env!("CARGO_BIN_EXE_herdr"),
-                pi_input.display(),
+                node_cli.display(),
             ),
         )
         .unwrap();
@@ -689,12 +700,15 @@ fn guarded_agent_prompt_refuses_foreground_change_while_native_writer_queued() {
         ),
     )
     .unwrap();
-    let probe = server.base.join("queued-reader.py");
+    let probe = server
+        .base
+        .join("node_modules/@earendil-works/pi-coding-agent/dist/cli.js");
     fs::write(
         &probe,
         format!(
-            "import ctypes, pathlib, time\nctypes.CDLL(None).prctl(15, b'pi', 0, 0, 0)\npathlib.Path({:?}).write_text('blocked')\nwhile True: time.sleep(0.01)\n",
-            server.base.join("reader-blocked").to_str().unwrap(),
+            "const fs=require('fs'); fs.writeFileSync({:?},''); fs.writeFileSync({:?},'blocked'); setInterval(()=>{{}},1000);\n",
+            server.pi_input,
+            server.base.join("reader-blocked"),
         ),
     )
     .unwrap();
@@ -703,11 +717,10 @@ fn guarded_agent_prompt_refuses_foreground_change_while_native_writer_queued() {
     fs::write(
         server.bin.join("pi"),
         format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$PROBE_ORIGIN\" >> '{}'\n/usr/bin/stty raw -echo\nexport HERDR_AGENT=pi\n'{}' pane report-agent \"$1\" --source custom:expected-terminal-test --agent pi --state idle >/dev/null\nprintf '\\033[?2004h'\nexec /bin/bash -c 'exec -a pi /usr/bin/python3 \"$1\"' -- '{}' > '{}'\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$PROBE_ORIGIN\" >> '{}'\n/usr/bin/stty raw -echo\n'{}' pane report-agent \"$1\" --source custom:expected-terminal-test --agent pi --state idle >/dev/null\nprintf '\\033[?2004h'\nexec /usr/local/bin/node '{}' \"$1\"\n",
             server.base.join("pi-launch").display(),
             env!("CARGO_BIN_EXE_herdr"),
             probe.display(),
-            server.pi_input.display()
         ),
     )
     .unwrap();
@@ -894,14 +907,12 @@ fn guarded_agent_prompt_refuses_delayed_enter_after_native_probe_consumes_text()
     let text = "--assignment\nλ 日本語\nsecond line";
     let payload = format!("\x1b[200~{text}\x1b[201~").into_bytes();
     let ready = server.base.join("raw-reader-ready");
-    let probe = server.base.join("raw-reader.py");
+    let probe = server
+        .base
+        .join("node_modules/@earendil-works/pi-coding-agent/dist/cli.js");
     fs::write(&probe, format!(
-        "import os, pathlib, termios, tty\nold=termios.tcgetattr(0)\ntty.setraw(0)\npathlib.Path({:?}).write_text('ready')\ndata=b''\nwhile len(data)<{}:\n data+=os.read(0, {}-len(data))\npathlib.Path({:?}).write_bytes(data)\ntermios.tcsetattr(0,termios.TCSANOW,old)\nos.write(1,b'\\x1b[?2004l')\n",
-        ready.to_str().unwrap(), payload.len(), payload.len(), server.pi_input.to_str().unwrap()
-    )).unwrap();
-    fs::write(server.bin.join("pi"), format!(
-        "#!/bin/sh\nprintf '%s\\n' \"$PROBE_ORIGIN\" >> '{}'\nexport HERDR_AGENT=pi\n'{}' pane report-agent \"$1\" --source custom:expected-terminal-test --agent pi --state idle >/dev/null\nprintf '\\033[?2004h'\nexec /bin/bash -c 'exec -a pi /usr/bin/python3 \"$@\"' -- '{}'\n",
-        server.base.join("pi-launch").display(), env!("CARGO_BIN_EXE_herdr"), probe.display()
+        "const fs=require('fs'); process.stdin.setRawMode(true); fs.writeFileSync({:?},'ready'); process.stdout.write('\\x1b[?2004h'); let data=Buffer.alloc(0); process.stdin.on('data', b=>{{ data=Buffer.concat([data,b]); if(data.length>={}){{ fs.writeFileSync({:?},data); require('child_process').spawnSync('/usr/bin/stty',['sane'],{{stdio:[0,1,2]}}); process.stdout.write('\\x1b[?2004l'); process.exit(0); }} }});\n",
+        ready, payload.len(), server.pi_input
     )).unwrap();
     let pane = server.pane("original");
     server.barrier(&pane);
@@ -943,6 +954,276 @@ fn guarded_agent_prompt_refuses_delayed_enter_after_native_probe_consumes_text()
     server.barrier(&pane);
     assert_eq!(fs::read(&prompts).unwrap().len(), prompts_before + 2);
     assert_eq!(fs::read(&server.pi_input).unwrap(), payload);
+}
+
+// Linux supplies independent executable, argv, generation and tpgid evidence.
+// This package-path Node helper is NOT installed Pi and never rewrites title.
+#[cfg(target_os = "linux")]
+fn native_launcher_identity(pid: u32) -> (u32, u32, u64) {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+    let fields: Vec<_> = stat
+        .rsplit_once(')')
+        .unwrap()
+        .1
+        .split_whitespace()
+        .collect();
+    (
+        fields[2].parse().unwrap(),
+        fields[5].parse().unwrap(),
+        fields[19].parse().unwrap(),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn native_surviving_launcher_case(mode: &str) {
+    use std::os::unix::fs::MetadataExt;
+    let server = GuardServer::new("0");
+    let text = "--assignment\nλ 日本語\nsecond line";
+    let payload = format!("\x1b[200~{text}\x1b[201~").into_bytes();
+    let probe = server
+        .base
+        .join("node_modules/@earendil-works/pi-coding-agent/dist/cli.js");
+    let ready = server.base.join("node-ready");
+    let body = if mode == "delayed" {
+        format!("let data=Buffer.alloc(0); process.stdin.on('data', b=>{{data=Buffer.concat([data,b]); if(data.length>={}){{fs.writeFileSync({:?},data); process.stdout.write('\\x1b[?2004l'); process.exit(0);}}}});", payload.len(), server.pi_input)
+    } else {
+        format!(
+            "process.stdin.on('data', b=>fs.appendFileSync({:?},b));",
+            server.pi_input
+        )
+    };
+    fs::write(&probe, format!("const fs=require('fs'); process.stdin.setRawMode(true); fs.writeFileSync({:?},''); process.stdout.write('\\x1b[?2004h'); fs.writeFileSync({ready:?},String(process.pid)); {body}\n", server.pi_input)).unwrap();
+    let follow = server.base.join("innocuous-follow.py");
+    let follow_ready = server.base.join("follow-ready");
+    let follow_input = server.base.join("follow-input");
+    let follow_done = server.base.join("follow-done");
+    let fence = "\x1fR6_FENCE\x1f";
+    // The unrecognized raw reader records ALL bytes, including a bare Enter.
+    // TCSANOW never flushes queued input. An explicit raw fence proves drainage
+    // without guessing a quiet interval or erasing residual text/Enter.
+    fs::write(&follow, format!("import os,pathlib,tty,termios\ntty.setraw(0,termios.TCSANOW)\npathlib.Path({follow_ready:?}).write_text(str(os.getpid()))\ndata=b''\nwhile not data.endswith(b'\\x1fR6_FENCE\\x1f'):\n data+=os.read(0,4096)\n pathlib.Path({follow_input:?}).write_bytes(data)\npathlib.Path({follow_done:?}).write_text('done')\nwhile True: os.read(0,4096)\n")).unwrap();
+    fs::write(server.bin.join("pi"), format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$PROBE_ORIGIN\" >> '{}'\n'{}' pane report-agent \"$1\" --source custom:expected-terminal-test --agent pi --state idle >/dev/null\nprintf '%s' \"$$\" > '{}'\n/usr/local/bin/node '{}' \"$1\" < /dev/tty &\nchild=$!\nprintf '%s' \"$child\" > '{}'\nwait \"$child\"\nprintf '\\033[?2004l'\n/usr/bin/python3 '{}'\n: surviving_nonexec_leader\n",
+        server.base.join("pi-launch").display(), env!("CARGO_BIN_EXE_herdr"), server.base.join("leader-pid").display(), probe.display(), server.base.join("child-pid").display(), follow.display()
+    )).unwrap();
+    let pane = server.pane("original");
+    server.barrier(&pane);
+    server.start_worker(&pane);
+    assert!(wait_until(
+        Duration::from_secs(3),
+        Duration::from_millis(10),
+        || ready.exists()
+    ));
+    // Apply lifecycle readiness only after the actual child published its raw
+    // input barrier; a pre-child launcher report can race startup detection.
+    let report = server.cli(&[
+        "pane",
+        "report-agent",
+        server.pane_id(&pane),
+        "--source",
+        "herdr:pi",
+        "--agent",
+        "pi",
+        "--state",
+        "idle",
+    ]);
+    assert!(
+        report.status.success(),
+        "{}",
+        String::from_utf8_lossy(&report.stderr)
+    );
+    let expected = server.observed_worker_terminal();
+    let child: u32 = fs::read_to_string(&ready).unwrap().parse().unwrap();
+    let leader: u32 = fs::read_to_string(server.base.join("leader-pid"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        fs::read_to_string(server.base.join("child-pid"))
+            .unwrap()
+            .parse::<u32>()
+            .unwrap(),
+        child
+    );
+    assert_eq!(
+        fs::read_link(format!("/proc/{child}/exe")).unwrap(),
+        fs::canonicalize("/usr/local/bin/node").unwrap()
+    );
+    let argv = fs::read(format!("/proc/{child}/cmdline")).unwrap();
+    assert!(
+        argv.split(|b| *b == 0)
+            .any(|arg| arg == probe.as_os_str().as_encoded_bytes()),
+        "explicit recognized CLI argv: {argv:?}"
+    );
+    assert_eq!(
+        fs::read_link(format!("/proc/{leader}/exe")).unwrap(),
+        fs::canonicalize("/bin/sh").unwrap()
+    );
+    let identity = native_launcher_identity(leader);
+    assert_eq!((identity.0, identity.1), (leader, leader));
+    assert_eq!(native_launcher_identity(child).0, leader);
+    let info = server.request("pane.process_info", json!({"pane_id":pane["pane_id"]}));
+    assert_eq!(
+        info["result"]["process_info"]["foreground_process_group_id"],
+        leader
+    );
+    eprintln!("native same-group {mode}: actual node={child}; exe/CLI argv verified; leader={leader}; pgrp/tpgid/start={identity:?}; terminal={expected}");
+    let kill_child = || {
+        // Never kill the group: the shell launcher MUST survive unchanged.
+        assert_eq!(
+            unsafe { libc::kill(child as libc::pid_t, libc::SIGTERM) },
+            0
+        );
+        assert!(wait_until(
+            Duration::from_secs(3),
+            Duration::from_millis(10),
+            || follow_ready.exists()
+        ));
+        assert!(
+            !Path::new(&format!("/proc/{child}")).exists(),
+            "actual child reaped"
+        );
+        assert_eq!(native_launcher_identity(leader), identity);
+    };
+    let log_path = server
+        .base
+        .join("state")
+        .join(app_dir_name())
+        .join("api-input.jsonl");
+    let log_before = fs::read(&log_path).unwrap();
+    let response = if mode == "lock" {
+        thread::scope(|scope| {
+            // Drop lock before scoped request joins, including during unwinding.
+            let lock = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&log_path)
+                .unwrap();
+            lock.lock().unwrap();
+            let meta = lock.metadata().unwrap();
+            let inode = format!(
+                "{:02x}:{:02x}:{}",
+                libc::major(meta.dev()),
+                libc::minor(meta.dev()),
+                meta.ino()
+            );
+            let server_pid = server.server.as_ref().unwrap().id().to_string();
+            let blocked = || {
+                fs::read_to_string("/proc/locks")
+                    .unwrap()
+                    .lines()
+                    .any(|line| {
+                        let fields: Vec<_> = line.split_whitespace().collect();
+                        ["->", "FLOCK", "WRITE", &server_pid, &inode]
+                            .iter()
+                            .all(|field| fields.contains(field))
+                    })
+            };
+            let writer = scope.spawn(|| native_guarded_request(&server.socket, text, &expected));
+            assert!(
+                wait_until(Duration::from_secs(3), Duration::from_millis(10), blocked),
+                "exact log inode waiter"
+            );
+            assert_eq!(fs::read(&log_path).unwrap(), log_before);
+            assert!(!writer.is_finished());
+            kill_child();
+            assert!(
+                blocked() && !writer.is_finished(),
+                "child exited while receiver still suspended"
+            );
+            assert!(fs::read(&server.pi_input).unwrap().is_empty());
+            drop(lock);
+            writer.join().unwrap()
+        })
+    } else {
+        if mode == "gone" {
+            kill_child();
+        }
+        // Reader exits itself on exact text, no parent sleep or guessed kill.
+        native_guarded_request(&server.socket, text, &expected)
+    };
+    assert!(wait_until(
+        Duration::from_secs(3),
+        Duration::from_millis(10),
+        || follow_ready.exists()
+    ));
+    assert_eq!(
+        native_launcher_identity(leader),
+        identity,
+        "launcher PID/start/group/tpgid unchanged"
+    );
+    let same = server.request("pane.get", json!({"pane_id":pane["pane_id"]}));
+    assert_eq!(same["result"]["pane"]["terminal_id"], expected);
+    let sent = server.request(
+        "pane.send_text",
+        json!({"pane_id":pane["pane_id"], "text":fence}),
+    );
+    assert!(sent.get("result").is_some(), "{sent}");
+    assert!(wait_until(
+        Duration::from_secs(3),
+        Duration::from_millis(10),
+        || follow_done.exists()
+    ));
+    let capture = fs::read(&server.pi_input).unwrap();
+    let downstream = fs::read(&follow_input).unwrap();
+    eprintln!("native same-group {mode} proof: response={response}; actual-node={capture:?}; follow-on={downstream:?}; explicit-fence={:?}; unchanged leader={identity:?}", fence.as_bytes());
+    assert_eq!(
+        capture,
+        if mode == "delayed" {
+            payload
+        } else {
+            Vec::new()
+        }
+    );
+    assert!(
+        response.get("result").is_none(),
+        "no successful acknowledgement: {response}"
+    );
+    assert!(
+        matches!(
+            response["error"]["code"].as_str(),
+            Some("agent_not_ready" | "agent_prompt_failed")
+        ),
+        "{response}"
+    );
+    assert_eq!(
+        downstream,
+        fence.as_bytes(),
+        "NO guarded text, Enter or residual; only explicit raw downstream fence"
+    );
+    if mode == "gone" {
+        let attempts = |bytes: &[u8]| {
+            String::from_utf8_lossy(bytes)
+                .lines()
+                .filter(|line| {
+                    serde_json::from_str::<Value>(line).unwrap()["method"] == "agent.prompt_guarded"
+                })
+                .count()
+        };
+        assert_eq!(
+            attempts(&fs::read(&log_path).unwrap()),
+            attempts(&log_before),
+            "launcher-only refuses before logging effects"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn guarded_agent_prompt_refuses_surviving_launcher_during_input_log_lock() {
+    native_surviving_launcher_case("lock");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn guarded_agent_prompt_refuses_surviving_launcher_delayed_enter() {
+    native_surviving_launcher_case("delayed");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn guarded_agent_prompt_refuses_launcher_only_after_actual_node_exits() {
+    native_surviving_launcher_case("gone");
 }
 
 #[test]
