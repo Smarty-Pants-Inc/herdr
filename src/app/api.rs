@@ -1737,6 +1737,25 @@ mod tests {
 
     #[tokio::test]
     async fn agent_explain_evaluates_with_server_manifest_cache() {
+        // Isolate config/state roots and the manifest cache without changing
+        // process-wide HOME/XDG variables. The guard restores both on drop.
+        let _dirs = crate::detect::manifest::test_manifest_dirs("api-explain-cache");
+        let manifest_path = crate::config::config_dir()
+            .join("agent-detection")
+            .join("codex.toml");
+        std::fs::create_dir_all(manifest_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &manifest_path,
+            r#"id = "codex"
+
+[[rules]]
+id = "api_cache_marker"
+state = "working"
+contains = ["herdr-api-cache-marker"]
+"#,
+        )
+        .unwrap();
+
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(
             &crate::config::Config::default(),
@@ -1759,11 +1778,23 @@ mod tests {
         let runtime = crate::terminal::TerminalRuntime::test_with_screen_bytes(
             80,
             24,
-            b"press enter to confirm or esc to cancel",
+            b"herdr-api-cache-marker",
         );
         app.terminal_runtimes.insert(terminal_id, runtime);
         let target = app.public_pane_id(0, pane_id).unwrap();
 
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "reload_explain_manifest".into(),
+            method: crate::api::schema::Method::ServerReloadAgentManifests(
+                crate::api::schema::EmptyParams::default(),
+            ),
+        });
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["result"]["type"], "agent_manifest_reload");
+
+        // Explain must evaluate the server's cached manifest, not reread disk
+        // or fall back to a bundled rule after the override disappears.
+        std::fs::remove_file(&manifest_path).unwrap();
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "agent_explain".into(),
             method: crate::api::schema::Method::AgentExplain(crate::api::schema::AgentTarget {
@@ -1773,10 +1804,14 @@ mod tests {
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
 
         assert_eq!(response["result"]["type"], "agent_explain");
-        assert_eq!(response["result"]["explain"]["state"], "blocked");
+        assert_eq!(response["result"]["explain"]["state"], "working");
         assert_eq!(
             response["result"]["explain"]["matched_rule"]["id"],
-            "live_strong_blocker"
+            "api_cache_marker"
+        );
+        assert_eq!(
+            response["result"]["explain"]["manifest_source"],
+            manifest_path.to_string_lossy().as_ref()
         );
     }
 
