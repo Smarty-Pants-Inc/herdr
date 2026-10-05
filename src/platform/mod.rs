@@ -3,6 +3,10 @@
 //! Centralizes OS-dependent behavior behind a clean boundary so core
 //! modules don't scatter `#[cfg]` branches through product logic.
 
+/// Guarded agent prompts require platform console ownership evidence.
+/// Windows support is deferred until that evidence is available.
+pub(crate) const GUARDED_AGENT_PROMPT_SUPPORTED: bool = !cfg!(windows);
+
 mod diagnostic_owner;
 pub(crate) use diagnostic_owner::{
     diagnostic_directory, diagnostic_owner_identity, diagnostic_snapshot_name,

@@ -187,6 +187,18 @@ pub(super) fn prompt_agent(
     let (mut params, expected_terminal) = match method {
         Method::AgentPrompt(params) => (params, None),
         Method::AgentPromptGuarded(params) => {
+            // Refuse before even the optional wait-mode agent lookup or app dispatch.
+            if !crate::platform::GUARDED_AGENT_PROMPT_SUPPORTED {
+                return serde_json::to_string(&ErrorResponse {
+                    id: request_id,
+                    error: ErrorBody {
+                        code: "platform_unsupported".into(),
+                        message: "agent.prompt_guarded is not supported on Windows".into(),
+                    },
+                })
+                .map(Some)
+                .map_err(std::io::Error::other);
+            }
             if let Err(message) =
                 crate::api::schema::validate_expected_terminal_identity(&params.expected_terminal)
             {

@@ -153,7 +153,7 @@ fn default_capabilities() -> Option<ServerCapabilities> {
         ssh_agent_registration: false,
         guarded_live_handoff: crate::platform::capabilities().live_handoff,
         expected_terminal_guard: true,
-        expected_terminal_agent_prompt_guard: true,
+        expected_terminal_agent_prompt_guard: crate::platform::GUARDED_AGENT_PROMPT_SUPPORTED,
     })
 }
 
@@ -885,6 +885,69 @@ mod windows_tests {
             done_tx.send(result).unwrap();
         });
         (done_rx, thread)
+    }
+
+    #[test]
+    fn windows_current_receiver_does_not_advertise_guarded_agent_prompt() {
+        let caps = default_capabilities().unwrap();
+        assert!(caps.expected_terminal_guard);
+        assert!(!caps.expected_terminal_agent_prompt_guard);
+    }
+
+    #[test]
+    fn windows_guarded_agent_prompt_never_dispatches_even_with_wait() {
+        for direct_wait_entry in [false, true] {
+            for wait in [false, true] {
+                let mut params = serde_json::json!({
+                    "target": "reviewer", "text": "must not send",
+                    "expected_terminal": "term_1", "allow_cross_pane": true,
+                });
+                if wait {
+                    params["wait"] = serde_json::json!({"timeout_ms": 1000});
+                }
+                let request = serde_json::json!({
+                    "id": "windows-guard-refused", "method": "agent.prompt_guarded",
+                    "params": params,
+                });
+                let (api_tx, mut api_rx) = tokio::sync::mpsc::unbounded_channel();
+                let (mut client, mut server, path) = local_stream_pair("unsupported-prompt-guard");
+                let running = Arc::new(AtomicBool::new(true));
+                let response = if direct_wait_entry {
+                    let request: Request = serde_json::from_value(request).unwrap();
+                    prompt_agent(
+                        request.id,
+                        request.method,
+                        ApiRequestContext::default(),
+                        &mut server,
+                        &api_tx,
+                        &EventHub::default(),
+                        &running,
+                    )
+                    .unwrap()
+                    .unwrap()
+                } else {
+                    writeln!(client, "{request}").unwrap();
+                    client.flush().unwrap();
+                    handle_connection(server, &api_tx, &EventHub::default(), &running, None)
+                        .unwrap();
+                    let mut response = String::new();
+                    BufReader::new(&mut client)
+                        .read_line(&mut response)
+                        .unwrap();
+                    response
+                };
+                let response: ErrorResponse = serde_json::from_str(&response).unwrap();
+                assert_eq!(response.id, "windows-guard-refused");
+                assert_eq!(response.error.code, "platform_unsupported");
+                assert!(response.error.message.contains("agent.prompt_guarded"));
+                assert!(response.error.message.contains("Windows"));
+                assert!(
+                    api_rx.try_recv().is_err(),
+                    "must not look up or dispatch to app"
+                );
+                let _ = std::fs::remove_file(path);
+            }
+        }
     }
 
     #[test]

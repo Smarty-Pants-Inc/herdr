@@ -432,6 +432,149 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_secs(60));
     }
 
+    #[cfg(target_os = "linux")]
+    fn wait_guard_exec_ready(
+        child: &mut GuardTestChild,
+        timeout: std::time::Duration,
+    ) -> std::io::Result<()> {
+        use std::io::Read;
+        use std::os::fd::AsRawFd;
+        let mut output = child.stdout.take().expect("helper stdout");
+        let fd = output.as_raw_fd();
+        // Nonblocking reads keep missing or partial receipts bounded too.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let deadline = std::time::Instant::now() + timeout;
+        let expected = format!("guard-exec-ready {}", child.id());
+        let mut receipt = Vec::new();
+        let mut buffer = [0; 1024];
+        loop {
+            match output.read(&mut buffer) {
+                Ok(0) => return Err(std::io::ErrorKind::UnexpectedEof.into()),
+                Ok(count) => {
+                    receipt.extend_from_slice(&buffer[..count]);
+                    // Only a complete line from this exact child opens the barrier.
+                    if receipt.split_inclusive(|byte| *byte == b'\n').any(|line| {
+                        line.strip_suffix(b"\n")
+                            .is_some_and(|line| line.ends_with(expected.as_bytes()))
+                    }) {
+                        return Ok(());
+                    }
+                    if receipt.len() > 8192 {
+                        return Err(std::io::ErrorKind::InvalidData.into());
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => return Err(error),
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(std::io::ErrorKind::TimedOut.into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn guard_exec_child(pane: Option<&str>) -> GuardTestChild {
+        let mut command =
+            std::process::Command::new(std::env::current_exe().expect("test executable"));
+        command
+            .args([
+                "--exact",
+                "app::api::input_guard::tests::guard_exec_peer_helper",
+                "--nocapture",
+            ])
+            .stdout(std::process::Stdio::piped());
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("HERDR_") {
+                command.env_remove(key);
+            }
+        }
+        command.env(
+            "HERDR_GUARD_EXEC_HELPER",
+            if pane.is_some() { "marked" } else { "ordinary" },
+        );
+        if let Some(pane) = pane {
+            command.env("HERDR_ENV", "1").env("HERDR_PANE_ID", pane);
+        }
+        let mut child = GuardTestChild(command.spawn().expect("owned exec helper"));
+        // spawn() alone does not prove /proc sees the new exec environment.
+        // The helper checks its own markers before emitting this receipt. Do not
+        // capture/retry expected API context until this startup barrier opens.
+        wait_guard_exec_ready(&mut child, std::time::Duration::from_secs(5))
+            .expect("post-exec readiness receipt");
+        child
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn guard_exec_readiness_rejects_missing_wrong_and_partial_receipts() {
+        for script in [
+            "exit 0",
+            "printf 'guard-exec-ready 0\\n'",
+            "printf 'guard-exec-ready %s' $$",
+        ] {
+            let mut child = GuardTestChild(
+                std::process::Command::new("sh")
+                    .args(["-c", script])
+                    .stdout(std::process::Stdio::piped())
+                    .spawn()
+                    .expect("owned negative receipt child"),
+            );
+            assert_eq!(
+                wait_guard_exec_ready(&mut child, std::time::Duration::from_secs(5))
+                    .expect_err("invalid readiness cannot open barrier")
+                    .kind(),
+                std::io::ErrorKind::UnexpectedEof
+            );
+        }
+        let mut child = GuardTestChild(
+            std::process::Command::new("sleep")
+                .arg("60")
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .expect("owned silent child"),
+        );
+        assert_eq!(
+            wait_guard_exec_ready(&mut child, std::time::Duration::from_millis(50))
+                .expect_err("silent child must hit deadline")
+                .kind(),
+            std::io::ErrorKind::TimedOut
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn guard_exec_readiness_requires_post_exec_marker_validation() {
+        for (mode, pane) in [("marked", None), ("ordinary", Some("w9V:p1"))] {
+            let mut command =
+                std::process::Command::new(std::env::current_exe().expect("test executable"));
+            command
+                .args([
+                    "--exact",
+                    "app::api::input_guard::tests::guard_exec_peer_helper",
+                    "--nocapture",
+                ])
+                .env_clear()
+                .env("HERDR_GUARD_EXEC_HELPER", mode)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null());
+            if let Some(pane) = pane {
+                command.env("HERDR_ENV", "1").env("HERDR_PANE_ID", pane);
+            }
+            let mut child = GuardTestChild(command.spawn().expect("invalid marker helper"));
+            assert_eq!(
+                wait_guard_exec_ready(&mut child, std::time::Duration::from_secs(5))
+                    .expect_err("helper must reject wrong markers before readiness")
+                    .kind(),
+                std::io::ErrorKind::UnexpectedEof
+            );
+            assert!(!child.wait().expect("reap rejecting helper").success());
+        }
+    }
+
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn detached_sleep_child() -> GuardTestChild {
         let mut command = std::process::Command::new("sleep");
@@ -1265,14 +1408,7 @@ mod tests {
             .runtime_for_pane_in_workspace(&fixture.app.terminal_runtimes, 0, target_pane)
             .expect("target runtime")
             .test_set_child_pid(target_root.id());
-        let marked_child = GuardTestChild(
-            std::process::Command::new("sleep")
-                .arg("60")
-                .env("HERDR_ENV", "1")
-                .env("HERDR_PANE_ID", &fixture.source_pane_id)
-                .spawn()
-                .expect("actual marked agent child"),
-        );
+        let marked_child = guard_exec_child(Some(&fixture.source_pane_id));
         fixture
             .app
             .state
@@ -1335,14 +1471,7 @@ mod tests {
             // Capture readable absence from an actual sanitized exec. Model its
             // older-server ancestry separately so this test remains valid when
             // nextest itself inherited pane markers from the enclosing harness.
-            let ordinary_child = GuardTestChild(
-                std::process::Command::new("sleep")
-                    .arg("60")
-                    .env_remove("HERDR_ENV")
-                    .env_remove("HERDR_PANE_ID")
-                    .spawn()
-                    .expect("marker-free ordinary child"),
-            );
+            let ordinary_child = guard_exec_child(None);
             let ordinary = ApiRequestContext::for_local_peer_pid(Some(ordinary_child.id()));
             assert_eq!(
                 ordinary.local_peer_pane_origin,

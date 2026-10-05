@@ -93,6 +93,15 @@ impl App {
             return false;
         }
         if let crate::api::schema::Method::AgentPromptGuarded(params) = &request.method {
+            // Internal dispatch must obey the same policy before attribution or input effects.
+            if !crate::platform::GUARDED_AGENT_PROMPT_SUPPORTED {
+                let _ = respond_to.send(encode_error(
+                    request.id,
+                    "platform_unsupported",
+                    "agent.prompt_guarded is not supported on Windows",
+                ));
+                return true;
+            }
             if let Err(message) =
                 crate::api::schema::validate_expected_terminal_identity(&params.expected_terminal)
             {
@@ -908,6 +917,7 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn guarded_prompt_rejects_terminal_mismatch_before_any_input() {
         let mut app = app_with_agent();
@@ -938,6 +948,7 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn guarded_prompt_accepts_same_terminal_multiline_once() {
         let mut app = app_with_agent();
@@ -973,6 +984,7 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn guarded_prompt_copilot_focus_is_part_of_checked_text_submission() {
         let mut app = app_with_agent();
@@ -1003,6 +1015,62 @@ mod tests {
         assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"\x1b[Iprompt"));
         assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"\r"));
         assert!(rx.try_recv().is_err());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_guarded_prompt_refuses_before_input_log_focus_or_enter() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_agent_name("reviewer".into());
+        terminal.set_detected_state(Some(Agent::GithubCopilot), AgentState::Idle);
+        let (runtime, mut rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.state.insert_test_runtime(pane_id, runtime);
+        app.state.outer_terminal_focus = Some(false);
+        let active = app.state.active;
+        let selected = app.state.selected;
+        let focused = app.state.workspaces[0].tabs[0].layout.focused();
+
+        for allow_cross_pane in [false, true] {
+            for expected_terminal in [terminal_id.to_string(), String::new()] {
+                let response = run_guarded_agent_prompt(
+                    &mut app,
+                    "windows-guard-refused",
+                    AgentPromptParams {
+                        target: "reviewer".into(),
+                        text: "must not send\nsecond line".into(),
+                        wait: None,
+                        allow_cross_pane,
+                    },
+                    expected_terminal,
+                );
+                let error: crate::api::schema::ErrorResponse =
+                    serde_json::from_str(&response).unwrap();
+                assert_eq!(error.id, "windows-guard-refused");
+                assert_eq!(error.error.code, "platform_unsupported");
+                assert!(error.error.message.contains("agent.prompt_guarded"));
+                assert!(error.error.message.contains("Windows"));
+                assert!(!app.api_input_log.exists());
+                assert!(app.accepted_api_inputs.is_empty());
+                assert_eq!(app.state.active, active);
+                assert_eq!(app.state.selected, selected);
+                assert_eq!(app.state.workspaces[0].tabs[0].layout.focused(), focused);
+                assert_eq!(app.state.outer_terminal_focus, Some(false));
+            }
+        }
+        assert!(
+            tokio::time::timeout(
+                AGENT_PROMPT_SUBMIT_DELAY + Duration::from_millis(100),
+                rx.recv()
+            )
+            .await
+            .is_err(),
+            "unsupported guarded prompt wrote focus, text, or delayed Enter"
+        );
     }
 
     #[test]
