@@ -46,6 +46,25 @@ fn protocol_schema_document() -> serde_json::Value {
 }
 
 #[test]
+fn resume_report_cross_pane_opt_in_defaults_false() {
+    for method in ["pane.report_agent", "pane.report_agent_session"] {
+        let mut value = serde_json::json!({
+            "id": "report-default", "method": method,
+            "params": {"pane_id": "w1:p1", "source": "custom:pi", "agent": "pi", "state": "idle"},
+        });
+        let request: Request = serde_json::from_value(value.clone()).unwrap();
+        let serialized = serde_json::to_value(&request).unwrap();
+        assert_eq!(serialized["params"]["allow_cross_pane"], false);
+        value["params"]["allow_cross_pane"] = true.into();
+        let request: Request = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            serde_json::to_value(request).unwrap()["params"]["allow_cross_pane"],
+            true
+        );
+    }
+}
+
+#[test]
 fn request_uses_dot_method_names() {
     let request = Request {
         id: "req_1".into(),

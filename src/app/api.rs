@@ -9,7 +9,6 @@ mod integrations;
 #[cfg(all(test, unix))]
 mod launch_env_defaults_tests;
 mod layouts;
-mod pane_graphics;
 mod panes;
 pub(crate) mod plugins;
 mod project_change;
@@ -479,6 +478,7 @@ impl App {
                     runtime.set_full_lifecycle_authority_active(
                         terminal.full_lifecycle_hook_authority_active(),
                     );
+                    runtime.set_self_reported_agent_active(terminal.self_reported_agent_active());
                 }
             }
         }
@@ -920,6 +920,8 @@ impl App {
         self.handle_api_request_after_internal_events_drained_with_context(request, context)
     }
 
+    // Production dispatch must preserve transport attribution via the context-aware entry point.
+    #[cfg(test)]
     pub(crate) fn handle_api_request_after_internal_events_drained(
         &mut self,
         request: crate::api::schema::Request,
@@ -1227,34 +1229,6 @@ impl App {
             }
             Method::PaneRename(params) => return self.handle_pane_rename(request.id, params),
             Method::PaneRead(params) => return self.handle_pane_read(request.id, params),
-            Method::PaneGraphicsSet(params) => {
-                return self.handle_pane_graphics_set(request.id, params);
-            }
-            Method::PaneGraphicsClear(params) => {
-                return self.handle_pane_graphics_clear(request.id, params);
-            }
-            Method::PaneGraphicsInfo(params) => {
-                return self.handle_pane_graphics_info(request.id, params);
-            }
-            Method::PaneGraphicsStream(_) => {
-                return responses::encode_error(
-                    request.id,
-                    "stream_transport_required",
-                    "pane.graphics.stream requires the streaming socket transport",
-                );
-            }
-            Method::PaneGraphicsStreamSet(params) => {
-                return self.handle_pane_graphics_stream_set(request.id, params);
-            }
-            Method::PaneGraphicsStreamDirect(params) => {
-                return self.handle_pane_graphics_stream_direct(request.id, params);
-            }
-            Method::PaneGraphicsStreamOpen(params) => {
-                return self.handle_pane_graphics_stream_open(request.id, params);
-            }
-            Method::PaneGraphicsStreamClose(params) => {
-                return self.handle_pane_graphics_stream_close(request.id, params);
-            }
             Method::PaneReportAgent(params) => {
                 return self.handle_pane_report_agent(request.id, params);
             }
@@ -1737,6 +1711,25 @@ mod tests {
 
     #[tokio::test]
     async fn agent_explain_evaluates_with_server_manifest_cache() {
+        // Isolate config/state roots and the manifest cache without changing
+        // process-wide HOME/XDG variables. The guard restores both on drop.
+        let _dirs = crate::detect::manifest::test_manifest_dirs("api-explain-cache");
+        let manifest_path = crate::config::config_dir()
+            .join("agent-detection")
+            .join("codex.toml");
+        std::fs::create_dir_all(manifest_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &manifest_path,
+            r#"id = "codex"
+
+[[rules]]
+id = "api_cache_marker"
+state = "working"
+contains = ["herdr-api-cache-marker"]
+"#,
+        )
+        .unwrap();
+
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(
             &crate::config::Config::default(),
@@ -1759,11 +1752,23 @@ mod tests {
         let runtime = crate::terminal::TerminalRuntime::test_with_screen_bytes(
             80,
             24,
-            b"press enter to confirm or esc to cancel",
+            b"herdr-api-cache-marker",
         );
         app.terminal_runtimes.insert(terminal_id, runtime);
         let target = app.public_pane_id(0, pane_id).unwrap();
 
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "reload_explain_manifest".into(),
+            method: crate::api::schema::Method::ServerReloadAgentManifests(
+                crate::api::schema::EmptyParams::default(),
+            ),
+        });
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["result"]["type"], "agent_manifest_reload");
+
+        // Explain must evaluate the server's cached manifest, not reread disk
+        // or fall back to a bundled rule after the override disappears.
+        std::fs::remove_file(&manifest_path).unwrap();
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "agent_explain".into(),
             method: crate::api::schema::Method::AgentExplain(crate::api::schema::AgentTarget {
@@ -1773,10 +1778,14 @@ mod tests {
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
 
         assert_eq!(response["result"]["type"], "agent_explain");
-        assert_eq!(response["result"]["explain"]["state"], "blocked");
+        assert_eq!(response["result"]["explain"]["state"], "working");
         assert_eq!(
             response["result"]["explain"]["matched_rule"]["id"],
-            "live_strong_blocker"
+            "api_cache_marker"
+        );
+        assert_eq!(
+            response["result"]["explain"]["manifest_source"],
+            manifest_path.to_string_lossy().as_ref()
         );
     }
 

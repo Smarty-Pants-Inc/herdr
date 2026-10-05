@@ -1206,8 +1206,9 @@ fn parse_pane_wait_output_args(args: &[String]) -> Result<PaneWaitForOutputParam
 }
 
 fn pane_report_agent(args: &[String]) -> std::io::Result<i32> {
-    const USAGE: &str = "usage: herdr pane report-agent <pane_id> --source ID --agent LABEL --state idle|working|blocked|unknown [--message TEXT] [--seq N] [--agent-session-id ID] [--agent-session-path PATH]";
+    const USAGE: &str = "usage: herdr pane report-agent <pane_id> --source ID --agent LABEL --state idle|working|blocked|unknown [--message TEXT] [--seq N] [--agent-session-id ID] [--agent-session-path PATH] [--allow-cross-pane] [-- <resume-command...>]";
 
+    let (args, resume_argv) = split_resume_argv(args);
     let args = super::expand_equals_args(
         args,
         &[
@@ -1228,10 +1229,15 @@ fn pane_report_agent(args: &[String]) -> std::io::Result<i32> {
     let mut seq = None;
     let mut agent_session_id = None;
     let mut agent_session_path = None;
+    let mut allow_cross_pane = false;
 
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
+            "--allow-cross-pane" => {
+                allow_cross_pane = true;
+                index += 1;
+            }
             "--source" => {
                 let Some(value) = args.get(index + 1) else {
                     eprintln!("missing value for --source");
@@ -1324,6 +1330,7 @@ fn pane_report_agent(args: &[String]) -> std::io::Result<i32> {
     };
 
     super::send_ok_request(Method::PaneReportAgent(PaneReportAgentParams {
+        allow_cross_pane,
         pane_id,
         source,
         agent,
@@ -1332,12 +1339,21 @@ fn pane_report_agent(args: &[String]) -> std::io::Result<i32> {
         seq,
         agent_session_id,
         agent_session_path,
+        resume_argv,
     }))
 }
 
-fn pane_report_agent_session(args: &[String]) -> std::io::Result<i32> {
-    const USAGE: &str = "usage: herdr pane report-agent-session <pane_id> --source ID --agent LABEL [--seq N] [--agent-session-id ID] [--agent-session-path PATH] [--session-start-source SOURCE]";
+fn split_resume_argv(args: &[String]) -> (&[String], Option<Vec<String>>) {
+    match args.iter().position(|arg| arg == "--") {
+        Some(separator) => (&args[..separator], Some(args[separator + 1..].to_vec())),
+        None => (args, None),
+    }
+}
 
+fn pane_report_agent_session(args: &[String]) -> std::io::Result<i32> {
+    const USAGE: &str = "usage: herdr pane report-agent-session <pane_id> --source ID --agent LABEL [--seq N] [--agent-session-id ID] [--agent-session-path PATH] [--session-start-source SOURCE] [--allow-cross-pane] [-- <resume-command...>]";
+
+    let (args, resume_argv) = split_resume_argv(args);
     let args = super::expand_equals_args(
         args,
         &[
@@ -1356,10 +1372,15 @@ fn pane_report_agent_session(args: &[String]) -> std::io::Result<i32> {
     let mut agent_session_id = None;
     let mut agent_session_path = None;
     let mut session_start_source = None;
+    let mut allow_cross_pane = false;
 
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
+            "--allow-cross-pane" => {
+                allow_cross_pane = true;
+                index += 1;
+            }
             "--source" => {
                 let Some(value) = args.get(index + 1) else {
                     eprintln!("missing value for --source");
@@ -1441,6 +1462,7 @@ fn pane_report_agent_session(args: &[String]) -> std::io::Result<i32> {
 
     super::send_ok_request(Method::PaneReportAgentSession(
         PaneReportAgentSessionParams {
+            allow_cross_pane,
             pane_id,
             source,
             agent,
@@ -1448,6 +1470,7 @@ fn pane_report_agent_session(args: &[String]) -> std::io::Result<i32> {
             agent_session_id,
             agent_session_path,
             session_start_source,
+            resume_argv,
         },
     ))
 }

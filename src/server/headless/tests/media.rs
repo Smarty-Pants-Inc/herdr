@@ -12,6 +12,7 @@ fn connect_media_shell(
         server.handle_server_event(ServerEvent::ClientShellConnected {
             surface_reuse: false,
             surface_delta: false,
+            surface_scroll: false,
             media_capable,
             client_id,
             surface_cols: 80,
@@ -57,7 +58,6 @@ fn media_api(
         },
         respond_to,
         response_write_complete: None,
-        stream_active: None,
     });
     response_rx
 }

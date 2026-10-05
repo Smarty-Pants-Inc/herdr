@@ -393,7 +393,7 @@ impl Drop for TestManifestCache {
 /// into MANIFEST_CACHE. Reloads still use the normal serialization mutex.
 #[cfg(test)]
 #[must_use]
-pub(super) struct TestManifestDirs {
+pub(crate) struct TestManifestDirs {
     // Fields drop in declaration order: restore the cache before directory inputs.
     _cache: TestManifestCache,
     _dirs: crate::config::TestConfigDirs,
@@ -408,7 +408,7 @@ impl Drop for TestManifestDirs {
 }
 
 #[cfg(test)]
-pub(super) fn test_manifest_dirs(name: &str) -> TestManifestDirs {
+pub(crate) fn test_manifest_dirs(name: &str) -> TestManifestDirs {
     static NEXT_DIR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let id = NEXT_DIR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let base =

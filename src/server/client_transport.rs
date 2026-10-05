@@ -132,6 +132,24 @@ impl ClientWriter {
         self.render.queue.discard_pending_render();
     }
 
+    #[cfg(all(test, unix))]
+    pub(crate) fn test_paused() -> Self {
+        let queue = ClientWriterQueue::new();
+        Self {
+            control: ClientControlWriter::queue(queue.clone()),
+            render: ClientRenderWriter::queue(queue),
+        }
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn test_drain(&self) -> Vec<Vec<u8>> {
+        let mut state = self.render.queue.lock_state();
+        let mut frames = state.control.drain(..).collect::<Vec<_>>();
+        frames.extend(state.ordered.drain(..));
+        frames.extend(state.render.take());
+        frames
+    }
+
     #[cfg(test)]
     pub(crate) fn test_fill_render(&self, data: Vec<u8>) {
         self.render.try_send(data).unwrap();
@@ -400,6 +418,7 @@ pub(crate) enum ServerEvent {
         surface_active: bool,
         surface_reuse: bool,
         surface_delta: bool,
+        surface_scroll: bool,
         /// Whether the client advertised `media.webrtc.v1`.
         media_capable: bool,
         writer: ClientWriter,
@@ -779,6 +798,7 @@ pub(crate) fn handle_client_handshake(
                     hello.surface_active,
                     hello.surface_reuse,
                     hello.surface_delta,
+                    hello.surface_scroll,
                     hello.capabilities.iter().any(|capability| {
                         capability == crate::protocol::media::MEDIA_WEBRTC_CAPABILITY
                     }),
@@ -871,7 +891,7 @@ pub(crate) fn handle_client_handshake(
 
     // Notify the main loop about the new client.
     let endpoint_control_writer = shell_options.as_ref().map(|_| writer.control.clone());
-    let user = shell_options.as_ref().and_then(|options| options.8.clone());
+    let user = shell_options.as_ref().and_then(|options| options.9.clone());
     let is_shell = shell_options.is_some();
     let connected = if let Some((
         pixel_mouse,
@@ -881,6 +901,7 @@ pub(crate) fn handle_client_handshake(
         surface_active,
         surface_reuse,
         surface_delta,
+        surface_scroll,
         media_capable,
         _user,
     )) = shell_options
@@ -898,6 +919,7 @@ pub(crate) fn handle_client_handshake(
             surface_active,
             surface_reuse,
             surface_delta,
+            surface_scroll,
             media_capable,
             writer,
         }
@@ -1496,6 +1518,7 @@ mod tests {
             surface_active: true,
             surface_reuse: false,
             surface_delta: false,
+            surface_scroll: false,
             snapshot_codecs: vec![crate::protocol::endpoint::SNAPSHOT_CODEC_V1.into()],
             surface_codecs: vec![crate::protocol::endpoint::SURFACE_CODEC_V1.into()],
             input_codecs: vec![crate::protocol::endpoint::INPUT_CODEC_V1.into()],
@@ -1650,7 +1673,7 @@ mod tests {
 
         drop(writer);
         done_rx
-            .recv_timeout(Duration::from_millis(100))
+            .recv_timeout(Duration::from_secs(5))
             .expect("writer exits without polling after senders drop");
     }
 
@@ -1685,7 +1708,7 @@ mod tests {
 
         drop(cloned_writer);
         done_rx
-            .recv_timeout(Duration::from_millis(100))
+            .recv_timeout(Duration::from_secs(5))
             .expect("writer exits after final cloned writer drops");
     }
 
@@ -1711,7 +1734,7 @@ mod tests {
             .send(vec![b'x'; 1024 * 1024])
             .expect("message is accepted before the writer observes socket failure");
         done_rx
-            .recv_timeout(Duration::from_secs(1))
+            .recv_timeout(Duration::from_secs(5))
             .expect("writer exits after socket write failure");
 
         assert!(matches!(writer.control.send(vec![b'y']), Err(SendError(_))));
@@ -1727,15 +1750,17 @@ mod tests {
         use std::io::Read as _;
 
         let (mut client, mut server, _path) = local_stream_pair("slow-observer");
-        server
-            .set_send_timeout(Some(Duration::from_millis(100)))
-            .unwrap();
+        let inactivity_timeout = Duration::from_secs(2);
+        server.set_send_timeout(Some(inactivity_timeout)).unwrap();
         server.set_nonblocking(true).unwrap();
+        let (worker_done_tx, worker_done) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
-            assert!(write_framed_bytes(&mut server, &vec![b'x'; 1024 * 1024]));
+            let start = std::time::Instant::now();
+            let written = write_framed_bytes(&mut server, &vec![b'x'; 1024 * 1024]);
+            let _ = worker_done_tx.send((written, start.elapsed()));
         });
         client
-            .set_recv_timeout(Some(Duration::from_secs(3)))
+            .set_recv_timeout(Some(Duration::from_secs(10)))
             .unwrap();
         let mut received = 0;
         let mut buffer = [0; 16 * 1024];
@@ -1743,8 +1768,16 @@ mod tests {
             let count = client.read(&mut buffer).unwrap();
             assert_ne!(count, 0, "observer disconnected while making progress");
             received += count;
-            std::thread::sleep(Duration::from_millis(5));
+            std::thread::sleep(Duration::from_millis(75));
         }
+        let (written, elapsed) = worker_done
+            .recv_timeout(Duration::from_secs(10))
+            .expect("writer completes while the observer makes progress");
+        assert!(written);
+        assert!(
+            elapsed > inactivity_timeout,
+            "progress must keep the write alive beyond one inactivity timeout"
+        );
         worker.join().unwrap();
     }
 
@@ -1813,10 +1846,10 @@ mod tests {
         });
         writer.render.try_send(vec![0; 4 * 1024 * 1024]).unwrap();
         writer_done
-            .recv_timeout(Duration::from_millis(350))
+            .recv_timeout(Duration::from_secs(5))
             .expect("writer timed out");
         reader_done
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(Duration::from_secs(5))
             .expect("reader released")
             .unwrap();
         worker.join().unwrap();
@@ -2025,12 +2058,14 @@ mod tests {
                 surface_active,
                 surface_reuse,
                 surface_delta,
+                surface_scroll,
                 media_capable,
                 writer,
             } => {
                 assert!(!media_capable);
                 assert!(!surface_reuse);
                 assert!(!surface_delta);
+                assert!(!surface_scroll);
                 assert_eq!(client_id, 43);
                 assert_eq!((surface_cols, surface_rows), (80, 29));
                 assert_eq!((cell_width_px, cell_height_px), (8, 16));

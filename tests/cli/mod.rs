@@ -5,6 +5,8 @@ mod agents;
 mod expected_terminal;
 mod harness;
 mod hooks;
+#[cfg(target_os = "linux")]
+mod input_log;
 mod panes;
 mod plugins;
 mod protocol;

@@ -106,6 +106,46 @@ pub(crate) fn fresh_foreground_job(shell_pid: u32) -> Option<ForegroundJob> {
     }
 }
 
+/// Best-effort diagnostic metadata, never evidence of pane membership.
+#[derive(Debug, Default)]
+pub(crate) struct CallerMetadata {
+    /// OS-reported executable path basename, not a mutable task name or full path.
+    pub(crate) exe: Option<String>,
+    pub(crate) ppid: Option<u32>,
+    pub(crate) unit: Option<String>,
+}
+
+/// Snapshot only the transport-pinned process instance; unsupported platforms
+/// deliberately preserve the input log's original caller shape.
+pub(crate) fn process_caller_metadata(peer: ProcessIdentity) -> Option<CallerMetadata> {
+    #[cfg(target_os = "linux")]
+    return linux::process_caller_metadata_platform(peer);
+    #[cfg(target_os = "macos")]
+    return macos::process_caller_metadata_platform(peer);
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = peer;
+        None
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[test]
+fn caller_metadata_rejects_a_stale_process_generation() {
+    // Cheap E2E cannot deterministically reuse a PID inside a metadata read.
+    let live = process_identity(std::process::id()).expect("live process");
+    let stale = ProcessIdentity {
+        start_time: live.start_time.wrapping_add(1),
+        ..live
+    };
+    assert!(process_caller_metadata(stale).is_none());
+    assert!(process_caller_metadata(ProcessIdentity {
+        pid: 0,
+        start_time: 0,
+    })
+    .is_none());
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Signal {
     Hangup,
@@ -1359,6 +1399,8 @@ mod remote_bridge;
 mod remote_bridge_tests;
 #[cfg(unix)]
 mod unix_common;
+#[cfg(unix)]
+pub(crate) mod unix_image_files;
 #[cfg(unix)]
 pub(crate) use unix_common::{
     begin_cli_output, end_cli_output, forward_remote_bridge_stdio, DiagnosticDirectoryScan,

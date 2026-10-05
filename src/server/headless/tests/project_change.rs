@@ -31,7 +31,6 @@ fn public_method(
         },
         respond_to,
         response_write_complete: None,
-        stream_active: None,
     });
     decode_response(&response_rx.recv().expect("project check response"))
 }
@@ -1403,7 +1402,6 @@ fn project_receiver_method(
             },
             respond_to,
             response_write_complete: None,
-            stream_active: None,
         },
     );
     decode_response(

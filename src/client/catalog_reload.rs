@@ -48,7 +48,7 @@ pub(super) fn apply_profiles(
         state.media.endpoint_gone(&endpoint_id);
         let cancelled = commands.disconnect(&endpoint_id);
         #[cfg(unix)]
-        state.retire_endpoint_graphics(&endpoint_id);
+        state.forget_endpoint_graphics(&endpoint_id);
         if let Some(shell) = state.shell.as_mut() {
             for request_id in cancelled {
                 shell.cancel_endpoint_request(&request_id);

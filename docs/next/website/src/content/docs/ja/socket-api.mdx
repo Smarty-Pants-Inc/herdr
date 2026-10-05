@@ -99,7 +99,7 @@ herdr pane read w1:p2 --source recent --lines 50
 | ワークスペース | `workspace.create`、`workspace.list`、`workspace.get`、`workspace.focus`、`workspace.rename`、`workspace.move`、`workspace.move_block`、`workspace.report_metadata`、`workspace.close` |
 | Worktree | `worktree.list`、`worktree.create`、`worktree.open`、`worktree.remove` |
 | タブ | `tab.create`、`tab.list`、`tab.get`、`tab.focus`、`tab.rename`、`tab.move`、`tab.close` |
-| ペイン | `pane.split`、`pane.swap`、`pane.move`、`pane.zoom`、`pane.layout`、`pane.process_info`、`pane.neighbor`、`pane.edges`、`pane.focus_direction`、`pane.resize`、`pane.list`、`pane.current`、`pane.get`、`pane.last_input`、`pane.rename`、`pane.send_text`、`pane.send_keys`、`pane.send_input`、`pane.send_input_guarded`、`pane.read`、`pane.graphics.info`、`pane.graphics.set`、`pane.graphics.clear`、`pane.graphics.stream`、`pane.report_agent`、`pane.report_agent_session`、`pane.report_metadata`、`pane.clear_agent_authority`、`pane.release_agent`、`pane.close`、`pane.wait_for_output` |
+| ペイン | `pane.split`、`pane.swap`、`pane.move`、`pane.zoom`、`pane.layout`、`pane.process_info`、`pane.neighbor`、`pane.edges`、`pane.focus_direction`、`pane.resize`、`pane.list`、`pane.current`、`pane.get`、`pane.last_input`、`pane.rename`、`pane.send_text`、`pane.send_keys`、`pane.send_input`、`pane.send_input_guarded`、`pane.read`、`pane.report_agent`、`pane.report_agent_session`、`pane.report_metadata`、`pane.clear_agent_authority`、`pane.release_agent`、`pane.close`、`pane.wait_for_output` |
 | ポップアップ | `popup.close` |
 | レイアウト | `layout.export`、`layout.apply`、`layout.apply_restorable`、`layout.set_split_ratio` |
 | エージェント | `agent.list`、`agent.get`、`agent.read`、`agent.explain`、`agent.send_keys`、`agent.prompt`、`agent.wait`、`agent.rename`、`agent.focus`、`agent.start`、`agent.start_guarded` |
@@ -246,20 +246,9 @@ command in a loop.
 
 ### ペイングラフィックス
 
-ペイングラフィックスを使うと、プラグインがペイン上に画像データを配置できます。デフォルトで利用でき、サーバーで `[terminal].kitty_graphics = false` が設定されている場合は、すべてのペイングラフィックスメソッドが `feature_disabled` を返します。この設定の変更にはサーバーの再起動が必要です。`pane.graphics.info` はグラフィックスレイヤーを作成せず、接続中クライアントのセルの幅と高さをピクセル単位で返します。`pane.graphics.set` は `data_base64` の `png`、`rgb`、`rgba` データを受け取り、`pane.graphics.clear` はレイヤーを削除します。
+アプリケーションとプラグインは、ペインのターミナル出力を通じて標準の Kitty グラフィックスプロトコルを送信してください。Herdr が対応する外側ターミナルで画像の配置、クリッピング、表示状態を管理します。
 
-```json
-{"id":"graphics_info","method":"pane.graphics.info","params":{"pane_id":"w1:p1"}}
-{"id":"graphics_set","method":"pane.graphics.set","params":{"pane_id":"w1:p1","format":"png","image_width":800,"image_height":600,"data_base64":"...","placement":{"viewport_col":0,"viewport_row":0,"grid_cols":80,"grid_rows":30}}}
-{"id":"graphics_clear","method":"pane.graphics.clear","params":{"pane_id":"w1:p1"}}
-```
-
-フレームを繰り返し送る場合は、`pane.graphics.stream` で専用ソケットを開きます。Herdr が `ok` を返した後、フレームごとに 1 つの JSON ヘッダーと正確に `data_length` バイトの生データを送ります。ソケットが閉じるまでストリームがそのペインのグラフィックスレイヤーを所有し、同時に set、clear、stream を要求すると `stream_conflict` を返します。
-
-```json
-{"id":"graphics_stream","method":"pane.graphics.stream","params":{"pane_id":"w1:p1"}}
-{"format":"png","image_width":800,"image_height":600,"data_length":12345,"placement":{"viewport_col":0,"viewport_row":0,"grid_cols":80,"grid_rows":30}}
-```
+外部ソケットのペイン画像オーバーレイ API は削除されました。`pane.graphics.info`、`pane.graphics.set`、`pane.graphics.clear`、`pane.graphics.stream` は利用できず、代替のソケット画像 API もありません。旧サーバーとの内部通信プロトコルの互換性は、これらの公開メソッドを復活させるものではありません。
 
 `pane.layout` は、`workspace_id`、`tab_id`、`zoomed`、外側の `area`、`focused_pane_id`、ペインの矩形、分割の矩形/比率を含むタブレイアウトのスナップショットを返します。`pane.neighbor` と `pane.edges` は同じレイアウトスナップショットを含むので、クライアントは非公開のレイアウト状態なしに次の判断を下せます。
 
@@ -596,6 +585,8 @@ Herdr はローカルソケット上の改行区切り JSON を使います。Un
 {"id":"req_1","result":{"type":"pong"}}
 ```
 
+JSON のデコードまで到達したリクエスト行では、メソッドやパラメーターが無効な場合も含め、エラーレスポンスにもリクエストの `id` がそのまま含まれます。JSON が無効、またはトップレベルの文字列 `id` を一意に特定できない場合、エラーレスポンスは空の `id` を使います。無効な UTF-8 などのトランスポートエラーでは、レスポンスを返さずに接続を閉じる場合があります。
+
 イベント購読は、最初のレスポンスの後も接続を開いたままにします。
 
 ## ソケットパス
@@ -651,6 +642,24 @@ Herdr はローカルソケット上の改行区切り JSON を使います。Un
     "source": "herdr:codex",
     "agent": "codex",
     "agent_session_id": "..."
+  }
+}
+```
+
+どちらのメソッドも、Herdr サーバーの再起動後に報告元の現在のセッションを再開するコマンドを、省略可能な `resume_argv` 配列で受け付けます。配列は最大 64 要素、合計 8 KiB までです。最初の要素はパスではなく単純なコマンド名でなければならず、どの要素にもアポストロフィや制御文字を含めることはできません。無効な値は `invalid_resume_argv` で失敗し、その報告は適用されません。カスタムエージェントは、コマンドを付ける前に `pane.report_agent` でペインを保持している必要があり、そうでない場合は `resume_not_accepted` で失敗します。Herdr は同じ `source` と `agent` がペインを保持している間だけコマンドを保持し、そのエージェントに対する Herdr 組み込みの resume コマンドより優先します。古い Herdr はこのフィールドを無視します。
+
+`resume_argv` を含む報告はコンテンツ書き込みです。Herdr はローカルのエージェント呼び出し元とその子プロセスをターミナルに帰属させ、別ペインへの報告を `cross_pane_input_denied` で拒否します。帰属を確認できない呼び出し元には `input_origin_unknown` を返します。両メソッドは明示的に許可する `allow_cross_pane`（既定値 `false`）を受け付け、CLI では `herdr pane report-agent ... --allow-cross-pane -- <resume-command...>` または `herdr pane report-agent-session ... --allow-cross-pane -- <resume-command...>` を使用します。`resume_argv` のない報告はメタデータのみで、この許可は不要です。明示的な許可はペイン間ポリシーのみを回避し、resume の検証や報告の権限ルールは回避しません。
+
+```json
+{
+  "id": "req_3",
+  "method": "pane.report_agent_session",
+  "params": {
+    "pane_id": "w1:p1",
+    "source": "custom:my-agent",
+    "agent": "my-agent",
+    "agent_session_id": "...",
+    "resume_argv": ["my-agent", "--resume", "..."]
   }
 }
 ```
@@ -736,7 +745,9 @@ workspace の get/list 応答は結果の `tokens` マップを公開し、ス�
 }
 ```
 
-最初のレスポンスは購読の確認応答です。以降の行はプッシュされるイベントです。ライフサイクルイベントの購読はリクエストが受理された時点から始まり、それ以前に保持されていたイベントは再生しません。
+最初のレスポンスは購読の確認応答です。以降の行はプッシュされるイベントです。
+すべての項目が有効でなければなりません。参照先ペインが 1 つでも存在しない場合、Herdr はリクエスト全体をエラーで拒否し、接続を閉じます。他の項目が購読されたと仮定せず、ペイン一覧を更新して再試行してください。
+ライフサイクルイベントの購読はリクエストが受理された時点から始まり、それ以前に保持されていたイベントは再生しません。
 
 ライフサイクルとエージェント状態のイベントは、各購読内の順序を保った上限付きのバッチで送信されます。イベント履歴は永続ログではありません。購読の初期化中も含め、購読者が保持範囲より遅れた場合、サーバーは元のリクエスト `id` と `error.code: "events_lost"` を含むエラーレスポンスを送り、その購読接続を閉じます。欠落したイベントを通知せずに配信を続けることはありません。他のクライアント接続には影響しません。履歴はイベント種別間で共有されるため、失われたイベントが購読条件に一致しなかった可能性があっても、保持範囲を超えたことを通知します。
 
@@ -756,6 +767,8 @@ worktree のイベント購読には `worktree.created`、`worktree.opened`、`w
 ## API 入力ログ
 
 `pane.send_text`、`pane.send_input`、`pane.send_keys`、`agent.send_keys`、`agent.prompt` がペインに書き込む前に、herdr は状態ディレクトリの `api-input.jsonl`（例: `~/.local/state/herdr/api-input.jsonl`。所有者だけが読めるファイル）に JSON を 1 行追記します。行には時刻（`ts_ms`）、メソッド、対象のペインとターミナル、バイト数、そしてソケットのピアプロセスから herdr が知る呼び出し元（pid、ペイン、エージェント名、エージェントセッション）が入ります。テキストは記録しません。herdr がこの行を書けない場合、入力は `input_log_unavailable` で拒否されます。
+
+Linux と macOS では、`caller.exe` と `caller.ppid` に書き込み時の実行ファイルのベース名（変更可能なプロセスラベルではありません）と親 PID を記録します。呼び出し元がどのペインにも属さない場合も同じです。Linux では、呼び出し元の cgroup に systemd の `.service` または `.scope` がある場合、`caller.unit` も記録します。取得できないフィールドは省略し、Windows やその他のプラットフォームではこれらのフィールドを記録しません。メタデータの取得失敗によって入力を拒否することはありません。打鍵された入力は API ログに記録しません。
 
 これにより、エージェントのセッションを読む側は、ターミナルのバイト列に何も加えずに、API がペインに送ったターンと打鍵されたターンを区別できます。
 
