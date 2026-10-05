@@ -1399,22 +1399,56 @@ pub(crate) fn process_identity(pid: u32) -> Option<crate::platform::ProcessIdent
     })
 }
 
+pub(crate) fn process_caller_metadata_platform(
+    peer: super::ProcessIdentity,
+) -> Option<super::CallerMetadata> {
+    if peer.pid == 0 {
+        return None;
+    }
+    let stat = std::fs::read_to_string(format!("/proc/{}/stat", peer.pid)).ok()?;
+    let (observed, ppid) = process_identity_and_parent_from_stat(peer.pid, &stat)?;
+    if observed != peer {
+        return None;
+    }
+    let exe = std::fs::read_link(format!("/proc/{}/exe", peer.pid))
+        .ok()
+        .and_then(|path| path.file_name()?.to_str().map(str::to_owned));
+    let unit = std::fs::read_to_string(format!("/proc/{}/cgroup", peer.pid))
+        .ok()
+        .and_then(|cgroup| {
+            cgroup.lines().find_map(|line| {
+                let path = line.splitn(3, ':').nth(2)?;
+                path.rsplit('/')
+                    .find(|part| part.ends_with(".service") || part.ends_with(".scope"))
+                    .map(str::to_owned)
+            })
+        });
+    // The exe and cgroup lookups reopen a numeric PID; discard the entire
+    // snapshot if the original instance exited or was replaced during either.
+    (process_identity(peer.pid) == Some(peer)).then_some(super::CallerMetadata {
+        exe,
+        ppid: Some(ppid),
+        unit,
+    })
+}
+
 pub(crate) fn parent_process_identity(
     identity: crate::platform::ProcessIdentity,
 ) -> Option<crate::platform::ProcessIdentity> {
     let stat = std::fs::read_to_string(format!("/proc/{}/stat", identity.pid)).ok()?;
+    let (observed, ppid) = process_identity_and_parent_from_stat(identity.pid, &stat)?;
+    crate::platform::checked_parent_process_identity(identity, observed, ppid)
+}
+
+fn process_identity_and_parent_from_stat(
+    pid: u32,
+    stat: &str,
+) -> Option<(super::ProcessIdentity, u32)> {
     let rest = stat.get(stat.rfind(')')? + 2..)?;
     let mut fields = rest.split_whitespace();
     let ppid = fields.nth(1)?.parse().ok()?;
     let start_time = fields.nth(17)?.parse().ok()?;
-    crate::platform::checked_parent_process_identity(
-        identity,
-        crate::platform::ProcessIdentity {
-            pid: identity.pid,
-            start_time,
-        },
-        ppid,
-    )
+    Some((super::ProcessIdentity { pid, start_time }, ppid))
 }
 
 /// Linux uses the shared generation-checked chronology walker: a live peer is
