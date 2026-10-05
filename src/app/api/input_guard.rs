@@ -42,6 +42,7 @@ impl App {
                 params.allow_cross_pane
             }
             Method::AgentPrompt(params) => params.allow_cross_pane,
+            Method::AgentPromptGuarded(params) => params.prompt.allow_cross_pane,
             Method::AgentSendKeys(params) => params.allow_cross_pane,
             Method::PaneSendText(params) => params.allow_cross_pane,
             Method::PaneSendKeys(params) => params.allow_cross_pane,
@@ -58,6 +59,9 @@ impl App {
                 self.pane_target(&params.pane_id)
             }
             Method::AgentPrompt(params) => self.resolve_agent_target(&params.target).ok(),
+            Method::AgentPromptGuarded(params) => {
+                self.resolve_agent_target(&params.prompt.target).ok()
+            }
             Method::AgentSendKeys(params) => self.resolve_agent_target(&params.target).ok(),
             Method::PaneSendText(params) => self.pane_target(&params.pane_id),
             Method::PaneSendKeys(params) => self.pane_target(&params.pane_id),
@@ -227,6 +231,12 @@ mod tests {
                     params.expected_terminal = Some("term_guarded".into());
                     Some(Method::PaneSendInputGuarded(params))
                 }
+                Method::AgentPrompt(params) => Some(Method::AgentPromptGuarded(
+                    crate::api::schema::AgentPromptGuardedParams {
+                        prompt: params.clone(),
+                        expected_terminal: "term_guarded".into(),
+                    },
+                )),
                 _ => None,
             })
             .collect();

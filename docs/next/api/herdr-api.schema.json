@@ -1228,6 +1228,40 @@
     },
     "request": {
       "$defs": {
+        "AgentPromptGuardedParams": {
+          "properties": {
+            "allow_cross_pane": {
+              "description": "Deliberately allow an agent-originated request to target another pane.",
+              "type": "boolean"
+            },
+            "expected_terminal": {
+              "description": "Required opaque identity of the terminal that must still host the agent.",
+              "type": "string"
+            },
+            "target": {
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            },
+            "wait": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/request/$defs/AgentPromptWaitOptions"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "target",
+            "text",
+            "expected_terminal"
+          ],
+          "type": "object"
+        },
         "AgentPromptParams": {
           "properties": {
             "allow_cross_pane": {
@@ -5791,6 +5825,23 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/AgentPromptParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Requires a terminal pin and agent-aware submission; older receivers reject this method.",
+          "properties": {
+            "method": {
+              "const": "agent.prompt_guarded",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentPromptGuardedParams"
             }
           },
           "required": [
@@ -11245,6 +11296,11 @@
                 "integer",
                 "null"
               ]
+            },
+            "expected_terminal_agent_prompt_guard": {
+              "default": false,
+              "description": "Supports `agent.prompt_guarded`, including terminal and live-agent checks before input.",
+              "type": "boolean"
             },
             "expected_terminal_guard": {
               "default": false,

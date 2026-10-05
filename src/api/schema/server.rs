@@ -54,4 +54,7 @@ pub struct ServerCapabilities {
     /// Supports the fail-closed `expected_terminal` guard on `agent.start` and `pane.send_input`.
     #[serde(default)]
     pub expected_terminal_guard: bool,
+    /// Supports `agent.prompt_guarded`, including terminal and live-agent checks before input.
+    #[serde(default)]
+    pub expected_terminal_agent_prompt_guard: bool,
 }

@@ -3,8 +3,8 @@ use std::time::Duration;
 use bytes::Bytes;
 
 use crate::api::schema::{
-    AgentPromptParams, AgentRenameParams, AgentSendKeysParams, AgentStartParams, AgentTarget,
-    PaneReadResult, ResponseResult,
+    AgentPromptGuardedParams, AgentPromptParams, AgentRenameParams, AgentSendKeysParams,
+    AgentStartParams, AgentTarget, PaneReadResult, ResponseResult,
 };
 use crate::app::App;
 
@@ -85,17 +85,37 @@ impl App {
         context: crate::api::ApiRequestContext,
         respond_to: std::sync::mpsc::Sender<String>,
     ) -> bool {
-        if !matches!(request.method, crate::api::schema::Method::AgentPrompt(_)) {
+        if !matches!(
+            &request.method,
+            crate::api::schema::Method::AgentPrompt(_)
+                | crate::api::schema::Method::AgentPromptGuarded(_)
+        ) {
             return false;
+        }
+        if let crate::api::schema::Method::AgentPromptGuarded(params) = &request.method {
+            if let Err(message) =
+                crate::api::schema::validate_expected_terminal_identity(&params.expected_terminal)
+            {
+                let _ = respond_to.send(encode_error(request.id, "invalid_request", message));
+                return true;
+            }
         }
         if let Some(response) = self.cross_pane_input_denial(&request, context) {
             let _ = respond_to.send(response);
             return true;
         }
-        let crate::api::schema::Method::AgentPrompt(params) = request.method else {
-            return false;
+        let (params, expected_terminal) = match request.method {
+            crate::api::schema::Method::AgentPrompt(params) => (params, None),
+            crate::api::schema::Method::AgentPromptGuarded(params) => {
+                let AgentPromptGuardedParams {
+                    prompt,
+                    expected_terminal,
+                } = params;
+                (prompt, Some(expected_terminal))
+            }
+            _ => return false,
         };
-        match self.queue_agent_prompt(request.id, params, context) {
+        match self.queue_agent_prompt(request.id, params, expected_terminal.as_deref(), context) {
             Ok((id, agent, completion)) => {
                 std::thread::spawn(move || {
                     let response = match completion.recv() {
@@ -120,6 +140,7 @@ impl App {
         &mut self,
         id: String,
         params: AgentPromptParams,
+        expected_terminal: Option<&str>,
         context: crate::api::ApiRequestContext,
     ) -> Result<
         (
@@ -152,6 +173,8 @@ impl App {
         let Some(terminal) = self.state.terminals.get(&terminal_id) else {
             return Err(agent_not_found(id, &params.target));
         };
+        self.check_expected_terminal(expected_terminal, Some(&terminal_id))
+            .map_err(|error| encode_error_body(id.clone(), error))?;
         if terminal.state == crate::detect::AgentState::Blocked {
             return Err(encode_error(
                 id,
@@ -168,6 +191,9 @@ impl App {
         if terminal.managed_agent_launch_pending() {
             return Err(agent_not_ready(id, &params.target));
         }
+        // Hold synchronous receiver ownership and this exact checked terminal runtime
+        // through foreground validation, logging, focus and text-plus-Enter enqueue.
+        // Never look the public pane up again at the effect.
         let Some(runtime) = self.lookup_runtime_sender(resolved.ws_idx, resolved.pane_id) else {
             return Err(agent_not_found(id, &params.target));
         };
@@ -184,7 +210,11 @@ impl App {
         // Before any write to the pane, including the Copilot focus event.
         self.log_api_input(
             &id,
-            "agent.prompt",
+            if expected_terminal.is_some() {
+                "agent.prompt_guarded"
+            } else {
+                "agent.prompt"
+            },
             resolved.ws_idx,
             resolved.pane_id,
             context,
@@ -473,6 +503,29 @@ mod tests {
         start_deferred_agent_prompt(app, id, params)
             .recv_timeout(Duration::from_secs(1))
             .expect("agent prompt responds after submission")
+    }
+
+    fn run_guarded_agent_prompt(
+        app: &mut App,
+        id: &str,
+        params: AgentPromptParams,
+        expected_terminal: String,
+    ) -> String {
+        let (respond_to, response_rx) = std::sync::mpsc::channel();
+        assert!(app.handle_deferred_agent_api_request(
+            crate::api::schema::Request {
+                id: id.into(),
+                method: crate::api::schema::Method::AgentPromptGuarded(AgentPromptGuardedParams {
+                    prompt: params,
+                    expected_terminal,
+                }),
+            },
+            crate::api::ApiRequestContext::default(),
+            respond_to,
+        ));
+        response_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("guarded agent prompt responds")
     }
 
     #[cfg(windows)]
@@ -801,6 +854,69 @@ mod tests {
         );
         let error: crate::api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();
         assert_eq!(error.error.code, "agent_not_ready");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn guarded_prompt_rejects_terminal_mismatch_before_any_input() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_agent_name("reviewer".into());
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
+        let (runtime, mut rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.state.insert_test_runtime(pane_id, runtime);
+
+        let response = run_guarded_agent_prompt(
+            &mut app,
+            "guard-mismatch",
+            AgentPromptParams {
+                target: "reviewer".into(),
+                text: "must not reach shell\nsecond line".into(),
+                wait: None,
+                allow_cross_pane: false,
+            },
+            "different-terminal".into(),
+        );
+        let error: crate::api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "terminal_identity_mismatch");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn guarded_prompt_accepts_same_terminal_multiline_once() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_agent_name("reviewer".into());
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Working);
+        let (runtime, mut rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.state.insert_test_runtime(pane_id, runtime);
+
+        let response = run_guarded_agent_prompt(
+            &mut app,
+            "guard-success",
+            AgentPromptParams {
+                target: "reviewer".into(),
+                text: "line one\nline two λ".into(),
+                wait: None,
+                allow_cross_pane: false,
+            },
+            terminal_id.to_string(),
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(matches!(
+            success.result,
+            ResponseResult::AgentPrompted { .. }
+        ));
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from("line one\nline two λ"));
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"\r"));
         assert!(rx.try_recv().is_err());
     }
 

@@ -201,6 +201,37 @@ pub struct AgentPromptParams {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgentPromptGuardedParams {
+    #[serde(flatten)]
+    pub prompt: AgentPromptParams,
+    /// Required opaque identity of the terminal that must still host the agent.
+    #[serde(deserialize_with = "deserialize_prompt_expected_terminal")]
+    pub expected_terminal: String,
+}
+
+pub(crate) fn validate_expected_terminal_identity(expected: &str) -> Result<(), &'static str> {
+    if expected.is_empty()
+        || expected
+            .chars()
+            .any(|ch| ch.is_whitespace() || ch.is_control())
+    {
+        return Err(
+            "expected_terminal must be a non-empty opaque identity without whitespace or control characters",
+        );
+    }
+    Ok(())
+}
+
+fn deserialize_prompt_expected_terminal<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let expected = String::deserialize(deserializer)?;
+    validate_expected_terminal_identity(&expected).map_err(serde::de::Error::custom)?;
+    Ok(expected)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AgentInfo {
     pub terminal_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]

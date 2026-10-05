@@ -364,7 +364,8 @@ fn agent_command() -> Command {
                 .about("Submit a prompt to an agent")
                 .override_usage("herdr agent prompt <TARGET> <TEXT> [OPTIONS]")
                 .arg(required("target", "TARGET"))
-                .arg(required("text", "TEXT"))
+                .arg(required("text", "TEXT").allow_hyphen_values(true))
+                .arg(expected_terminal_option())
                 .arg(
                     flag("wait")
                         .help("Wait for the first matching state observed after submission"),
@@ -1220,6 +1221,75 @@ mod tests {
                     path.join(" ")
                 );
             }
+        }
+    }
+
+    #[test]
+    fn agent_prompt_spec_accepts_guard_and_exact_single_text_positional() {
+        // The completion/help spec is not the runtime parser: known option-like
+        // TEXT is covered by the manual prompt parser's exact-argv tests.
+        for text in ["--assignment\nλ 日本語", "hello\n日本語"] {
+            let matches = super::command()
+                .try_get_matches_from([
+                    "herdr",
+                    "agent",
+                    "prompt",
+                    "w1:p2",
+                    text,
+                    "--expected-terminal",
+                    "opaque:λ/42",
+                    "--wait",
+                    "--timeout",
+                    "1234",
+                ])
+                .unwrap();
+            let prompt = matches
+                .subcommand_matches("agent")
+                .unwrap()
+                .subcommand_matches("prompt")
+                .unwrap();
+            assert_eq!(
+                prompt.get_one::<String>("text").map(String::as_str),
+                Some(text)
+            );
+            assert_eq!(
+                prompt
+                    .get_one::<String>("expected-terminal")
+                    .map(String::as_str),
+                Some("opaque:λ/42")
+            );
+            assert!(prompt.get_flag("wait"));
+        }
+        assert!(super::command()
+            .try_get_matches_from([
+                "herdr",
+                "agent",
+                "prompt",
+                "w1:p2",
+                "first",
+                "second",
+                "--expected-terminal",
+                "term",
+            ])
+            .is_err());
+    }
+
+    #[test]
+    fn agent_prompt_help_flag_text_is_not_intercepted_as_help() {
+        for text in ["--help", "-h"] {
+            let args = [
+                "herdr",
+                "agent",
+                "prompt",
+                "w1:p2",
+                text,
+                "--expected-terminal",
+                "term",
+            ]
+            .map(str::to_owned);
+            let mut output = Vec::new();
+            assert!(!super::write_requested_help(&args, &mut output, || {}).unwrap());
+            assert!(output.is_empty());
         }
     }
 

@@ -2848,6 +2848,7 @@ mod tests {
                 ssh_agent_registration: false,
                 guarded_live_handoff: true,
                 expected_terminal_guard: true,
+                expected_terminal_agent_prompt_guard: true,
             }),
         };
         let missing_baseline = crate::api::RuntimeStatus {
@@ -2915,6 +2916,7 @@ mod tests {
                 version: Some("0.6.2".to_string()),
                 protocol: Some(76),
                 capabilities: Some(crate::api::schema::ServerCapabilities {
+                    expected_terminal_agent_prompt_guard: true,
                     expected_terminal_guard: true,
                     live_handoff: true,
                     detached_server_daemon: true,
@@ -3168,6 +3170,7 @@ mod tests {
                 version: Some("9.8.6".to_string()),
                 protocol: Some(76),
                 capabilities: Some(crate::api::schema::ServerCapabilities {
+                    expected_terminal_agent_prompt_guard: true,
                     expected_terminal_guard: true,
                     live_handoff: true,
                     detached_server_daemon: true,

@@ -8,6 +8,7 @@ struct GuardServer {
     socket: PathBuf,
     bin: PathBuf,
     config: String,
+    pi_input: PathBuf,
     server: Option<std::process::Child>,
 }
 
@@ -18,13 +19,17 @@ impl GuardServer {
         fs::set_permissions(&base, fs::Permissions::from_mode(0o700)).unwrap();
         let bin = base.join("bin");
         fs::create_dir_all(&bin).unwrap();
+        // This executable is only a small PTY probe with Pi's process hint; the
+        // installed Pi live proof is kept separate from this deterministic test.
         let pi = bin.join("pi");
+        let pi_input = base.join("pi-input");
         fs::write(
             &pi,
             format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$PROBE_ORIGIN\" >> '{}'\nexport HERDR_AGENT=pi\n'{}' pane report-agent \"$1\" --source custom:expected-terminal-test --agent pi --state idle >/dev/null\nwhile IFS= read -r prompt; do :; done\n",
+                "#!/bin/sh\nprintf '%s\\n' \"$PROBE_ORIGIN\" >> '{}'\nexport HERDR_AGENT=pi\n'{}' pane report-agent \"$1\" --source custom:expected-terminal-test --agent pi --state idle >/dev/null\nprintf '\\033[?2004h'\nexec /bin/cat > '{}'\n",
                 base.join("pi-launch").display(),
                 env!("CARGO_BIN_EXE_herdr"),
+                pi_input.display(),
             ),
         )
         .unwrap();
@@ -46,6 +51,7 @@ impl GuardServer {
             socket,
             bin,
             config,
+            pi_input,
             server: None,
         };
         fixture.spawn();
@@ -148,6 +154,72 @@ impl GuardServer {
         let mut params = self.start_params(pane);
         params["expected_terminal"] = expected;
         self.request("agent.start", params)
+    }
+
+    fn start_worker(&self, pane: &Value) {
+        let started = self.guarded_start(pane, pane["terminal_id"].clone());
+        assert_eq!(
+            started["result"]["agent"]["terminal_id"], pane["terminal_id"],
+            "{started}"
+        );
+        assert!(wait_until(
+            Duration::from_secs(3),
+            Duration::from_millis(25),
+            || self.base.join("pi-launch").exists()
+        ));
+    }
+
+    fn guarded_prompt(&self, text: &str, expected: &str) -> std::process::Output {
+        self.cli(&[
+            "agent",
+            "prompt",
+            "worker",
+            text,
+            "--expected-terminal",
+            expected,
+        ])
+    }
+
+    fn observed_worker_terminal(&self) -> String {
+        assert!(wait_until(
+            Duration::from_secs(3),
+            Duration::from_millis(25),
+            || {
+                let observed = self.request("agent.get", json!({"target": "worker"}));
+                observed["result"]["agent"]["agent"] == "pi"
+                    && observed["result"]["agent"]["name"] == "worker"
+                    && observed["result"]["agent"]["interactive_ready"] == true
+            }
+        ));
+        let observed = self.request("agent.get", json!({"target": "worker"}));
+        assert!(observed.get("result").is_some(), "{observed}");
+        observed["result"]["agent"]["terminal_id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    fn kill_observed_foreground_group(&self, pane: &Value) {
+        let info = self.request("pane.process_info", json!({"pane_id": pane["pane_id"]}));
+        let pgid = info["result"]["process_info"]["foreground_process_group_id"]
+            .as_i64()
+            .expect("foreground process group id");
+        assert!(pgid > 0, "{info}");
+        assert_eq!(
+            unsafe { libc::kill(-(pgid as libc::pid_t), libc::SIGTERM) },
+            0
+        );
+    }
+
+    fn prompt_error(output: std::process::Output) -> Value {
+        assert_eq!(output.status.code(), Some(1));
+        serde_json::from_slice(&output.stderr).unwrap_or_else(|err| {
+            panic!(
+                "prompt did not return JSON error: {err}; stderr={}; stdout={}",
+                String::from_utf8_lossy(&output.stderr),
+                String::from_utf8_lossy(&output.stdout)
+            )
+        })
     }
 
     fn barrier(&self, pane: &Value) {
@@ -363,12 +435,127 @@ fn expected_terminal_native_json_rejects_invalid_present_guards_without_effects(
 }
 
 #[test]
+fn guarded_agent_prompt_refuses_after_foreground_loss_without_shell_effects() {
+    let server = GuardServer::new("0");
+    let pane = server.pane("original");
+    server.barrier(&pane);
+    server.start_worker(&pane);
+    let expected = server.observed_worker_terminal();
+    let poison = server.base.join("foreground-loss-prompt-reached-shell");
+    server.kill_observed_foreground_group(&pane);
+
+    let response = GuardServer::prompt_error(server.guarded_prompt(
+        &format!("printf poisoned > '{}'", poison.display()),
+        &expected,
+    ));
+    assert_eq!(response["error"]["code"], "agent_not_ready", "{response}");
+    assert!(!poison.exists(), "guarded prompt reached the shell");
+    assert!(
+        fs::read(&server.pi_input).unwrap_or_default().is_empty(),
+        "guarded prompt reached the old Pi"
+    );
+}
+
+#[test]
+fn guarded_agent_prompt_refuses_blocked_agent_without_input() {
+    let server = GuardServer::new("0");
+    let pane = server.pane("original");
+    server.barrier(&pane);
+    server.start_worker(&pane);
+    let expected = server.observed_worker_terminal();
+    let poison = server.base.join("blocked-prompt-reached-agent");
+    let blocked = server.cli(&[
+        "pane",
+        "report-agent",
+        server.pane_id(&pane),
+        "--source",
+        "custom:expected-terminal-test",
+        "--agent",
+        "pi",
+        "--state",
+        "blocked",
+    ]);
+    assert!(
+        blocked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&blocked.stderr)
+    );
+
+    let response = GuardServer::prompt_error(server.guarded_prompt(
+        &format!("printf poisoned > '{}'", poison.display()),
+        &expected,
+    ));
+    assert_eq!(response["error"]["code"], "agent_blocked", "{response}");
+    assert!(!poison.exists(), "blocked prompt reached the shell");
+    assert!(
+        fs::read(&server.pi_input).unwrap_or_default().is_empty(),
+        "blocked prompt reached Pi"
+    );
+}
+
+#[test]
+fn guarded_agent_prompt_refuses_replaced_terminal_after_agent_observation() {
+    let mut server = GuardServer::new("0");
+    let original = server.pane("original");
+    server.barrier(&original);
+    server.start_worker(&original);
+    let expected = server.observed_worker_terminal();
+    let poison = server.base.join("replacement-prompt-reached-shell");
+    let replacement = server.replace(&original);
+    assert_ne!(replacement["terminal_id"], expected);
+
+    let response = GuardServer::prompt_error(server.guarded_prompt(
+        &format!("printf poisoned > '{}'", poison.display()),
+        &expected,
+    ));
+    assert!(
+        matches!(
+            response["error"]["code"].as_str(),
+            Some("terminal_identity_mismatch" | "agent_not_found")
+        ),
+        "{response}"
+    );
+    assert!(!poison.exists(), "prompt reached the replacement shell");
+    assert!(
+        fs::read(&server.pi_input).unwrap_or_default().is_empty(),
+        "prompt reached the old Pi"
+    );
+}
+
+#[test]
+fn guarded_agent_prompt_accepts_same_terminal_pi_input_once_and_intact() {
+    let server = GuardServer::new("0");
+    let pane = server.pane("original");
+    server.barrier(&pane);
+    server.start_worker(&pane);
+    let expected = server.observed_worker_terminal();
+    let text = "--assignment\nλ 日本語\nsecond line";
+
+    let output = server.guarded_prompt(text, &expected);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let expected_bytes = format!("\x1b[200~{text}\x1b[201~\n").into_bytes();
+    assert!(
+        wait_until(
+            Duration::from_secs(3),
+            Duration::from_millis(25),
+            || fs::read(&server.pi_input).ok().as_deref() == Some(expected_bytes.as_slice())
+        ),
+        "captured={:?}, expected={expected_bytes:?}",
+        fs::read(&server.pi_input).ok()
+    );
+    assert_eq!(fs::read(&server.pi_input).unwrap(), expected_bytes);
+}
+
+#[test]
 fn expected_terminal_capability_and_cli_flags_refuse_then_accept_exact_identity() {
     let server = GuardServer::new("0");
-    assert_eq!(
-        server.request("ping", json!({}))["result"]["capabilities"]["expected_terminal_guard"],
-        true
-    );
+    let capabilities = server.request("ping", json!({}))["result"]["capabilities"].clone();
+    assert_eq!(capabilities["expected_terminal_guard"], true);
+    assert_eq!(capabilities["expected_terminal_agent_prompt_guard"], true);
     let pane = server.pane("original");
     server.barrier(&pane);
     let other = server.pane("other");

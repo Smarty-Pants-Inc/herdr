@@ -177,18 +177,38 @@ pub(super) fn wait_for_agent(
 
 pub(super) fn prompt_agent(
     request_id: String,
-    mut params: crate::api::schema::AgentPromptParams,
+    method: Method,
     context: ApiRequestContext,
     stream: &mut LocalStream,
     api_tx: &ApiRequestSender,
     event_hub: &EventHub,
     running: &Arc<AtomicBool>,
 ) -> std::io::Result<Option<String>> {
+    let (mut params, expected_terminal) = match method {
+        Method::AgentPrompt(params) => (params, None),
+        Method::AgentPromptGuarded(params) => {
+            if let Err(message) =
+                crate::api::schema::validate_expected_terminal_identity(&params.expected_terminal)
+            {
+                return serde_json::to_string(&ErrorResponse {
+                    id: request_id,
+                    error: ErrorBody {
+                        code: "invalid_request".into(),
+                        message: message.into(),
+                    },
+                })
+                .map(Some)
+                .map_err(std::io::Error::other);
+            }
+            (params.prompt, Some(params.expected_terminal))
+        }
+        _ => return Err(std::io::Error::other("expected agent prompt method")),
+    };
     let Some(wait) = params.wait.clone() else {
         return Ok(Some(dispatch_to_app_with_timeout_and_context(
             Request {
                 id: request_id,
-                method: Method::AgentPrompt(params),
+                method: prompt_submission_method(params, expected_terminal),
             },
             api_tx,
             None,
@@ -222,7 +242,7 @@ pub(super) fn prompt_agent(
     let last_event_sequence = event_hub.current_sequence();
     let prompt_request = Request {
         id: request_id.clone(),
-        method: Method::AgentPrompt(params),
+        method: prompt_submission_method(params, expected_terminal),
     };
     #[cfg(windows)]
     let prompt_response = dispatch_to_app_with_caller_timeout(
@@ -324,6 +344,21 @@ pub(super) fn prompt_agent(
         AgentWaitOutcome::Response(response) => return Ok(Some(response)),
     };
     agent_prompt_success(request_id, agent).map(Some)
+}
+
+fn prompt_submission_method(
+    params: crate::api::schema::AgentPromptParams,
+    expected_terminal: Option<String>,
+) -> Method {
+    match expected_terminal {
+        Some(expected_terminal) => {
+            Method::AgentPromptGuarded(crate::api::schema::AgentPromptGuardedParams {
+                prompt: params,
+                expected_terminal,
+            })
+        }
+        None => Method::AgentPrompt(params),
+    }
 }
 
 fn remaining_timeout_ms(total_ms: Option<u64>, started: std::time::Instant) -> Option<u64> {

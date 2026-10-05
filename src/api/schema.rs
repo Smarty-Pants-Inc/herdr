@@ -167,6 +167,9 @@ pub enum Method {
     AgentStartGuarded(AgentStartParams),
     #[serde(rename = "agent.prompt")]
     AgentPrompt(AgentPromptParams),
+    /// Requires a terminal pin and agent-aware submission; older receivers reject this method.
+    #[serde(rename = "agent.prompt_guarded")]
+    AgentPromptGuarded(AgentPromptGuardedParams),
     #[serde(rename = "agent.wait")]
     AgentWait(AgentWaitParams),
     #[serde(rename = "pane.split")]
