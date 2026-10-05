@@ -438,6 +438,126 @@ pub(super) fn runtime_hosts_agent(
     live_runtime_agent(runtime) == Some(expected)
 }
 
+fn submission_not_ready() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        "pinned agent is no longer the terminal foreground process",
+    )
+}
+
+/// A job label is not an instance identity. Identify a concrete member using the
+/// existing detector on a one-member job, retaining its PID rather than its label.
+fn identified_agent_process(
+    job: &crate::platform::ForegroundJob,
+    expected: crate::detect::Agent,
+) -> Option<u32> {
+    let identifies = |process: &&crate::platform::ForegroundProcess| {
+        let member_job = crate::platform::ForegroundJob {
+            process_group_id: job.process_group_id,
+            processes: vec![(*process).clone()],
+        };
+        crate::detect::identify_agent_in_job(&member_job)
+            .is_some_and(|(agent, _)| agent == expected)
+    };
+    // Preserve leader preference, but never mistake an unrecognized wrapper's
+    // group ID for the actual recognized agent process.
+    job.processes
+        .iter()
+        .filter(|process| process.pid == job.process_group_id)
+        .find(identifies)
+        .or_else(|| job.processes.iter().find(identifies))
+        .map(|process| process.pid)
+}
+
+#[derive(Clone)]
+struct AgentSubmissionPin {
+    // Evidence belongs to this checked runtime's terminal, never a re-resolved pane.
+    terminal_id: crate::terminal::TerminalId,
+    shell: crate::platform::ProcessIdentity,
+    agent: crate::platform::ProcessIdentity,
+    process_group_id: u32,
+    expected: crate::detect::Agent,
+}
+
+impl AgentSubmissionPin {
+    fn check(&self) -> std::io::Result<()> {
+        self.check_observed(crate::platform::process_identity, || {
+            crate::platform::fresh_foreground_job(self.shell.pid)
+        })
+        .map_err(|err| {
+            std::io::Error::new(err.kind(), format!("terminal {}: {err}", self.terminal_id))
+        })
+    }
+
+    fn check_observed(
+        &self,
+        identity_of: impl Fn(u32) -> Option<crate::platform::ProcessIdentity>,
+        job_now: impl FnOnce() -> Option<crate::platform::ForegroundJob>,
+    ) -> std::io::Result<()> {
+        let instances_live = || {
+            identity_of(self.shell.pid) == Some(self.shell)
+                && identity_of(self.agent.pid) == Some(self.agent)
+        };
+        if !instances_live() {
+            return Err(submission_not_ready());
+        }
+        let job = job_now().ok_or_else(submission_not_ready)?;
+        let member = job
+            .processes
+            .iter()
+            .find(|process| process.pid == self.agent.pid)
+            .cloned();
+        let recognized_member = member.is_some_and(|member| {
+            identified_agent_process(
+                &crate::platform::ForegroundJob {
+                    process_group_id: job.process_group_id,
+                    processes: vec![member],
+                },
+                self.expected,
+            ) == Some(self.agent.pid)
+        });
+        // Recheck both generations after numeric OS reads: an exited or reused
+        // endpoint must not lend its evidence to a replacement process.
+        if job.process_group_id != self.process_group_id || !recognized_member || !instances_live()
+        {
+            return Err(submission_not_ready());
+        }
+        Ok(())
+    }
+}
+
+pub(super) fn capture_agent_submission_guard(
+    terminal_id: &crate::terminal::TerminalId,
+    runtime: &crate::terminal::TerminalRuntime,
+    expected: crate::detect::Agent,
+) -> std::io::Result<crate::pty::actor::SubmissionGuard> {
+    #[cfg(test)]
+    if runtime.child_pid().is_none() {
+        // Synthetic runtimes have no OS process. Production has no such fallback.
+        return Ok(crate::pty::actor::SubmissionGuard::new(|| Ok(())));
+    }
+    let shell = runtime
+        .child_process_identity()
+        .ok_or_else(submission_not_ready)?;
+    let job = crate::platform::fresh_foreground_job(shell.pid).ok_or_else(submission_not_ready)?;
+    if crate::detect::identify_agent_in_job(&job).map(|(agent, _)| agent) != Some(expected) {
+        return Err(submission_not_ready());
+    }
+    let agent_pid = identified_agent_process(&job, expected).ok_or_else(submission_not_ready)?;
+    let agent = crate::platform::process_identity(agent_pid).ok_or_else(submission_not_ready)?;
+    let pin = AgentSubmissionPin {
+        terminal_id: terminal_id.clone(),
+        shell,
+        agent,
+        process_group_id: job.process_group_id,
+        expected,
+    };
+    // The second fresh observation binds identification to the captured instance,
+    // including replacement during initial metadata collection.
+    pin.check()?;
+    Ok(crate::pty::actor::SubmissionGuard::new(move || pin.check()))
+}
+
 fn live_runtime_agent(runtime: &crate::terminal::TerminalRuntime) -> Option<crate::detect::Agent> {
     let job = crate::detect::foreground_job(runtime.child_pid()?)?;
     crate::detect::identify_agent_in_job(&job)
@@ -478,7 +598,189 @@ pub(super) enum AgentRenameError {
 
 #[cfg(test)]
 mod tests {
-    use super::valid_agent_name;
+    use super::*;
+
+    fn submission_pin_fixture() -> (AgentSubmissionPin, crate::platform::ForegroundJob) {
+        let pin = AgentSubmissionPin {
+            terminal_id: crate::terminal::TerminalId::alloc(),
+            shell: crate::platform::ProcessIdentity {
+                pid: 10,
+                start_time: 1,
+            },
+            agent: crate::platform::ProcessIdentity {
+                pid: 21,
+                start_time: 2,
+            },
+            process_group_id: 20,
+            expected: crate::detect::Agent::Pi,
+        };
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 20,
+            processes: vec![crate::platform::ForegroundProcess {
+                pid: 21,
+                name: "pi".into(),
+                argv0: None,
+                argv: None,
+                cmdline: None,
+            }],
+        };
+        (pin, job)
+    }
+
+    #[test]
+    fn guarded_submission_pins_recognized_member_not_wrapper_group() {
+        let (pin, job) = submission_pin_fixture();
+        assert_eq!(identified_agent_process(&job, pin.expected), Some(21));
+        assert!(pin
+            .check_observed(
+                |pid| Some(if pid == pin.shell.pid {
+                    pin.shell
+                } else {
+                    pin.agent
+                }),
+                || Some(job),
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn guarded_submission_refusal_retains_checked_terminal_identity() {
+        let (mut pin, _) = submission_pin_fixture();
+        pin.shell.pid = 0;
+        let error = pin.check().unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains(pin.terminal_id.as_str()));
+    }
+
+    #[test]
+    fn guarded_submission_rejects_unknown_reused_and_lost_processes() {
+        let (pin, job) = submission_pin_fixture();
+        for endpoint in [pin.shell, pin.agent] {
+            for replacement in [
+                None,
+                Some(crate::platform::ProcessIdentity {
+                    start_time: endpoint.start_time + 1,
+                    ..endpoint
+                }),
+            ] {
+                let error = pin
+                    .check_observed(
+                        |pid| {
+                            if pid == endpoint.pid {
+                                replacement
+                            } else {
+                                Some(if pid == pin.shell.pid {
+                                    pin.shell
+                                } else {
+                                    pin.agent
+                                })
+                            }
+                        },
+                        || Some(job.clone()),
+                    )
+                    .unwrap_err();
+                assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+            }
+        }
+        let live = |pid| {
+            Some(if pid == pin.shell.pid {
+                pin.shell
+            } else {
+                pin.agent
+            })
+        };
+        for observation in [
+            None,
+            Some(crate::platform::ForegroundJob {
+                process_group_id: pin.shell.pid,
+                ..job.clone()
+            }),
+            Some(crate::platform::ForegroundJob {
+                processes: Vec::new(),
+                ..job.clone()
+            }),
+        ] {
+            assert_eq!(
+                pin.check_observed(live, || observation).unwrap_err().kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+        }
+        let mut shell_job = job.clone();
+        shell_job.processes[0].name = "sh".into();
+        assert!(pin.check_observed(live, || Some(shell_job)).is_err());
+    }
+
+    #[test]
+    fn guarded_submission_preserves_argv_wrappers_and_rejects_in_place_shell_exec() {
+        let (pin, mut job) = submission_pin_fixture();
+        let live = |pid| {
+            Some(if pid == pin.shell.pid {
+                pin.shell
+            } else {
+                pin.agent
+            })
+        };
+        let process = &mut job.processes[0];
+        process.name = "node".into();
+        process.argv = Some(vec![
+            "node".into(),
+            "/opt/node_modules/@earendil-works/pi-coding-agent/dist/cli.js".into(),
+        ]);
+        assert!(pin.check_observed(live, || Some(job.clone())).is_ok());
+        // Exec does not change start time; fresh expected-agent classification is
+        // essential even when all numeric identities and groups still match.
+        job.processes[0].name = "sh".into();
+        job.processes[0].argv = Some(vec!["/bin/sh".into()]);
+        assert_eq!(
+            pin.check_observed(live, || Some(job)).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn guarded_submission_revalidates_instances_after_foreground_capture() {
+        let (pin, job) = submission_pin_fixture();
+        for endpoint in [pin.shell, pin.agent] {
+            let replaced = std::cell::Cell::new(false);
+            assert_eq!(
+                pin.check_observed(
+                    |pid| {
+                        let mut identity = if pid == pin.shell.pid {
+                            pin.shell
+                        } else {
+                            pin.agent
+                        };
+                        if pid == endpoint.pid && replaced.get() {
+                            identity.start_time += 1;
+                        }
+                        Some(identity)
+                    },
+                    || {
+                        replaced.set(true);
+                        Some(job.clone())
+                    },
+                )
+                .unwrap_err()
+                .kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn guarded_submission_synthetic_runtime_is_explicitly_test_only() {
+        let (runtime, _rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        let terminal_id = crate::terminal::TerminalId::alloc();
+        let guard =
+            capture_agent_submission_guard(&terminal_id, &runtime, crate::detect::Agent::Pi)
+                .expect("synthetic test guard");
+        assert!(guard.check().is_ok());
+        runtime.test_set_child_pid(u32::MAX);
+        assert!(
+            capture_agent_submission_guard(&terminal_id, &runtime, crate::detect::Agent::Pi)
+                .is_err()
+        );
+    }
 
     #[test]
     fn agent_names_use_a_small_cli_safe_grammar() {

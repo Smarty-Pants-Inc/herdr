@@ -39,6 +39,7 @@ pub(crate) fn extract_remote_args(
         cleaned.push(program.clone());
     }
 
+    let payload_slots = crate::session::agent_prompt_payload_slots(args);
     let mut remote_target = None;
     let mut keybindings = RemoteKeybindings::Local;
     let mut keybindings_seen = false;
@@ -49,6 +50,11 @@ pub(crate) fn extract_remote_args(
         if arg == "--" {
             cleaned.extend_from_slice(&args[index..]);
             break;
+        }
+        if payload_slots.contains(&index) {
+            cleaned.push(arg.clone());
+            index += 1;
+            continue;
         }
         if arg == "--handoff" {
             live_handoff = true;

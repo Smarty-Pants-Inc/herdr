@@ -777,33 +777,49 @@ pub(super) fn send_request(request: &Request) -> std::io::Result<serde_json::Val
         Method::PaneSendInput(params) if params.expected_terminal.is_some() => {
             Some(Method::PaneSendInputGuarded(params.clone()))
         }
+        Method::AgentPromptGuarded(_) => Some(request.method.clone()),
         Method::AgentStartGuarded(_) | Method::PaneSendInputGuarded(_) => {
             Some(request.method.clone())
         }
         _ => None,
     };
-    if guarded_method.is_some()
-        && !status
-            .capabilities
-            .is_some_and(|caps| caps.expected_terminal_guard)
-    {
-        return Ok(serde_json::json!({
-            "id": request.id,
-            "error": {
-                "code": "expected_terminal_unsupported",
-                "message": "server does not advertise expected_terminal_guard; guarded input was not sent",
-            },
-        }));
-    }
     // Ping and effect use separate connections. A server may be replaced between
     // them, so the effect must use a method old servers cannot silently accept.
     let guarded_request = guarded_method.map(|method| Request {
         id: request.id.clone(),
         method,
     });
+    let request = guarded_request.as_ref().unwrap_or(request);
+    if let Some(error) = expected_terminal_capability_error(request, status.capabilities.as_ref()) {
+        return Ok(error);
+    }
     client
-        .request_value(guarded_request.as_ref().unwrap_or(request))
+        .request_value(request)
         .map_err(|err| map_server_not_running_or_io(err, &request.id, &client))
+}
+
+fn expected_terminal_capability_error(
+    request: &Request,
+    capabilities: Option<&crate::api::schema::ServerCapabilities>,
+) -> Option<serde_json::Value> {
+    let (capability, supported) = match &request.method {
+        Method::AgentPromptGuarded(_) => (
+            "expected_terminal_agent_prompt_guard",
+            capabilities.is_some_and(|caps| caps.expected_terminal_agent_prompt_guard),
+        ),
+        Method::AgentStartGuarded(_) | Method::PaneSendInputGuarded(_) => (
+            "expected_terminal_guard",
+            capabilities.is_some_and(|caps| caps.expected_terminal_guard),
+        ),
+        _ => return None,
+    };
+    (!supported).then(|| serde_json::json!({
+        "id": request.id,
+        "error": {
+            "code": "expected_terminal_unsupported",
+            "message": format!("server does not advertise {capability}; guarded input was not sent"),
+        },
+    }))
 }
 
 pub(super) fn send_request_unchecked(request: &Request) -> std::io::Result<serde_json::Value> {
@@ -1088,6 +1104,49 @@ fn _print_json<T: Serialize>(value: &T) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn prompt_guard_capability_is_independent_and_fails_closed() {
+        use crate::api::schema::{AgentPromptGuardedParams, AgentPromptParams, ServerCapabilities};
+        let prompt = AgentPromptParams {
+            target: "w1:p2".into(),
+            text: "assignment".into(),
+            wait: None,
+            allow_cross_pane: false,
+        };
+        let guarded = super::Request {
+            id: "guarded".into(),
+            method: super::Method::AgentPromptGuarded(AgentPromptGuardedParams {
+                prompt: prompt.clone(),
+                expected_terminal: "opaque-term".into(),
+            }),
+        };
+        let mut old_caps: ServerCapabilities = serde_json::from_value(serde_json::json!({
+            "live_handoff": false, "expected_terminal_guard": true,
+        }))
+        .unwrap();
+        for caps in [None, Some(&old_caps)] {
+            let error = super::expected_terminal_capability_error(&guarded, caps).unwrap();
+            assert_eq!(error["id"], "guarded");
+            assert_eq!(error["error"]["code"], "expected_terminal_unsupported");
+            assert!(error["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("expected_terminal_agent_prompt_guard"));
+        }
+        old_caps.expected_terminal_agent_prompt_guard = true;
+        old_caps.expected_terminal_guard = false;
+        assert!(super::expected_terminal_capability_error(&guarded, Some(&old_caps)).is_none());
+        let legacy = super::Request {
+            id: "legacy".into(),
+            method: super::Method::AgentPrompt(prompt),
+        };
+        assert!(super::expected_terminal_capability_error(&legacy, None).is_none());
+        assert_eq!(
+            serde_json::to_value(&guarded).unwrap()["method"],
+            "agent.prompt_guarded"
+        );
+    }
+
     #[test]
     fn parses_channel_set_argument() {
         assert_eq!(

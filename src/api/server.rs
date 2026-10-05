@@ -151,6 +151,7 @@ fn default_capabilities() -> Option<ServerCapabilities> {
         ssh_agent_registration: false,
         guarded_live_handoff: crate::platform::capabilities().live_handoff,
         expected_terminal_guard: true,
+        expected_terminal_agent_prompt_guard: crate::platform::GUARDED_AGENT_PROMPT_SUPPORTED,
     })
 }
 
@@ -584,10 +585,10 @@ fn handle_connection_with_stop(
             )?;
             finish_wait_response(&mut stream, response, &request_id, method, changes_ui)
         }
-        Method::AgentPrompt(params) => {
+        prompt @ (Method::AgentPrompt(_) | Method::AgentPromptGuarded(_)) => {
             let response = prompt_agent(
                 request_id.clone(),
-                params,
+                prompt,
                 context,
                 &mut stream,
                 api_tx,
@@ -813,6 +814,7 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::AgentStart(_) => "agent.start",
         Method::AgentStartGuarded(_) => "agent.start_guarded",
         Method::AgentPrompt(_) => "agent.prompt",
+        Method::AgentPromptGuarded(_) => "agent.prompt_guarded",
         Method::AgentWait(_) => "agent.wait",
         Method::PaneSplit(_) => "pane.split",
         Method::PaneSwap(_) => "pane.swap",
@@ -991,6 +993,69 @@ mod windows_tests {
             done_tx.send(result).unwrap();
         });
         (done_rx, thread)
+    }
+
+    #[test]
+    fn windows_current_receiver_does_not_advertise_guarded_agent_prompt() {
+        let caps = default_capabilities().unwrap();
+        assert!(caps.expected_terminal_guard);
+        assert!(!caps.expected_terminal_agent_prompt_guard);
+    }
+
+    #[test]
+    fn windows_guarded_agent_prompt_never_dispatches_even_with_wait() {
+        for direct_wait_entry in [false, true] {
+            for wait in [false, true] {
+                let mut params = serde_json::json!({
+                    "target": "reviewer", "text": "must not send",
+                    "expected_terminal": "term_1", "allow_cross_pane": true,
+                });
+                if wait {
+                    params["wait"] = serde_json::json!({"timeout_ms": 1000});
+                }
+                let request = serde_json::json!({
+                    "id": "windows-guard-refused", "method": "agent.prompt_guarded",
+                    "params": params,
+                });
+                let (api_tx, mut api_rx) = tokio::sync::mpsc::unbounded_channel();
+                let (mut client, mut server, path) = local_stream_pair("unsupported-prompt-guard");
+                let running = Arc::new(AtomicBool::new(true));
+                let response = if direct_wait_entry {
+                    let request: Request = serde_json::from_value(request).unwrap();
+                    prompt_agent(
+                        request.id,
+                        request.method,
+                        ApiRequestContext::default(),
+                        &mut server,
+                        &api_tx,
+                        &EventHub::default(),
+                        &running,
+                    )
+                    .unwrap()
+                    .unwrap()
+                } else {
+                    writeln!(client, "{request}").unwrap();
+                    client.flush().unwrap();
+                    handle_connection(server, &api_tx, &EventHub::default(), &running, None)
+                        .unwrap();
+                    let mut response = String::new();
+                    BufReader::new(&mut client)
+                        .read_line(&mut response)
+                        .unwrap();
+                    response
+                };
+                let response: ErrorResponse = serde_json::from_str(&response).unwrap();
+                assert_eq!(response.id, "windows-guard-refused");
+                assert_eq!(response.error.code, "platform_unsupported");
+                assert!(response.error.message.contains("agent.prompt_guarded"));
+                assert!(response.error.message.contains("Windows"));
+                assert!(
+                    api_rx.try_recv().is_err(),
+                    "must not look up or dispatch to app"
+                );
+                let _ = std::fs::remove_file(path);
+            }
+        }
     }
 
     #[test]
@@ -2012,6 +2077,7 @@ mod tests {
                 ssh_agent_registration: false,
                 guarded_live_handoff: true,
                 expected_terminal_guard: true,
+                expected_terminal_agent_prompt_guard: true,
             }),
             None,
             None,
@@ -2327,6 +2393,49 @@ mod tests {
     }
 
     #[test]
+    fn guarded_agent_prompt_invalid_pin_never_dispatches() {
+        for pin in [
+            None,
+            Some(serde_json::Value::Null),
+            Some(serde_json::json!(42)),
+            Some(serde_json::json!("")),
+            Some(serde_json::json!("term space")),
+            Some(serde_json::json!("term\u{0000}")),
+            Some(serde_json::json!("term\n")),
+        ] {
+            let mut params = serde_json::json!({
+                "target": "w1:p1", "text": "must not send", "wait": {"timeout_ms": 1000},
+            });
+            if let Some(pin) = pin {
+                params["expected_terminal"] = pin;
+            }
+            let request = serde_json::json!({
+                "id": "guarded-invalid", "method": "agent.prompt_guarded", "params": params,
+            });
+            let (api_tx, mut api_rx) = mpsc::unbounded_channel();
+            let (mut client, server, path) = local_stream_pair("invalid-prompt-guard");
+            writeln!(client, "{request}").unwrap();
+            let running = Arc::new(AtomicBool::new(true));
+            handle_connection(server, &api_tx, &EventHub::default(), &running, None).unwrap();
+            let response: ErrorResponse = serde_json::from_str(&read_line(&mut client)).unwrap();
+            assert_eq!(response.id, "guarded-invalid");
+            assert_eq!(response.error.code, "invalid_request");
+            assert!(
+                api_rx.try_recv().is_err(),
+                "invalid guard must not dispatch any app request"
+            );
+            fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn current_receiver_advertises_guarded_agent_prompt() {
+        let caps = default_capabilities().unwrap();
+        assert!(caps.expected_terminal_guard);
+        assert!(caps.expected_terminal_agent_prompt_guard);
+    }
+
+    #[test]
     fn invalid_requests_preserve_only_unambiguous_string_ids() {
         let cases = [
             (
@@ -2482,14 +2591,34 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn agent_prompt_wait_preserves_local_peer_context() {
+        for method in ["agent.prompt", "agent.prompt_guarded"] {
+            for wait in [false, true] {
+                assert_prompt_dispatch_preserves_context(method, wait);
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn assert_prompt_dispatch_preserves_context(method: &str, wait: bool) {
         let (api_tx, mut api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
         let (mut client, server, path) = local_stream_pair("agent-prompt-context");
-        client
-            .write_all(
-                br#"{"id":"prompt_wait","method":"agent.prompt","params":{"target":"target","text":"hello","wait":{"timeout_ms":100}}}"#,
-            )
-            .unwrap();
-        client.write_all(b"\n").unwrap();
+        let mut params = serde_json::json!({
+            "target": "target", "text": "--assignment\nλ 日本語", "allow_cross_pane": true,
+        });
+        if wait {
+            params["wait"] = serde_json::json!({"timeout_ms": 1000});
+        }
+        if method == "agent.prompt_guarded" {
+            params["expected_terminal"] = serde_json::json!("opaque:λ/42");
+        }
+        writeln!(
+            client,
+            "{}",
+            serde_json::json!({
+                "id": "prompt_wait", "method": method, "params": params,
+            })
+        )
+        .unwrap();
         client.flush().unwrap();
 
         let running = Arc::new(AtomicBool::new(true));
@@ -2499,46 +2628,47 @@ mod tests {
             handle_connection(server, &api_tx, &event_hub, &server_running, None)
         });
 
-        let agent_get = api_rx.blocking_recv().expect("agent.get dispatch");
-        assert!(matches!(agent_get.request.method, Method::AgentGet(_)));
-        agent_get
-            .respond_to
-            .send(
-                serde_json::to_string(&SuccessResponse {
-                    id: agent_get.request.id,
-                    result: ResponseResult::AgentInfo {
-                        agent: crate::api::schema::AgentInfo {
-                            terminal_id: "term_1".into(),
-                            name: Some("target".into()),
-                            agent: Some("pi".into()),
-                            title: None,
-                            terminal_title: None,
-                            terminal_title_stripped: None,
-                            display_agent: None,
-                            agent_status: crate::api::schema::AgentStatus::Idle,
-                            screen_detection_skipped: false,
-                            state_labels: HashMap::new(),
-                            tokens: HashMap::new(),
-                            agent_session: None,
-                            workspace_id: "ws_1".into(),
-                            tab_id: "tab_1".into(),
-                            pane_id: "pane_1".into(),
-                            focused: true,
-                            launch_pending: false,
-                            interactive_ready: true,
-                            state_change_seq: 1,
-                            completion_seq: None,
-                            cwd: None,
-                            foreground_cwd: None,
-                            revision: 0,
+        if wait {
+            let agent_get = api_rx.blocking_recv().expect("agent.get dispatch");
+            assert!(matches!(agent_get.request.method, Method::AgentGet(_)));
+            agent_get
+                .respond_to
+                .send(
+                    serde_json::to_string(&SuccessResponse {
+                        id: agent_get.request.id,
+                        result: ResponseResult::AgentInfo {
+                            agent: crate::api::schema::AgentInfo {
+                                terminal_id: "term_1".into(),
+                                name: Some("target".into()),
+                                agent: Some("pi".into()),
+                                title: None,
+                                terminal_title: None,
+                                terminal_title_stripped: None,
+                                display_agent: None,
+                                agent_status: crate::api::schema::AgentStatus::Idle,
+                                screen_detection_skipped: false,
+                                state_labels: HashMap::new(),
+                                tokens: HashMap::new(),
+                                agent_session: None,
+                                workspace_id: "ws_1".into(),
+                                tab_id: "tab_1".into(),
+                                pane_id: "pane_1".into(),
+                                focused: true,
+                                launch_pending: false,
+                                interactive_ready: true,
+                                state_change_seq: 1,
+                                completion_seq: None,
+                                cwd: None,
+                                foreground_cwd: None,
+                                revision: 0,
+                            },
                         },
-                    },
-                })
-                .unwrap(),
-            )
-            .unwrap();
-
-        let prompt = api_rx.blocking_recv().expect("agent.prompt dispatch");
+                    })
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+        let prompt = api_rx.blocking_recv().expect("agent prompt dispatch");
         assert_eq!(
             prompt.context.local_peer_pid(),
             Some(std::process::id()),
@@ -2549,7 +2679,22 @@ mod tests {
             crate::platform::process_identity(std::process::id()),
             "wait-mode prompt must retain the captured socket process instance"
         );
-        assert!(matches!(prompt.request.method, Method::AgentPrompt(_)));
+        assert_eq!(api_method_name(&prompt.request.method), method);
+        let prompt_params = match &prompt.request.method {
+            Method::AgentPrompt(params) => params,
+            Method::AgentPromptGuarded(params) => {
+                assert_eq!(params.expected_terminal, "opaque:λ/42");
+                &params.prompt
+            }
+            _ => panic!("expected prompt dispatch"),
+        };
+        assert_eq!(prompt_params.text, "--assignment\nλ 日本語");
+        assert!(prompt_params.allow_cross_pane);
+        assert_eq!(prompt_params.wait.is_some(), wait);
+        if let Some(options) = &prompt_params.wait {
+            assert_eq!(options.timeout_ms, Some(1000));
+            assert!(options.submission_deadline.is_some());
+        }
         let prompt_id = prompt.request.id.clone();
         prompt
             .respond_to

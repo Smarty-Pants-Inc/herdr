@@ -1,9 +1,10 @@
 use std::time::{Duration, Instant};
 
 use crate::api::schema::{
-    AgentPromptParams, AgentPromptWaitOptions, AgentReadParams, AgentRenameParams,
-    AgentSendKeysParams, AgentStartParams, AgentTarget, AgentWaitParams, EmptyParams, ErrorBody,
-    ErrorResponse, Method, PaneProcessInfoParams, PaneTarget, ReadFormat, ReadSource, Request,
+    AgentPromptGuardedParams, AgentPromptParams, AgentPromptWaitOptions, AgentReadParams,
+    AgentRenameParams, AgentSendKeysParams, AgentStartParams, AgentTarget, AgentWaitParams,
+    EmptyParams, ErrorBody, ErrorResponse, Method, PaneProcessInfoParams, PaneTarget, ReadFormat,
+    ReadSource, Request,
 };
 
 const AGENT_START_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -767,21 +768,24 @@ fn agent_rename(args: &[String]) -> std::io::Result<i32> {
     })?)
 }
 
-fn agent_prompt(args: &[String]) -> std::io::Result<i32> {
+fn parse_agent_prompt_args(args: &[String]) -> Result<Method, i32> {
     let Some(target) = args.first() else {
         eprintln!(
-            "usage: herdr agent prompt <target> <text> [--wait] [--until STATUS]... [--timeout MS] [--allow-cross-pane]"
+            "usage: herdr agent prompt <target> <text> [--expected-terminal TERM] [--wait] [--until STATUS]... [--timeout MS] [--allow-cross-pane]"
         );
-        return Ok(2);
+        return Err(2);
     };
+    // TEXT is one literal argv value, including flag-like text and newlines.
+    // Only parse options after the two positional arguments.
     let Some(text) = args.get(1) else {
         eprintln!("agent prompt requires text");
-        return Ok(2);
+        return Err(2);
     };
     let mut wait = false;
     let mut until = Vec::new();
     let mut timeout_ms = None;
     let mut allow_cross_pane = false;
+    let mut expected_terminal = None;
     let mut index = 2;
     while index < args.len() {
         match args[index].as_str() {
@@ -792,60 +796,95 @@ fn agent_prompt(args: &[String]) -> std::io::Result<i32> {
             "--until" => {
                 let Some(value) = args.get(index + 1) else {
                     eprintln!("--until requires at least one status");
-                    return Ok(2);
+                    return Err(2);
                 };
-                let status = match super::parse_agent_status(value) {
-                    Ok(status) => status,
-                    Err(err) => {
-                        eprintln!("{err}");
-                        return Ok(2);
-                    }
-                };
+                let status = super::parse_agent_status(value).map_err(|err| {
+                    eprintln!("{err}");
+                    2
+                })?;
                 until.push(status);
                 index += 2;
             }
             "--timeout" => {
                 let Some(value) = args.get(index + 1) else {
                     eprintln!("missing value for --timeout");
-                    return Ok(2);
+                    return Err(2);
                 };
-                timeout_ms = match parse_timeout(value) {
-                    Ok(timeout_ms) => Some(timeout_ms),
-                    Err(exit_code) => return Ok(exit_code),
-                };
+                timeout_ms = Some(parse_timeout(value)?);
                 index += 2;
             }
             "--allow-cross-pane" => {
                 allow_cross_pane = true;
                 index += 1;
             }
-
+            option
+                if option == "--expected-terminal"
+                    || option.starts_with("--expected-terminal=") =>
+            {
+                if expected_terminal.is_some() {
+                    eprintln!("--expected-terminal may only be specified once");
+                    return Err(2);
+                }
+                let value = if let Some((_, value)) = option.split_once('=') {
+                    index += 1;
+                    value
+                } else {
+                    let Some(value) = args.get(index + 1) else {
+                        eprintln!("missing value for --expected-terminal");
+                        return Err(2);
+                    };
+                    index += 2;
+                    value.as_str()
+                };
+                crate::api::schema::validate_expected_terminal_identity(value).map_err(
+                    |message| {
+                        eprintln!("{message}");
+                        2
+                    },
+                )?;
+                expected_terminal = Some(value.to_owned());
+            }
             option => {
                 eprintln!("unknown option: {option}");
-                return Ok(2);
+                return Err(2);
             }
         }
     }
     if !until.is_empty() && !wait {
         eprintln!("--until requires --wait");
-        return Ok(2);
+        return Err(2);
     }
     if timeout_ms.is_some() && !wait {
         eprintln!("--timeout requires --wait");
-        return Ok(2);
+        return Err(2);
     }
+    let prompt = AgentPromptParams {
+        target: target.clone(),
+        text: text.clone(),
+        wait: wait.then_some(AgentPromptWaitOptions {
+            until,
+            timeout_ms,
+            submission_deadline: None,
+        }),
+        allow_cross_pane,
+    };
+    Ok(match expected_terminal {
+        Some(expected_terminal) => Method::AgentPromptGuarded(AgentPromptGuardedParams {
+            prompt,
+            expected_terminal,
+        }),
+        None => Method::AgentPrompt(prompt),
+    })
+}
+
+fn agent_prompt(args: &[String]) -> std::io::Result<i32> {
+    let method = match parse_agent_prompt_args(args) {
+        Ok(method) => method,
+        Err(exit_code) => return Ok(exit_code),
+    };
     let response = super::send_request(&Request {
         id: "cli:agent:prompt".into(),
-        method: Method::AgentPrompt(AgentPromptParams {
-            target: target.clone(),
-            text: text.clone(),
-            wait: wait.then_some(AgentPromptWaitOptions {
-                until,
-                timeout_ms,
-                submission_deadline: None,
-            }),
-            allow_cross_pane,
-        }),
+        method,
     })?;
     super::print_response(&response)
 }
@@ -951,7 +990,7 @@ fn print_agent_help() {
     eprintln!("  herdr agent get <target>");
     eprintln!("  herdr agent read <target> [--source visible|recent|recent-unwrapped|detection] [--lines N] [--format text|ansi] [--ansi]");
     eprintln!("  herdr agent send-keys <target> [--allow-cross-pane] <key> [key ...]");
-    eprintln!("  herdr agent prompt <target> <text> [--wait] [--until STATUS]... [--timeout MS] [--allow-cross-pane]");
+    eprintln!("  herdr agent prompt <target> <text> [--expected-terminal TERM] [--wait] [--until STATUS]... [--timeout MS] [--allow-cross-pane]");
     eprintln!("  herdr agent rename <target> <name>|--clear");
     eprintln!("  herdr agent focus <target>");
     eprintln!("  herdr agent wait <target> [--until STATUS]... [--timeout MS]");
@@ -980,6 +1019,113 @@ mod tests {
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn prompt_guarded_parser_preserves_literal_text_and_wait_options() {
+        for text in [
+            "--assignment\nλ 日本語\nsecond line",
+            "--wait",
+            "--help",
+            "-h",
+            "--expected-terminal=payload",
+        ] {
+            let method = parse_agent_prompt_args(&args(&[
+                "w1:p2",
+                text,
+                "--expected-terminal",
+                "opaque:λ/42",
+                "--wait",
+                "--until",
+                "done",
+                "--until",
+                "idle",
+                "--timeout",
+                "1234",
+                "--allow-cross-pane",
+            ]))
+            .unwrap();
+            let Method::AgentPromptGuarded(params) = method else {
+                panic!("expected guarded wire method");
+            };
+            assert_eq!(params.expected_terminal, "opaque:λ/42");
+            assert_eq!(params.prompt.target, "w1:p2");
+            assert_eq!(params.prompt.text, text);
+            assert!(params.prompt.allow_cross_pane);
+            let wait = params.prompt.wait.unwrap();
+            assert_eq!(
+                wait.until,
+                [
+                    crate::api::schema::AgentStatus::Done,
+                    crate::api::schema::AgentStatus::Idle
+                ]
+            );
+            assert_eq!(wait.timeout_ms, Some(1234));
+            assert!(wait.submission_deadline.is_none());
+        }
+        let method = parse_agent_prompt_args(&args(&[
+            "worker",
+            "--literal\nhello",
+            "--expected-terminal=opaque=terminal",
+        ]))
+        .unwrap();
+        let Method::AgentPromptGuarded(params) = method else {
+            panic!("guarded");
+        };
+        assert_eq!(params.expected_terminal, "opaque=terminal");
+        assert!(params.prompt.wait.is_none());
+    }
+
+    #[test]
+    fn prompt_guarded_parser_rejects_missing_malformed_and_ambiguous_pins() {
+        for values in [
+            vec!["w1:p2", "text", "--expected-terminal"],
+            vec!["w1:p2", "text", "--expected-terminal="],
+            vec!["w1:p2", "text", "--expected-terminal", ""],
+            vec!["w1:p2", "text", "--expected-terminal", "term space"],
+            vec!["w1:p2", "text", "--expected-terminal", "term\n"],
+            vec!["w1:p2", "text", "--expected-terminal", "term\u{0000}"],
+            vec![
+                "w1:p2",
+                "text",
+                "--expected-terminal",
+                "term",
+                "--expected-terminal=other",
+            ],
+            vec!["w1:p2", "text", "--expected-terminal", "term", "extra-text"],
+            vec![
+                "w1:p2",
+                "text",
+                "--expected-terminal",
+                "term",
+                "--until",
+                "idle",
+            ],
+            vec![
+                "w1:p2",
+                "text",
+                "--expected-terminal",
+                "term",
+                "--timeout",
+                "1",
+            ],
+        ] {
+            assert_eq!(
+                parse_agent_prompt_args(&args(&values)),
+                Err(2),
+                "{values:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn prompt_without_pin_remains_legacy() {
+        let method = parse_agent_prompt_args(&args(&["worker", "--expected-terminal\nλ"])).unwrap();
+        let Method::AgentPrompt(params) = method else {
+            panic!("legacy prompt");
+        };
+        assert_eq!(params.text, "--expected-terminal\nλ");
+        assert!(params.wait.is_none());
     }
 
     #[test]

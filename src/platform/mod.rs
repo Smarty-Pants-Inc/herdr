@@ -3,6 +3,10 @@
 //! Centralizes OS-dependent behavior behind a clean boundary so core
 //! modules don't scatter `#[cfg]` branches through product logic.
 
+/// Guarded agent prompts require platform console ownership evidence.
+/// Windows support is deferred until that evidence is available.
+pub(crate) const GUARDED_AGENT_PROMPT_SUPPORTED: bool = !cfg!(windows);
+
 mod diagnostic_owner;
 pub(crate) use diagnostic_owner::{
     diagnostic_directory, diagnostic_owner_identity, diagnostic_snapshot_name,
@@ -81,6 +85,25 @@ pub struct ForegroundJob {
 pub(crate) struct ProcessIdentity {
     pub(crate) pid: u32,
     pub(crate) start_time: u64,
+}
+
+/// Uncached foreground evidence for guarded API submissions only. Detection keeps
+/// its existing cache/fallback policy; an unobservable native Unix group refuses.
+pub(crate) fn fresh_foreground_job(shell_pid: u32) -> Option<ForegroundJob> {
+    #[cfg(windows)]
+    return windows::fresh_foreground_job(shell_pid);
+    #[cfg(unix)]
+    {
+        let group = foreground_process_group_id(shell_pid)?;
+        let job = foreground_job(shell_pid)?;
+        (job.process_group_id == group && foreground_process_group_id(shell_pid) == Some(group))
+            .then_some(job)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = shell_pid;
+        None
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

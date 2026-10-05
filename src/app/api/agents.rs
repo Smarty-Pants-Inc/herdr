@@ -3,8 +3,8 @@ use std::time::Duration;
 use bytes::Bytes;
 
 use crate::api::schema::{
-    AgentPromptParams, AgentRenameParams, AgentSendKeysParams, AgentStartParams, AgentTarget,
-    PaneReadResult, ResponseResult,
+    AgentPromptGuardedParams, AgentPromptParams, AgentRenameParams, AgentSendKeysParams,
+    AgentStartParams, AgentTarget, PaneReadResult, ResponseResult,
 };
 use crate::app::App;
 
@@ -85,17 +85,47 @@ impl App {
         context: crate::api::ApiRequestContext,
         respond_to: std::sync::mpsc::Sender<String>,
     ) -> bool {
-        if !matches!(request.method, crate::api::schema::Method::AgentPrompt(_)) {
+        if !matches!(
+            &request.method,
+            crate::api::schema::Method::AgentPrompt(_)
+                | crate::api::schema::Method::AgentPromptGuarded(_)
+        ) {
             return false;
+        }
+        if let crate::api::schema::Method::AgentPromptGuarded(params) = &request.method {
+            // Internal dispatch must obey the same policy before attribution or input effects.
+            if !crate::platform::GUARDED_AGENT_PROMPT_SUPPORTED {
+                let _ = respond_to.send(encode_error(
+                    request.id,
+                    "platform_unsupported",
+                    "agent.prompt_guarded is not supported on Windows",
+                ));
+                return true;
+            }
+            if let Err(message) =
+                crate::api::schema::validate_expected_terminal_identity(&params.expected_terminal)
+            {
+                let _ = respond_to.send(encode_error(request.id, "invalid_request", message));
+                return true;
+            }
         }
         if let Some(response) = self.cross_pane_input_denial(&request, context) {
             let _ = respond_to.send(response);
             return true;
         }
-        let crate::api::schema::Method::AgentPrompt(params) = request.method else {
-            return false;
+        let (params, expected_terminal) = match request.method {
+            crate::api::schema::Method::AgentPrompt(params) => (params, None),
+            crate::api::schema::Method::AgentPromptGuarded(params) => {
+                let AgentPromptGuardedParams {
+                    prompt,
+                    expected_terminal,
+                } = params;
+                (prompt, Some(expected_terminal))
+            }
+            _ => return false,
         };
-        match self.queue_agent_prompt(request.id, params, context) {
+        let guarded = expected_terminal.is_some();
+        match self.queue_agent_prompt(request.id, params, expected_terminal.as_deref(), context) {
             Ok((id, agent, completion)) => {
                 std::thread::spawn(move || {
                     let response = match completion.recv() {
@@ -103,7 +133,7 @@ impl App {
                         Ok(Err(err)) if err.kind() == std::io::ErrorKind::TimedOut => {
                             encode_error(id, "timeout", err.to_string())
                         }
-                        Ok(Err(err)) => encode_error(id, "agent_prompt_failed", err.to_string()),
+                        Ok(Err(err)) => agent_prompt_io_error(id, guarded, err),
                         Err(_) => encode_error(id, "agent_prompt_failed", "pty actor closed"),
                     };
                     let _ = respond_to.send(response);
@@ -120,6 +150,7 @@ impl App {
         &mut self,
         id: String,
         params: AgentPromptParams,
+        expected_terminal: Option<&str>,
         context: crate::api::ApiRequestContext,
     ) -> Result<
         (
@@ -152,6 +183,8 @@ impl App {
         let Some(terminal) = self.state.terminals.get(&terminal_id) else {
             return Err(agent_not_found(id, &params.target));
         };
+        self.check_expected_terminal(expected_terminal, Some(&terminal_id))
+            .map_err(|error| encode_error_body(id.clone(), error))?;
         if terminal.state == crate::detect::AgentState::Blocked {
             return Err(encode_error(
                 id,
@@ -168,10 +201,26 @@ impl App {
         if terminal.managed_agent_launch_pending() {
             return Err(agent_not_ready(id, &params.target));
         }
+        // Hold this exact checked terminal runtime through logging and enqueue.
+        // Guarded submissions additionally pin the live job before logging and
+        // carry a fresh instance check through the asynchronous writer boundaries.
+        let guarded = expected_terminal.is_some();
         let Some(runtime) = self.lookup_runtime_sender(resolved.ws_idx, resolved.pane_id) else {
             return Err(agent_not_found(id, &params.target));
         };
-        if !super::super::agents::runtime_hosts_agent(runtime, expected_agent) {
+        let submission_guard = if guarded {
+            Some(
+                super::super::agents::capture_agent_submission_guard(
+                    &terminal_id,
+                    runtime,
+                    expected_agent,
+                )
+                .map_err(|err| agent_prompt_io_error(id.clone(), true, err))?,
+            )
+        } else {
+            None
+        };
+        if !guarded && !super::super::agents::runtime_hosts_agent(runtime, expected_agent) {
             return Err(encode_error(
                 id,
                 "agent_not_ready",
@@ -184,7 +233,11 @@ impl App {
         // Before any write to the pane, including the Copilot focus event.
         self.log_api_input(
             &id,
-            "agent.prompt",
+            if expected_terminal.is_some() {
+                "agent.prompt_guarded"
+            } else {
+                "agent.prompt"
+            },
             resolved.ws_idx,
             resolved.pane_id,
             context,
@@ -197,6 +250,7 @@ impl App {
             .and_then(|wait| wait.submission_deadline);
         #[cfg(not(windows))]
         let submit_deadline = None;
+        let mut guarded_focus = None;
         if expected_agent == crate::detect::Agent::GithubCopilot {
             // Copilot ignores synthetic Enter after focus loss until it receives focus gained.
             let focus = match crate::ghostty::encode_focus(crate::ghostty::FocusEvent::Gained) {
@@ -205,7 +259,10 @@ impl App {
                     return Err(encode_error(id, "agent_prompt_failed", err.to_string()));
                 }
             };
-            if let Err(err) = runtime.try_send_bytes(Bytes::from(focus)) {
+            if guarded {
+                // The writer must validate before focus, not just before prompt text.
+                guarded_focus = Some(focus);
+            } else if let Err(err) = runtime.try_send_bytes(Bytes::from(focus)) {
                 return Err(encode_error(id, "agent_prompt_failed", err.to_string()));
             }
         }
@@ -219,17 +276,37 @@ impl App {
         } else {
             text
         };
+        let text = if let Some(mut focus) = guarded_focus {
+            focus.extend_from_slice(&text);
+            focus
+        } else {
+            text
+        };
         let Some(agent) = self.agent_info(resolved.ws_idx, resolved.pane_id) else {
             return Err(agent_not_found(id, &params.target));
         };
-        let completion = runtime
-            .queue_user_input_submission(
+        let completion = if let Some(guard) = submission_guard {
+            // Logging can block; this early recheck is useful, but writer checks
+            // remain mandatory after queueing and before delayed Enter.
+            guard
+                .check()
+                .map_err(|err| agent_prompt_io_error(id.clone(), true, err))?;
+            runtime.queue_guarded_user_input_submission(
+                Bytes::from(text),
+                Bytes::from(enter),
+                AGENT_PROMPT_SUBMIT_DELAY,
+                submit_deadline,
+                guard,
+            )
+        } else {
+            runtime.queue_user_input_submission(
                 Bytes::from(text),
                 Bytes::from(enter),
                 AGENT_PROMPT_SUBMIT_DELAY,
                 submit_deadline,
             )
-            .map_err(|err| encode_error(id.clone(), "agent_prompt_failed", err.to_string()))?;
+        }
+        .map_err(|err| agent_prompt_io_error(id.clone(), guarded, err))?;
         // Receipt is issued on enqueue, before the asynchronous submission completes.
         self.accepted_api_inputs.push(resolved.pane_id);
         Ok((id, agent, completion))
@@ -408,6 +485,15 @@ impl App {
     }
 }
 
+fn agent_prompt_io_error(id: String, guarded: bool, err: std::io::Error) -> String {
+    let code = if guarded && err.kind() == std::io::ErrorKind::PermissionDenied {
+        "agent_not_ready"
+    } else {
+        "agent_prompt_failed"
+    };
+    encode_error(id, code, err.to_string())
+}
+
 fn agent_not_ready(id: String, target: &str) -> String {
     encode_error(
         id,
@@ -473,6 +559,29 @@ mod tests {
         start_deferred_agent_prompt(app, id, params)
             .recv_timeout(Duration::from_secs(1))
             .expect("agent prompt responds after submission")
+    }
+
+    fn run_guarded_agent_prompt(
+        app: &mut App,
+        id: &str,
+        params: AgentPromptParams,
+        expected_terminal: String,
+    ) -> String {
+        let (respond_to, response_rx) = std::sync::mpsc::channel();
+        assert!(app.handle_deferred_agent_api_request(
+            crate::api::schema::Request {
+                id: id.into(),
+                method: crate::api::schema::Method::AgentPromptGuarded(AgentPromptGuardedParams {
+                    prompt: params,
+                    expected_terminal,
+                }),
+            },
+            crate::api::ApiRequestContext::default(),
+            respond_to,
+        ));
+        response_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("guarded agent prompt responds")
     }
 
     #[cfg(windows)]
@@ -806,6 +915,175 @@ mod tests {
         let error: crate::api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();
         assert_eq!(error.error.code, "agent_not_ready");
         assert!(rx.try_recv().is_err());
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn guarded_prompt_rejects_terminal_mismatch_before_any_input() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_agent_name("reviewer".into());
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
+        let (runtime, mut rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.state.insert_test_runtime(pane_id, runtime);
+
+        let response = run_guarded_agent_prompt(
+            &mut app,
+            "guard-mismatch",
+            AgentPromptParams {
+                target: "reviewer".into(),
+                text: "must not reach shell\nsecond line".into(),
+                wait: None,
+                // This test isolates terminal fencing from #152 caller attribution.
+                allow_cross_pane: true,
+            },
+            "different-terminal".into(),
+        );
+        let error: crate::api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "terminal_identity_mismatch");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn guarded_prompt_accepts_same_terminal_multiline_once() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_agent_name("reviewer".into());
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Working);
+        let (runtime, mut rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.state.insert_test_runtime(pane_id, runtime);
+
+        let response = run_guarded_agent_prompt(
+            &mut app,
+            "guard-success",
+            AgentPromptParams {
+                target: "reviewer".into(),
+                text: "line one\nline two λ".into(),
+                wait: None,
+                // This test isolates submission from #152 caller attribution.
+                allow_cross_pane: true,
+            },
+            terminal_id.to_string(),
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(matches!(
+            success.result,
+            ResponseResult::AgentPrompted { .. }
+        ));
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from("line one\nline two λ"));
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"\r"));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn guarded_prompt_copilot_focus_is_part_of_checked_text_submission() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_agent_name("reviewer".into());
+        terminal.set_detected_state(Some(Agent::GithubCopilot), AgentState::Idle);
+        let (runtime, mut rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.state.insert_test_runtime(pane_id, runtime);
+        let response = run_guarded_agent_prompt(
+            &mut app,
+            "guard-focus",
+            AgentPromptParams {
+                target: "reviewer".into(),
+                text: "prompt".into(),
+                wait: None,
+                allow_cross_pane: true,
+            },
+            terminal_id.to_string(),
+        );
+        assert!(
+            serde_json::from_str::<SuccessResponse>(&response).is_ok(),
+            "{response}"
+        );
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"\x1b[Iprompt"));
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"\r"));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_guarded_prompt_refuses_before_input_log_focus_or_enter() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_agent_name("reviewer".into());
+        terminal.set_detected_state(Some(Agent::GithubCopilot), AgentState::Idle);
+        let (runtime, mut rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.state.insert_test_runtime(pane_id, runtime);
+        app.state.outer_terminal_focus = Some(false);
+        let active = app.state.active;
+        let selected = app.state.selected;
+        let focused = app.state.workspaces[0].tabs[0].layout.focused();
+
+        for allow_cross_pane in [false, true] {
+            for expected_terminal in [terminal_id.to_string(), String::new()] {
+                let response = run_guarded_agent_prompt(
+                    &mut app,
+                    "windows-guard-refused",
+                    AgentPromptParams {
+                        target: "reviewer".into(),
+                        text: "must not send\nsecond line".into(),
+                        wait: None,
+                        allow_cross_pane,
+                    },
+                    expected_terminal,
+                );
+                let error: crate::api::schema::ErrorResponse =
+                    serde_json::from_str(&response).unwrap();
+                assert_eq!(error.id, "windows-guard-refused");
+                assert_eq!(error.error.code, "platform_unsupported");
+                assert!(error.error.message.contains("agent.prompt_guarded"));
+                assert!(error.error.message.contains("Windows"));
+                assert!(!app.api_input_log.exists());
+                assert!(app.accepted_api_inputs.is_empty());
+                assert_eq!(app.state.active, active);
+                assert_eq!(app.state.selected, selected);
+                assert_eq!(app.state.workspaces[0].tabs[0].layout.focused(), focused);
+                assert_eq!(app.state.outer_terminal_focus, Some(false));
+            }
+        }
+        assert!(
+            tokio::time::timeout(
+                AGENT_PROMPT_SUBMIT_DELAY + Duration::from_millis(100),
+                rx.recv()
+            )
+            .await
+            .is_err(),
+            "unsupported guarded prompt wrote focus, text, or delayed Enter"
+        );
+    }
+
+    #[test]
+    fn guarded_prompt_permission_denial_maps_to_not_ready_only_for_guarded_method() {
+        for (guarded, expected) in [(true, "agent_not_ready"), (false, "agent_prompt_failed")] {
+            let response = agent_prompt_io_error(
+                "req".into(),
+                guarded,
+                std::io::Error::new(std::io::ErrorKind::PermissionDenied, "guard refused"),
+            );
+            let error: crate::api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();
+            assert_eq!(error.error.code, expected);
+        }
     }
 
     #[test]

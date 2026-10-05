@@ -1146,7 +1146,7 @@ impl App {
             Method::AgentStart(params) | Method::AgentStartGuarded(params) => {
                 return self.handle_agent_start(request.id, params);
             }
-            Method::AgentPrompt(_) => {
+            Method::AgentPrompt(_) | Method::AgentPromptGuarded(_) => {
                 return responses::encode_error(
                     request.id,
                     "invalid_request",

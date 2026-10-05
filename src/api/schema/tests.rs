@@ -559,10 +559,99 @@ fn expected_terminal_guard_is_optional_but_present_values_must_be_strings() {
 }
 
 #[test]
+fn agent_prompt_guarded_has_flat_params_and_preserves_prompt_options() {
+    let value = serde_json::json!({
+        "id": "guarded-prompt",
+        "method": "agent.prompt_guarded",
+        "params": {
+            "target": "w1:p2", "text": "--assignment\nλ 日本語\nsecond line",
+            "expected_terminal": "opaque/terminal:λ-not-a-uuid",
+            "wait": {"until": ["done", "idle"], "timeout_ms": 1234},
+            "allow_cross_pane": true,
+        },
+    });
+    let request: Request = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(serde_json::to_value(&request).unwrap(), value);
+    assert_eq!(
+        crate::api::api_method_name(&request.method),
+        "agent.prompt_guarded"
+    );
+    assert!(crate::api::request_changes_ui(&request));
+}
+
+#[test]
+fn agent_prompt_guarded_requires_non_null_well_formed_terminal_identity() {
+    let base = serde_json::json!({
+        "id": "invalid-guard", "method": "agent.prompt_guarded",
+        "params": {"target": "w1:p1", "text": "must not send"},
+    });
+    assert!(serde_json::from_value::<Request>(base.clone()).is_err());
+    for pin in [
+        serde_json::Value::Null,
+        serde_json::json!(1),
+        serde_json::json!(false),
+        serde_json::json!({}),
+        serde_json::json!([]),
+        serde_json::json!(""),
+        serde_json::json!(" "),
+        serde_json::json!(" term"),
+        serde_json::json!("term "),
+        serde_json::json!("term mid"),
+        serde_json::json!("term\n"),
+        serde_json::json!("term\u{0000}"),
+        serde_json::json!("term\u{007f}"),
+        serde_json::json!("term\u{00a0}"),
+    ] {
+        let mut value = base.clone();
+        value["params"]["expected_terminal"] = pin.clone();
+        assert!(
+            serde_json::from_value::<Request>(value).is_err(),
+            "accepted {pin:?}"
+        );
+    }
+    let mut valid = base;
+    valid["params"]["expected_terminal"] = serde_json::json!("term_opaque:λ/42");
+    assert!(serde_json::from_value::<Request>(valid).is_ok());
+}
+
+#[test]
+fn agent_prompt_guarded_schema_requires_string_pin_and_flat_prompt() {
+    let schema = serde_json::to_value(schemars::schema_for!(AgentPromptGuardedParams)).unwrap();
+    assert_eq!(schema["properties"]["expected_terminal"]["type"], "string");
+    let required = schema["required"].as_array().unwrap();
+    for field in ["expected_terminal", "target", "text"] {
+        assert!(
+            required.contains(&serde_json::json!(field)),
+            "missing required {field}"
+        );
+    }
+    assert!(schema["properties"].get("prompt").is_none());
+}
+
+#[test]
+fn legacy_agent_prompt_does_not_advertise_terminal_guard() {
+    let schema = serde_json::to_value(schemars::schema_for!(AgentPromptParams)).unwrap();
+    assert!(schema["properties"].get("expected_terminal").is_none());
+    let prompt = AgentPromptParams {
+        target: "worker".into(),
+        text: "hello".into(),
+        wait: None,
+        allow_cross_pane: false,
+    };
+    assert_eq!(
+        serde_json::to_value(prompt).unwrap(),
+        serde_json::json!({
+            "target": "worker", "text": "hello",
+        })
+    );
+}
+
+#[test]
 fn old_server_capabilities_do_not_advertise_expected_terminal_guard() {
     let caps: ServerCapabilities =
         serde_json::from_value(serde_json::json!({"live_handoff": false})).unwrap();
     assert!(!caps.expected_terminal_guard);
+    assert!(!caps.expected_terminal_agent_prompt_guard);
 }
 
 #[test]
@@ -904,6 +993,7 @@ fn success_response_round_trips() {
                 ssh_agent_registration: false,
                 guarded_live_handoff: true,
                 expected_terminal_guard: true,
+                expected_terminal_agent_prompt_guard: true,
             }),
         },
     };

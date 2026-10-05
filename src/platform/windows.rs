@@ -1512,6 +1512,24 @@ pub fn foreground_job(child_pid: u32) -> Option<ForegroundJob> {
     select_pane_foreground_job_cached(child_pid)
 }
 
+/// Writer-boundary evidence must not reuse either the detector snapshot or its
+/// selected-job cache. Verify the fresh snapshot describes the live generations.
+pub(crate) fn fresh_foreground_job(child_pid: u32) -> Option<ForegroundJob> {
+    let snapshot = ProcessSnapshot::new(snapshot_processes());
+    let shell = process_identity(child_pid)?;
+    if snapshot.entry(child_pid)?.command().creation_time? != shell.start_time {
+        return None;
+    }
+    let job = select_pane_foreground_job_from_snapshot_uncached(child_pid, &snapshot)?;
+    for process in &job.processes {
+        let identity = process_identity(process.pid)?;
+        if snapshot.entry(process.pid)?.command().creation_time? != identity.start_time {
+            return None;
+        }
+    }
+    (process_identity(child_pid) == Some(shell)).then_some(job)
+}
+
 pub(crate) fn available_pane_shell(child_pid: u32) -> Option<String> {
     let snapshot = ProcessSnapshot::new(snapshot_processes());
     available_pane_shell_from_snapshot(child_pid, &snapshot)
