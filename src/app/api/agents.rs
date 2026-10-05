@@ -881,7 +881,8 @@ mod tests {
                 target: "reviewer".into(),
                 text: "must not reach shell\nsecond line".into(),
                 wait: None,
-                allow_cross_pane: false,
+                // This test isolates terminal fencing from #152 caller attribution.
+                allow_cross_pane: true,
             },
             "different-terminal".into(),
         );
@@ -910,7 +911,8 @@ mod tests {
                 target: "reviewer".into(),
                 text: "line one\nline two λ".into(),
                 wait: None,
-                allow_cross_pane: false,
+                // This test isolates submission from #152 caller attribution.
+                allow_cross_pane: true,
             },
             terminal_id.to_string(),
         );
