@@ -102,6 +102,13 @@ jobs:
         if: github.event_name == 'push'
         run: python3 scripts/conventional_commits.py --range "${{ github.event.before }}..${{ github.event.after }}"
 
+      - name: Validate PR commit subjects
+        if: github.event_name == 'pull_request'
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: python3 scripts/conventional_commits.py --range "$PR_BASE_SHA..$PR_HEAD_SHA"
+
       - name: Validate PR title
         if: ${{ github.event_name == 'pull_request' && (github.event.pull_request.user.id != 37929162 || startsWith(github.event.pull_request.head.ref, 'mergify/merge-queue/') == false) }}
         env:
