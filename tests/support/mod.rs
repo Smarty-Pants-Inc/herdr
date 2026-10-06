@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
@@ -7,8 +7,9 @@ use std::sync::{Mutex, Once, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-static PID_REGISTRY: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
-static RUNTIME_DIR_REGISTRY: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+// Re-registration transfers cleanup ownership to the latest registering thread.
+static PID_REGISTRY: OnceLock<Mutex<HashMap<u32, thread::ThreadId>>> = OnceLock::new();
+static RUNTIME_DIR_REGISTRY: OnceLock<Mutex<HashMap<PathBuf, thread::ThreadId>>> = OnceLock::new();
 static INIT: Once = Once::new();
 static CLEANUP_GUARD: OnceLock<CleanupGuard> = OnceLock::new();
 const WATCHDOG_SCAN_INTERVAL: Duration = Duration::from_secs(1);
@@ -31,7 +32,7 @@ pub fn register_spawned_herdr_pid(pid: Option<u32>) {
 
     ensure_cleanup_hooks();
     let mut registry = pid_registry_lock();
-    registry.insert(pid);
+    registry.insert(pid, thread::current().id());
 }
 
 pub fn unregister_spawned_herdr_pid(pid: Option<u32>) {
@@ -59,7 +60,7 @@ pub fn register_runtime_dir(path: &Path) {
         .and_then(|()| fs::rename(&staged, path.join(RUNTIME_OWNER_MARKER)));
 
     let mut runtime_dirs = runtime_dir_registry_lock();
-    runtime_dirs.insert(path.to_path_buf());
+    runtime_dirs.insert(path.to_path_buf(), thread::current().id());
 }
 
 pub fn unregister_runtime_dir(path: &Path) {
@@ -706,9 +707,27 @@ pub fn wait_for_disconnect(stream: &mut UnixStream, timeout: Duration) -> Result
 }
 
 pub fn cleanup_registered_herdr_pids() {
+    cleanup_registered_herdr_pids_for_thread(None);
+    let _ = cleanup_servers_with_missing_runtime_dir();
+}
+
+fn cleanup_registered_herdr_pids_for_thread(owner: Option<thread::ThreadId>) {
     let pids: Vec<u32> = {
         let mut registry = pid_registry_lock();
-        registry.drain().collect()
+        if let Some(owner) = owner {
+            let mut pids = Vec::new();
+            registry.retain(|pid, registered_owner| {
+                if *registered_owner == owner {
+                    pids.push(*pid);
+                    false
+                } else {
+                    true
+                }
+            });
+            pids
+        } else {
+            registry.drain().map(|(pid, _)| pid).collect()
+        }
     };
 
     for pid in pids {
@@ -717,11 +736,23 @@ pub fn cleanup_registered_herdr_pids() {
 
     let runtime_dirs: HashSet<PathBuf> = {
         let mut runtime_dirs = runtime_dir_registry_lock();
-        runtime_dirs.drain().collect()
+        if let Some(owner) = owner {
+            let mut owned_dirs = HashSet::new();
+            runtime_dirs.retain(|path, registered_owner| {
+                if *registered_owner == owner {
+                    owned_dirs.insert(path.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            owned_dirs
+        } else {
+            runtime_dirs.drain().map(|(path, _)| path).collect()
+        }
     };
 
     terminate_servers_for_runtime_dirs(&runtime_dirs);
-    let _ = cleanup_servers_with_missing_runtime_dir();
 }
 
 fn ensure_cleanup_hooks() {
@@ -733,7 +764,9 @@ fn ensure_cleanup_hooks() {
 
         let previous_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |panic_info| {
-            cleanup_registered_herdr_pids();
+            // Even a caught panic runs this hook. Clean only this thread's registrations;
+            // other tests may still own live servers. Process-exit hooks still drain all.
+            cleanup_registered_herdr_pids_for_thread(Some(thread::current().id()));
             previous_hook(panic_info);
         }));
 
@@ -748,16 +781,17 @@ fn ensure_cleanup_hooks() {
     });
 }
 
-fn pid_registry_lock() -> std::sync::MutexGuard<'static, HashSet<u32>> {
+fn pid_registry_lock() -> std::sync::MutexGuard<'static, HashMap<u32, thread::ThreadId>> {
     PID_REGISTRY
-        .get_or_init(|| Mutex::new(HashSet::new()))
+        .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn runtime_dir_registry_lock() -> std::sync::MutexGuard<'static, HashSet<PathBuf>> {
+fn runtime_dir_registry_lock() -> std::sync::MutexGuard<'static, HashMap<PathBuf, thread::ThreadId>>
+{
     RUNTIME_DIR_REGISTRY
-        .get_or_init(|| Mutex::new(HashSet::new()))
+        .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
@@ -767,7 +801,9 @@ fn registered_runtime_dirs_snapshot() -> HashSet<PathBuf> {
         runtime_dirs
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
+            .keys()
+            .cloned()
+            .collect()
     } else {
         HashSet::new()
     }
