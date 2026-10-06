@@ -459,10 +459,161 @@ fn wait_for_pid_marker(path: &Path, timeout: Duration) -> u32 {
         .unwrap_or_else(|| panic!("invalid PID marker at {}: {text:?}", path.display()))
 }
 
+struct PanicCleanupFixture {
+    base: PathBuf,
+    api_socket: PathBuf,
+    spawned: Option<SpawnedHerdr>,
+    registration: &'static str,
+}
+
+impl PanicCleanupFixture {
+    fn new(register_pid: bool) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let base = std::env::temp_dir().join(format!(
+            "hpc-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&base).expect("create private panic cleanup fixture");
+        let runtime_dir = base.join("runtime");
+        let mut fixture = Self {
+            api_socket: runtime_dir.join("herdr.sock"),
+            base,
+            spawned: None,
+            registration: if register_pid { "PID" } else { "runtime-only" },
+        };
+        fs::set_permissions(&fixture.base, fs::Permissions::from_mode(0o700)).unwrap();
+        register_runtime_dir(&runtime_dir);
+        fixture.spawned = Some(spawn_server(
+            &fixture.base.join("config"),
+            &runtime_dir,
+            &fixture.api_socket,
+        ));
+        if !register_pid {
+            unregister_spawned_herdr_pid(Some(fixture.pid()));
+        }
+        wait_for_socket(&fixture.api_socket, Duration::from_secs(10));
+        fixture.assert_running("before panic");
+        fixture
+    }
+
+    fn pid(&self) -> u32 {
+        self.spawned
+            .as_ref()
+            .expect("owned server")
+            .child
+            .process_id()
+            .expect("server PID")
+    }
+
+    fn assert_running(&mut self, phase: &str) {
+        let response = try_request(
+            &self.api_socket,
+            serde_json::json!({
+                "id": format!("test:panic-cleanup:{}:{phase}", self.registration),
+                "method": "ping",
+                "params": {}
+            }),
+        )
+        .unwrap_or_else(|error| panic!("{} server {phase}: {}", self.registration, error.message));
+        assert_ok(response);
+        assert!(
+            self.spawned
+                .as_mut()
+                .expect("owned server")
+                .child
+                .try_wait()
+                .expect("inspect server liveness")
+                .is_none(),
+            "{} server must stay alive {phase}",
+            self.registration
+        );
+    }
+}
+
+impl Drop for PanicCleanupFixture {
+    fn drop(&mut self) {
+        if let Some(mut spawned) = self.spawned.take() {
+            let _ = spawned.child.kill();
+            let _ = spawned.child.wait();
+            drop(spawned);
+        }
+        cleanup_test_base(&self.base);
+    }
+}
+
+#[test]
+fn caught_panic_preserves_other_threads_registered_servers() {
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (caught_tx, caught_rx) = mpsc::channel();
+
+    thread::scope(|scope| {
+        let owner = scope.spawn(move || {
+            let mut fixtures = [
+                PanicCleanupFixture::new(true),
+                PanicCleanupFixture::new(false),
+            ];
+            // Both servers have answered a real request and remain owned here
+            // until the peer confirms its panic hook and catch have completed.
+            ready_tx.send(()).expect("signal running servers");
+            caught_rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("peer caught its intentional panic");
+            for fixture in &mut fixtures {
+                fixture.assert_running("after peer caught panic");
+            }
+        });
+        let peer = scope.spawn(move || {
+            ready_rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("owner has running servers");
+            let panic = std::panic::catch_unwind(|| panic!("intentional peer panic"))
+                .expect_err("peer panic must be caught");
+            assert_eq!(
+                panic.downcast_ref::<&str>(),
+                Some(&"intentional peer panic")
+            );
+            caught_tx.send(()).expect("signal completed panic catch");
+        });
+        owner.join().expect("server owner thread succeeds");
+        peer.join().expect("panicking peer thread succeeds");
+    });
+}
+
+// Runtime-only cleanup currently discovers servers through /proc.
+#[cfg(target_os = "linux")]
+#[test]
+fn caught_panic_cleans_own_threads_registered_servers() {
+    thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                // Keep the guards outside the caught closure: only the hook,
+                // not unwinding their RAII guards, may terminate these servers.
+                let fixtures = [
+                    PanicCleanupFixture::new(true),
+                    PanicCleanupFixture::new(false),
+                ];
+                let pids = fixtures.each_ref().map(PanicCleanupFixture::pid);
+                let panic = std::panic::catch_unwind(|| panic!("intentional owner panic"))
+                    .expect_err("owner panic must be caught");
+                assert_eq!(panic.downcast_ref::<&str>(), Some(&"intentional owner panic"));
+                assert!(
+                    support::wait_until(Duration::from_secs(5), Duration::from_millis(25), || {
+                        pids.iter().all(|pid| !support::test_process_running(*pid))
+                    }),
+                    "panic hook must terminate both PID and runtime-only servers owned by its thread"
+                );
+                drop(fixtures);
+            })
+            .join()
+            .expect("panicking owner thread succeeds");
+    });
+}
+
 #[test]
 fn pid_marker_waits_for_complete_line() {
-    // Caught panics still run the cleanup hook; exclude active server fixtures.
-    let _guard = test_lock();
     let base = unique_test_dir();
     fs::create_dir_all(&base).unwrap();
     let marker = base.join("child.pid");
