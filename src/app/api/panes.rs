@@ -1362,6 +1362,18 @@ impl App {
                 .record_pane_focus_change(previous_focus, target_ws_idx, moved_pane_id);
             self.state.mode = crate::app::Mode::Terminal;
         }
+        // Focus recording above can capture the moved pane in its old workspace.
+        if cross_workspace
+            && self
+                .state
+                .previous_pane_focus
+                .as_ref()
+                .is_some_and(|focus| {
+                    focus.workspace_id == previous_workspace_id && focus.pane_id == moved_pane_id
+                })
+        {
+            self.state.previous_pane_focus = None;
+        }
         let created_workspace = created_workspace.then(|| self.workspace_info(target_ws_idx));
         let created_tab = if created_tab {
             self.tab_info(target_ws_idx, target_tab_idx)
