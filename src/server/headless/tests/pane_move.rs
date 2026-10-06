@@ -43,6 +43,130 @@ fn public_move(
 }
 
 #[tokio::test]
+async fn public_pane_move_keeps_previous_focus_within_its_workspace() {
+    use crate::app::state::PaneFocusTarget;
+
+    for focus in [true, false] {
+        for case in ["focused", "history", "unrelated", "same-workspace"] {
+            let mut server = pane_move_server();
+            let p = server.app.state.workspaces[0].tabs[0].root_pane;
+            let q = server.app.state.workspaces[0].tabs[1].root_pane;
+            let source_workspace_id = server.app.public_workspace_id(0);
+            let p_focus = PaneFocusTarget {
+                workspace_id: source_workspace_id.clone(),
+                pane_id: p,
+            };
+            let q_focus = PaneFocusTarget {
+                workspace_id: source_workspace_id.clone(),
+                pane_id: q,
+            };
+            // P starts focused; Q is in another tab. Navigation establishes real
+            // history rather than seeding a stale workspace/pane pair by hand.
+            let history_before = match case {
+                "history" | "same-workspace" => {
+                    assert!(server.app.state.focus_pane_in_workspace(0, q));
+                    Some(p_focus.clone())
+                }
+                "unrelated" => {
+                    assert!(server.app.state.focus_pane_in_workspace(0, q));
+                    assert!(server.app.state.focus_pane_in_workspace(0, p));
+                    Some(q_focus.clone())
+                }
+                _ => None,
+            };
+            assert_eq!(server.app.state.previous_pane_focus, history_before);
+            server.app.state.assert_invariants_for_test();
+
+            let same_workspace = case == "same-workspace";
+            let destination_ws = usize::from(!same_workspace);
+            let destination_id = server.app.public_workspace_id(destination_ws);
+            let source_id = server.app.public_pane_id(0, p).unwrap();
+            let moved = public_move(
+                &mut server,
+                PaneMoveParams {
+                    allow_project_change: false,
+                    pane_id: source_id,
+                    destination: PaneMoveDestination::NewTab {
+                        workspace_id: Some(destination_id.clone()),
+                        label: None,
+                    },
+                    focus,
+                },
+            )
+            .unwrap();
+            assert!(moved.changed, "{case}, focus={focus}");
+            assert_eq!(moved.closed_workspace_id, None);
+            assert!(moved.closed_tab_id.is_some());
+            assert_eq!(moved.pane.workspace_id, destination_id);
+            assert_eq!(
+                server.app.parse_pane_id(&moved.pane.pane_id),
+                Some((destination_ws, p))
+            );
+            assert_eq!(
+                server.app.state.workspaces[0]
+                    .find_tab_index_for_pane(p)
+                    .is_some(),
+                same_workspace,
+                "{case}, focus={focus}"
+            );
+
+            let expected_history = match (case, focus) {
+                ("history" | "same-workspace", true) => Some(q_focus.clone()),
+                ("unrelated", false) => Some(q_focus.clone()),
+                ("same-workspace", false) => Some(p_focus.clone()),
+                _ => None,
+            };
+            assert_eq!(
+                server.app.state.previous_pane_focus, expected_history,
+                "{case}, focus={focus}: clear only invalid moved-pane history, not valid history"
+            );
+            // This includes every workspace's invariants and rejects any history
+            // referencing a pane that no longer belongs to the named workspace.
+            server.app.state.assert_invariants_for_test();
+
+            // There is no public previous-focus operation: the TUI's LastPane
+            // uses client previous_pane_id and emits pane.focus. pane.current
+            // can probe the actual public API focus target without pretending
+            // the server's previous_pane_focus drives that client action.
+            let (respond_to, response_rx) = std::sync::mpsc::channel();
+            server.handle_api_request_with_shutdown_check(crate::api::ApiRequestMessage {
+                context: crate::api::ApiRequestContext::default(),
+                request: crate::api::schema::Request {
+                    id: "current-after-move".into(),
+                    method: crate::api::schema::Method::PaneCurrent(Default::default()),
+                },
+                respond_to,
+                response_write_complete: None,
+            });
+            let response = response_rx.recv().expect("pane current response");
+            let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+            let ResponseResult::PaneCurrent { pane } = success.result else {
+                panic!("expected pane current response, got {:?}", success.result);
+            };
+            let expected_pane = if focus { p } else { q };
+            let expected_ws = if focus { destination_ws } else { 0 };
+            assert_eq!(
+                pane.pane_id,
+                server
+                    .app
+                    .public_pane_id(expected_ws, expected_pane)
+                    .unwrap(),
+                "{case}, focus={focus}: public focus target"
+            );
+            assert_eq!(
+                pane.workspace_id,
+                server.app.public_workspace_id(expected_ws)
+            );
+            if focus {
+                assert_eq!(pane.tab_id, moved.pane.tab_id);
+            }
+            server.app.state.assert_invariants_for_test();
+            shutdown_test_runtimes(&mut server);
+        }
+    }
+}
+
+#[tokio::test]
 async fn public_pane_move_focus_follows_the_moved_pane() {
     let mut server = pane_move_server();
     let source = server.app.state.workspaces[0].tabs[0].root_pane;
