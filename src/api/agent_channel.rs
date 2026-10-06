@@ -23,6 +23,9 @@ use crate::platform::ProcessIdentity;
 pub(crate) const MAX_FRAME_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_LEDGER_KEYS: usize = 256;
 pub(crate) const MAX_LEDGER_BYTES: usize = 16 * 1024 * 1024;
+// Leave headroom before either hard ledger bound; never evict an active epoch's keys.
+pub(crate) const ROTATE_LEDGER_KEYS: usize = 192;
+pub(crate) const ROTATE_LEDGER_BYTES: usize = MAX_LEDGER_BYTES * 3 / 4;
 pub(crate) const MAX_IN_FLIGHT: usize = 32;
 pub(crate) const MAX_ID_BYTES: usize = 256;
 pub(crate) const MAX_RECEIPT_WAITERS: usize = 128;
@@ -54,6 +57,9 @@ impl Outcome {
                 if *code == "agent_prompt_rejected" {
                     value["error"]["reason"] = reason.clone().into();
                 }
+                if duplicate {
+                    value["error"]["duplicate"] = true.into();
+                }
                 value
             }
         };
@@ -78,6 +84,7 @@ pub(crate) struct Delivery {
     channel_waiters: Arc<AtomicUsize>,
 }
 pub(crate) struct ReceiptWaiter(Arc<Delivery>);
+pub(crate) type Reservation = (Arc<Delivery>, bool, ReceiptWaiter);
 impl Drop for ReceiptWaiter {
     fn drop(&mut self) {
         self.0.waiters.fetch_sub(1, Ordering::AcqRel);
@@ -189,6 +196,7 @@ pub(crate) struct Channel {
     pub(crate) pane_id: crate::layout::PaneId,
     active: AtomicBool,
     ready: AtomicBool,
+    rotating: AtomicBool,
     /// Serializes revocation with each actual socket write, never with App access.
     effect: Mutex<()>,
     waiters: Arc<AtomicUsize>,
@@ -209,6 +217,7 @@ impl Channel {
         root: ProcessIdentity,
         workspace_id: String,
         pane_id: crate::layout::PaneId,
+        previous: Option<&Self>,
     ) -> (Arc<Self>, std::sync::mpsc::Receiver<Arc<Delivery>>) {
         let (outbound, receiver) = std::sync::mpsc::sync_channel(MAX_IN_FLIGHT);
         (
@@ -222,8 +231,11 @@ impl Channel {
                 pane_id,
                 active: AtomicBool::new(true),
                 ready: AtomicBool::new(false),
+                rotating: AtomicBool::new(false),
                 effect: Mutex::new(()),
-                waiters: Arc::new(AtomicUsize::new(0)),
+                // Receipt threads still holding older epochs share this owner's budget.
+                waiters: previous
+                    .map_or_else(|| Arc::new(AtomicUsize::new(0)), |old| old.waiters.clone()),
                 ledger: Mutex::new(Ledger::default()),
                 outbound,
                 #[cfg(test)]
@@ -254,13 +266,49 @@ impl Channel {
             }
         }
     }
+    /// Historical lookup only: even an unseen key can never enqueue on a retired epoch.
+    pub(crate) fn duplicate(
+        &self,
+        request_id: &str,
+        text: &str,
+    ) -> Result<Option<Reservation>, Outcome> {
+        let ledger = self
+            .ledger
+            .lock()
+            .map_err(|_| Outcome::failure("agent_channel_unavailable", "ledger unavailable"))?;
+        Self::lookup_duplicate(&ledger, request_id, text)
+    }
+    fn lookup_duplicate(
+        ledger: &Ledger,
+        request_id: &str,
+        text: &str,
+    ) -> Result<Option<Reservation>, Outcome> {
+        let Some(existing) = ledger.requests.get(request_id) else {
+            return Ok(None);
+        };
+        if existing.text != text {
+            return Err(Outcome::failure(
+                "payload_mismatch",
+                "request ID already reserved with different text",
+            ));
+        }
+        Ok(Some((existing.clone(), true, existing.waiter()?)))
+    }
+    fn rotation_drained(&self) -> bool {
+        self.rotating.load(Ordering::Acquire)
+            && self.ledger.lock().is_ok_and(|ledger| {
+                // A terminal delivery_unknown is immutable and retained, not pending.
+                // Waiting for a late ACK to resolve it would permanently disable rollover.
+                ledger.requests.values().all(|delivery| !delivery.pending())
+            })
+    }
     pub(crate) fn reserve(
         &self,
         request_id: String,
         text: String,
         timeout: Duration,
-    ) -> Result<(Arc<Delivery>, bool, ReceiptWaiter), Outcome> {
-        if !self.is_ready() {
+    ) -> Result<Reservation, Outcome> {
+        if !self.is_ready() && !self.rotating.load(Ordering::Acquire) {
             return Err(Outcome::failure(
                 "agent_channel_unavailable",
                 "no ready channel",
@@ -270,15 +318,22 @@ impl Channel {
             .ledger
             .lock()
             .map_err(|_| Outcome::failure("agent_channel_unavailable", "ledger unavailable"))?;
-        if let Some(existing) = ledger.requests.get(&request_id) {
-            return if existing.text == text {
-                Ok((existing.clone(), true, existing.waiter()?))
-            } else {
-                Err(Outcome::failure(
-                    "payload_mismatch",
-                    "request ID already reserved with different text",
-                ))
-            };
+        if let Some(duplicate) = Self::lookup_duplicate(&ledger, &request_id, &text)? {
+            return Ok(duplicate);
+        }
+        if self.rotating.load(Ordering::Acquire) {
+            return Err(Outcome::failure(
+                "agent_channel_rotating",
+                "epoch rotating; request not reserved or delivered; discover a fresh epoch",
+            ));
+        }
+        // Revocation may have won after the optimistic readiness check, while we
+        // waited for the ledger. Do not reserve a fresh key on that closed channel.
+        if !self.is_ready() {
+            return Err(Outcome::failure(
+                "agent_channel_unavailable",
+                "channel revoked before reservation",
+            ));
         }
         let frame = serde_json::json!({"type":"deliver","registration_epoch":self.epoch,
             "request_id":request_id,"session_generation":self.session_generation,"text":text})
@@ -322,6 +377,9 @@ impl Channel {
         let waiter = delivery.waiter()?; // Capacity refusal is before the dispatch queue effect.
         ledger.bytes += retained_bytes;
         ledger.requests.insert(request_id, delivery.clone()); // Reservation precedes enqueue/effect.
+        if ledger.requests.len() >= ROTATE_LEDGER_KEYS || ledger.bytes >= ROTATE_LEDGER_BYTES {
+            self.rotating.store(true, Ordering::Release);
+        }
         if self.outbound.try_send(delivery.clone()).is_err() {
             delivery.finish(Outcome::failure(
                 "agent_channel_capacity",
@@ -481,6 +539,17 @@ fn serve_inner(
                 && !stop.is_some_and(|flag| flag.load(Ordering::Acquire))
                 && channel.is_active()
             {
+                if channel.rotation_drained() {
+                    write_rotation(stream, channel, api_tx, || {
+                        running.load(Ordering::Acquire)
+                            && !stop.is_some_and(|flag| flag.load(Ordering::Acquire))
+                            && crate::platform::registered_process_is_foreground(
+                                channel.root,
+                                channel.peer,
+                            )
+                    })?;
+                    break; // Explicit clean rotation, followed by joined ACK-reader shutdown.
+                }
                 let delivery = match receiver.recv_timeout(Duration::from_millis(5)) {
                     Ok(delivery) => delivery,
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
@@ -511,6 +580,53 @@ fn serve_inner(
             .map_err(|_| io::Error::other("agent ACK reader panicked"))?;
         written.and(read)
     })
+}
+
+/// A control frame uses exactly the same attachment/native/effect write boundaries as
+/// delivery, with a finite deadline. Partial/failed control writes are transport loss,
+/// never a valid clean rotation and never authorization to replay a prompt.
+fn write_rotation(
+    stream: &mut LocalStream,
+    channel: &Channel,
+    api_tx: &crate::api::ApiRequestSender,
+    native_valid: impl FnMut() -> bool,
+) -> io::Result<()> {
+    let frame = format!(
+        "{}\n",
+        serde_json::json!({"type":"rotate",
+        "registration_epoch":channel.epoch, "session_generation":channel.session_generation})
+    );
+    let control = Delivery {
+        text: String::new(),
+        frame: frame.into_bytes(),
+        deadline: Instant::now() + Duration::from_secs(2),
+        state: Mutex::new(RequestState {
+            possible_dispatch: false,
+            complete_dispatch: false,
+            outcome: None,
+        }),
+        completed: Condvar::new(),
+        waiters: AtomicUsize::new(0),
+        channel_waiters: channel.waiters.clone(),
+    };
+    write_delivery(
+        stream,
+        channel,
+        &control,
+        || boundary_valid(channel, api_tx),
+        native_valid,
+    )?;
+    if control
+        .state
+        .lock()
+        .is_ok_and(|state| state.complete_dispatch)
+    {
+        Ok(())
+    } else {
+        Err(io::Error::other(
+            "rotation lost eligibility before complete control frame",
+        ))
+    }
 }
 
 /// One bounded parser per connection, independent of App round trips and write retries.

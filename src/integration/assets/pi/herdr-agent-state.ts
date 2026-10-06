@@ -19,7 +19,7 @@ const MAX_CHANNEL_FRAME = 64 * 1024;
 const MAX_CHANNEL_LEDGER = 256;
 const MAX_CHANNEL_INFLIGHT = 32;
 const MAX_RECONNECT_ATTEMPTS = 2;
-const MAX_CHANNEL_EPOCHS = 256;
+const RECENT_CHANNEL_EPOCHS = 2;
 const MAX_CHANNEL_ID = 1024;
 const RECONNECT_DELAY_MS = 250;
 const REGISTRATION_TIMEOUT_MS = 2000;
@@ -236,12 +236,25 @@ export default function (pi) {
   let registrationTimer: ReturnType<typeof setTimeout> | undefined;
   let reconnectAttempts = 0;
   let currentContext: any;
+  // The server must issue a fresh random epoch, never reuse a retired one. Keep the current and
+  // previous accepted epochs plus epochs with unresolved Pi calls; stale deliveries are also
+  // fenced by their connection token and current epoch. This is bounded by 2 + 32, not by the
+  // number of registrations over the extension's lifetime.
   const usedEpochs = new Set<string>();
-  type LedgerEntry = { text: string; receipt?: Record<string, any>; duplicate: boolean };
+  const recentEpochs: string[] = [];
+  type LedgerEntry = { epoch: string; text: string; receipt?: Record<string, any>; duplicate: boolean };
   const ledger = new Map<string, LedgerEntry>();
   // Keep unresolved calls counted across reconnect/session replacement: an old callback must not
   // free a newer request's slot, and repeated replacement cannot create unlimited pending calls.
   const inflight = new Set<LedgerEntry>();
+
+  function pruneEpochs() {
+    const retained = new Set(recentEpochs);
+    for (const entry of inflight) retained.add(entry.epoch);
+    for (const epoch of usedEpochs) {
+      if (!retained.has(epoch)) usedEpochs.delete(epoch);
+    }
+  }
 
   function clearReconnectTimer() {
     if (reconnectTimer) {
@@ -403,7 +416,7 @@ export default function (pi) {
       return;
     }
 
-    const entry: LedgerEntry = { text: frame.text, duplicate: false };
+    const entry: LedgerEntry = { epoch: registrationEpoch, text: frame.text, duplicate: false };
     ledger.set(requestId, entry); // Reserve before invoking Pi, including known capacity failures.
     if (inflight.size >= MAX_CHANNEL_INFLIGHT) {
       entry.receipt = receiptForError("admission_refused", expectedSessionGeneration);
@@ -441,6 +454,7 @@ export default function (pi) {
     });
     void call.then((receipt) => {
       inflight.delete(entry);
+      pruneEpochs();
       if (token !== channelGeneration || socket !== channelSocket || channelEpoch !== registrationEpoch) return;
       if (!receipt || currentContext?.userMessageSessionGeneration !== expectedSessionGeneration) {
         socket.destroy();
@@ -449,6 +463,26 @@ export default function (pi) {
       entry.receipt = receipt;
       acknowledge(socket, token, requestId, registrationEpoch, expectedSessionGeneration, receipt, entry.duplicate);
     });
+  }
+
+  function handleRotate(socket: any, token: number, frame: Record<string, any>) {
+    if (
+      token !== channelGeneration ||
+      socket !== channelSocket ||
+      !channelReady ||
+      channelClosing ||
+      socket.destroyed ||
+      frame.registration_epoch !== channelEpoch ||
+      frame.session_generation !== channelSessionGeneration ||
+      currentContext?.userMessageSessionGeneration !== channelSessionGeneration
+    ) {
+      return;
+    }
+    // Only a complete, correlated clean-rotation control renews the transport retry budget.
+    // Destroy the old connection; onDisconnect registers afresh, never resending deliveries or
+    // ACKs. Unresolved Pi calls keep their capacity slots/epoch pins and old callback fences.
+    reconnectAttempts = 0;
+    socket.destroy();
   }
 
   function scheduleReconnect(ctx: any) {
@@ -571,7 +605,6 @@ export default function (pi) {
             !validChannelId(result.terminal_id) ||
             result.ready !== true ||
             !validChannelId(epoch) ||
-            usedEpochs.size >= MAX_CHANNEL_EPOCHS ||
             typeof sessionGeneration !== "string" ||
             sessionGeneration !== expectedSessionGeneration ||
             ctx?.userMessageSessionGeneration !== expectedSessionGeneration ||
@@ -582,6 +615,9 @@ export default function (pi) {
           }
           clearRegistrationTimer();
           usedEpochs.add(epoch);
+          recentEpochs.push(epoch);
+          if (recentEpochs.length > RECENT_CHANNEL_EPOCHS) recentEpochs.shift();
+          pruneEpochs();
           channelEpoch = epoch;
           channelSessionGeneration = sessionGeneration;
           channelReady = true;
@@ -589,6 +625,8 @@ export default function (pi) {
         }
         if (isRecord(parsed) && parsed.type === "deliver") {
           handleDeliver(socket, token, parsed);
+        } else if (isRecord(parsed) && parsed.type === "rotate") {
+          handleRotate(socket, token, parsed);
         }
       }
     });

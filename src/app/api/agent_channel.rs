@@ -15,6 +15,9 @@ use std::time::Duration;
 #[derive(Debug, Default)]
 pub(crate) struct AgentChannels {
     owners: std::collections::HashMap<String, Arc<Channel>>,
+    // Exactly one prior epoch per terminal. Older epochs are unconditionally refused,
+    // so dropping them cannot turn any old key into a new admission.
+    retired: std::collections::HashMap<String, Arc<Channel>>,
 }
 impl AgentChannels {
     pub(crate) fn revoke_all(&mut self) {
@@ -22,8 +25,25 @@ impl AgentChannels {
             channel.revoke();
         }
         self.owners.clear();
+        self.retired.clear();
+    }
+    fn replace(&mut self, channel: Arc<Channel>) {
+        if let Some(old) = self.owners.remove(&channel.terminal_id) {
+            old.revoke(); // Finalize pending/uncertain outcomes before retaining history.
+            if old.peer == channel.peer
+                && old.root == channel.root
+                && old.workspace_id == channel.workspace_id
+                && old.pane_id == channel.pane_id
+            {
+                self.retired.insert(channel.terminal_id.clone(), old);
+            } else {
+                self.retired.remove(&channel.terminal_id);
+            }
+        }
+        self.owners.insert(channel.terminal_id.clone(), channel);
     }
     pub(crate) fn revoke_terminal(&mut self, terminal: &str) {
+        self.retired.remove(terminal);
         if let Some(channel) = self.owners.remove(terminal) {
             channel.revoke();
         }
@@ -99,8 +119,12 @@ impl App {
             })
     }
     fn channel_valid(&self, channel: &Channel) -> bool {
-        if !channel.is_ready()
-            || !self.channel_attached(channel)
+        channel.is_ready() && self.channel_eligible(channel)
+    }
+    // Historical receipt reads have no effect, but keep the same attribution,
+    // attachment and native foreground checks as live reservations.
+    fn channel_eligible(&self, channel: &Channel) -> bool {
+        if !self.channel_attached(channel)
             || !crate::platform::registered_process_is_foreground(channel.root, channel.peer)
         {
             return false;
@@ -229,7 +253,6 @@ impl App {
                 "connection closed or already registered",
             );
         }
-        self.agent_channels.revoke_terminal(&target.terminal_id); // Old epoch revoked before new activation.
         let (channel, receiver) = Channel::new(
             target.terminal_id.clone(),
             epoch.clone(),
@@ -238,14 +261,17 @@ impl App {
             root,
             self.state.workspaces[target.ws_idx].id.clone(),
             target.pane_id,
+            self.agent_channels
+                .owners
+                .get(&target.terminal_id)
+                .map(Arc::as_ref),
         );
+        // Replacement revokes the old epoch before the new socket can activate.
+        self.agent_channels.replace(channel.clone());
         if let Some(terminal) = self.state.terminals.get(target.terminal_id.as_str()) {
             self.terminal_runtimes
                 .bind_agent_channel(terminal.id.clone(), &channel);
         }
-        self.agent_channels
-            .owners
-            .insert(target.terminal_id.clone(), channel.clone());
         slot.channel = Some((channel, receiver));
         json_success(
             id,
@@ -366,12 +392,20 @@ impl App {
             .get(&target.terminal_id)
             .ok_or_else(|| Outcome::failure("agent_channel_unavailable", "no registered owner"))?;
         if channel.epoch != params.expected_registration_epoch {
+            if let Some(old) = self.agent_channels.retired.get(&target.terminal_id) {
+                if old.epoch == params.expected_registration_epoch && self.channel_eligible(channel)
+                {
+                    if let Some(duplicate) = old.duplicate(&params.request_id, &params.text)? {
+                        return Ok(duplicate);
+                    }
+                }
+            }
             return Err(Outcome::failure(
                 "registration_epoch_mismatch",
-                "obsolete registration epoch; never replay into a new channel",
+                "obsolete or unreserved registration epoch; never replay into a new channel",
             ));
         }
-        if !self.channel_valid(channel) {
+        if !self.channel_eligible(channel) {
             return Err(Outcome::failure(
                 "agent_channel_unavailable",
                 "registered owner is disconnected, stale or not foreground",

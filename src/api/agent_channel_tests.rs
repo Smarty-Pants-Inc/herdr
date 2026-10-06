@@ -16,6 +16,7 @@ fn channel() -> (Arc<Channel>, std::sync::mpsc::Receiver<Arc<Delivery>>) {
         identity,
         "w1".into(),
         crate::layout::PaneId::from_raw(1),
+        None,
     );
     pair.0.mark_ready();
     pair
@@ -116,6 +117,15 @@ fn channel_rejected_ack_is_typed_failure_not_success() {
     assert_eq!(response["error"]["code"], "agent_prompt_rejected");
     assert_eq!(response["error"]["reason"], "admission_refused");
     assert!(response.get("result").is_none());
+    let first = delivery.wait();
+    channel.revoke();
+    let (duplicate, dup, _waiter) = channel.duplicate("r", &delivery.text).unwrap().unwrap();
+    assert!(dup);
+    assert_eq!(duplicate.wait(), first);
+    let response: serde_json::Value =
+        serde_json::from_str(&duplicate.wait().response("retry".into(), true)).unwrap();
+    assert_eq!(response["error"]["reason"], "admission_refused");
+    assert_eq!(response["error"]["duplicate"], true);
 }
 #[test]
 fn channel_successful_attachment_check_then_exit_has_zero_socket_bytes() {
@@ -241,6 +251,70 @@ fn channel_receipt_timeout_after_full_dispatch_stays_unknown_for_duplicates() {
     assert_eq!(code(duplicate.wait()), "delivery_unknown");
 }
 #[test]
+fn channel_rotation_fences_new_keys_until_pending_is_terminal_and_keeps_unknown() {
+    let (channel, receiver) = channel();
+    for index in 0..ROTATE_LEDGER_KEYS - 1 {
+        let (delivery, _, _waiter) = reserve(&channel, &format!("r{index}"));
+        delivery.finish(Outcome::failure("test", "first reason"));
+        let _ = receiver.try_recv().unwrap();
+    }
+    let (last, _, _waiter) = channel
+        .reserve("last".into(), "literal".into(), Duration::from_millis(20))
+        .unwrap();
+    assert!(!channel.rotation_drained()); // Never rotate an unresolved reservation.
+    assert_eq!(
+        code(reserve_error(&channel, "new")),
+        "agent_channel_rotating"
+    );
+    assert_eq!(receiver.try_iter().count(), 1); // Refusal is definite non-delivery.
+    assert_eq!(
+        channel.ledger.lock().unwrap().requests.len(),
+        ROTATE_LEDGER_KEYS
+    );
+    assert!(reserve(&channel, "r0").1); // First refusal reason still readable during drain.
+    write_delivery(&mut Vec::new(), &channel, &last, || true, || true).unwrap();
+    assert_eq!(code(last.wait()), "delivery_unknown");
+    assert!(channel.rotation_drained()); // A terminal unknown cannot strand the epoch forever.
+    channel.revoke();
+    let (duplicate, dup, _waiter) = channel.duplicate("last", "literal").unwrap().unwrap();
+    assert!(dup);
+    assert_eq!(code(duplicate.wait()), "delivery_unknown");
+    assert!(channel.duplicate("unseen", "literal").unwrap().is_none());
+    assert_eq!(
+        code(channel.duplicate("last", "different").err().unwrap()),
+        "payload_mismatch"
+    );
+    assert!(receiver.try_recv().is_err());
+}
+#[test]
+fn channel_byte_high_water_rotates_before_hard_capacity() {
+    let (channel, receiver) = channel();
+    loop {
+        let count = channel.ledger.lock().unwrap().requests.len();
+        let (delivery, _, _waiter) = channel
+            .reserve(
+                format!("r{count}"),
+                "x".repeat(MAX_FRAME_BYTES - 512),
+                Duration::from_secs(1),
+            )
+            .unwrap();
+        delivery.finish(Outcome::failure("test", "complete"));
+        let _ = receiver.try_recv().unwrap();
+        if channel.rotation_drained() {
+            break;
+        }
+    }
+    let ledger = channel.ledger.lock().unwrap();
+    assert!(ledger.requests.len() < ROTATE_LEDGER_KEYS);
+    assert!(ledger.bytes >= ROTATE_LEDGER_BYTES && ledger.bytes < MAX_LEDGER_BYTES);
+    drop(ledger);
+    assert_eq!(
+        code(reserve_error(&channel, "new")),
+        "agent_channel_rotating"
+    );
+    assert!(receiver.try_recv().is_err());
+}
+#[test]
 fn channel_capacity_never_evicts_keys_and_duplicate_waiters_are_bounded() {
     let (channel, receiver) = channel();
     let (delivery, _, _waiter) = reserve(&channel, "r");
@@ -251,9 +325,11 @@ fn channel_capacity_never_evicts_keys_and_duplicate_waiters_are_bounded() {
     drop(waiters);
     delivery.finish(Outcome::failure("test", "complete"));
     let _ = receiver.try_recv();
+    // Isolate the hard no-eviction limit; normal serving rotates at the high-water.
     for index in 1..MAX_LEDGER_KEYS {
         let (request, _, _waiter) = reserve(&channel, &format!("r{index}"));
         request.finish(Outcome::failure("test", "complete"));
+        channel.rotating.store(false, Ordering::Release);
         let _ = receiver.try_recv();
     }
     assert_eq!(
@@ -281,6 +357,8 @@ fn channel_retained_byte_capacity_accepts_exact_fit_and_refuses_one_more_before_
         assert!(!duplicate);
         assert!(Arc::ptr_eq(&delivery, &receiver.try_recv().unwrap()));
         delivery.finish(Outcome::failure("test", "complete"));
+        // Exercise the hard byte bound separately from the earlier rotation trigger.
+        channel.rotating.store(false, Ordering::Release);
     }
     assert!(receiver.try_recv().is_err());
     let retained = channel.ledger.lock().unwrap().bytes;
@@ -335,6 +413,7 @@ fn channel_retained_byte_capacity_accepts_exact_fit_and_refuses_one_more_before_
     assert!(Arc::ptr_eq(&delivery, &receiver.try_recv().unwrap()));
     assert!(receiver.try_recv().is_err());
     delivery.finish(Outcome::failure("test", "complete"));
+    channel.rotating.store(false, Ordering::Release);
     let (completed_duplicate, duplicate, _waiter3) = channel
         .reserve(request_id.into(), text, Duration::from_secs(30))
         .unwrap();
@@ -353,6 +432,40 @@ fn channel_retained_byte_capacity_accepts_exact_fit_and_refuses_one_more_before_
     let ledger = channel.ledger.lock().unwrap();
     assert_eq!(ledger.bytes, MAX_LEDGER_BYTES);
     assert_eq!(ledger.requests.len(), 129); // No dedup key eviction on completion or refusal.
+}
+#[test]
+fn channel_waiter_budget_survives_300_epoch_replacements() {
+    let (old, receiver) = channel();
+    let mut waiters = Vec::new();
+    for request in 0..(MAX_RECEIPT_WAITERS / MAX_WAITERS_PER_REQUEST) {
+        for _ in 0..MAX_WAITERS_PER_REQUEST {
+            waiters.push(reserve(&old, &format!("r{request}")).2);
+        }
+    }
+    assert_eq!(receiver.try_iter().count(), 16);
+    old.revoke();
+    let mut current = old.clone();
+    for index in 0..300 {
+        let (next, receiver) = Channel::new(
+            old.terminal_id.clone(),
+            format!("epoch-{index}"),
+            "session_test".into(),
+            old.peer,
+            old.root,
+            old.workspace_id.clone(),
+            old.pane_id,
+            Some(&current),
+        );
+        next.mark_ready();
+        assert!(Arc::ptr_eq(&next.waiters, &old.waiters));
+        assert_eq!(code(reserve_error(&next, "new")), "agent_channel_capacity");
+        assert!(receiver.try_recv().is_err());
+        current = next;
+    }
+    drop(waiters);
+    assert_eq!(old.waiters.load(Ordering::Acquire), 0);
+    let (_, duplicate, _waiter) = reserve(&current, "new");
+    assert!(!duplicate);
 }
 #[test]
 fn channel_total_waiter_capacity_refuses_new_dispatch_before_effect() {
@@ -515,6 +628,7 @@ mod transport {
                 identity,
                 "w1".into(),
                 crate::layout::PaneId::from_raw(1),
+                None,
             );
             if mode.starts_with("drain-") {
                 *channel.reader_gate.lock().unwrap() =
@@ -640,6 +754,67 @@ mod transport {
         };
         let path = std::path::PathBuf::from(path);
         let mode = std::env::var("CHANNEL_TEST_MODE").unwrap();
+        if mode.starts_with("rollover") || mode == "registrations" {
+            let mut delivered = 0;
+            let mut epochs = std::collections::HashSet::new();
+            for registration in 0..300 {
+                let mut stream = crate::ipc::connect_local_stream(&path.join("s")).unwrap();
+                writeln!(
+                    stream,
+                    "{}",
+                    serde_json::json!({"id":"register","method":"agent.register_self",
+                    "params":{"session_generation":"session_test"}})
+                )
+                .unwrap();
+                let response: serde_json::Value =
+                    serde_json::from_slice(&frame(&mut stream)).unwrap();
+                assert_eq!(response["result"]["ready"], true, "{response}");
+                let epoch = response["result"]["registration_epoch"].as_str().unwrap();
+                assert!(epochs.insert(epoch.to_owned()));
+                std::fs::write(path.join("registrations"), (registration + 1).to_string()).unwrap();
+                if mode == "registrations" {
+                    continue;
+                }
+                loop {
+                    let line = frame(&mut stream);
+                    assert!(
+                        !line.is_empty(),
+                        "rollover must send an explicit control frame"
+                    );
+                    let request: serde_json::Value = serde_json::from_slice(&line).unwrap();
+                    assert_eq!(request["registration_epoch"], epoch);
+                    assert_eq!(request["session_generation"], "session_test");
+                    if request["type"] == "rotate" {
+                        std::fs::write(path.join("rotated"), b"").unwrap();
+                        break;
+                    }
+                    assert_eq!(request["type"], "deliver");
+                    assert_eq!(request["request_id"], format!("prompt-{delivered}"));
+                    assert_eq!(request["text"], format!("literal-{delivered}"));
+                    if mode != "rollover-unknown" || delivered != 191 {
+                        send_ack(
+                            &mut stream,
+                            &request,
+                            if delivered % 2 == 0 {
+                                "accepted"
+                            } else {
+                                "queued"
+                            },
+                            "normal",
+                        );
+                    }
+                    delivered += 1;
+                    if delivered == 300 {
+                        std::fs::write(path.join("delivered"), delivered.to_string()).unwrap();
+                        until(|| path.join("done").exists());
+                        return;
+                    }
+                }
+            }
+            std::fs::write(path.join("registered"), epochs.len().to_string()).unwrap();
+            until(|| path.join("done").exists());
+            return;
+        }
         let mut stream = crate::ipc::connect_local_stream(&path.join("s")).unwrap();
         let a: serde_json::Value = serde_json::from_slice(&frame(&mut stream)).unwrap();
         let mut first = [0];

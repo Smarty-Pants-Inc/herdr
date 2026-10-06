@@ -699,11 +699,17 @@ fn guarded_channel_pending_duplicate_shares_uncertain_outcome_without_second_fra
     assert_eq!(second["error"]["code"], "delivery_unknown", "{second}");
     let retry = server.prompt(&pane, &registration, "pending", "one pending input");
     assert_eq!(retry["error"]["code"], "delivery_unknown", "{retry}");
+    assert_eq!(retry["error"]["message"], first["error"]["message"]);
+    assert_eq!(retry["error"]["duplicate"], true);
     assert_eq!(pane.entries("frames.jsonl").len(), 1);
     let reconnected = pane.control(json!({"op": "reregister"}));
     assert_result(&reconnected);
     pane.wait_ready(&reconnected["result"]);
-    assert_refusal(&server.prompt(&pane, &registration, "pending", "one pending input"));
+    let historical = server.prompt(&pane, &registration, "pending", "one pending input");
+    assert_eq!(historical["error"]["code"], "delivery_unknown");
+    assert_eq!(historical["error"]["message"], first["error"]["message"]);
+    assert_eq!(historical["error"]["duplicate"], true);
+    assert_eq!(pane.entries("frames.jsonl").len(), 1);
     // Re-registration must not itself replay an uncertain old delivery. A new
     // explicit ID below is a new request, not an automatically retargeted retry.
     pane.control(json!({"op": "mode", "mode": "accepted"}));
