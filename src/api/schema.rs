@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+pub mod agent_channel;
 pub mod agents;
 pub mod commands;
 pub mod common;
@@ -15,6 +16,7 @@ pub mod tabs;
 pub mod workspaces;
 pub mod worktrees;
 
+pub use agent_channel::*;
 pub use agents::*;
 pub use commands::*;
 pub use common::*;
@@ -167,6 +169,12 @@ pub enum Method {
     AgentStartGuarded(AgentStartParams),
     #[serde(rename = "agent.prompt")]
     AgentPrompt(AgentPromptParams),
+    #[serde(rename = "agent.register_self")]
+    AgentRegisterSelf(AgentRegisterSelfParams),
+    #[serde(rename = "agent.channel_info")]
+    AgentChannelInfo(AgentChannelInfoParams),
+    #[serde(rename = "agent.prompt_guarded")]
+    AgentPromptGuarded(AgentPromptGuardedParams),
     #[serde(rename = "agent.wait")]
     AgentWait(AgentWaitParams),
     #[serde(rename = "pane.split")]

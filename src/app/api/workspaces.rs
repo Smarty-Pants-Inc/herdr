@@ -399,6 +399,7 @@ impl App {
                 )
             })
             .collect::<Vec<_>>();
+        self.revoke_agent_channels_for_workspace_close(index);
         self.state.selected = index;
         self.state.close_selected_workspace();
         self.shutdown_detached_terminal_runtimes();

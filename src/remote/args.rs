@@ -39,6 +39,7 @@ pub(crate) fn extract_remote_args(
         cleaned.push(program.clone());
     }
 
+    let literal_slots = crate::cli::agent_channel_literal_slots(args);
     let mut remote_target = None;
     let mut keybindings = RemoteKeybindings::Local;
     let mut keybindings_seen = false;
@@ -46,6 +47,11 @@ pub(crate) fn extract_remote_args(
     let mut index = 1;
     while index < args.len() {
         let arg = &args[index];
+        if literal_slots.contains(&index) {
+            cleaned.push(arg.clone());
+            index += 1;
+            continue;
+        }
         if arg == "--" {
             cleaned.extend_from_slice(&args[index..]);
             break;
@@ -123,4 +129,81 @@ pub(crate) fn validate_remote_target(target: &str) -> Result<&str, String> {
         return Err("--remote target must not start with '-'".to_string());
     }
     Ok(target)
+}
+
+#[cfg(test)]
+mod channel_tests {
+    use super::*;
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    #[test]
+    fn channel_global_extraction_preserves_literal_payload_and_guard_values() {
+        for target in ["--remote", "--handoff", "--remote-keybindings=server"] {
+            for text in [
+                "--remote=other",
+                "--remote-keybindings",
+                "--handoff",
+                "--session=literal",
+            ] {
+                let input = args(&[
+                    "herdr",
+                    "agent",
+                    "prompt-guarded",
+                    target,
+                    text,
+                    "--expected-terminal",
+                    "--remote=terminal",
+                    "--expected-registration-epoch",
+                    "--handoff",
+                    "--request-id",
+                    "--remote-keybindings=literal",
+                ]);
+                let (cleaned, remote) = extract_remote_args(&input).unwrap();
+                assert_eq!(cleaned, input);
+                assert_eq!(remote, None);
+            }
+            let input = args(&["herdr", "agent", "channel-info", target]);
+            assert_eq!(extract_remote_args(&input).unwrap(), (input, None));
+        }
+    }
+
+    #[test]
+    fn channel_global_extraction_keeps_separator_and_prefix_behavior() {
+        let input = args(&[
+            "herdr",
+            "--remote",
+            "server",
+            "agent",
+            "prompt-guarded",
+            "--expected-terminal",
+            "--remote=terminal",
+            "--expected-registration-epoch",
+            "--handoff",
+            "--request-id",
+            "--remote-keybindings=literal",
+            "--",
+            "--remote=target",
+            "--handoff",
+        ]);
+        let (cleaned, remote) = extract_remote_args(&input).unwrap();
+        assert_eq!(cleaned, [args(&["herdr"]), input[3..].to_vec()].concat());
+        assert_eq!(remote.unwrap().target, "server");
+        let input = args(&["herdr", "agent", "channel-info", "--", "--remote"]);
+        assert_eq!(extract_remote_args(&input).unwrap(), (input, None));
+    }
+
+    #[test]
+    fn existing_prompt_globals_remain_literal_in_both_positional_slots() {
+        for target in ["worker", "--remote=target", "--handoff"] {
+            let input = args(&["herdr", "agent", "prompt", target, "--remote=payload"]);
+            assert_eq!(extract_remote_args(&input).unwrap(), (input, None));
+        }
+        let input = args(&["herdr", "status", "--remote=server"]);
+        let (cleaned, remote) = extract_remote_args(&input).unwrap();
+        assert_eq!(cleaned, args(&["herdr", "status"]));
+        assert_eq!(remote.unwrap().target, "server");
+    }
 }

@@ -102,11 +102,72 @@ herdr pane read w1:p2 --source recent --lines 50
 | 窗格 | `pane.split`、`pane.swap`、`pane.move`、`pane.zoom`、`pane.layout`、`pane.process_info`、`pane.neighbor`、`pane.edges`、`pane.focus_direction`、`pane.resize`、`pane.list`、`pane.current`、`pane.get`、`pane.last_input`、`pane.rename`、`pane.send_text`、`pane.send_keys`、`pane.send_input`、`pane.send_input_guarded`、`pane.read`、`pane.report_agent`、`pane.report_agent_session`、`pane.report_metadata`、`pane.clear_agent_authority`、`pane.release_agent`、`pane.close`、`pane.wait_for_output` |
 | 弹窗 | `popup.close` |
 | 布局 | `layout.export`、`layout.apply`、`layout.apply_restorable`、`layout.set_split_ratio` |
-| 智能体 | `agent.list`、`agent.get`、`agent.read`、`agent.explain`、`agent.send_keys`、`agent.prompt`、`agent.wait`、`agent.rename`、`agent.focus`、`agent.start`、`agent.start_guarded` |
+| 智能体 | `agent.list`、`agent.get`、`agent.read`、`agent.explain`、`agent.send_keys`、`agent.prompt`、`agent.register_self`、`agent.channel_info`、`agent.prompt_guarded`、`agent.wait`、`agent.rename`、`agent.focus`、`agent.start`、`agent.start_guarded` |
 | 事件 | `events.subscribe`、`events.wait` |
 | 集成 | `integration.install`、`integration.uninstall` |
 | 插件 | `plugin.link`、`plugin.list`、`plugin.unlink`、`plugin.enable`、`plugin.disable`、`plugin.action.list`、`plugin.action.invoke`、`plugin.log.list`、`plugin.pane.open`、`plugin.pane.focus`、`plugin.pane.close` |
 | 媒体 | `pane.media_open`、`media.answer`、`media.mute`、`media.state`、`media.close` |
+
+### 已注册智能体通道（未发布）
+
+已注册通道是仅限 socket 的提示投递路径。它不会写入 PTY 文本、准备字节、输入焦点事件、转义序列或 Enter，也绝不回退到 `agent.prompt`。没有注册 CLI：智能体集成直接在持久的本地 socket 上自行注册。
+
+使用前检查 `ping.result.capabilities.agent_channel_methods`。在支持的 Linux 和 macOS 服务器上，它包含 `agent.register_self`、`agent.channel_info` 和 `agent.prompt_guarded`。Windows 的 `agent_registration_channel` 和 `guarded_agent_prompt` 为 `false`；`agent.channel_info` 仍可查询，但返回 `ready: false`，不会尝试投递。
+
+#### 注册与发现
+
+`agent.register_self` 只接受持久直接本地 socket 上的第一个请求。服务器使用内核身份和经过检查的祖先进程关系，将 socket 对端归属到恰好一个实时窗格；调用方提供的进程 ID、可执行文件名、标题、脚本和智能体检测都不是注册依据。例如：
+
+```json
+{"id":"register","method":"agent.register_self","params":{"session_generation":"pi-session-token","pane_id":"w1:p1"}}
+```
+
+`pane_id` 可选，只断言对端当前窗格，不用于选择窗格。成功响应表示连接已准备好接收投递，不表示任何提示已被接纳：
+
+```json
+{"id":"register","result":{"terminal_id":"term_opaque","registration_epoch":"epoch_opaque","session_generation":"pi-session-token","ready":true}}
+```
+
+使用 `agent.channel_info` 在不依赖智能体屏幕检测的情况下发现当前终端通道：
+
+```json
+{"id":"info","method":"agent.channel_info","params":{"target":"w1:p1"}}
+```
+
+就绪结果包含 `terminal_id`、`registration_epoch` 和 `session_generation`；通道缺失、过期、断开、不支持或尚未注册时返回 `ready: false`。调用方必须固定此响应中的终端和注册 epoch，并在投递时原样传入。同一实时对端重新注册时，会先撤销旧 epoch，再激活新 epoch；其他实时对端会被拒绝。断开会撤销就绪状态，但保留实时所有者的占用；只有确认进程死亡后才会释放，无法确定存活状态时拒绝接管。终端/根进程替换、交接、恢复和工作区销毁都会撤销通道。
+
+注册响应之后 socket 仍保持打开。服务器到智能体的投递和智能体到服务器的确认使用有界的换行分隔 JSON 帧：
+
+```json
+{"type":"deliver","registration_epoch":"epoch_opaque","request_id":"caller-key","session_generation":"pi-session-token","text":"literal message"}
+{"type":"ack","registration_epoch":"epoch_opaque","request_id":"caller-key","session_generation":"pi-session-token","status":"accepted"}
+```
+
+ACK 必须匹配实时连接、epoch、请求 ID 和会话代数。ACK 的 `status` 为 `accepted`、`queued` 或 `rejected`；`rejected` 必须带有类型化的 `reason`，`duplicate: true` 可选。拒绝的 ACK 会变为带该 `reason` 的 `agent_prompt_rejected` 错误，而不是成功回执。
+
+只有完整帧才会提交。帧大小、并发请求、回执等待方和每个 epoch 的去重账本都有上限；容量耗尽时拒绝，不会驱逐仍可复用的去重键。服务器在发送前预留 `(registration_epoch, request_id, exact text)`。相同载荷的重复请求共享首次回执并标记 `duplicate`；载荷改变时以 `payload_mismatch` 拒绝。新的请求 ID 绝不是自动重试。
+
+#### 守卫投递与接纳
+
+`agent.prompt_guarded` 要求目标、字面 `text`、`expected_terminal`、`expected_registration_epoch` 和调用方唯一的 `request_id`。`timeout_ms` 默认 10000，必须在 1 到 300000 之间；`allow_cross_pane` 可选，但不会绕过通道校验：
+
+```json
+{"id":"deliver-1","method":"agent.prompt_guarded","params":{"target":"w1:p1","text":"Review this change","expected_terminal":"term_opaque","expected_registration_epoch":"epoch_opaque","request_id":"review-1","timeout_ms":10000}}
+```
+
+服务器会重新检查终端连接、窗格祖先关系、所有者存活状态、前台资格、epoch 以及 socket 写入边界。只有固定通道仍有效时才发送帧。成功响应是接纳回执：
+
+```json
+{"id":"deliver-1","result":{"terminal_id":"term_opaque","registration_epoch":"epoch_opaque","request_id":"review-1","status":"accepted","session_generation":"pi-session-token"}}
+```
+
+`accepted` 表示已接纳到活动 Pi 会话输入；`queued` 表示已进入该会话的后续队列。两者都不表示模型轮次已完成或成功。托管 Pi 集成只在 TUI 模式注册，并检测 `pi.submitUserMessage` 和 `ctx.userMessageSessionGeneration`。任一缺失或会话处于 headless 模式时，都不注册接收器，守卫投递会拒绝；旧的无返回值 `sendUserMessage` API 绝不会作为回退。
+
+Pi 使用 `registrationEpoch`、`requestId`、`sessionGeneration`、字面 `text`、`deliverAs: "followUp"` 和 `expandPromptTemplates: false` 调用带回执的入口。它返回 `accepted`、`queued` 或带类型的 `rejected` 原因，例如 `no_session`、`session_changed`、`payload_mismatch`、`shutting_down`、`admission_refused` 或 `unsupported`。被输入钩子消费或拒绝的内容不是已接纳的用户消息。排队工作绑定到捕获的会话代数；会话替换时取消，不会改投到新会话。
+
+如果 socket 在可能发送前关闭或超时，投递会失败并保持拒绝。如果可能已经接纳但 ACK 丢失，结果为 `delivery_unknown`，既不是成功也不能证明未投递。绝不自动重试、重放旧 epoch、创建新的请求 ID 重新发送或回退到 PTY 输入。通道对保留的 epoch 账本提供至多一次尝试，但不承诺崩溃时的恰好一次。
+
+身份边界是合作式同用户边界：内核对端身份能证明进程和窗格归属，但不能证明该进程就是 Pi，也不能阻止同用户对端伪造协议。现有所有者冲突可防止意外接管，而不是防御恶意同用户冒充。重连、重载或会话替换需要重新注册；服务器重启、恢复、交接或终端/根进程替换不会保留通道或固定标识。新的 epoch 和会话代数围栏防止迟到的帧和 ACK 跨越这些边界；未知投递绝不重放。
 
 `agent.wait` 由服务器拥有并由事件驱动。它会固定到已解析的窗格占用者,因此替换后的智能体不能满足该等待。`agent.prompt` 接受可选的 `wait` 对象,其中包含 `until` 和 `timeout_ms`;这样可在一个请求中提交提示并开始等待,避免两个独立调用之间的竞态。如果解析出的智能体已经是 `blocked`,`agent.prompt` 不会发送输入或开始等待,而是返回 `agent_blocked`。
 

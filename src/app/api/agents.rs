@@ -85,6 +85,12 @@ impl App {
         context: crate::api::ApiRequestContext,
         respond_to: std::sync::mpsc::Sender<String>,
     ) -> bool {
+        if matches!(
+            request.method,
+            crate::api::schema::Method::AgentPromptGuarded(_)
+        ) {
+            return self.handle_deferred_guarded_agent_prompt(request, context, respond_to);
+        }
         if !matches!(request.method, crate::api::schema::Method::AgentPrompt(_)) {
             return false;
         }

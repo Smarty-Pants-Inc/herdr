@@ -1228,6 +1228,52 @@
     },
     "request": {
       "$defs": {
+        "AgentChannelInfoParams": {
+          "properties": {
+            "target": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "target"
+          ],
+          "type": "object"
+        },
+        "AgentPromptGuardedParams": {
+          "properties": {
+            "allow_cross_pane": {
+              "type": "boolean"
+            },
+            "expected_registration_epoch": {
+              "type": "string"
+            },
+            "expected_terminal": {
+              "type": "string"
+            },
+            "request_id": {
+              "type": "string"
+            },
+            "target": {
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            },
+            "timeout_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "target",
+            "text",
+            "expected_terminal",
+            "expected_registration_epoch",
+            "request_id"
+          ],
+          "type": "object"
+        },
         "AgentPromptParams": {
           "properties": {
             "allow_cross_pane": {
@@ -1304,6 +1350,23 @@
           "required": [
             "target",
             "source"
+          ],
+          "type": "object"
+        },
+        "AgentRegisterSelfParams": {
+          "properties": {
+            "pane_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "session_generation": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "session_generation"
           ],
           "type": "object"
         },
@@ -5717,6 +5780,54 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/AgentPromptParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "agent.register_self",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentRegisterSelfParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "agent.channel_info",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentChannelInfoParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "agent.prompt_guarded",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentPromptGuardedParams"
             }
           },
           "required": [

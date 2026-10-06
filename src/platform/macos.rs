@@ -621,6 +621,47 @@ fn process_group_pids(process_group_id: u32) -> Vec<u32> {
 
 /// Read `e_tpgid` (foreground process group of the controlling terminal)
 /// for the given PID.
+pub(crate) fn registered_process_liveness(peer: super::ProcessIdentity) -> super::ProcessLiveness {
+    use super::ProcessLiveness;
+    if let Some(info) = process_bsdinfo(peer.pid) {
+        if info.pbi_status == libc::SZOMB {
+            return ProcessLiveness::Dead;
+        }
+        return match process_identity_from_bsdinfo(peer.pid, &info) {
+            Some(identity) if identity == peer => ProcessLiveness::Alive,
+            Some(_) => ProcessLiveness::Dead,
+            None => ProcessLiveness::Unknown,
+        };
+    }
+    let result = unsafe { libc::kill(peer.pid as libc::pid_t, 0) };
+    if result < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+        ProcessLiveness::Dead
+    } else {
+        ProcessLiveness::Unknown
+    }
+}
+
+pub(crate) fn registered_process_is_foreground(
+    root: super::ProcessIdentity,
+    peer: super::ProcessIdentity,
+) -> bool {
+    if process_identity(root.pid) != Some(root) || process_identity(peer.pid) != Some(peer) {
+        return false;
+    }
+    let Some(info) = process_bsdinfo(peer.pid) else {
+        return false;
+    };
+    if info.pbi_status == libc::SSTOP || info.pbi_status == libc::SZOMB {
+        return false;
+    }
+    let group = unsafe { libc::getpgid(peer.pid as libc::pid_t) };
+    group > 0
+        && foreground_process_group_id(root.pid) == Some(group as u32)
+        && super::process_identity_in_pane_session(root, peer) == Some(true)
+        && process_identity(root.pid) == Some(root)
+        && process_identity(peer.pid) == Some(peer)
+}
+
 pub fn foreground_process_group_id(pid: u32) -> Option<u32> {
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
     let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;

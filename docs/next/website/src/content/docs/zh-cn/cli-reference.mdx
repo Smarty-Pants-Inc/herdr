@@ -345,6 +345,34 @@ herdr agent explain --file PATH --agent LABEL [--json|--verbose]
 
 普通终端、服务器、测试、shell 或底层终端控制,请使用 `pane send-text`、`pane send-keys`、`pane run` 和 `terminal attach`。想带回车提交命令时用 `pane run`。
 
+### 已注册通道提示（未发布）
+
+```bash
+herdr agent channel-info <target>
+herdr agent prompt-guarded <target> <text> --expected-terminal TERMINAL_ID --expected-registration-epoch EPOCH --request-id ID [--timeout-ms MS] [--allow-cross-pane]
+```
+
+这些命令不依赖智能体屏幕检测来解析终端。请使用明确的窗格 ID、不透明的终端 ID 或唯一的实时智能体名称。`channel-info` 返回 `terminal_id` 和 `ready`；就绪时还包含 `registration_epoch` 和 `session_generation`。查询不会注册智能体。请从同一个就绪响应复制终端和 epoch，不要根据名称或窗格位置推导：
+
+```bash
+herdr agent channel-info w1:p1
+# 从 result.terminal_id 和 result.registration_epoch 设置这两个变量。
+herdr agent prompt-guarded w1:p1 "Review this change" \
+  --expected-terminal "$terminal_id" \
+  --expected-registration-epoch "$registration_epoch" \
+  --request-id review-1 --timeout-ms 10000
+```
+
+`prompt-guarded` 只通过智能体已注册的 socket 通道发送字面文本，绝不向 PTY 写入提示文本、准备字节或 Enter，不改变输入焦点，也不回退到 `agent prompt`。现有 `agent prompt` 命令保持不变。目标、文本、两个固定标识和请求 ID 都不能为空。`--timeout-ms` 等待的是接纳回执，而非轮次完成；默认 10000，允许 1–300000 毫秒。`--allow-cross-pane` 显式允许现有跨窗格输入策略中的操作，但不会绕过通道或身份检查。
+
+成功返回 `status: "accepted"`（已接纳到活动会话的输入）或 `"queued"`（已进入该会话的后续消息队列），以及固定的终端、epoch、请求 ID 和会话代数。两种状态都不保证模型轮次已完成或成功。同一 epoch 中，相同请求 ID 和完全相同文本共享首次结果，不会再次提交；改变文本返回 `payload_mismatch`。新 ID 表示新请求，不是安全重试。
+
+通道缺失或断开、固定标识过期、服务器不支持时，会拒绝操作且不写入 PTY。如果可能已接纳但回执丢失，返回 `delivery_unknown`：**绝不自动重试，不要更换 ID/epoch 重放，也不要回退到终端输入**。传输失败也可能使接纳结果未知。
+
+通道仅支持 Linux 和 macOS。Windows 的注册和守卫提示能力为 `false`，`channel-info` 返回 `ready: false`。托管 Pi 集成仅在 TUI 模式且同时提供 `pi.submitUserMessage` 和 `ctx.userMessageSessionGeneration` 时直接注册；缺少任一项就不注册通道，守卫投递会拒绝，旧的 `sendUserMessage` API 不是回退路径。没有注册 CLI。
+
+重连、集成重载或智能体会话替换需要新的注册 epoch。排队输入绑定到捕获的智能体会话；替换时取消，而不转移。服务器重启、恢复、实时交接或终端/根进程替换不会保留通道或旧标识，未知投递绝不重放。注册在合作的同用户信任边界内标识内核 socket 对端，并不认证 Pi 应用身份。直接注册协议及所有者生命周期见[已注册智能体通道](/zh-cn/docs/socket-api/#已注册智能体通道未发布)。
+
 ## 直接终端附加
 
 ```bash

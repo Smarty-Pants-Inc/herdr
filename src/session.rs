@@ -67,6 +67,8 @@ pub fn configure_from_args(args: &[String]) -> Result<Vec<String>, String> {
         return Ok(cleaned);
     }
 
+    // Protect target, literal prompt text and guarded option values before stripping globals.
+    let literal_slots = crate::cli::agent_channel_literal_slots(args);
     let mut requested_session = None;
     let mut index = 1;
     while index < args.len() {
@@ -74,6 +76,11 @@ pub fn configure_from_args(args: &[String]) -> Result<Vec<String>, String> {
         if arg == "--" {
             cleaned.extend_from_slice(&args[index..]);
             break;
+        }
+        if literal_slots.contains(&index) {
+            cleaned.push(arg.clone());
+            index += 1;
+            continue;
         }
         if arg == "--session" {
             let Some(value) = args.get(index + 1) else {

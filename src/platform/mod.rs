@@ -1125,6 +1125,7 @@ fn configure_background_command_platform(_command: &mut std::process::Command) {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PlatformCapabilities {
+    pub(crate) registered_agent_channel: bool,
     pub(crate) live_handoff: bool,
     pub(crate) direct_terminal_attach: bool,
     pub(crate) preserve_legacy_doubled_escape_input: bool,
@@ -1132,9 +1133,64 @@ pub(crate) struct PlatformCapabilities {
 
 pub(crate) const fn capabilities() -> PlatformCapabilities {
     PlatformCapabilities {
+        registered_agent_channel: cfg!(any(target_os = "linux", target_os = "macos")),
         live_handoff: cfg!(unix),
         direct_terminal_attach: cfg!(unix),
         preserve_legacy_doubled_escape_input: cfg!(target_os = "macos"),
+    }
+}
+
+/// Exact-instance liveness; inaccessible evidence never releases an ownership pin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProcessLiveness {
+    #[cfg(any(target_os = "linux", target_os = "macos", test))]
+    Alive,
+    Dead,
+    Unknown,
+}
+
+pub(crate) fn registered_process_liveness(peer: ProcessIdentity) -> ProcessLiveness {
+    #[cfg(target_os = "linux")]
+    return linux::registered_process_liveness(peer);
+    #[cfg(target_os = "macos")]
+    return macos::registered_process_liveness(peer);
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = peer;
+        ProcessLiveness::Unknown
+    }
+}
+
+/// Narrow OS group observation only: no agent metadata, executable or title detection.
+pub(crate) fn registered_process_is_foreground(
+    root: ProcessIdentity,
+    peer: ProcessIdentity,
+) -> bool {
+    #[cfg(target_os = "linux")]
+    return linux::registered_process_is_foreground(root, peer);
+    #[cfg(target_os = "macos")]
+    return macos::registered_process_is_foreground(root, peer);
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (root, peer);
+        false
+    }
+}
+
+pub(crate) fn fresh_registration_epoch() -> std::io::Result<String> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        use std::io::Read;
+        let mut bytes = [0u8; 32];
+        std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+        Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "agent channels unsupported",
+        ))
     }
 }
 

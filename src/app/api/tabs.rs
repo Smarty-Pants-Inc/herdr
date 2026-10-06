@@ -296,6 +296,7 @@ impl App {
                 );
             }
             let workspace = self.workspace_info(ws_idx);
+            self.revoke_agent_channels_for_workspace_close(ws_idx);
             self.state.selected = ws_idx;
             self.state.close_selected_workspace();
             self.state.remove_plugin_pane_records(pane_ids);
@@ -321,6 +322,7 @@ impl App {
             return encode_success(id, ResponseResult::Ok {});
         }
 
+        self.revoke_agent_channels_for_terminals(terminal_ids.clone());
         let Some(ws) = self.state.workspaces.get_mut(ws_idx) else {
             return tab_not_found(id, &target.tab_id);
         };

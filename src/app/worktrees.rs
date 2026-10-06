@@ -17,6 +17,7 @@ impl App {
             .filter(|space| space.is_linked_worktree)
             .map(|space| space.key.clone());
 
+        self.revoke_agent_channels_for_workspace_close(ws_idx);
         self.state.selected = ws_idx;
         self.state.close_selected_workspace();
 

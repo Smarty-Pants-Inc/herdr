@@ -10,6 +10,7 @@ use super::{TerminalId, TerminalRuntime};
 #[derive(Default)]
 pub(crate) struct TerminalRuntimeRegistry {
     runtimes: HashMap<TerminalId, TerminalRuntime>,
+    agent_channels: HashMap<TerminalId, std::sync::Weak<crate::api::agent_channel::Channel>>,
 }
 
 impl TerminalRuntimeRegistry {
@@ -21,15 +22,54 @@ impl TerminalRuntimeRegistry {
         self.runtimes.get(terminal_id)
     }
 
+    pub(crate) fn get_str(&self, terminal_id: &str) -> Option<&TerminalRuntime> {
+        self.runtimes.get(terminal_id)
+    }
+
+    pub(crate) fn bind_agent_channel(
+        &mut self,
+        terminal_id: TerminalId,
+        channel: &std::sync::Arc<crate::api::agent_channel::Channel>,
+    ) {
+        self.revoke_agent_channel(&terminal_id);
+        self.agent_channels
+            .insert(terminal_id, std::sync::Arc::downgrade(channel));
+    }
+
+    pub(crate) fn agent_channel_bound(
+        &self,
+        terminal_id: &str,
+        channel: &crate::api::agent_channel::Channel,
+    ) -> bool {
+        self.runtimes.contains_key(terminal_id)
+            && self
+                .agent_channels
+                .get(terminal_id)
+                .and_then(std::sync::Weak::upgrade)
+                .is_some_and(|bound| std::ptr::eq(bound.as_ref(), channel))
+    }
+
+    fn revoke_agent_channel(&mut self, terminal_id: &TerminalId) {
+        if let Some(channel) = self
+            .agent_channels
+            .remove(terminal_id)
+            .and_then(|channel| channel.upgrade())
+        {
+            channel.revoke();
+        }
+    }
+
     pub(crate) fn insert(
         &mut self,
         terminal_id: TerminalId,
         runtime: TerminalRuntime,
     ) -> Option<TerminalRuntime> {
+        self.revoke_agent_channel(&terminal_id);
         self.runtimes.insert(terminal_id, runtime)
     }
 
     pub(crate) fn remove(&mut self, terminal_id: &TerminalId) -> Option<TerminalRuntime> {
+        self.revoke_agent_channel(terminal_id);
         self.runtimes.remove(terminal_id)
     }
 
@@ -71,6 +111,13 @@ impl TerminalRuntimeRegistry {
     pub(crate) fn drain_for_handoff(
         &mut self,
     ) -> impl Iterator<Item = (TerminalId, TerminalRuntime)> + '_ {
+        for channel in self
+            .agent_channels
+            .drain()
+            .filter_map(|(_, channel)| channel.upgrade())
+        {
+            channel.revoke();
+        }
         self.runtimes.drain()
     }
 
@@ -82,6 +129,9 @@ impl TerminalRuntimeRegistry {
 
 impl From<HashMap<TerminalId, TerminalRuntime>> for TerminalRuntimeRegistry {
     fn from(runtimes: HashMap<TerminalId, TerminalRuntime>) -> Self {
-        Self { runtimes }
+        Self {
+            runtimes,
+            agent_channels: HashMap::new(),
+        }
     }
 }
