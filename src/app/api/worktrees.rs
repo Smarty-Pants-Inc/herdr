@@ -70,6 +70,7 @@ impl App {
         &mut self,
         id: String,
         params: WorktreeOpenParams,
+        allow_project_change: bool,
         mut source: WorktreeSource,
         entry: crate::worktree::ExistingWorktree,
     ) -> String {
@@ -92,6 +93,16 @@ impl App {
         let canonical_source = crate::worktree::canonical_or_original(&source.source_checkout_path);
         let target_is_source = canonical_path == canonical_source;
         let already_open = self.open_workspace_idx_for_checkout(&canonical_path);
+        let project_changes = match self.precheck_worktree_memberships(
+            &source,
+            already_open,
+            &canonical_path,
+            allow_project_change,
+            "worktree.open_project_checked",
+        ) {
+            Ok(changes) => changes,
+            Err(message) => return encode_error(id, "project_change_refused", message),
+        };
         let defer_source_created_event = target_is_source && already_open.is_none();
         let created_source_workspace =
             match self.ensure_source_parent_membership(&mut source, !defer_source_created_event) {
@@ -148,6 +159,7 @@ impl App {
         let tab_idx = self.state.workspaces[ws_idx].active_tab;
         let worktree = self.worktree_info_for_entry(&source, entry);
         self.emit_worktree_opened_event(ws_idx, worktree.clone(), already_open.is_some());
+        Self::log_project_changes_with_context(&project_changes, "worktree.open_project_checked");
         encode_success(
             id,
             ResponseResult::WorktreeOpened {
@@ -271,6 +283,30 @@ impl App {
             repo_key: space.key,
             repo_name: space.repo_name,
         })
+    }
+
+    /// Project both membership writes together before creating/focusing anything.
+    /// New workspaces contain only new shells, so only existing holders can
+    /// reclassify surviving sessions. Use the same parent fallback as ensure.
+    fn precheck_worktree_memberships(
+        &self,
+        source: &WorktreeSource,
+        target_workspace_idx: Option<usize>,
+        target_path: &Path,
+        allow_project_change: bool,
+        checked_method: &str,
+    ) -> Result<Vec<super::project_change::ProjectChange>, String> {
+        let mut projected = self.project_topology();
+        if let Some(ws_idx) = source
+            .workspace_idx
+            .or_else(|| self.find_parent_workspace_by_key(&source.repo_key))
+        {
+            projected[ws_idx].checkout_path = Some(source.source_checkout_path.clone());
+        }
+        if let Some(ws_idx) = target_workspace_idx {
+            projected[ws_idx].checkout_path = Some(target_path.to_path_buf());
+        }
+        self.precheck_project_change(&projected, allow_project_change, checked_method)
     }
 
     fn ensure_source_parent_membership(
@@ -1043,6 +1079,7 @@ mod tests {
                 repo_name: "herdr".into(),
                 label: None,
                 focus: false,
+                allow_project_change: false,
                 respond_to,
             }),
             result: Ok(()),

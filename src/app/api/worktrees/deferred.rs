@@ -20,12 +20,22 @@ impl App {
     ) -> bool {
         match request.method {
             crate::api::schema::Method::WorktreeList(_)
-            | crate::api::schema::Method::WorktreeOpen(_) => {
+            | crate::api::schema::Method::WorktreeOpen(_)
+            | crate::api::schema::Method::WorktreeOpenProjectChecked(_) => {
                 self.start_api_worktree_read(request, respond_to, client_local);
                 true
             }
             crate::api::schema::Method::WorktreeCreate(params) => {
-                self.start_api_worktree_create(request.id, params, respond_to);
+                self.start_api_worktree_create(request.id, params, false, respond_to);
+                true
+            }
+            crate::api::schema::Method::WorktreeCreateProjectChecked(params) => {
+                self.start_api_worktree_create(
+                    request.id,
+                    params.params,
+                    params.allow_project_change,
+                    respond_to,
+                );
                 true
             }
             crate::api::schema::Method::WorktreeRemove(params) => {
@@ -101,6 +111,7 @@ impl App {
         &mut self,
         id: String,
         params: WorktreeCreateParams,
+        allow_project_change: bool,
         respond_to: std::sync::mpsc::Sender<String>,
     ) {
         let branch = params
@@ -161,6 +172,21 @@ impl App {
             );
             return;
         }
+        // Reject before the Git worker creates directories, branches or a checkout.
+        // Recheck on completion: panes/metadata/holders can change while Git runs.
+        if let Err(message) = self.precheck_worktree_memberships(
+            &source,
+            self.open_workspace_idx_for_checkout(&checkout_path),
+            &checkout_path,
+            allow_project_change,
+            "worktree.create_project_checked",
+        ) {
+            Self::send_api_response(
+                respond_to,
+                encode_error(id, "project_change_refused", message),
+            );
+            return;
+        }
         let operation_id = self.next_api_worktree_operation_id();
         self.pending_api_worktree_creates
             .insert(checkout_key.clone(), operation_id);
@@ -188,6 +214,7 @@ impl App {
             repo_name: source.repo_name,
             label: params.label,
             focus: params.focus,
+            allow_project_change,
             respond_to,
         };
         let path = checkout_path;
@@ -410,33 +437,49 @@ impl App {
             repo_key: api.repo_key,
             repo_name: api.repo_name,
         };
+        let already_open = self.open_workspace_idx_for_checkout(&result.path);
+        let project_changes = match self.precheck_worktree_memberships(
+            &source,
+            already_open,
+            &result.path,
+            api.allow_project_change,
+            "worktree.create_project_checked",
+        ) {
+            Ok(changes) => changes,
+            Err(message) => {
+                Self::send_api_response(
+                    api.respond_to,
+                    encode_error(api.id, "project_change_refused", message),
+                );
+                return;
+            }
+        };
         if let Err(err) = self.ensure_source_parent_membership(&mut source, true) {
             Self::send_api_response(api.respond_to, encode_error(api.id, err.code, err.message));
             return;
         }
 
-        let (ws_idx, created_workspace) =
-            if let Some(ws_idx) = self.open_workspace_idx_for_checkout(&result.path) {
-                if api.focus {
-                    self.state.switch_workspace(ws_idx);
+        let (ws_idx, created_workspace) = if let Some(ws_idx) = already_open {
+            if api.focus {
+                self.state.switch_workspace(ws_idx);
+            }
+            (ws_idx, false)
+        } else {
+            match self.create_workspace_with_options(result.path.clone(), api.focus) {
+                Ok(ws_idx) => (ws_idx, true),
+                Err(err) => {
+                    Self::send_api_response(
+                        api.respond_to,
+                        encode_error(
+                            api.id,
+                            "worktree_open_failed",
+                            format!("created worktree but failed to open workspace: {err}"),
+                        ),
+                    );
+                    return;
                 }
-                (ws_idx, false)
-            } else {
-                match self.create_workspace_with_options(result.path.clone(), api.focus) {
-                    Ok(ws_idx) => (ws_idx, true),
-                    Err(err) => {
-                        Self::send_api_response(
-                            api.respond_to,
-                            encode_error(
-                                api.id,
-                                "worktree_open_failed",
-                                format!("created worktree but failed to open workspace: {err}"),
-                            ),
-                        );
-                        return;
-                    }
-                }
-            };
+            }
+        };
 
         self.mark_worktree_membership(
             &source,
@@ -480,6 +523,7 @@ impl App {
                 worktree,
             },
         );
+        Self::log_project_changes_with_context(&project_changes, "worktree.create_project_checked");
         Self::send_api_response(api.respond_to, response);
     }
 

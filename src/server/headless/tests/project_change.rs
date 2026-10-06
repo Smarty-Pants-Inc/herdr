@@ -18,6 +18,727 @@ fn project_server() -> HeadlessServer {
     server
 }
 
+// #4551: membership repins keep workspace/first-Pi identity unchanged, but can
+// still change the reported session's fallback project. Use the real deferred
+// headless receiver, not a direct membership setter or a fabricated completion.
+struct WorktreeRepinFixture {
+    server: HeadlessServer,
+    directory: std::path::PathBuf,
+    repo: std::path::PathBuf,
+    checkout: std::path::PathBuf,
+    old_project: std::path::PathBuf,
+    workspace: usize,
+    pane: crate::layout::PaneId,
+    session: String,
+}
+
+impl Drop for WorktreeRepinFixture {
+    fn drop(&mut self) {
+        shutdown_test_runtimes(&mut self.server);
+        let _ = std::fs::remove_dir_all(&self.directory);
+        if let Some(parent) = self.server.client_socket_path.parent() {
+            let _ = std::fs::remove_dir_all(parent);
+        }
+    }
+}
+
+fn worktree_repin_fixture(create: bool, target: bool, unchanged: bool) -> WorktreeRepinFixture {
+    let directory = std::env::temp_dir().join(format!(
+        "repin-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let repo = directory.join("repo");
+    let checkout = directory.join("checkout");
+    std::fs::create_dir_all(&repo).unwrap();
+    worktree_repin_git(&repo, &["init", "--quiet"]);
+    worktree_repin_git(
+        &repo,
+        &[
+            "-c",
+            "user.name=Herdr Test",
+            "-c",
+            "user.email=herdr@example.invalid",
+            "commit",
+            "--quiet",
+            "--allow-empty",
+            "-m",
+            "initial",
+        ],
+    );
+    if !create {
+        worktree_repin_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "repin",
+                checkout.to_str().unwrap(),
+            ],
+        );
+    }
+    let mut server = test_headless_server();
+    let space = crate::workspace::git_space_metadata(&repo).unwrap();
+    let mut parent = crate::workspace::Workspace::test_new("parent");
+    parent.identity_cwd = repo.clone();
+    parent.cached_git_space = Some(space.clone());
+    server.app.state.workspaces = vec![parent];
+    if target {
+        let mut child = crate::workspace::Workspace::test_new("existing-target");
+        child.identity_cwd = checkout.clone();
+        // A workspace may already track the checkout when create finishes.
+        // Cached Git identity lets it be found independently of the Pi cwd.
+        child.cached_git_space = Some(crate::workspace::GitSpaceMetadata {
+            checkout_key: crate::worktree::canonical_or_original(&checkout)
+                .display()
+                .to_string(),
+            repo_root: checkout.clone(),
+            is_linked_worktree: true,
+            ..space
+        });
+        server.app.state.workspaces.push(child);
+    }
+    server.app.state.ensure_test_terminals();
+    server.app.state.active = Some(0);
+    server.app.state.selected = 0;
+    server.app.state.mode = crate::app::Mode::Terminal;
+    let workspace = usize::from(target);
+    let pane = root(&server, workspace, 0);
+    let old_project = if unchanged {
+        if target {
+            checkout.clone()
+        } else {
+            repo.clone()
+        }
+    } else {
+        directory.join("old-project")
+    };
+    // Create the unchanged target directory only for open. A create target must
+    // remain absent so Git creates it through the actual worker.
+    if old_project != checkout {
+        std::fs::create_dir_all(&old_project).unwrap();
+    }
+    cwd(&mut server, pane, &old_project);
+    let session = session(
+        &mut server,
+        pane,
+        directory.file_name().unwrap().to_str().unwrap(),
+    );
+    // Deliberately stale cached cwd: project authority is the runtime's first
+    // Pi foreground cwd, not identity_cwd, cached Git discovery, or shell cwd.
+    let terminal = server.app.state.workspaces[workspace]
+        .terminal_id(pane)
+        .unwrap()
+        .clone();
+    server.app.state.terminals.get_mut(&terminal).unwrap().cwd = repo.clone();
+    assert!(server.app.state.workspaces[workspace]
+        .worktree_space()
+        .is_none());
+    WorktreeRepinFixture {
+        server,
+        directory,
+        repo,
+        checkout,
+        old_project,
+        workspace,
+        pane,
+        session,
+    }
+}
+
+fn worktree_repin_git(repo: &std::path::Path, args: &[&str]) {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn worktree_repin_start(
+    fixture: &mut WorktreeRepinFixture,
+    create: bool,
+    allow: Option<bool>,
+) -> std::sync::mpsc::Receiver<String> {
+    let mut params = serde_json::json!({
+        "workspace_id": fixture.server.app.public_workspace_id(0),
+        "path": fixture.checkout,
+        "focus": false,
+        "label": "intentional repin"
+    });
+    if create {
+        params["branch"] = serde_json::json!("repin");
+    }
+    if let Some(allow) = allow {
+        params["allow_project_change"] = serde_json::json!(allow);
+    }
+    // RED on the legacy endpoints is preserved in .local/red-tests.md. Opt-in
+    // uses additive methods; legacy refusal calls keep the frozen parameter shape.
+    let method = match (create, allow.is_some()) {
+        (true, true) => "worktree.create_project_checked",
+        (false, true) => "worktree.open_project_checked",
+        (true, false) => "worktree.create",
+        (false, false) => "worktree.open",
+    };
+    let request = serde_json::from_value(serde_json::json!({
+        "id": "worktree-repin-4551",
+        "method": method,
+        "params": params
+    }))
+    .unwrap();
+    let (respond_to, response_rx) = std::sync::mpsc::channel();
+    fixture
+        .server
+        .handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+            context: api::ApiRequestContext::default(),
+            request,
+            respond_to,
+            response_write_complete: None,
+        });
+    response_rx
+}
+
+async fn worktree_repin_request(
+    fixture: &mut WorktreeRepinFixture,
+    create: bool,
+    allow: Option<bool>,
+) -> Result<ResponseResult, ErrorResponse> {
+    let response_rx = worktree_repin_start(fixture, create, allow);
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if let Ok(response) = response_rx.try_recv() {
+                return decode_response(&response);
+            }
+            let event = fixture
+                .server
+                .app
+                .event_rx
+                .recv()
+                .await
+                .expect("deferred worktree event");
+            fixture.server.handle_internal_event_with_forwarding(event);
+        }
+    })
+    .await
+    .expect("bounded deferred headless response")
+}
+
+async fn assert_worktree_repin(create: bool, target: bool, outcome: &str) {
+    let unchanged = matches!(outcome, "unchanged" | "unknown");
+    let mut fixture = worktree_repin_fixture(create, target, unchanged);
+    if outcome == "metadata" {
+        // Both sides are the same hosting workspace, with complete project
+        // authority. A checkout pin must not override its metadata project.
+        metadata(
+            &mut fixture.server,
+            fixture.workspace,
+            Some("smarty-pants"),
+            "herdr",
+        );
+    }
+    if outcome == "unknown" {
+        // An unchanged explicit pin must not turn an unknown first-Pi cwd into
+        // a false project change (including a checkout path which is still absent).
+        membership(&mut fixture.server, fixture.workspace, &fixture.old_project);
+        fixture.server.app.state.workspaces[fixture.workspace]
+            .worktree_space
+            .as_mut()
+            .unwrap()
+            .is_linked_worktree = target;
+        let terminal = fixture.server.app.state.workspaces[fixture.workspace]
+            .terminal_id(fixture.pane)
+            .unwrap();
+        fixture
+            .server
+            .app
+            .terminal_runtimes
+            .get(terminal)
+            .unwrap()
+            .test_set_foreground_cwd(None);
+    }
+    let combined_session = if outcome == "combined" {
+        assert!(target);
+        let source_pane = root(&fixture.server, 0, 0);
+        let source_project = fixture.directory.join("old-source-project");
+        std::fs::create_dir_all(&source_project).unwrap();
+        cwd(&mut fixture.server, source_pane, &source_project);
+        Some(session(
+            &mut fixture.server,
+            source_pane,
+            &format!(
+                "source-{}",
+                fixture.directory.file_name().unwrap().to_str().unwrap()
+            ),
+        ))
+    } else {
+        None
+    };
+    let before = fingerprint(&fixture.server);
+    let memberships: Vec<_> = fixture
+        .server
+        .app
+        .state
+        .workspaces
+        .iter()
+        .map(|ws| ws.worktree_space().cloned())
+        .collect();
+    let counts = (
+        fixture.server.app.state.workspaces.len(),
+        fixture.server.app.state.terminals.len(),
+        fixture.server.app.terminal_runtimes.len(),
+    );
+    let old_workspace = fixture.server.app.public_workspace_id(fixture.workspace);
+    let old_pane = fixture
+        .server
+        .app
+        .public_pane_id(fixture.workspace, fixture.pane)
+        .unwrap();
+    let repinned = if target {
+        fixture.checkout.clone()
+    } else {
+        fixture.repo.clone()
+    };
+    let logs = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let writer = logs.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::INFO)
+        .with_writer(move || LogWriter(writer.clone()))
+        .finish();
+    let guard = tracing::subscriber::set_default(subscriber);
+    let result = worktree_repin_request(
+        &mut fixture,
+        create,
+        (matches!(outcome, "allow" | "combined") || unchanged).then_some(true),
+    )
+    .await;
+    if outcome == "refuse" {
+        assert!(
+            result.is_err(),
+            "#4551 must refuse repinning an existing Pi workspace; got {result:?}"
+        );
+        let error = result.unwrap_err();
+        assert_eq!(error.error.code, "project_change_refused");
+        for text in [
+            old_pane.as_str(),
+            "Path",
+            fixture.session.as_str(),
+            fixture.old_project.to_str().unwrap(),
+            repinned.to_str().unwrap(),
+        ] {
+            assert!(
+                error.error.message.contains(text),
+                "missing {text}: {}",
+                error.error.message
+            );
+        }
+        assert!(error.error.message.contains("--allow-project-change"));
+        assert!(error.error.message.contains(if create {
+            "worktree.create_project_checked"
+        } else {
+            "worktree.open_project_checked"
+        }));
+        if create {
+            assert!(
+                !fixture.checkout.exists(),
+                "initial refusal cannot create checkout"
+            );
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&fixture.repo)
+                .args(["show-ref", "--verify", "--quiet", "refs/heads/repin"])
+                .output()
+                .unwrap();
+            assert!(
+                !output.status.success(),
+                "initial refusal cannot create branch"
+            );
+        }
+        assert_eq!(
+            fingerprint(&fixture.server),
+            before,
+            "refusal has no events, rename, or topology effects"
+        );
+        assert_eq!(
+            fixture
+                .server
+                .app
+                .state
+                .workspaces
+                .iter()
+                .map(|ws| ws.worktree_space().cloned())
+                .collect::<Vec<_>>(),
+            memberships
+        );
+        assert_eq!(
+            (
+                fixture.server.app.state.workspaces.len(),
+                fixture.server.app.state.terminals.len(),
+                fixture.server.app.terminal_runtimes.len()
+            ),
+            counts,
+            "refusal cannot spawn a workspace or runtime"
+        );
+    } else {
+        let response = result.unwrap();
+        match response {
+            ResponseResult::WorktreeCreated { workspace, .. } if create => {
+                if target {
+                    assert_eq!(workspace.workspace_id, old_workspace);
+                }
+            }
+            ResponseResult::WorktreeOpened {
+                workspace,
+                already_open,
+                ..
+            } if !create => {
+                assert_eq!(already_open, target);
+                if target {
+                    assert_eq!(workspace.workspace_id, old_workspace);
+                }
+            }
+            other => panic!("unexpected deferred result: {other:?}"),
+        }
+        assert_eq!(
+            fixture.server.app.state.workspaces.len(),
+            2,
+            "existing workspace reused"
+        );
+        assert_eq!(
+            fixture.server.app.state.workspaces[fixture.workspace]
+                .worktree_space()
+                .unwrap()
+                .checkout_path,
+            crate::worktree::canonical_or_original(&repinned)
+        );
+    }
+    if outcome == "combined" {
+        // The same successful command is now a no-op membership repin. It
+        // must neither re-prompt nor append an audit for either session.
+        assert!(worktree_repin_request(&mut fixture, false, None)
+            .await
+            .is_ok());
+    }
+    drop(guard);
+    let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+    let audits: Vec<_> = logs
+        .lines()
+        .filter(|line| line.contains("intentional project change allowed"))
+        .collect();
+    let expected = usize::from(matches!(outcome, "allow" | "combined"));
+    assert_eq!(
+        audits.len(),
+        expected,
+        "#4551 one intentional command must emit exactly one audit: {logs}"
+    );
+    assert_eq!(
+        logs.matches("intentional project change allowed").count(),
+        expected,
+        "{logs}"
+    );
+    if expected == 1 {
+        for text in [
+            old_pane.as_str(),
+            "Path",
+            fixture.session.as_str(),
+            fixture.old_project.to_str().unwrap(),
+            repinned.to_str().unwrap(),
+        ] {
+            assert!(audits[0].contains(text), "missing {text}: {logs}");
+        }
+    }
+    if let Some(combined_session) = combined_session {
+        assert!(
+            audits[0].contains(&combined_session),
+            "source session absent: {logs}"
+        );
+        assert!(
+            audits[0].contains(fixture.repo.to_str().unwrap()),
+            "source target absent: {logs}"
+        );
+        assert_eq!(
+            audits[0].matches("would change project").count(),
+            2,
+            "{logs}"
+        );
+        let source_pane = root(&fixture.server, 0, 0);
+        let terminal = fixture.server.app.state.workspaces[0]
+            .terminal_id(source_pane)
+            .unwrap();
+        assert_eq!(
+            fixture.server.app.state.terminals[terminal]
+                .agent_session_reference()
+                .unwrap()
+                .value,
+            combined_session
+        );
+    }
+    let terminal = fixture.server.app.state.workspaces[fixture.workspace]
+        .terminal_id(fixture.pane)
+        .unwrap();
+    assert_eq!(
+        fixture.server.app.state.terminals[terminal]
+            .agent_session_reference()
+            .unwrap()
+            .value,
+        fixture.session
+    );
+    assert!(fixture.server.app.terminal_runtimes.get(terminal).is_some());
+    assert_eq!(
+        fixture.server.app.public_workspace_id(fixture.workspace),
+        old_workspace
+    );
+    assert_eq!(
+        fixture
+            .server
+            .app
+            .public_pane_id(fixture.workspace, fixture.pane)
+            .unwrap(),
+        old_pane
+    );
+    assert_eq!(fixture.server.app.state.active, Some(0));
+    assert!(fixture.server.app.pending_api_worktree_creates.is_empty());
+    fixture.server.app.state.assert_invariants_for_test();
+}
+
+macro_rules! worktree_repin_tests {
+    ($(($name:ident, $create:expr, $target:expr, $outcome:expr)),+ $(,)?) => {
+        $(#[tokio::test]
+        async fn $name() { assert_worktree_repin($create, $target, $outcome).await; })+
+    };
+}
+
+worktree_repin_tests!(
+    (
+        project_change_worktree_4551_open_metadata_no_audit,
+        false,
+        true,
+        "metadata"
+    ),
+    (
+        project_change_worktree_4551_create_metadata_no_audit,
+        true,
+        true,
+        "metadata"
+    ),
+    (
+        project_change_worktree_4551_open_unknown_noop_no_audit,
+        false,
+        true,
+        "unknown"
+    ),
+    (
+        project_change_worktree_4551_create_unknown_noop_no_audit,
+        true,
+        true,
+        "unknown"
+    ),
+    (
+        project_change_worktree_4551_open_combined_audit,
+        false,
+        true,
+        "combined"
+    ),
+    (
+        project_change_worktree_4551_create_combined_audit,
+        true,
+        true,
+        "combined"
+    ),
+    (
+        project_change_worktree_4551_open_source_refuses,
+        false,
+        false,
+        "refuse"
+    ),
+    (
+        project_change_worktree_4551_open_target_refuses,
+        false,
+        true,
+        "refuse"
+    ),
+    (
+        project_change_worktree_4551_create_source_refuses,
+        true,
+        false,
+        "refuse"
+    ),
+    (
+        project_change_worktree_4551_create_target_refuses,
+        true,
+        true,
+        "refuse"
+    ),
+    (
+        project_change_worktree_4551_open_source_allows_once,
+        false,
+        false,
+        "allow"
+    ),
+    (
+        project_change_worktree_4551_open_target_allows_once,
+        false,
+        true,
+        "allow"
+    ),
+    (
+        project_change_worktree_4551_create_source_allows_once,
+        true,
+        false,
+        "allow"
+    ),
+    (
+        project_change_worktree_4551_create_target_allows_once,
+        true,
+        true,
+        "allow"
+    ),
+    (
+        project_change_worktree_4551_open_source_unchanged_no_audit,
+        false,
+        false,
+        "unchanged"
+    ),
+    (
+        project_change_worktree_4551_open_target_unchanged_no_audit,
+        false,
+        true,
+        "unchanged"
+    ),
+    (
+        project_change_worktree_4551_create_source_unchanged_no_audit,
+        true,
+        false,
+        "unchanged"
+    ),
+    (
+        project_change_worktree_4551_create_target_unchanged_no_audit,
+        true,
+        true,
+        "unchanged"
+    ),
+);
+
+#[tokio::test]
+async fn project_change_worktree_4551_create_completion_rechecks_topology_drift() {
+    for target_drift in [false, true] {
+        for allow in [false, true] {
+            let mut fixture = worktree_repin_fixture(true, false, true);
+            // Initial source project equals its proposed pin; no rejection at
+            // start. Delay consuming the actual Git completion, not the worker.
+            let response_rx = worktree_repin_start(&mut fixture, true, allow.then_some(true));
+            let event =
+                tokio::time::timeout(Duration::from_secs(30), fixture.server.app.event_rx.recv())
+                    .await
+                    .unwrap()
+                    .expect("real Git completion");
+            assert!(matches!(
+                &event,
+                crate::events::AppEvent::WorktreeAddFinished(_)
+            ));
+            assert!(
+                fixture.checkout.exists(),
+                "Git already created the checkout"
+            );
+            let drift_workspace = if target_drift {
+                let mut workspace = crate::workspace::Workspace::test_new("arrived-during-Git");
+                workspace.identity_cwd = fixture.checkout.clone();
+                workspace.cached_git_space =
+                    crate::workspace::git_space_metadata(&fixture.checkout);
+                fixture.server.app.state.workspaces.push(workspace);
+                fixture.server.app.state.ensure_test_terminals();
+                1
+            } else {
+                0
+            };
+            let pane = root(&fixture.server, drift_workspace, 0);
+            let drift_project = fixture.directory.join("async-drift-project");
+            std::fs::create_dir_all(&drift_project).unwrap();
+            cwd(&mut fixture.server, pane, &drift_project);
+            let drift_session = session(
+                &mut fixture.server,
+                pane,
+                &format!(
+                    "drift-{}",
+                    fixture.directory.file_name().unwrap().to_str().unwrap()
+                ),
+            );
+            let before = fingerprint(&fixture.server);
+            let count = fixture.server.app.state.workspaces.len();
+            let logs = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let writer = logs.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::INFO)
+                .with_writer(move || LogWriter(writer.clone()))
+                .finish();
+            tracing::subscriber::with_default(subscriber, || {
+                fixture.server.handle_internal_event_with_forwarding(event);
+            });
+            let response =
+                decode_response(&response_rx.recv_timeout(Duration::from_secs(2)).unwrap());
+            if allow {
+                assert!(matches!(
+                    response.unwrap(),
+                    ResponseResult::WorktreeCreated { .. }
+                ));
+                assert_eq!(fixture.server.app.state.workspaces.len(), 2);
+            } else {
+                let error = response.unwrap_err();
+                assert_eq!(error.error.code, "project_change_refused");
+                assert!(error.error.message.contains(&drift_session));
+                assert!(error
+                    .error
+                    .message
+                    .contains(drift_project.to_str().unwrap()));
+                assert_eq!(fingerprint(&fixture.server), before);
+                assert_eq!(fixture.server.app.state.workspaces.len(), count);
+                assert!(fixture
+                    .server
+                    .app
+                    .state
+                    .workspaces
+                    .iter()
+                    .all(|ws| ws.worktree_space().is_none()));
+            }
+            let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+            assert_eq!(
+                logs.matches("intentional project change allowed").count(),
+                usize::from(allow),
+                "{logs}"
+            );
+            if allow {
+                assert!(logs.contains(&drift_session), "{logs}");
+            }
+            let terminal = fixture.server.app.state.workspaces[drift_workspace]
+                .terminal_id(pane)
+                .unwrap();
+            assert_eq!(
+                fixture.server.app.state.terminals[terminal]
+                    .agent_session_reference()
+                    .unwrap()
+                    .value,
+                drift_session
+            );
+            assert!(fixture.server.app.terminal_runtimes.get(terminal).is_some());
+            assert!(fixture.server.app.pending_api_worktree_creates.is_empty());
+            fixture.server.app.state.assert_invariants_for_test();
+        }
+    }
+}
+
 fn public_method(
     server: &mut HeadlessServer,
     method: Method,

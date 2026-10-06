@@ -97,7 +97,7 @@ herdr pane read w1:p2 --source recent --lines 50
 | クライアント | `client.window_title.set`、`client.window_title.clear` |
 | セッション | `session.snapshot` |
 | ワークスペース | `workspace.create`、`workspace.list`、`workspace.get`、`workspace.focus`、`workspace.rename`、`workspace.move`、`workspace.move_block`、`workspace.report_metadata`、`workspace.close` |
-| Worktree | `worktree.list`、`worktree.create`、`worktree.open`、`worktree.remove` |
+| Worktree | `worktree.list`、`worktree.create`、`worktree.create_project_checked`、`worktree.open`、`worktree.open_project_checked`、`worktree.remove` |
 | タブ | `tab.create`、`tab.list`、`tab.get`、`tab.focus`、`tab.rename`、`tab.move`、`tab.close` |
 | ペイン | `pane.split`、`pane.swap`、`pane.move`、`pane.zoom`、`pane.layout`、`pane.process_info`、`pane.neighbor`、`pane.edges`、`pane.focus_direction`、`pane.resize`、`pane.list`、`pane.current`、`pane.get`、`pane.last_input`、`pane.rename`、`pane.send_text`、`pane.send_keys`、`pane.send_input`、`pane.send_input_guarded`、`pane.read`、`pane.report_agent`、`pane.report_agent_session`、`pane.report_metadata`、`pane.clear_agent_authority`、`pane.release_agent`、`pane.close`、`pane.wait_for_output` |
 | ポップアップ | `popup.close` |
@@ -364,6 +364,17 @@ reason の候補は `shown`、`disabled`、`rate_limited`、`no_foreground_clien
 `client.window_title.clear` はタイトルを `ui.window_title` に戻します。レスポンスは `type: "client_window_title"` で、`changed` と、`set`、`cleared`、`no_foreground_client` のいずれかの reason を含みます。
 
 Worktree メソッドは Git チェックアウトを Herdr ワークスペースとして管理します。`worktree.create` はチェックアウトを作成し、新しい `workspace`、`tab`、`root_pane`、`worktree` のレコードを返します。要求されたブランチがローカルに既存ならそれをチェックアウトし、なければ要求されたベースまたは `HEAD` からブランチを作成します。`worktree.open` は既存のチェックアウトを開くか、すでに開いているワークスペースを返します。`worktree.remove` はリンクされた子ワークスペースに対して `git worktree remove` を実行し、ブランチは決して削除しません。
+
+`worktree.create_project_checked` と `worktree.open_project_checked` は安全性を検証する別名です。従来のメソッドと同じフラットなパラメーターとレスポンスに、省略可能な `allow_project_change`（デフォルト `false`）を追加します。存続するエージェントセッションのプロジェクト所有関係を保持し、変更に明示的な許可が必要な場合は `project_change_refused` を返します。所有関係を意図的に変更する場合にのみ `allow_project_change: true` を指定してください。これはリポジトリへの信頼を許可しません。従来の `worktree.create` と `worktree.open` はパラメーターの形を変更せず、この許可を与えません。
+
+CLI は `--allow-project-change` がなくても常に検証付きの名前を使います。エンドポイントクライアントは welcome の `methods` 一覧で検証付きの名前を確認してください。古いサーバーはこれらのメソッドを拒否します。従来の名前へフォールバックしたり、従来のメソッドへ許可フィールドを送信したりしないでください。
+
+```json
+{"id":"checked_create","method":"worktree.create_project_checked","params":{"workspace_id":"w1","branch":"worktree/api","allow_project_change":true}}
+{"id":"checked_open","method":"worktree.open_project_checked","params":{"workspace_id":"w1","branch":"worktree/api","allow_project_change":false}}
+```
+
+以下の対象選択、パスの規則、レスポンスのレコード、ライフサイクルイベントは、検証付きの別名にも適用されます。
 
 元のワークスペースから worktree を作成する:
 

@@ -101,7 +101,7 @@ Raw socket method names use dot notation:
 | Client | `client.window_title.set`, `client.window_title.clear` |
 | Session | `session.snapshot` |
 | Workspace | `workspace.create`, `workspace.create_linked`, `workspace.list`, `workspace.get`, `workspace.focus`, `workspace.rename`, `workspace.move`, `workspace.move_block`, `workspace.report_metadata`, `workspace.close` |
-| Worktree | `worktree.list`, `worktree.create`, `worktree.open`, `worktree.remove` |
+| Worktree | `worktree.list`, `worktree.create`, `worktree.create_project_checked`, `worktree.open`, `worktree.open_project_checked`, `worktree.remove` |
 | Tab | `tab.create`, `tab.list`, `tab.get`, `tab.focus`, `tab.rename`, `tab.move`, `tab.close` |
 | Pane | `pane.split`, `pane.swap`, `pane.move`, `pane.zoom`, `pane.layout`, `pane.process_info`, `pane.neighbor`, `pane.edges`, `pane.focus_direction`, `pane.resize`, `pane.list`, `pane.current`, `pane.get`, `pane.last_input`, `pane.rename`, `pane.send_text`, `pane.send_keys`, `pane.send_input`, `pane.send_input_guarded`, `pane.read`, `pane.report_agent`, `pane.report_agent_session`, `pane.report_metadata`, `pane.clear_agent_authority`, `pane.release_agent`, `pane.close`, `pane.wait_for_output` |
 | Popup | `popup.close` |
@@ -442,6 +442,17 @@ Set or clear the foreground client's outer terminal window title:
 `no_foreground_client`.
 
 Worktree methods manage Git checkouts as Herdr workspaces. `worktree.create` creates a checkout and returns the new `workspace`, `tab`, `root_pane`, and `worktree` records. If the requested branch already exists locally, it checks out that branch; otherwise it creates the branch from the requested base or `HEAD`. `worktree.open` opens an existing checkout or returns the already-open workspace. `worktree.remove` runs `git worktree remove` against a linked child workspace and never deletes the branch.
+
+`worktree.create_project_checked` and `worktree.open_project_checked` are safety-checked aliases with the same flattened parameters and responses as their legacy methods, plus optional `allow_project_change` (default `false`). They preserve project ownership for surviving agent sessions and return `project_change_refused` when a change needs explicit permission. Set `allow_project_change: true` only for an intentional ownership change; it does not grant repository trust. Legacy `worktree.create` and `worktree.open` keep their unchanged parameter shapes and never grant this permission.
+
+The CLI always uses the checked names, even without `--allow-project-change`. Endpoint clients must check the welcome `methods` list for the checked name. Older servers reject these methods; never fall back to the legacy names or send the permission field to a legacy method.
+
+```json
+{"id":"checked_create","method":"worktree.create_project_checked","params":{"workspace_id":"w1","branch":"worktree/api","allow_project_change":true}}
+{"id":"checked_open","method":"worktree.open_project_checked","params":{"workspace_id":"w1","branch":"worktree/api","allow_project_change":false}}
+```
+
+The source selection, path rules, response records, and lifecycle events described below also apply to the checked aliases.
 
 Create a worktree from a source workspace:
 
