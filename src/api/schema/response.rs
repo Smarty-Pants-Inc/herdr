@@ -287,6 +287,14 @@ pub enum ResponseResult {
         session_id: String,
         sdp: String,
     },
+    /// Advisory only: binding can change before the authoritative open gate.
+    MediaPreflight {
+        bound: bool,
+        client: Option<u64>,
+        webrtc: bool,
+        ended_receipt: bool,
+        refusal: Option<String>,
+    },
     MediaSession {
         session_id: String,
         state: super::media::MediaSessionState,
@@ -295,6 +303,8 @@ pub enum ResponseResult {
         code: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ended: Option<super::media::MediaEndedReceipt>,
     },
 }
 

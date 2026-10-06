@@ -93,8 +93,10 @@ async fn pane_media_open_binds_to_the_client_that_typed_last() {
     let capable = connect_media_shell(&mut server, 31, true);
     let legacy = connect_media_shell(&mut server, 32, false);
     let pane_open = |pane_id: &str| {
-        api::schema::Method::PaneMediaOpen(api::schema::PaneTarget {
+        api::schema::Method::PaneMediaOpen(api::schema::MediaOpenParams {
             pane_id: pane_id.to_owned(),
+            generation: None,
+            attempt: None,
         })
     };
 

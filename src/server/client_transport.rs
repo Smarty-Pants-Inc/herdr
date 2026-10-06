@@ -423,6 +423,8 @@ pub(crate) enum ServerEvent {
         media_capable: bool,
         writer: ClientWriter,
     },
+    /// Endpoint hello receipt capability, never supplied by media API callers.
+    ClientMediaReceiptCapability { client_id: u64, capable: bool },
     /// JSON-only self-declared display metadata, ordered after connection registration.
     ClientUser {
         client_id: u64,
@@ -803,6 +805,9 @@ pub(crate) fn handle_client_handshake(
                         capability == crate::protocol::media::MEDIA_WEBRTC_CAPABILITY
                     }),
                     hello.user,
+                    hello.capabilities.iter().any(|capability| {
+                        capability == crate::protocol::media::MEDIA_ENDED_CAPABILITY
+                    }),
                 )),
             )
         }
@@ -892,6 +897,7 @@ pub(crate) fn handle_client_handshake(
     // Notify the main loop about the new client.
     let endpoint_control_writer = shell_options.as_ref().map(|_| writer.control.clone());
     let user = shell_options.as_ref().and_then(|options| options.9.clone());
+    let ended_receipt = shell_options.as_ref().is_some_and(|options| options.10);
     let is_shell = shell_options.is_some();
     let connected = if let Some((
         pixel_mouse,
@@ -904,6 +910,7 @@ pub(crate) fn handle_client_handshake(
         surface_scroll,
         media_capable,
         _user,
+        _ended_receipt,
     )) = shell_options
     {
         ServerEvent::ClientShellConnected {
@@ -947,6 +954,10 @@ pub(crate) fn handle_client_handshake(
     if is_shell {
         // The event channel is ordered: identity is installed before any client input.
         let _ = server_event_tx.blocking_send(ServerEvent::ClientUser { client_id, user });
+        let _ = server_event_tx.blocking_send(ServerEvent::ClientMediaReceiptCapability {
+            client_id,
+            capable: ended_receipt,
+        });
     }
 
     // Enter read loop — read client messages and forward to main loop.

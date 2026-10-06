@@ -876,6 +876,7 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::PluginPaneFocus(_) => "plugin.pane.focus",
         Method::PluginPaneClose(_) => "plugin.pane.close",
         Method::PaneMediaOpen(_) => "pane.media_open",
+        Method::PaneMediaPreflight(_) => "pane.media_preflight",
         Method::MediaAnswer(_) => "media.answer",
         Method::MediaMute(_) => "media.mute",
         Method::MediaState(_) => "media.state",

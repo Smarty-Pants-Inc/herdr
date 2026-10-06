@@ -6,6 +6,7 @@ pub(super) fn is_media_method(method: &api::schema::Method) -> bool {
     matches!(
         method,
         api::schema::Method::PaneMediaOpen(_)
+            | api::schema::Method::PaneMediaPreflight(_)
             | api::schema::Method::MediaAnswer(_)
             | api::schema::Method::MediaMute(_)
             | api::schema::Method::MediaState(_)
@@ -17,6 +18,7 @@ impl HeadlessServer {
     pub(super) fn perform_media_actions(&mut self, actions: Vec<MediaAction>) {
         for action in actions {
             match action {
+                MediaAction::Publish(event) => self.app.event_hub.push(*event),
                 MediaAction::Send { client_id, control } => match control.server_message() {
                     Ok(message) => {
                         self.send_to_client(client_id, message);
@@ -112,7 +114,37 @@ impl HeadlessServer {
         let id = request.id;
         let now = Instant::now();
         let immediate = match request.method {
+            Method::PaneMediaPreflight(target) => {
+                let Some((workspace_index, pane_id)) = self.app.parse_pane_id(&target.pane_id)
+                else {
+                    let _ = respond_to.send(error_response(id, "pane_not_found", "pane not found"));
+                    return;
+                };
+                let result = self.media.preflight(
+                    pane_id,
+                    |client_id| self.shell_client_views_pane(client_id, workspace_index, pane_id),
+                    now,
+                );
+                let _ = respond_to.send(success_response(id, result));
+                return;
+            }
             Method::PaneMediaOpen(target) => {
+                let valid = match (&target.generation, &target.attempt) {
+                    (None, None) => true,
+                    (Some(generation), Some(attempt)) => {
+                        crate::protocol::media::valid_media_token(generation)
+                            && crate::protocol::media::valid_media_token(attempt)
+                    }
+                    _ => false,
+                };
+                if !valid {
+                    let _ = respond_to.send(error_response(
+                        id,
+                        "invalid_params",
+                        "generation and attempt must be a valid token pair",
+                    ));
+                    return;
+                }
                 let Some((workspace_index, pane_id)) = self.app.parse_pane_id(&target.pane_id)
                 else {
                     let _ = respond_to.send(error_response(id, "pane_not_found", "pane not found"));
@@ -126,10 +158,12 @@ impl HeadlessServer {
                         self.shell_client_views_pane(client_id, workspace_index, pane_id)
                     })
                     .collect::<HashSet<_>>();
-                let actions = self.media.open(
+                let actions = self.media.open_with_receipt(
                     id,
                     respond_to,
                     pane_id,
+                    target.generation,
+                    target.attempt,
                     |client_id| viewers.contains(&client_id),
                     now,
                 );
@@ -161,7 +195,22 @@ impl HeadlessServer {
                 let _ = respond_to.send(response);
                 return;
             }
-            Method::MediaClose(params) => Ok(self.media.close(&params.session_id, now)),
+            Method::MediaClose(params) => {
+                if params
+                    .request_id
+                    .as_deref()
+                    .is_some_and(|id| !crate::protocol::media::valid_media_token(id))
+                {
+                    Err((
+                        "invalid_params",
+                        "request_id must be a valid media token".to_owned(),
+                    ))
+                } else {
+                    Ok(self
+                        .media
+                        .close_with_request(&params.session_id, params.request_id, now))
+                }
+            }
             _ => Err(("invalid_params", "not a media method".to_owned())),
         };
         let response = match immediate {

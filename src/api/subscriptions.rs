@@ -159,6 +159,10 @@ impl ActiveSubscription {
                 Ok(event_subscription(EventKind::PaneAgentDetected))
             }
             Subscription::LayoutUpdated {} => Ok(event_subscription(EventKind::LayoutUpdated)),
+            Subscription::MediaEnded {} => Ok(event_subscription(EventKind::MediaEnded)),
+            Subscription::MediaTeardownStuck {} => {
+                Ok(event_subscription(EventKind::MediaTeardownStuck))
+            }
             Subscription::PaneOutputMatched {
                 pane_id,
                 source,

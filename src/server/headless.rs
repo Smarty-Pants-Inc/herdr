@@ -2702,6 +2702,10 @@ impl HeadlessServer {
                 );
                 navigation_changed | geometry_changed
             }
+            ServerEvent::ClientMediaReceiptCapability { client_id, capable } => {
+                self.media.set_client_ended_receipt(client_id, capable);
+                false
+            }
             ServerEvent::ClientMediaControl { client_id, control } => {
                 let actions = self
                     .media
