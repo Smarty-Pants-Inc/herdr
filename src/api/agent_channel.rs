@@ -12,6 +12,8 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
+use interprocess::TryClone as _;
+
 use crate::api::schema::{AdmissionAck, AdmissionStatus, AgentChannelInfoParams, Method, Request};
 use crate::ipc::{
     poll_local_stream_read_count, set_local_stream_polling, LocalStream, LocalStreamReadCount,
@@ -173,6 +175,9 @@ struct Ledger {
     requests: HashMap<String, Arc<Delivery>>,
     bytes: usize,
 }
+#[cfg(test)]
+type ReaderGate = Arc<(Mutex<bool>, Condvar)>;
+
 #[derive(Debug)]
 pub(crate) struct Channel {
     pub(crate) terminal_id: String,
@@ -189,6 +194,11 @@ pub(crate) struct Channel {
     waiters: Arc<AtomicUsize>,
     ledger: Mutex<Ledger>,
     outbound: std::sync::mpsc::SyncSender<Arc<Delivery>>,
+    // Test-only scheduling fence reproduces a reader first scheduled after writer expiry.
+    #[cfg(test)]
+    reader_gate: Mutex<Option<ReaderGate>>,
+    #[cfg(test)]
+    writer_stopped: AtomicBool,
 }
 impl Channel {
     pub(crate) fn new(
@@ -216,6 +226,10 @@ impl Channel {
                 waiters: Arc::new(AtomicUsize::new(0)),
                 ledger: Mutex::new(Ledger::default()),
                 outbound,
+                #[cfg(test)]
+                reader_gate: Mutex::new(None),
+                #[cfg(test)]
+                writer_stopped: AtomicBool::new(false),
             }),
             receiver,
         )
@@ -443,35 +457,108 @@ fn serve_inner(
     stop: Option<&AtomicBool>,
 ) -> io::Result<()> {
     set_local_stream_polling(stream, true)?;
-    channel.mark_ready();
+    let mut reader_stream = stream.try_clone()?;
+    let reader_stop = AtomicBool::new(false);
+    // Stop even if the writer unwinds; scope joins before either stream can escape.
+    struct StopReader<'a>(&'a AtomicBool);
+    impl Drop for StopReader<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+    std::thread::scope(|scope| {
+        let stop_reader = StopReader(&reader_stop);
+        let reader = std::thread::Builder::new()
+            .name("agent-channel-ack".into())
+            .spawn_scoped(scope, || {
+                let result = read_acks(&mut reader_stream, channel, running, stop, &reader_stop);
+                channel.revoke();
+                result
+            })?;
+        channel.mark_ready();
+        let written = (|| {
+            while running.load(Ordering::Acquire)
+                && !stop.is_some_and(|flag| flag.load(Ordering::Acquire))
+                && channel.is_active()
+            {
+                let delivery = match receiver.recv_timeout(Duration::from_millis(5)) {
+                    Ok(delivery) => delivery,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                };
+                write_delivery(
+                    stream,
+                    channel,
+                    &delivery,
+                    || boundary_valid(channel, api_tx),
+                    || {
+                        running.load(Ordering::Acquire)
+                            && !stop.is_some_and(|flag| flag.load(Ordering::Acquire))
+                            && crate::platform::registered_process_is_foreground(
+                                channel.root,
+                                channel.peer,
+                            )
+                    },
+                )?;
+            }
+            Ok(())
+        })();
+        drop(stop_reader);
+        #[cfg(test)]
+        channel.writer_stopped.store(true, Ordering::Release);
+        let read = reader
+            .join()
+            .map_err(|_| io::Error::other("agent ACK reader panicked"))?;
+        written.and(read)
+    })
+}
+
+/// One bounded parser per connection, independent of App round trips and write retries.
+/// ACK handling takes ledger -> request state, never the effect gate or the App queue.
+fn read_acks(
+    stream: &mut LocalStream,
+    channel: &Channel,
+    running: &AtomicBool,
+    stop: Option<&AtomicBool>,
+    reader_stop: &AtomicBool,
+) -> io::Result<()> {
+    #[cfg(test)]
+    if let Some(gate) = channel
+        .reader_gate
+        .lock()
+        .ok()
+        .and_then(|gate| gate.clone())
+    {
+        let (open, changed) = &*gate;
+        let mut open = open
+            .lock()
+            .map_err(|_| io::Error::other("reader test gate"))?;
+        while !*open {
+            open = changed
+                .wait(open)
+                .map_err(|_| io::Error::other("reader test gate"))?;
+        }
+    }
     let mut input = Vec::new();
     let mut bytes = [0u8; 4096];
+    let mut drain_remaining = None;
     while running.load(Ordering::Acquire)
         && !stop.is_some_and(|flag| flag.load(Ordering::Acquire))
         && channel.is_active()
     {
-        // A bounded dispatch batch yields to ACK parsing, even under constant arrivals.
-        for _ in 0..MAX_IN_FLIGHT {
-            let Ok(delivery) = receiver.try_recv() else {
-                break;
-            };
-            write_delivery(
-                stream,
-                channel,
-                &delivery,
-                || boundary_valid(channel, api_tx),
-                || {
-                    running.load(Ordering::Acquire)
-                        && !stop.is_some_and(|flag| flag.load(Ordering::Acquire))
-                        && crate::platform::registered_process_is_foreground(
-                            channel.root,
-                            channel.peer,
-                        )
-                },
-            )?;
+        if reader_stop.load(Ordering::Acquire) && drain_remaining.is_none() {
+            // Preserve buffered receipts when a partial outbound frame expires before the
+            // reader is scheduled. Never wait for more bytes, and cap even a flooding peer.
+            drain_remaining = Some(MAX_IN_FLIGHT * (MAX_FRAME_BYTES + 1));
         }
         match poll_local_stream_read_count(stream, &mut bytes)? {
             LocalStreamReadCount::Data(count) => {
+                if let Some(remaining) = &mut drain_remaining {
+                    if count > *remaining {
+                        return Err(io::Error::other("agent ACK stop drain exceeded capacity"));
+                    }
+                    *remaining -= count;
+                }
                 for byte in &bytes[..count] {
                     if *byte == b'\n' {
                         let ack = serde_json::from_slice::<AdmissionAck>(&input)
@@ -486,7 +573,12 @@ fn serve_inner(
                     }
                 }
             }
-            LocalStreamReadCount::Pending => std::thread::sleep(Duration::from_millis(5)),
+            LocalStreamReadCount::Pending => {
+                if reader_stop.load(Ordering::Acquire) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
             LocalStreamReadCount::Closed => break,
         }
     }

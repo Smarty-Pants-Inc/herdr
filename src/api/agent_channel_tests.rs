@@ -428,6 +428,415 @@ fn channel_epoch_is_fresh_across_restart_handoff_and_slot_cancellation() {
     assert!(transport.take().is_none());
     assert!(transport.0.lock().unwrap().closed); // Timed-out transport cannot install later.
 }
+#[cfg(target_os = "linux")]
+mod transport {
+    use super::*;
+    use interprocess::local_socket::traits::Listener as _;
+    use std::io::Read as _;
+    use std::os::fd::AsRawFd as _;
+
+    struct Fixture {
+        path: std::path::PathBuf,
+        child: Box<dyn portable_pty::Child + Send + Sync>,
+        _pty: portable_pty::PtyPair,
+        running: Arc<AtomicBool>,
+        app: Option<std::thread::JoinHandle<()>>,
+        server: Option<std::thread::JoinHandle<io::Result<()>>>,
+        channel: Arc<Channel>,
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            self.running.store(false, Ordering::Release);
+            if let Some(gate) = self.channel.reader_gate.lock().unwrap().as_ref() {
+                *gate.0.lock().unwrap() = true;
+                gate.1.notify_all();
+            }
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            if let Some(server) = self.server.take() {
+                let _ = server.join();
+            }
+            if let Some(app) = self.app.take() {
+                let _ = app.join();
+            }
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+    fn until(mut predicate: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !predicate() {
+            assert!(Instant::now() < deadline, "transport condition timed out");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    impl Fixture {
+        fn new(mode: &str) -> Self {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "c176-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&path).unwrap();
+            let socket = path.join("s");
+            let listener = crate::ipc::bind_local_listener(&socket).unwrap();
+            listener
+                .set_nonblocking(interprocess::local_socket::ListenerNonblockingMode::Both)
+                .unwrap();
+            let pair = portable_pty::native_pty_system()
+                .openpty(portable_pty::PtySize {
+                    rows: 24,
+                    cols: 80,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
+                .unwrap();
+            let mut command = portable_pty::CommandBuilder::new(std::env::current_exe().unwrap());
+            command.args([
+                "--exact",
+                "api::agent_channel::tests::transport::channel_transport_peer",
+                "--nocapture",
+                "--test-threads=1",
+            ]);
+            command.env("CHANNEL_TEST_PATH", &path);
+            command.env("CHANNEL_TEST_MODE", mode);
+            let child = pair.slave.spawn_command(command).unwrap();
+            let identity = crate::platform::process_identity(child.process_id().unwrap()).unwrap();
+            let (channel, receiver) = Channel::new(
+                "term_test".into(),
+                if mode == "replacement" {
+                    "replacement"
+                } else {
+                    "epoch_test"
+                }
+                .into(),
+                "session_test".into(),
+                identity,
+                identity,
+                "w1".into(),
+                crate::layout::PaneId::from_raw(1),
+            );
+            if mode.starts_with("drain-") {
+                *channel.reader_gate.lock().unwrap() =
+                    Some(Arc::new((Mutex::new(false), Condvar::new())));
+            }
+            let mut fixture = Self {
+                path,
+                child,
+                _pty: pair,
+                running: Arc::new(AtomicBool::new(true)),
+                app: None,
+                server: None,
+                channel: channel.clone(),
+            };
+            let mut stream = None;
+            until(|| match listener.accept() {
+                Ok(accepted) => {
+                    stream = Some(accepted);
+                    true
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => false,
+                Err(error) => panic!("accept: {error}"),
+            });
+            let stream = stream.unwrap();
+            assert_eq!(
+                crate::ipc::local_stream_peer_identity(&stream),
+                Some(identity)
+            );
+            until(|| crate::platform::registered_process_is_foreground(identity, identity));
+            let LocalStream::UdSocket(socket) = &stream;
+            let size: libc::c_int = 4096;
+            assert_eq!(
+                unsafe {
+                    libc::setsockopt(
+                        socket.inner().as_raw_fd(),
+                        libc::SOL_SOCKET,
+                        libc::SO_SNDBUF,
+                        (&size as *const libc::c_int).cast(),
+                        std::mem::size_of_val(&size) as libc::socklen_t,
+                    )
+                },
+                0
+            );
+            let (tx, mut rx) =
+                tokio::sync::mpsc::unbounded_channel::<crate::api::ApiRequestMessage>();
+            let running = fixture.running.clone();
+            let checked = channel.clone();
+            fixture.app = Some(std::thread::spawn(move || {
+                while running.load(Ordering::Acquire) {
+                    if let Ok(message) = rx.try_recv() {
+                        assert!(matches!(
+                            message.request.method,
+                            Method::AgentChannelInfo(_)
+                        ));
+                        let _ = message.respond_to.send(json_success(
+                            message.request.id,
+                            serde_json::json!({"ready":checked.is_ready(), "registration_epoch":checked.epoch}),
+                        ));
+                    } else {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
+            }));
+            let running = fixture.running.clone();
+            fixture.server = Some(std::thread::spawn(move || {
+                serve(stream, channel, receiver, &tx, &running, None)
+            }));
+            until(|| fixture.channel.is_ready());
+            fixture
+        }
+        fn release(&self) {
+            std::fs::write(self.path.join("release"), b"").unwrap();
+        }
+        fn release_reader(&self) {
+            let gate = self.channel.reader_gate.lock().unwrap().clone().unwrap();
+            *gate.0.lock().unwrap() = true;
+            gate.1.notify_all();
+        }
+        fn join_server(&mut self) -> io::Result<()> {
+            self.server.take().unwrap().join().unwrap()
+        }
+    }
+    fn frame(stream: &mut LocalStream) -> Vec<u8> {
+        let mut line = Vec::new();
+        let mut byte = [0];
+        loop {
+            match stream.read(&mut byte) {
+                Ok(0) => break,
+                Ok(_) => line.push(byte[0]),
+                Err(error) if crate::ipc::is_connection_closed_error(&error) => break,
+                Err(error) => panic!("peer frame read: {error}"),
+            }
+            if byte[0] == b'\n' {
+                break;
+            }
+        }
+        line
+    }
+    fn send_ack(stream: &mut LocalStream, request: &serde_json::Value, status: &str, mode: &str) {
+        let mut receipt = serde_json::json!({"type":"ack", "registration_epoch":request["registration_epoch"],
+            "session_generation":request["session_generation"], "request_id":request["request_id"], "status":status});
+        if mode.ends_with("stale") {
+            receipt["registration_epoch"] = "old_epoch".into();
+        } else if mode == "replacement" {
+            receipt["registration_epoch"] = "epoch_test".into();
+        } else if mode == "early-b" {
+            receipt["request_id"] = "b".into();
+        }
+        let line = format!("{receipt}\n");
+        stream
+            .write_all(if mode.ends_with("partial") {
+                &line.as_bytes()[..line.len() / 2]
+            } else {
+                line.as_bytes()
+            })
+            .unwrap();
+    }
+    // Reexecuted in a real foreground PTY process; no mock writer or direct ack() call.
+    #[test]
+    fn channel_transport_peer() {
+        let Some(path) = std::env::var_os("CHANNEL_TEST_PATH") else {
+            return;
+        };
+        let path = std::path::PathBuf::from(path);
+        let mode = std::env::var("CHANNEL_TEST_MODE").unwrap();
+        let mut stream = crate::ipc::connect_local_stream(&path.join("s")).unwrap();
+        let a: serde_json::Value = serde_json::from_slice(&frame(&mut stream)).unwrap();
+        let mut first = [0];
+        stream.read_exact(&mut first).unwrap(); // B has actually started its partial frame.
+        if !mode.ends_with("absent") && mode != "late" {
+            send_ack(
+                &mut stream,
+                &a,
+                if mode.ends_with("queued") {
+                    "queued"
+                } else {
+                    "accepted"
+                },
+                &mode,
+            );
+        }
+        std::fs::write(path.join("blocked"), first).unwrap();
+        until(|| path.join("release").exists()); // Stop draining B: native socket backpressure.
+        if mode == "late" {
+            send_ack(&mut stream, &a, "accepted", &mode);
+        }
+        let mut b = first.to_vec();
+        b.extend(frame(&mut stream));
+        std::fs::write(path.join("b-frame"), &b).unwrap();
+        if !b.ends_with(b"\n") {
+            return;
+        }
+        let b: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        send_ack(&mut stream, &b, "queued", "normal");
+        for _ in 0..8 {
+            let line = frame(&mut stream);
+            if line.is_empty() {
+                return;
+            }
+            let request: serde_json::Value = serde_json::from_slice(&line).unwrap();
+            send_ack(&mut stream, &request, "accepted", "normal");
+        }
+        until(|| path.join("done").exists());
+    }
+    fn deliveries(
+        fixture: &Fixture,
+        b_timeout: Duration,
+    ) -> (Arc<Delivery>, ReceiptWaiter, Arc<Delivery>, ReceiptWaiter) {
+        let (a, _, aw) = fixture
+            .channel
+            .reserve("a".into(), "A".into(), Duration::from_millis(600))
+            .unwrap();
+        let (b, _, bw) = fixture
+            .channel
+            .reserve("b".into(), "B".repeat(48 * 1024), b_timeout)
+            .unwrap();
+        until(|| fixture.path.join("blocked").exists());
+        assert!(a.state.lock().unwrap().complete_dispatch);
+        assert!(b.state.lock().unwrap().possible_dispatch);
+        assert!(!b.state.lock().unwrap().complete_dispatch);
+        (a, aw, b, bw)
+    }
+    #[test]
+    fn channel_transport_ack_survives_backpressure_past_deadline_and_multiple_acks() {
+        for status in ["accepted", "queued"] {
+            let mut fixture = Fixture::new(status);
+            let (a, _aw, b, _bw) = deliveries(&fixture, Duration::from_secs(4));
+            let receipt = a.wait();
+            assert!(matches!(&receipt, Outcome::Receipt(value) if value["status"] == status));
+            std::thread::sleep(
+                a.deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(100),
+            );
+            assert!(b.pending());
+            assert!(!b.state.lock().unwrap().complete_dispatch);
+            assert_eq!(a.wait(), receipt);
+            let (duplicate, dup, _dw) = fixture
+                .channel
+                .reserve("a".into(), "A".into(), Duration::from_secs(1))
+                .unwrap();
+            assert!(dup);
+            assert_eq!(duplicate.wait(), receipt);
+            fixture.release();
+            assert!(matches!(b.wait(), Outcome::Receipt(value) if value["status"] == "queued"));
+            let requests: Vec<_> = (0..8)
+                .map(|index| {
+                    fixture
+                        .channel
+                        .reserve(format!("c{index}"), "C".into(), Duration::from_secs(2))
+                        .unwrap()
+                })
+                .collect();
+            for (request, _, _) in &requests {
+                assert!(matches!(request.wait(), Outcome::Receipt(_)));
+            }
+            std::fs::write(fixture.path.join("done"), b"").unwrap();
+            assert!(fixture.join_server().is_ok());
+            assert!(!fixture.channel.is_active());
+        }
+    }
+    #[test]
+    fn channel_transport_ack_survives_partial_expiry_without_extra_complete_frame() {
+        for status in ["accepted", "queued"] {
+            let mut fixture = Fixture::new(status);
+            let (a, _aw, b, _bw) = deliveries(&fixture, Duration::from_millis(1100));
+            let receipt = a.wait();
+            assert!(matches!(&receipt, Outcome::Receipt(value) if value["status"] == status));
+            assert!(fixture.join_server().is_err());
+            assert_eq!(a.wait(), receipt);
+            assert_eq!(code(b.wait()), "delivery_unknown");
+            assert!(!fixture.channel.is_active());
+            assert!(fixture
+                .channel
+                .reserve("b".into(), b.text.clone(), Duration::from_secs(1))
+                .is_err());
+            fixture.release();
+            until(|| fixture.path.join("b-frame").exists());
+            let bytes = std::fs::read(fixture.path.join("b-frame")).unwrap();
+            assert!(!bytes.contains(&b'\n'));
+            assert!(bytes.len() < b.frame.len());
+        }
+    }
+    #[test]
+    fn channel_transport_stop_drains_buffered_ack_after_partial_expiry_before_reader_scheduled() {
+        for mode in [
+            "drain-accepted",
+            "drain-queued",
+            "drain-absent",
+            "drain-partial",
+            "drain-stale",
+            "drain-revoked",
+        ] {
+            let mut fixture = Fixture::new(mode);
+            let (a, _, _aw) = fixture
+                .channel
+                .reserve("a".into(), "A".into(), Duration::from_secs(3))
+                .unwrap();
+            let (b, _, _bw) = fixture
+                .channel
+                .reserve(
+                    "b".into(),
+                    "B".repeat(48 * 1024),
+                    Duration::from_millis(250),
+                )
+                .unwrap();
+            until(|| fixture.path.join("blocked").exists());
+            until(|| fixture.channel.writer_stopped.load(Ordering::Acquire));
+            assert!(a.pending()); // ACK is in the socket; reader has never run.
+            assert!(a.state.lock().unwrap().complete_dispatch);
+            assert!(!b.state.lock().unwrap().complete_dispatch);
+            assert!(fixture.channel.is_active());
+            if mode == "drain-revoked" {
+                fixture.channel.revoke(); // Buffered old ACK must not survive structural revocation.
+            }
+            fixture.release_reader();
+            assert!(fixture.join_server().is_err()); // Partial B always retires the transport.
+            let first = a.wait();
+            if mode == "drain-accepted" || mode == "drain-queued" {
+                let status = mode.strip_prefix("drain-").unwrap();
+                assert!(matches!(&first, Outcome::Receipt(value) if value["status"] == status));
+            } else {
+                assert_eq!(code(first.clone()), "delivery_unknown");
+            }
+            assert_eq!(a.wait(), first);
+            assert_eq!(code(b.wait()), "delivery_unknown");
+            assert!(!fixture.channel.is_active());
+            fixture.release();
+            until(|| fixture.path.join("b-frame").exists());
+            assert!(!std::fs::read(fixture.path.join("b-frame"))
+                .unwrap()
+                .contains(&b'\n'));
+        }
+    }
+    #[test]
+    fn channel_transport_absent_stale_and_late_ack_never_create_success() {
+        for mode in ["absent", "stale", "late", "replacement", "early-b"] {
+            let mut fixture = Fixture::new(mode);
+            let (a, _aw, b, _bw) = deliveries(&fixture, Duration::from_secs(3));
+            assert_eq!(code(a.wait()), "delivery_unknown");
+            if matches!(mode, "stale" | "replacement" | "early-b") {
+                if mode == "replacement" {
+                    assert_eq!(fixture.channel.epoch, "replacement");
+                }
+                assert!(fixture.join_server().is_err());
+                assert!(!fixture.channel.is_active());
+                assert_eq!(code(b.wait()), "delivery_unknown");
+                fixture.release();
+                until(|| fixture.path.join("b-frame").exists());
+                assert!(!std::fs::read(fixture.path.join("b-frame"))
+                    .unwrap()
+                    .contains(&b'\n'));
+            } else {
+                fixture.release();
+                assert!(matches!(b.wait(), Outcome::Receipt(_)));
+                assert_eq!(code(a.wait()), "delivery_unknown");
+                std::fs::write(fixture.path.join("done"), b"").unwrap();
+                fixture.running.store(false, Ordering::Release);
+                assert!(fixture.join_server().is_ok());
+            }
+        }
+    }
+}
+
 #[test]
 fn channel_ack_parser_is_closed_typed_and_complete() {
     let base = serde_json::json!({"type":"ack","registration_epoch":"e","request_id":"r","session_generation":"s","status":"accepted"});
