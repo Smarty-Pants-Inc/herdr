@@ -129,104 +129,148 @@ fn load(setgid: bool, effective_gid: u32) -> Option<LockedKey> {
         // Test-only trust root; release builds read only KEY_PATH.
         return read_key(Path::new(&path), None);
     }
-    load_with(setgid, effective_gid, &mut Nss, read_key)
+    load_with(setgid, effective_gid, &SYSTEM_ACCOUNTS, read_key)
 }
 
-/// Who holds a group, so the loader can prove the key group is the server's alone.
-pub(crate) trait GroupDb {
-    /// Supplementary members of `gid`, or `None` when the group cannot be resolved.
-    fn members(&mut self, gid: u32) -> Option<Vec<String>>;
-    /// Whether any account has `gid` as its primary group (`None`: cannot tell).
-    fn is_primary_of_any_user(&mut self, gid: u32) -> Option<bool>;
+/// The account database files; injectable so tests never touch the real `/etc`.
+struct AccountFiles<'a> {
+    nsswitch: &'a str,
+    group: &'a str,
+    passwd: &'a str,
 }
+
+const SYSTEM_ACCOUNTS: AccountFiles<'static> = AccountFiles {
+    nsswitch: "/etc/nsswitch.conf",
+    group: "/etc/group",
+    passwd: "/etc/passwd",
+};
 
 /// The key file is `0640 root:herdr`, so every member of `herdr` could read it and forge
-/// signatures. Load only when the group has no supplementary members and is nobody's primary
-/// group: then only the setgid binary holds it (review #188 P1). Unresolvable means refuse.
+/// signatures. Load only when the group is provably the setgid binary's alone (review #188
+/// P1, r4): NSS resolves `passwd`, `group` and `initgroups` from local files only, so no
+/// later or unavailable source (sss, ldap, systemd, nis) can grant membership, and the local
+/// files give the group no members and nobody as primary group. Anything else refuses.
 fn load_with<K>(
     setgid: bool,
     effective_gid: u32,
-    groups: &mut impl GroupDb,
+    accounts: &AccountFiles,
     read: impl FnOnce(&Path, Option<u32>) -> Option<K>,
 ) -> Option<K> {
-    if !setgid
-        || groups
-            .members(effective_gid)
-            .is_none_or(|members| !members.is_empty())
-        || groups.is_primary_of_any_user(effective_gid) != Some(false)
-    {
+    if !setgid {
+        return None;
+    }
+    if let Err(why) = key_group_is_private(accounts, effective_gid) {
+        eprintln!("herdr: server key refused: {why}");
         return None;
     }
     read(Path::new(KEY_PATH), Some(effective_gid))
 }
 
-/// `next` yields each account's primary gid, or `Err(errno)` when getpwent returned NULL.
-/// errno 0 or ENOENT is the end; anything else is an error and means "cannot tell".
-fn scan_primary(gid: u32, mut next: impl FnMut() -> Result<u32, i32>) -> Option<bool> {
-    loop {
-        match next() {
-            Ok(primary) if primary == gid => return Some(true),
-            Ok(_) => {}
-            Err(0) | Err(libc::ENOENT) => return Some(false),
-            Err(_) => return None,
-        }
-    }
+fn key_group_is_private(accounts: &AccountFiles, gid: u32) -> Result<(), String> {
+    let read =
+        |path: &str| std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"));
+    nss_is_files_only(&read(accounts.nsswitch)?)?;
+    group_has_no_members(&read(accounts.group)?, gid)?;
+    no_primary_holder(&read(accounts.passwd)?, gid)
 }
 
-/// The system account databases through NSS (files, LDAP, sssd alike).
-struct Nss;
-
-impl GroupDb for Nss {
-    fn members(&mut self, gid: u32) -> Option<Vec<String>> {
-        let mut buf = vec![0 as libc::c_char; 1 << 16];
-        let mut group = std::mem::MaybeUninit::<libc::group>::uninit();
-        let mut found = std::ptr::null_mut();
-        // SAFETY: getgrgid_r fills `group` using `buf`, both valid for the given length.
-        let rc = unsafe {
-            libc::getgrgid_r(
-                gid,
-                group.as_mut_ptr(),
-                buf.as_mut_ptr(),
-                buf.len(),
-                &mut found,
-            )
+/// `passwd` and `group` must be listed exactly as `files`; `initgroups` (supplementary
+/// groups at login) too when listed. Any other source, action or duplicate refuses.
+fn nss_is_files_only(conf: &str) -> Result<(), String> {
+    let (mut passwd, mut group) = (false, false);
+    let mut seen = Vec::new();
+    for raw in conf.lines() {
+        let line = raw.split('#').next().unwrap_or_default().trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some((db, sources)) = line.split_once(':') else {
+            return Err(format!("nsswitch.conf: cannot parse `{line}`"));
         };
-        if rc != 0 || found.is_null() {
-            return None;
+        let db = db.trim().to_ascii_lowercase();
+        if !matches!(db.as_str(), "passwd" | "group" | "initgroups") {
+            continue;
         }
-        // SAFETY: on success `group` is initialized and gr_mem is a NULL-terminated array of
-        // C strings inside `buf`, which outlives this loop.
-        let mut cursor = unsafe { group.assume_init().gr_mem };
-        let mut members = Vec::new();
-        while !cursor.is_null() && !unsafe { *cursor }.is_null() {
-            // SAFETY: each entry is a valid C string (see above).
-            let name = unsafe { std::ffi::CStr::from_ptr(*cursor) };
-            members.push(name.to_string_lossy().into_owned());
-            // SAFETY: stays within the NULL-terminated array.
-            cursor = unsafe { cursor.add(1) };
+        if seen.contains(&db) {
+            return Err(format!("nsswitch.conf lists `{db}` twice"));
         }
-        Some(members)
+        let sources = sources.split_whitespace().collect::<Vec<_>>();
+        if sources != ["files"] {
+            return Err(format!(
+                "nsswitch.conf maps `{db}` to `{}`; the server key needs `{db}: files` only",
+                sources.join(" ")
+            ));
+        }
+        passwd |= db == "passwd";
+        group |= db == "group";
+        seen.push(db);
     }
-    fn is_primary_of_any_user(&mut self, gid: u32) -> Option<bool> {
-        // The startup thread is single; getpwent's static cursor is not shared yet.
-        // getpwent returns NULL both at the end and on error, so errno decides: an error
-        // (EINTR, EIO, ENOMEM, an NSS backend failure) is "cannot tell", never "no".
-        // SAFETY: setpwent/getpwent/endpwent iterate the password database; each entry is
-        // read before the next call; errno is this thread's.
-        unsafe { libc::setpwent() };
-        let found = scan_primary(gid, || unsafe {
-            *libc::__errno_location() = 0;
-            let entry = libc::getpwent();
-            if entry.is_null() {
-                Err(*libc::__errno_location())
-            } else {
-                Ok((*entry).pw_gid)
+    if !(passwd && group) {
+        return Err("nsswitch.conf must map both `passwd` and `group` to `files`".into());
+    }
+    Ok(())
+}
+
+/// The records of an `/etc/group` or `/etc/passwd` file, split into exactly `fields` fields.
+/// NIS `+`/`-` entries and malformed lines are errors, never skipped.
+fn records<'a>(
+    text: &'a str,
+    name: &'a str,
+    fields: usize,
+) -> impl Iterator<Item = Result<Vec<&'a str>, String>> + 'a {
+    text.lines()
+        .filter(|line| {
+            let line = line.trim_start();
+            !line.is_empty() && !line.starts_with('#')
+        })
+        .map(move |line| {
+            let parts = line.split(':').collect::<Vec<_>>();
+            if line.starts_with(['+', '-']) || parts.len() != fields {
+                return Err(format!("{name}: cannot parse `{line}`"));
             }
-        });
-        // SAFETY: closes the enumeration opened above.
-        unsafe { libc::endpwent() };
-        found
+            Ok(parts)
+        })
+}
+
+fn field_id(value: &str, name: &str) -> Result<u32, String> {
+    value
+        .parse()
+        .map_err(|_| format!("{name}: bad id `{value}`"))
+}
+
+fn group_has_no_members(text: &str, gid: u32) -> Result<(), String> {
+    let mut found = false;
+    for record in records(text, "/etc/group", 4) {
+        let fields = record?;
+        if field_id(fields[2], "/etc/group")? != gid {
+            continue;
+        }
+        found = true;
+        if !fields[3].trim().is_empty() {
+            return Err(format!(
+                "group {} (gid {gid}) has members `{}`; it must have none",
+                fields[0], fields[3]
+            ));
+        }
     }
+    if !found {
+        return Err(format!("gid {gid} is not a local group in /etc/group"));
+    }
+    Ok(())
+}
+
+fn no_primary_holder(text: &str, gid: u32) -> Result<(), String> {
+    for record in records(text, "/etc/passwd", 7) {
+        let fields = record?;
+        field_id(fields[2], "/etc/passwd")?;
+        if field_id(fields[3], "/etc/passwd")? == gid {
+            return Err(format!(
+                "account {} has gid {gid} as its primary group",
+                fields[0]
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// A heap buffer pinned in RAM before any secret byte is written to it; wiped on drop.
@@ -505,78 +549,113 @@ mod tests {
         unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0) };
     }
 
-    struct Groups {
-        members: Option<Vec<String>>,
-        primary: Option<bool>,
-    }
-    impl GroupDb for Groups {
-        fn members(&mut self, _: u32) -> Option<Vec<String>> {
-            self.members.clone()
-        }
-        fn is_primary_of_any_user(&mut self, _: u32) -> Option<bool> {
-            self.primary
-        }
-    }
+    const CLEAN_NSS: &str = "# comment\npasswd:  files\ngroup:   files # local\nhosts: files dns\n";
+    const CLEAN_GROUP: &str = "root:x:0:\nherdr:x:990:\nusers:x:100:alice,bob\n";
+    const CLEAN_PASSWD: &str =
+        "root:x:0:0:root:/root:/bin/sh\nalice:x:1000:100::/home/alice:/bin/sh\n";
 
-    #[test]
-    fn server_key_group_with_any_member_never_reads_the_key() {
-        // Review #188 P1: a member of the key group could read the 0640 key and forge.
-        for (members, primary) in [
-            (Some(vec!["mallory".to_string()]), Some(false)),
-            (Some(vec![]), Some(true)),
-            (None, Some(false)),
-            (Some(vec![]), None),
-        ] {
-            let mut groups = Groups { members, primary };
-            let key = load_with(true, 990, &mut groups, |_, _| -> Option<()> {
-                panic!("must not read the key")
-            });
-            assert_eq!(key, None);
-        }
-        // Counterpart: a private group (no members, nobody's primary) reads the real path.
-        let mut groups = Groups {
-            members: Some(vec![]),
-            primary: Some(false),
-        };
-        let mut read = None;
-        let key = load_with(true, 990, &mut groups, |path, gid| {
-            read = Some((path.to_owned(), gid));
-            Some(())
+    /// Runs `load_with` against injected account files; `Some(gid)` means the key was read.
+    fn load_from(nss: &str, group: &str, passwd: &str) -> Option<Option<u32>> {
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-accounts-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("tempdir");
+        let dir = TempDir(dir);
+        let paths = ["nsswitch.conf", "group", "passwd"].map(|name| {
+            dir.0
+                .join(name)
+                .to_str()
+                .expect("utf-8 temp path")
+                .to_owned()
         });
-        assert_eq!(key, Some(()));
-        assert_eq!(read, Some((Path::new(KEY_PATH).to_owned(), Some(990))));
-        // Not setgid: never reads.
-        assert_eq!(load_with(false, 990, &mut groups, |_, _| Some(())), None);
+        for (path, text) in paths.iter().zip([nss, group, passwd]) {
+            std::fs::write(path, text).expect("write");
+        }
+        let accounts = AccountFiles {
+            nsswitch: &paths[0],
+            group: &paths[1],
+            passwd: &paths[2],
+        };
+        load_with(true, 990, &accounts, |path, gid| {
+            assert_eq!(path, Path::new(KEY_PATH));
+            Some(gid)
+        })
     }
 
     #[test]
-    fn server_key_passwd_scan_error_is_not_a_clean_end() {
-        // Review #188 r2: getpwent NULL with an error errno must not authorize loading.
-        for errno in [libc::EINTR, libc::EIO, libc::ENOMEM, libc::ERANGE] {
-            let mut entries = vec![Ok(1000), Ok(1001), Err(errno)].into_iter();
+    fn server_key_non_files_nss_source_is_refused() {
+        // Review #188 P1 r4: a member known only to sss/ldap/systemd is invisible to the
+        // local files, so any such source for passwd, group or initgroups refuses the key.
+        for nss in [
+            "passwd: files\ngroup: files sss\n",
+            "passwd: files\ngroup: sss files\n",
+            "passwd: files\ngroup: files ldap\n",
+            "passwd: files\ngroup: files systemd\n",
+            "passwd: files sss\ngroup: files\n",
+            "passwd: files ldap\ngroup: files\n",
+            "passwd: files systemd\ngroup: files\n",
+            "passwd: compat\ngroup: compat\n",
+            "passwd: files\ngroup: files [SUCCESS=merge] sss\n",
+            "passwd: files\ngroup: files\ninitgroups: files sss\n",
+            "passwd: files\ngroup: files\ngroup: files ldap\n",
+            "passwd: files\n",
+            "group: files\n",
+            "",
+            "passwd files\ngroup: files\n",
+        ] {
+            assert_eq!(load_from(nss, CLEAN_GROUP, CLEAN_PASSWD), None, "{nss:?}");
+        }
+    }
+
+    #[test]
+    fn server_key_local_group_members_and_primary_holders_are_refused() {
+        for (group, passwd) in [
+            ("herdr:x:990:mallory\n", CLEAN_PASSWD),
+            ("herdr:x:990:\nalias:x:990:mallory\n", CLEAN_PASSWD),
+            (CLEAN_GROUP, "mallory:x:1001:990::/home/m:/bin/sh\n"),
+            // Absent group, NIS compat entries and malformed records fail closed.
+            ("root:x:0:\n", CLEAN_PASSWD),
+            ("herdr:x:990:\n+:::\n", CLEAN_PASSWD),
+            (CLEAN_GROUP, "root:x:0:0:root:/root:/bin/sh\n+::::::\n"),
+            ("herdr:x:990\n", CLEAN_PASSWD),
+            ("herdr:x:nine:\n", CLEAN_PASSWD),
+            (CLEAN_GROUP, "alice:x:1000:100:/home/alice:/bin/sh\n"),
+            (CLEAN_GROUP, "alice:x:1000:x::/home/alice:/bin/sh\n"),
+        ] {
             assert_eq!(
-                scan_primary(990, || entries.next().unwrap()),
+                load_from(CLEAN_NSS, group, passwd),
                 None,
-                "{errno}"
+                "{group:?} {passwd:?}"
             );
         }
-        for end in [0, libc::ENOENT] {
-            let mut entries = vec![Ok(1000), Err(end)].into_iter();
-            assert_eq!(scan_primary(990, || entries.next().unwrap()), Some(false));
-        }
-        let mut entries = vec![Ok(1000), Ok(990)].into_iter();
-        assert_eq!(scan_primary(990, || entries.next().unwrap()), Some(true));
     }
 
     #[test]
-    fn server_key_real_nss_sees_this_users_primary_group() {
-        // SAFETY: getgid takes no arguments and cannot fail.
-        let gid = unsafe { libc::getgid() };
-        assert_eq!(Nss.is_primary_of_any_user(gid), Some(true));
-        assert!(Nss.members(gid).is_some());
-        assert_eq!(Nss.members(u32::MAX - 7), None);
-        // Counterpart for the errno check: a full clean scan ends as "no", not "cannot tell".
-        assert_eq!(Nss.is_primary_of_any_user(u32::MAX - 7), Some(false));
+    fn server_key_clean_files_only_accounts_read_the_key() {
+        assert_eq!(
+            load_from(CLEAN_NSS, CLEAN_GROUP, CLEAN_PASSWD),
+            Some(Some(990))
+        );
+        // initgroups listed as files only is fine too.
+        let nss = "passwd: files\ngroup: files\ninitgroups: files\n";
+        assert_eq!(load_from(nss, CLEAN_GROUP, CLEAN_PASSWD), Some(Some(990)));
+        // Not setgid: never reads.
+        assert_eq!(
+            load_with(false, 990, &SYSTEM_ACCOUNTS, |_, _| -> Option<()> {
+                panic!("must not read the key")
+            }),
+            None
+        );
+        // Unreadable files refuse.
+        let missing = "/nonexistent/herdr-accounts";
+        let accounts = AccountFiles {
+            nsswitch: missing,
+            group: missing,
+            passwd: missing,
+        };
+        assert_eq!(load_with(true, 990, &accounts, |_, _| Some(())), None);
     }
 
     #[test]
