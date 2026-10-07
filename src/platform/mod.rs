@@ -83,6 +83,108 @@ pub(crate) struct ProcessIdentity {
     pub(crate) start_time: u64,
 }
 
+/// Linux consumer proof; unsupported platforms deliberately refuse.
+#[cfg(unix)]
+#[derive(Debug, Clone)]
+pub(crate) struct InputConsumerSnapshot {
+    pub peer: ProcessIdentity,
+    pub pgid: u32,
+    pub leader: ProcessIdentity,
+    pub sid: u32,
+    pub tty: u32,
+    pub termios: Vec<u64>,
+    /// Peer and leader pidfds pinned at enroll. They let the per-event
+    /// liveness check use syscalls instead of /proc reads; `None` falls back
+    /// to the full /proc proof.
+    pub pidfds: Option<std::sync::Arc<[std::os::fd::OwnedFd; 2]>>,
+}
+
+/// Input-consumer cuts are Linux-server only in v2 (ruling r3 C).
+pub(crate) fn input_consumer_supported() -> bool {
+    cfg!(target_os = "linux")
+}
+
+#[cfg(unix)]
+pub(crate) fn input_consumer_incarnation(
+    fd: std::os::fd::RawFd,
+    peer: ProcessIdentity,
+) -> std::io::Result<ProcessIdentity> {
+    #[cfg(target_os = "linux")]
+    return linux::input_consumer::incarnation(fd, peer);
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (fd, peer);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "unsupported",
+        ))
+    }
+}
+#[cfg(unix)]
+pub(crate) fn input_consumer_snapshot(
+    fd: std::os::fd::RawFd,
+    peer: ProcessIdentity,
+) -> std::io::Result<InputConsumerSnapshot> {
+    #[cfg(target_os = "linux")]
+    return linux::input_consumer::snapshot(fd, peer);
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (fd, peer);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "unsupported",
+        ))
+    }
+}
+#[cfg(unix)]
+pub(crate) fn input_consumer_alive(fd: std::os::fd::RawFd, s: &InputConsumerSnapshot) -> bool {
+    #[cfg(target_os = "linux")]
+    return linux::input_consumer::alive(fd, s);
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (fd, s);
+        false
+    }
+}
+#[cfg(unix)]
+pub(crate) fn input_consumer_unchanged(fd: std::os::fd::RawFd, s: &InputConsumerSnapshot) -> bool {
+    #[cfg(target_os = "linux")]
+    return linux::input_consumer::unchanged(fd, s);
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (fd, s);
+        false
+    }
+}
+#[cfg(unix)]
+pub(crate) fn input_consumer_random(bytes: &mut [u8]) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    return linux::input_consumer::random_bytes(bytes);
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = bytes;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "unsupported",
+        ))
+    }
+}
+pub(crate) fn resolve_client_principal(
+    peer: Option<ProcessIdentity>,
+) -> Option<crate::pty::input_consumer::Principal> {
+    #[cfg(target_os = "linux")]
+    return linux::client_identity::resolve_client_principal(peer);
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = peer;
+        None
+    }
+}
+pub(crate) fn initialize_client_principals() {
+    #[cfg(target_os = "linux")]
+    linux::client_identity::initialize_client_principals();
+}
+
 /// Best-effort diagnostic metadata, never evidence of pane membership.
 #[derive(Debug, Default)]
 pub(crate) struct CallerMetadata {

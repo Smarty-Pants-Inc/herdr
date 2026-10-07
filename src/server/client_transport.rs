@@ -397,6 +397,7 @@ pub(crate) enum ServerEvent {
     /// A new client completed the handshake.
     ClientConnected {
         client_id: u64,
+        principal: Option<crate::pty::input_consumer::Principal>,
         cols: u16,
         rows: u16,
         cell_width_px: u32,
@@ -407,6 +408,7 @@ pub(crate) enum ServerEvent {
     /// A client-owned shell completed its dedicated handshake.
     ClientShellConnected {
         client_id: u64,
+        principal: Option<crate::pty::input_consumer::Principal>,
         surface_cols: u16,
         surface_rows: u16,
         cell_width_px: u32,
@@ -682,12 +684,17 @@ fn set_client_recv_timeout(
 pub(crate) fn handle_client_handshake(
     mut stream: LocalStream,
     client_id: u64,
+    peer: Option<crate::platform::ProcessIdentity>,
     server_event_tx: &mpsc::Sender<ServerEvent>,
     should_quit: &Arc<AtomicBool>,
 ) -> io::Result<()> {
     if should_quit.load(Ordering::Acquire) {
         return Ok(());
     }
+
+    // This identity was pinned at accept, not repinned from a delayed hello.
+    // Resolve before reading any client-controlled field or forwarding input.
+    let principal = crate::platform::resolve_client_principal(peer);
 
     // Reset to blocking mode — the accept loop sets nonblocking but
     // the handshake thread needs blocking I/O for read_message/write_message.
@@ -908,6 +915,7 @@ pub(crate) fn handle_client_handshake(
     {
         ServerEvent::ClientShellConnected {
             client_id,
+            principal,
             surface_cols: client_cols,
             surface_rows: client_rows,
             cell_width_px,
@@ -926,6 +934,7 @@ pub(crate) fn handle_client_handshake(
     } else {
         ServerEvent::ClientConnected {
             client_id,
+            principal,
             cols: client_cols,
             rows: client_rows,
             cell_width_px,
@@ -1951,7 +1960,7 @@ mod tests {
         let should_quit = Arc::new(AtomicBool::new(false));
         let handshake_quit = should_quit.clone();
         let handle = std::thread::spawn(move || {
-            handle_client_handshake(server_stream, 42, &server_event_tx, &handshake_quit)
+            handle_client_handshake(server_stream, 42, None, &server_event_tx, &handshake_quit)
         });
 
         protocol::write_message(
@@ -1988,6 +1997,7 @@ mod tests {
         {
             ServerEvent::ClientConnected {
                 client_id,
+                principal,
                 cols,
                 rows,
                 cell_width_px,
@@ -1995,6 +2005,7 @@ mod tests {
                 pixel_mouse,
                 writer,
             } => {
+                assert_eq!(principal, None);
                 assert_eq!(client_id, 42);
                 assert_eq!((cols, rows), (100, 30));
                 assert_eq!((cell_width_px, cell_height_px), (8, 16));
@@ -2019,7 +2030,7 @@ mod tests {
         let should_quit = Arc::new(AtomicBool::new(false));
         let handshake_quit = should_quit.clone();
         let handle = std::thread::spawn(move || {
-            handle_client_handshake(server_stream, 43, &server_event_tx, &handshake_quit)
+            handle_client_handshake(server_stream, 43, None, &server_event_tx, &handshake_quit)
         });
 
         let ClientMessage::EndpointControl { kind, data } = endpoint_hello(80, 29) else {
@@ -2035,6 +2046,13 @@ mod tests {
             },
         )
         .expect("write shell hello");
+        protocol::write_message(
+            &mut client_stream,
+            &ClientMessage::Input {
+                data: b"queued before welcome".to_vec(),
+            },
+        )
+        .expect("queue input before welcome");
 
         let welcome: ServerMessage =
             protocol::read_message(&mut client_stream, MAX_FRAME_SIZE).expect("read welcome");
@@ -2047,6 +2065,7 @@ mod tests {
         {
             ServerEvent::ClientShellConnected {
                 client_id,
+                principal,
                 surface_cols,
                 surface_rows,
                 cell_width_px,
@@ -2062,6 +2081,10 @@ mod tests {
                 media_capable,
                 writer,
             } => {
+                assert_eq!(
+                    principal, None,
+                    "self-declared hello.user cannot authenticate"
+                );
                 assert!(!media_capable);
                 assert!(!surface_reuse);
                 assert!(!surface_delta);
@@ -2080,7 +2103,11 @@ mod tests {
         }
         assert!(
             matches!(server_event_rx.blocking_recv(), Some(ServerEvent::ClientUser { client_id: 43, user: Some(user) }) if user == "Alice"),
-            "identity follows registration before the input read loop"
+            "self-declared metadata follows principal-bearing registration"
+        );
+        assert!(
+            matches!(server_event_rx.blocking_recv(), Some(ServerEvent::ClientInput { client_id: 43, data }) if data == b"queued before welcome"),
+            "principal-bearing connected event must precede already-queued input"
         );
 
         drop(client_stream);
@@ -2099,7 +2126,7 @@ mod tests {
         let should_quit = Arc::new(AtomicBool::new(false));
         let handshake_quit = should_quit.clone();
         let handle = std::thread::spawn(move || {
-            handle_client_handshake(server_stream, 43, &server_event_tx, &handshake_quit)
+            handle_client_handshake(server_stream, 43, None, &server_event_tx, &handshake_quit)
         });
 
         protocol::write_message(&mut client_stream, &endpoint_hello(0, 29))

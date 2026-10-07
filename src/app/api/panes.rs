@@ -2023,7 +2023,10 @@ impl App {
             return pane_not_found(id, &params.pane_id);
         };
         let has_input = !params.text.is_empty();
-        if let Err(err) = runtime.try_send_bytes(Bytes::from(params.text)) {
+        if let Err(err) = runtime.try_send_bytes_with_source(
+            Bytes::from(params.text),
+            crate::pty::input_consumer::InputSource::Api,
+        ) {
             return encode_error(id, "pane_send_failed", err.to_string());
         }
         if has_input {
@@ -2077,7 +2080,10 @@ impl App {
             return response;
         }
         let has_input = !bytes.is_empty();
-        if let Err(err) = runtime.try_send_bytes(Bytes::from(bytes)) {
+        if let Err(err) = runtime.try_send_bytes_with_source(
+            Bytes::from(bytes),
+            crate::pty::input_consumer::InputSource::Api,
+        ) {
             return encode_error(id, "pane_send_failed", err.to_string());
         }
         if has_input {
@@ -2195,7 +2201,10 @@ impl App {
         let mut accepted_input = false;
         for bytes in encoded_keys {
             let has_input = !bytes.is_empty();
-            if let Err(err) = runtime.try_send_bytes(Bytes::from(bytes)) {
+            if let Err(err) = runtime.try_send_bytes_with_source(
+                Bytes::from(bytes),
+                crate::pty::input_consumer::InputSource::Api,
+            ) {
                 // A partial multi-key send must invalidate even when a later enqueue fails.
                 if accepted_input {
                     self.accepted_api_inputs.push(pane_id);

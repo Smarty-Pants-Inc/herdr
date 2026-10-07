@@ -104,6 +104,7 @@ Raw socket method names use dot notation:
 | Worktree | `worktree.list`, `worktree.create`, `worktree.open`, `worktree.remove` |
 | Tab | `tab.create`, `tab.list`, `tab.get`, `tab.focus`, `tab.rename`, `tab.move`, `tab.close` |
 | Pane | `pane.split`, `pane.swap`, `pane.move`, `pane.zoom`, `pane.layout`, `pane.process_info`, `pane.neighbor`, `pane.edges`, `pane.focus_direction`, `pane.resize`, `pane.list`, `pane.current`, `pane.get`, `pane.last_input`, `pane.rename`, `pane.send_text`, `pane.send_keys`, `pane.send_input`, `pane.send_input_guarded`, `pane.read`, `pane.report_agent`, `pane.report_agent_session`, `pane.report_metadata`, `pane.clear_agent_authority`, `pane.release_agent`, `pane.close`, `pane.wait_for_output` |
+| Input consumer (local JSON only) | `pane.input_consumer.enroll`, `pane.input_consumer.cut`, `pane.input_consumer.release` |
 | Popup | `popup.close` |
 | Layout | `layout.export`, `layout.apply`, `layout.apply_restorable`, `layout.set_split_ratio` |
 | Agent | `agent.list`, `agent.get`, `agent.read`, `agent.explain`, `agent.send_keys`, `agent.prompt`, `agent.wait`, `agent.rename`, `agent.focus`, `agent.start`, `agent.start_guarded`, `agent.view.set`, `agent.view.clear` |
@@ -195,6 +196,129 @@ is unavailable, the pane and replay intent remain with a restore error; no
 replacement process is launched elsewhere. When the terminal converts to a shell,
 the existing shell-respawn lifecycle clears the mark; it does not restart the
 command in a loop.
+
+### Local input-consumer cuts
+
+Use `herdr api schema --json` from the target build before integrating. These
+methods are for a cooperating raw-input consumer on a Linux server's **local
+JSON socket only**, not the frozen client endpoint or a shell-command interface.
+They attribute byte intervals, not the authorship of editor text; `pane.last_input`
+and client hello names are not substitutes.
+
+| Method | Required params | Purpose |
+| --- | --- | --- |
+| `pane.input_consumer.enroll` | `pane_id` | Admit the local socket peer and issue `epoch`, secret `epoch_key`, and `nonce`. |
+| `pane.input_consumer.cut` | `epoch`, `epoch_key`, `seq`, `token`, `cut`, `digest`, `kind` | Close an interval; `kind` is `submit` or `discard`. |
+| `pane.input_consumer.release` | `epoch`, `epoch_key` | End the epoch before exit, suspension, or TTY handover. |
+
+Requests and responses below are separate JSON lines. Success echoes `id` with
+a flat `result`, **without a `type` tag**. `<epoch>`, `<epoch_key>`, and `<nonce>`
+are illustrative placeholders, not usable credentials; use the values returned
+by enrollment privately.
+
+```json
+{"id":"enroll","method":"pane.input_consumer.enroll","params":{"pane_id":"w1:p1"}}
+{"id":"enroll","result":{"epoch":"<epoch>","epoch_key":"<epoch_key>","nonce":"<nonce>"}}
+```
+
+For the first interval containing exactly `a\r` (hex bytes `61 0d`), `cut = 2`
+and `digest` is SHA-256 of those two bytes, not of the literal backslash notation:
+
+```json
+{"id":"cut","method":"pane.input_consumer.cut","params":{"epoch":"<epoch>","epoch_key":"<epoch_key>","seq":1,"token":"example-submit-1","cut":2,"digest":"961a57df036f6c4f44ca8a054271c45e823f469bcc439f0255c40974c3e3d131","kind":"submit"}}
+```
+
+Alternative responses to that cut (one response per request):
+
+```json
+{"id":"cut","result":{"source":"client","principal":null}}
+{"id":"cut","result":{"source":"client","principal":{"smarty_id":"kate","display_name":"Kate"}}}
+{"id":"cut","result":{"source":"api"}}
+{"id":"cut","result":{"source":"mixed"}}
+{"id":"cut","result":{"source":"unknown","reason":"input_log_unavailable"}}
+```
+
+Release succeeds with an empty object. Refusals use the standard `error`
+envelope with `code` and `message`, not an attribution result:
+
+```json
+{"id":"release","method":"pane.input_consumer.release","params":{"epoch":"<epoch>","epoch_key":"<epoch_key>"}}
+{"id":"release","result":{}}
+{"id":"cut","error":{"code":"token_conflict","message":"token_conflict"}}
+```
+
+All params are required; `cut` and `release` take **no `pane_id`**. Enrollment
+checks the socket peer's controlling TTY against the pane PTY, foreground group
+membership (`getpgid(peer) == tcgetpgrp(master)`), and pane session membership
+(`getsid(peer)`). First enrollment wins for a process-group incarnation (pgid
+plus leader start time); another process receives `already_enrolled` for that
+incarnation's life. The first consumer (same pid and start time) may enroll
+again after its epoch ends (release, poison, or a foreground change such as
+Ctrl+Z and resume) and gets a fresh epoch with an empty replay cache. There is no extra
+ancestry test: consumers must enroll before extensions or children and isolate
+tool-child groups. `ICANON`, `ECHO`, `ICRNL`, `ISTRIP`, `IXON`, and `IEXTEN` must
+all be off. Each cut rechecks raw mode and unchanged termios; failure returns
+`unknown` and poisons the epoch. Check
+`ping.result.capabilities.input_consumer == true` first: non-Linux servers
+advertise `false` and refuse all three methods with `unsupported_platform`.
+
+Enrollment and the marker write are one ordered pane-actor operation. The marker
+is `ESC _ herdr-epoch;<nonce> ESC \\`; discard earlier input and strip the expected
+marker before counting. Offset 0 is the first byte after it. `cut` is an
+**exclusive byte count**, not a character index: bytes `a\r` give `cut = 2`.
+Intervals are `[prev_cut, cut)`, initially `prev_cut = 0`; `digest` is the lowercase
+SHA-256 hex of those exact bytes. Bytes after the cut remain for the next
+interval. Herdr neutralizes the reserved marker introducer on all other input
+paths, including client input, API input, and terminal replies.
+
+Ignoring approved neutral replies, one unique client connection produces
+`client`: its mapped principal has `smarty_id` and `display_name`, or its
+`principal` is `null` when unmapped. API-only input produces `api`; API plus
+client input or two client connections produces `mixed`, even if both clients
+map to one person. An uncertain interval produces `unknown` with a reason.
+Only approved **server-generated numeric or fixed-format** replies are neutral:
+DA1–3, DSR/CPR, DECRQM, kitty keyboard flags, XTVERSION, and numeric RGB OSC
+10/11/4 reports. OSC 52, CSI 20t/21t, DECRQSS, and every unapproved reply are
+unknown, never neutral. API text and API-sent Enter are not neutral.
+
+New cuts increment `seq` by one, starting at 1. `token` is an idempotency and
+correlation identifier, not authority. An exact retry (same epoch, sequence,
+token, cut, digest, and kind with valid key) returns the recorded result. Changed
+fields for a known token are refused as `token_conflict`; an old token cannot
+answer a new sequence. A cut must arrive within **30 seconds** of the server
+writing its endpoint byte. Retained receipts have a 10-minute limit; raw interval
+bytes and separately accounted exact replay records share a **1 MiB per-pane
+memory budget**. Replay records are never evicted to weaken conflict detection:
+exhaustion poisons the epoch as `replay_overflow`. Raw retention overflow cannot
+establish attribution. A digest mismatch or a cut beyond written bytes also
+returns `unknown` and poisons the epoch. Consumer exit (pid/start time), a
+foreground-group change, pane-runtime or server restart, and release end the
+epoch; capabilities and receipts are not persisted. A new epoch has an empty
+replay cache.
+
+Principal resolution is server-owned and bound once per client connection.
+On Linux, the verified remote-client bridge must lead to root sshd evidence:
+one accepted SSH key fingerprint and a Tailscale `Node.StableID` must both map
+to the same unique principal. Local attaches, missing evidence, mismatches,
+and duplicate mappings remain unmapped; client `hello.user`, `SSH_CONNECTION`,
+and other client-supplied claims are never trusted. A Mac client can be mapped
+when its server is Linux. `/etc/herdr/principals.json` must be root-owned and
+not group- or world-writable, with this version-1 shape:
+
+```json
+{"version":1,"principals":[{"smarty_id":"alice","display_name":"Alice","ssh_keys":["SHA256:example"],"tailscale_nodes":["example-stable-id"]}]}
+```
+
+The map is read at server start and checked by mtime on new connections. An
+invalid map supplies no labels; existing connections keep their bindings.
+**There is no SIGHUP reload**; do not send SIGHUP to refresh the map.
+
+Keep `epoch_key` private and **never log it**. A separate owner-only
+input-consumer audit log records token, epoch, sequence, cut, digest, kind, and
+result, never the key, nonce, or raw input. Attribution requires durable
+append/fsync before returning: failure yields `unknown` with
+`input_log_unavailable` and poisons the epoch. Exact retries reuse the durable
+record. This audit is separate from the existing API prewrite input log.
 
 ### Last pane input
 

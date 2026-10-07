@@ -31,6 +31,9 @@ pub(crate) use super::unix_common::remote_bridge_endpoint_path_in;
 #[cfg(test)]
 mod config_file_tests;
 
+pub(super) mod client_identity;
+pub(super) mod input_consumer;
+
 mod shutdown;
 pub(crate) use shutdown::monitor_host_shutdown;
 

@@ -100,6 +100,7 @@ herdr pane read w1:p2 --source recent --lines 50
 | Worktree | `worktree.list`、`worktree.create`、`worktree.open`、`worktree.remove` |
 | 标签页 | `tab.create`、`tab.list`、`tab.get`、`tab.focus`、`tab.rename`、`tab.move`、`tab.close` |
 | 窗格 | `pane.split`、`pane.swap`、`pane.move`、`pane.zoom`、`pane.layout`、`pane.process_info`、`pane.neighbor`、`pane.edges`、`pane.focus_direction`、`pane.resize`、`pane.list`、`pane.current`、`pane.get`、`pane.last_input`、`pane.rename`、`pane.send_text`、`pane.send_keys`、`pane.send_input`、`pane.send_input_guarded`、`pane.read`、`pane.report_agent`、`pane.report_agent_session`、`pane.report_metadata`、`pane.clear_agent_authority`、`pane.release_agent`、`pane.close`、`pane.wait_for_output` |
+| 输入消费者（仅本地 JSON） | `pane.input_consumer.enroll`、`pane.input_consumer.cut`、`pane.input_consumer.release` |
 | 弹窗 | `popup.close` |
 | 布局 | `layout.export`、`layout.apply`、`layout.apply_restorable`、`layout.set_split_ratio` |
 | 智能体 | `agent.list`、`agent.get`、`agent.read`、`agent.explain`、`agent.send_keys`、`agent.prompt`、`agent.wait`、`agent.rename`、`agent.focus`、`agent.start`、`agent.start_guarded` |
@@ -178,6 +179,65 @@ is unavailable, the pane and replay intent remain with a restore error; no
 replacement process is launched elsewhere. When the terminal converts to a shell,
 the existing shell-respawn lifecycle clears the mark; it does not restart the
 command in a loop.
+
+### 本地输入消费者的切分
+
+集成前请检查目标构建的 `herdr api schema --json`。这些方法供协作的 raw 输入消费者使用，**仅适用于 Linux 服务器的本地 JSON socket**，不属于冻结的客户端端点，也不是 shell 命令接口。它们判定字节区间的来源，不证明编辑器文本的作者；`pane.last_input` 和客户端 hello 名称不能替代它们。
+
+| 方法 | 必填 params | 用途 |
+| --- | --- | --- |
+| `pane.input_consumer.enroll` | `pane_id` | 验证本地 socket 对端，发放 `epoch`、秘密 `epoch_key` 和 `nonce`。 |
+| `pane.input_consumer.cut` | `epoch`、`epoch_key`、`seq`、`token`、`cut`、`digest`、`kind` | 关闭区间；`kind` 为 `submit` 或 `discard`。 |
+| `pane.input_consumer.release` | `epoch`、`epoch_key` | 在退出、挂起或交接 TTY 前结束 epoch。 |
+
+以下请求和响应各占一行 JSON。成功响应回显 `id`，并返回扁平的 `result`，**没有 `type` 标签**。`<epoch>`、`<epoch_key>` 和 `<nonce>` 仅为说明用占位符，不是可用的凭据；请私密地使用注册返回的实际值。
+
+```json
+{"id":"enroll","method":"pane.input_consumer.enroll","params":{"pane_id":"w1:p1"}}
+{"id":"enroll","result":{"epoch":"<epoch>","epoch_key":"<epoch_key>","nonce":"<nonce>"}}
+```
+
+若第一个区间仅包含确切的 `a\r`（十六进制字节 `61 0d`），则 `cut = 2`，`digest` 为这两个字节的 SHA-256，而不是反斜杠表示法本身的哈希。
+
+```json
+{"id":"cut","method":"pane.input_consumer.cut","params":{"epoch":"<epoch>","epoch_key":"<epoch_key>","seq":1,"token":"example-submit-1","cut":2,"digest":"961a57df036f6c4f44ca8a054271c45e823f469bcc439f0255c40974c3e3d131","kind":"submit"}}
+```
+
+该切分可能得到的响应如下（每个请求只返回一个响应）：
+
+```json
+{"id":"cut","result":{"source":"client","principal":null}}
+{"id":"cut","result":{"source":"client","principal":{"smarty_id":"kate","display_name":"Kate"}}}
+{"id":"cut","result":{"source":"api"}}
+{"id":"cut","result":{"source":"mixed"}}
+{"id":"cut","result":{"source":"unknown","reason":"input_log_unavailable"}}
+```
+
+release 成功时返回空对象。拒绝使用含 `code` 和 `message` 的标准 `error` 包装，而不是归属判定结果：
+
+```json
+{"id":"release","method":"pane.input_consumer.release","params":{"epoch":"<epoch>","epoch_key":"<epoch_key>"}}
+{"id":"release","result":{}}
+{"id":"cut","error":{"code":"token_conflict","message":"token_conflict"}}
+```
+
+所有 params 均必填；`cut` 和 `release` **不接受 `pane_id`**。注册时检查 socket 对端的控制 TTY 是否为窗格 PTY、是否属于前台进程组（`getpgid(peer) == tcgetpgrp(master)`），以及是否属于窗格会话（`getsid(peer)`）。同一进程组实例（pgid 加组长启动时间）仅首次注册成功，在该实例存续期间，其他进程的注册得到 `already_enrolled`。首个消费者（相同 pid 和启动时间）在其 epoch 结束后（release、失效，或 Ctrl+Z 与恢复等前台变化）可以重新注册，并获得重放缓存为空的新 epoch。没有额外的祖先检查：消费者必须先于扩展和子进程注册，并将工具子进程隔离到其他进程组。`ICANON`、`ECHO`、`ICRNL`、`ISTRIP`、`IXON`、`IEXTEN` 必须全部关闭。每次切分重新检查 raw 模式及 termios 是否与注册时一致；失败返回 `unknown` 并使 epoch 失效。请先检查 `ping.result.capabilities.input_consumer == true`：非 Linux 服务器通告 `false`，并以 `unsupported_platform` 拒绝全部三个方法。
+
+注册和写入标记是同一个有序窗格 actor 操作。标记为 `ESC _ herdr-epoch;<nonce> ESC \\`；丢弃更早的输入，移除预期标记后再计数。偏移 0 是标记后的第一个字节。`cut` 是**不含终点的字节计数**，不是字符索引：字节 `a\r` 对应 `cut = 2`。区间为 `[prev_cut, cut)`，初始 `prev_cut = 0`；`digest` 是这些确切字节的 SHA-256 小写十六进制值。切分之后的字节保留给下一区间。Herdr 在所有其他输入路径中中和保留标记的引导序列，包括客户端输入、API 输入和终端回复。
+
+忽略获批的中性回复后，来自唯一客户端连接的输入得到 `client`：已映射的 principal 包含 `smarty_id` 和 `display_name`，未映射时 `principal` 为 `null`。仅 API 输入得到 `api`；API 与客户端混合，或两个客户端连接参与时得到 `mixed`，即使两个客户端映射到同一个人也一样。不确定的区间得到带原因的 `unknown`。只有获批的**服务器生成的数值或固定格式**回复是中性的：DA1–3、DSR/CPR、DECRQM、kitty 键盘标志、XTVERSION，以及数值 RGB 的 OSC 10/11/4 报告。OSC 52、CSI 20t/21t、DECRQSS 和所有未获批回复均为 unknown，绝不中性。API 文本和 API 发送的 Enter 也不中性。
+
+新切分的 `seq` 从 1 开始，每次加 1。`token` 是幂等性和关联标识符，不是权限。使用有效密钥的完全相同重试（相同 epoch、序号、token、cut、digest 和 kind）返回已记录的结果。更改已知 token 的字段会以 `token_conflict` 拒绝；旧 token 不能用于新序号。切分必须在服务器写入终点字节后 **30 秒内**到达。保留的收据有 10 分钟上限；原始区间字节和单独计入的精确重放记录共享**每窗格 1 MiB 的内存上限**。不会通过淘汰记录来削弱冲突检测：容量耗尽会以 `replay_overflow` 使 epoch 失效。原始字节保留溢出也无法建立归属。digest 不匹配或 cut 超出已写字节范围时，同样返回 `unknown` 并使 epoch 失效。消费者退出（pid/启动时间）、前台组变化、窗格运行时或服务器重启，以及 release 都会结束 epoch。权限和收据不持久化；新 epoch 的重放缓存为空。
+
+principal 由服务器解析，每个客户端连接只绑定一次。在 Linux 上，已验证的 remote-client bridge 必须能追溯到 root sshd 证据：唯一的已接受 SSH 密钥指纹和 Tailscale 的 `Node.StableID` 必须都映射到同一个唯一 principal。本地附加、缺少证据、不匹配或重复映射都保持未映射；绝不信任客户端的 `hello.user`、`SSH_CONNECTION` 或其他自报字段。服务器为 Linux 时，Mac 客户端也可以映射。`/etc/herdr/principals.json` 必须归 root 所有，且组和其他用户均不可写。版本 1 的格式如下：
+
+```json
+{"version":1,"principals":[{"smarty_id":"alice","display_name":"Alice","ssh_keys":["SHA256:example"],"tailscale_nodes":["example-stable-id"]}]}
+```
+
+服务器启动时读取映射，新连接时按 mtime 检查。无效映射不提供标签；现有连接保留原有绑定。**没有 SIGHUP 重载**；不要发送 SIGHUP 来刷新映射。
+
+保持 `epoch_key` 私密，**绝不写入日志**。独立的仅所有者可访问的输入消费者审计日志记录 token、epoch、序号、cut、digest、kind 和 result，绝不记录密钥、nonce 或原始输入。归属判定要求在返回前完成持久追加和 fsync；失败时返回原因为 `input_log_unavailable` 的 `unknown`，并使 epoch 失效。完全相同的重试复用持久记录。该审计日志独立于现有的 API 写入前输入日志。
 
 ### 窗格最近的输入
 

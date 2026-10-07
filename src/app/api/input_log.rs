@@ -18,6 +18,20 @@ pub(crate) fn default_api_input_log_path() -> std::path::PathBuf {
 }
 
 impl App {
+    /// The actor invokes this durable sink before releasing an authoritative cut.
+    /// Only metadata is representable in AuditRecord; capabilities, nonce and raw
+    /// input cannot accidentally enter this log. Failure is handled by the actor
+    /// as unknown(input_log_unavailable) plus epoch poison, not by this transport.
+    pub(super) fn input_consumer_audit_sink(&self) -> crate::pty::input_consumer::AuditSink {
+        let path = self.api_input_log.with_file_name("input-consumer.jsonl");
+        std::sync::Arc::new(move |record| {
+            let line = serde_json::to_string(record).map_err(std::io::Error::other)?;
+            append_line(&path, &line).inspect_err(|err| {
+                tracing::warn!(err = %err, path = %path.display(), "input consumer audit log write failed");
+            })
+        })
+    }
+
     /// Appends the log line for an API write of `bytes` bytes to a pane's input. On error the
     /// caller must not write, and returns the encoded error.
     pub(super) fn log_api_input(
@@ -185,6 +199,77 @@ mod tests {
         source_pane_id: String,
         target_pane_id: String,
         target_rx: tokio::sync::mpsc::Receiver<bytes::Bytes>,
+    }
+
+    fn audit_record() -> crate::pty::input_consumer::AuditRecord {
+        crate::pty::input_consumer::AuditRecord {
+            epoch: "epoch-id".into(),
+            seq: 1,
+            token: "submission-token".into(),
+            cut: 2,
+            digest: "ab".repeat(32),
+            kind: crate::pty::input_consumer::CutKind::Submit,
+            result: crate::pty::input_consumer::CutResult::Client { principal: None },
+        }
+    }
+
+    #[tokio::test]
+    async fn input_consumer_audit_is_owner_only_metadata_and_durable() {
+        let fixture = fixture();
+        let path = fixture
+            .app
+            .api_input_log
+            .with_file_name("input-consumer.jsonl");
+        let sink = fixture.app.input_consumer_audit_sink();
+        sink(&audit_record()).expect("durable audit");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(raw.lines().count(), 1);
+        let record: serde_json::Value = serde_json::from_str(raw.trim()).unwrap();
+        assert_eq!(record["epoch"], "epoch-id");
+        assert_eq!(record["seq"], 1);
+        assert_eq!(record["token"], "submission-token");
+        assert_eq!(record["cut"], 2);
+        assert_eq!(record["kind"], "submit");
+        assert_eq!(
+            record["result"],
+            serde_json::json!({"source":"client", "principal":null})
+        );
+        assert_eq!(record.as_object().unwrap().len(), 7);
+        for forbidden in ["raw", "epoch_key", "nonce", "text"] {
+            assert!(record.get(forbidden).is_none());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn input_consumer_audit_propagates_append_and_directory_sync_failure() {
+        let fixture = fixture();
+        let path = fixture
+            .app
+            .api_input_log
+            .with_file_name("input-consumer.jsonl");
+        std::fs::create_dir(&path).unwrap();
+        let sink = fixture.app.input_consumer_audit_sink();
+        assert!(
+            sink(&audit_record()).is_err(),
+            "actor must observe append failure"
+        );
+        std::fs::remove_dir(&path).unwrap();
+        super::FAIL_DIRECTORY_SYNCS.set(1);
+        assert!(
+            sink(&audit_record()).is_err(),
+            "actor must observe durability failure"
+        );
+        super::FAIL_DIRECTORY_SYNCS.set(0);
+        std::fs::remove_file(path).unwrap();
     }
 
     /// A caller pane (this test process, an agent named "sender") and a target pane.

@@ -100,6 +100,7 @@ herdr pane read w1:p2 --source recent --lines 50
 | Worktree | `worktree.list`、`worktree.create`、`worktree.open`、`worktree.remove` |
 | タブ | `tab.create`、`tab.list`、`tab.get`、`tab.focus`、`tab.rename`、`tab.move`、`tab.close` |
 | ペイン | `pane.split`、`pane.swap`、`pane.move`、`pane.zoom`、`pane.layout`、`pane.process_info`、`pane.neighbor`、`pane.edges`、`pane.focus_direction`、`pane.resize`、`pane.list`、`pane.current`、`pane.get`、`pane.last_input`、`pane.rename`、`pane.send_text`、`pane.send_keys`、`pane.send_input`、`pane.send_input_guarded`、`pane.read`、`pane.report_agent`、`pane.report_agent_session`、`pane.report_metadata`、`pane.clear_agent_authority`、`pane.release_agent`、`pane.close`、`pane.wait_for_output` |
+| 入力コンシューマー（ローカル JSON 専用） | `pane.input_consumer.enroll`、`pane.input_consumer.cut`、`pane.input_consumer.release` |
 | ポップアップ | `popup.close` |
 | レイアウト | `layout.export`、`layout.apply`、`layout.apply_restorable`、`layout.set_split_ratio` |
 | エージェント | `agent.list`、`agent.get`、`agent.read`、`agent.explain`、`agent.send_keys`、`agent.prompt`、`agent.wait`、`agent.rename`、`agent.focus`、`agent.start`、`agent.start_guarded` |
@@ -177,6 +178,65 @@ is unavailable, the pane and replay intent remain with a restore error; no
 replacement process is launched elsewhere. When the terminal converts to a shell,
 the existing shell-respawn lifecycle clears the mark; it does not restart the
 command in a loop.
+
+### ローカル入力コンシューマーのカット
+
+統合前に対象ビルドの `herdr api schema --json` を確認してください。これらのメソッドは Linux サーバーの **ローカル JSON ソケット専用**で、協調する raw 入力コンシューマー向けです。凍結済みのクライアントエンドポイントやシェルコマンドのインターフェースではありません。バイト区間の送信元を判定するもので、エディター内のテキストの作成者を証明しません。`pane.last_input` やクライアントの hello 名は代用できません。
+
+| メソッド | 必須 params | 用途 |
+| --- | --- | --- |
+| `pane.input_consumer.enroll` | `pane_id` | ローカルソケットのピアを検証し、`epoch`、秘密の `epoch_key`、`nonce` を発行します。 |
+| `pane.input_consumer.cut` | `epoch`、`epoch_key`、`seq`、`token`、`cut`、`digest`、`kind` | 区間を閉じます。`kind` は `submit` または `discard` です。 |
+| `pane.input_consumer.release` | `epoch`、`epoch_key` | 終了、一時停止、TTY 引き渡しの前に epoch を終了します。 |
+
+以下ではリクエストとレスポンスをそれぞれ別の JSON 行で示します。成功時は同じ `id` とフラットな `result` を返し、**`type` タグはありません**。`<epoch>`、`<epoch_key>`、`<nonce>` は説明用のプレースホルダーで、使用可能な認証情報ではありません。登録で返された値を秘密に扱って使用してください。
+
+```json
+{"id":"enroll","method":"pane.input_consumer.enroll","params":{"pane_id":"w1:p1"}}
+{"id":"enroll","result":{"epoch":"<epoch>","epoch_key":"<epoch_key>","nonce":"<nonce>"}}
+```
+
+最初の区間が正確に `a\r`（16 進バイト `61 0d`）だけを含む場合、`cut = 2` です。`digest` はこの 2 バイトの SHA-256 であり、バックスラッシュ表記そのもののハッシュではありません。
+
+```json
+{"id":"cut","method":"pane.input_consumer.cut","params":{"epoch":"<epoch>","epoch_key":"<epoch_key>","seq":1,"token":"example-submit-1","cut":2,"digest":"961a57df036f6c4f44ca8a054271c45e823f469bcc439f0255c40974c3e3d131","kind":"submit"}}
+```
+
+このカットに対するレスポンスの候補です（リクエストごとに 1 つのレスポンス）。
+
+```json
+{"id":"cut","result":{"source":"client","principal":null}}
+{"id":"cut","result":{"source":"client","principal":{"smarty_id":"kate","display_name":"Kate"}}}
+{"id":"cut","result":{"source":"api"}}
+{"id":"cut","result":{"source":"mixed"}}
+{"id":"cut","result":{"source":"unknown","reason":"input_log_unavailable"}}
+```
+
+release の成功は空のオブジェクトを返します。拒否時は送信元判定の結果ではなく、`code` と `message` を持つ標準の `error` エンベロープを使用します。
+
+```json
+{"id":"release","method":"pane.input_consumer.release","params":{"epoch":"<epoch>","epoch_key":"<epoch_key>"}}
+{"id":"release","result":{}}
+{"id":"cut","error":{"code":"token_conflict","message":"token_conflict"}}
+```
+
+すべての params が必須で、`cut` と `release` に **`pane_id` はありません**。登録時には、ソケットピアの制御 TTY がペイン PTY と一致すること、フォアグラウンドグループのメンバーであること（`getpgid(peer) == tcgetpgrp(master)`）、ペインのセッションに属すること（`getsid(peer)`）を確認します。プロセスグループのインカーネーション（pgid とリーダーの開始時刻）ごとに最初の登録だけが成功し、そのインカーネーションが続く間、他のプロセスの登録は `already_enrolled` になります。最初のコンシューマー（同じ pid と開始時刻）は、epoch の終了後（release、無効化、Ctrl+Z と再開などのフォアグラウンド変更）に再登録でき、リプレイキャッシュが空の新しい epoch を受け取ります。追加の祖先チェックはありません。コンシューマーは拡張機能や子プロセスより先に登録し、ツールの子プロセスを別グループに分離する必要があります。`ICANON`、`ECHO`、`ICRNL`、`ISTRIP`、`IXON`、`IEXTEN` はすべてオフでなければなりません。各カットで raw モードと termios が登録時から変わっていないことを再確認し、失敗時は `unknown` を返して epoch を無効化します。先に `ping.result.capabilities.input_consumer == true` を確認してください。Linux 以外のサーバーは `false` を通知し、3 つのメソッドすべてを `unsupported_platform` で拒否します。
+
+登録とマーカーの書き込みは、順序保証された単一のペインアクター操作です。マーカーは `ESC _ herdr-epoch;<nonce> ESC \\` です。それ以前の入力を捨て、期待するマーカーを取り除いてから数えます。オフセット 0 はマーカー直後の最初のバイトです。`cut` は文字インデックスではなく、**終端を含まないバイト数**です。バイト列 `a\r` なら `cut = 2` になります。区間は `[prev_cut, cut)` で、初期値は `prev_cut = 0` です。`digest` はその正確なバイト列の SHA-256 を小文字の 16 進数で表した値です。カット以降のバイトは次の区間に残ります。Herdr は、クライアント入力、API 入力、ターミナル応答など、他のすべての入力経路で予約済みマーカーの導入部を無害化します。
+
+承認済みの中立な応答を除き、単一のクライアント接続からの入力は `client` です。マッピング済みの principal は `smarty_id` と `display_name` を持ち、未マッピングなら `principal` は `null` です。API のみなら `api`、API とクライアントの混在、または 2 つのクライアント接続なら `mixed` です。両クライアントが同一人物にマッピングされていても同じです。不確かな区間は理由付きの `unknown` になります。中立なのは、承認された **サーバー生成の数値または固定形式**の応答だけです。対象は DA1–3、DSR/CPR、DECRQM、kitty キーボードフラグ、XTVERSION、数値 RGB の OSC 10/11/4 レポートです。OSC 52、CSI 20t/21t、DECRQSS、および未承認の応答はすべて unknown で、中立にはなりません。API のテキストと API が送った Enter も中立ではありません。
+
+新しいカットでは `seq` を 1 ずつ増やし、1 から始めます。`token` は冪等性と照合の識別子であり、権限ではありません。有効なキーを使った完全一致の再試行（同じ epoch、シーケンス、token、cut、digest、kind）は記録済みの結果を返します。既知の token のフィールドを変更すると `token_conflict` で拒否され、古い token を新しいシーケンスに使うことはできません。カットは、サーバーが終端バイトを書いてから **30 秒以内**に到着する必要があります。保持する受領情報には 10 分の上限があり、生の区間バイトと別途計上する完全再試行レコードは、**ペインあたり 1 MiB のメモリ上限**を共有します。競合検出を弱めるレコードの削除は行わず、容量超過は `replay_overflow` として epoch を無効化します。生バイトの保持容量を超えた場合も送信元を確定できません。digest の不一致や書き込み済み範囲を超える cut も `unknown` を返し、epoch を無効化します。コンシューマーの終了（pid/開始時刻）、フォアグラウンドグループの変更、ペインランタイムまたはサーバーの再起動、release で epoch は終了します。権限と受領情報は永続化されず、新しい epoch の再試行キャッシュは空です。
+
+principal の解決はサーバーが行い、クライアント接続ごとに一度だけ固定します。Linux では、検証済み remote-client bridge から root sshd の証拠にたどり着き、単一の受理済み SSH キーフィンガープリントと Tailscale の `Node.StableID` の両方が、同じ一意の principal にマッピングされる必要があります。ローカル接続、証拠の欠落、不一致、重複したマッピングは未マッピングのままです。クライアントの `hello.user`、`SSH_CONNECTION`、その他のクライアント申告は信用しません。サーバーが Linux なら Mac クライアントもマッピングできます。`/etc/herdr/principals.json` は root 所有で、グループや他ユーザーが書き込めない必要があります。バージョン 1 の形式は次のとおりです。
+
+```json
+{"version":1,"principals":[{"smarty_id":"alice","display_name":"Alice","ssh_keys":["SHA256:example"],"tailscale_nodes":["example-stable-id"]}]}
+```
+
+マップはサーバー起動時に読み込み、新規接続時に mtime を確認します。無効なマップではラベルを付けず、既存の接続は固定済みのマッピングを維持します。**SIGHUP によるリロードはありません**。マップ更新のために SIGHUP を送らないでください。
+
+`epoch_key` は秘密に保ち、**決してログに記録しないでください**。独立した所有者専用の入力コンシューマー監査ログに token、epoch、シーケンス、cut、digest、kind、result を記録します。キー、nonce、生の入力は記録しません。結果を返す前に追記と fsync が成功することが送信元判定の条件です。失敗時は理由 `input_log_unavailable` の `unknown` を返し、epoch を無効化します。完全一致の再試行は永続化済みのレコードを再利用します。この監査ログは、既存の API 書き込み前入力ログとは別です。
 
 ### ペインへの最後の入力
 

@@ -480,6 +480,7 @@ mod tests {
                 ssh_agent_registration: false,
                 guarded_live_handoff: true,
                 expected_terminal_guard: true,
+                input_consumer: false,
             }),
         }
     }

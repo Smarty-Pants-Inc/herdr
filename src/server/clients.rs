@@ -131,6 +131,8 @@ impl ClientShellLocation {
 
 /// A connected client tracked by the server.
 pub(crate) struct ClientConnection {
+    /// Immutable accept-time binding; never derived from hello.user.
+    pub(crate) principal: Option<crate::pty::input_consumer::Principal>,
     /// Whether this connection owns the Herdr shell or one direct terminal stream.
     pub(crate) mode: ClientConnectionMode,
     /// The client's terminal size after clamping.
@@ -224,6 +226,7 @@ impl ClientConnection {
         writer: Option<ClientWriter>,
     ) -> Self {
         Self {
+            principal: None,
             mode,
             terminal_size,
             cell_size,

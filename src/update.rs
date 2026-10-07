@@ -3049,6 +3049,7 @@ mod tests {
                 ssh_agent_registration: false,
                 guarded_live_handoff: true,
                 expected_terminal_guard: true,
+                input_consumer: false,
             }),
         };
         let missing_baseline = crate::api::RuntimeStatus {
@@ -3126,6 +3127,7 @@ mod tests {
                     health_check: true,
                     ssh_agent_registration: false,
                     guarded_live_handoff: true,
+                    input_consumer: false,
                 }),
             },
         };
@@ -3379,6 +3381,7 @@ mod tests {
                     health_check: true,
                     ssh_agent_registration: false,
                     guarded_live_handoff: true,
+                    input_consumer: false,
                 }),
             },
         };

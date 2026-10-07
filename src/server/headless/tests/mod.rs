@@ -4,6 +4,7 @@ use super::*;
 #[path = "client_listener.rs"]
 mod client_listener_tests;
 mod event_fairness;
+mod input_consumer;
 #[path = "last_input_alt_read.rs"]
 mod last_input_alt_read_tests;
 #[path = "last_input_scroll.rs"]
@@ -740,6 +741,7 @@ async fn client_shell_attach_seeds_workspace() {
             surface_scroll: false,
             media_capable: false,
             client_id: 6,
+            principal: None,
             surface_cols: 80,
             surface_rows: 23,
             cell_width_px: 0,
@@ -770,6 +772,7 @@ async fn completion_guard_endpoint_pairs_runtime_completions_with_snapshots() {
     let (writer, control_rx, _render_rx) = test_client_writer();
     server.handle_server_event(ServerEvent::ClientShellConnected {
         client_id: 78,
+        principal: None,
         surface_cols: 80,
         surface_rows: 24,
         cell_width_px: 0,
@@ -834,6 +837,7 @@ async fn client_shell_endpoint_request_uses_the_selected_connection() {
             surface_scroll: false,
             media_capable: false,
             client_id,
+            principal: None,
             surface_cols: 80,
             surface_rows: 23,
             cell_width_px: 0,
@@ -918,6 +922,7 @@ fn terminal_client_endpoint_request_error_removes_client() {
     let (writer, _control_rx, _render_rx) = test_client_writer();
     let client_id = 42;
     assert!(!server.handle_server_event(ServerEvent::ClientConnected {
+        principal: None,
         client_id,
         cols: 80,
         rows: 24,
@@ -954,6 +959,7 @@ async fn client_shell_pairs_agent_view_set_replacement_and_clear_with_snapshots(
             surface_scroll: false,
             media_capable: false,
             client_id: 77,
+            principal: None,
             surface_cols: 80,
             surface_rows: 23,
             cell_width_px: 0,
@@ -1058,6 +1064,7 @@ async fn client_shell_receives_metadata_then_shell_free_pane_surface() {
             surface_scroll: false,
             media_capable: false,
             client_id: 7,
+            principal: None,
             surface_cols: 80,
             surface_rows: 23,
             cell_width_px: 10,
@@ -1227,6 +1234,7 @@ fn connect_test_shell(
             surface_scroll: false,
             media_capable: false,
             client_id,
+            principal: None,
             surface_cols,
             surface_rows,
             cell_width_px: 0,
@@ -1833,6 +1841,7 @@ async fn client_shell_config_diagnostics_follow_keybinding_ownership() {
             surface_scroll: false,
             media_capable: false,
             client_id: 13,
+            principal: None,
             surface_cols: 80,
             surface_rows: 23,
             cell_width_px: 0,
@@ -1859,6 +1868,7 @@ async fn client_shell_config_diagnostics_follow_keybinding_ownership() {
             surface_scroll: false,
             media_capable: false,
             client_id: 14,
+            principal: None,
             surface_cols: 80,
             surface_rows: 23,
             cell_width_px: 0,
@@ -2938,6 +2948,7 @@ async fn public_api_focus_replaces_every_client_shell_projection() {
             surface_scroll: false,
             media_capable: false,
             client_id: 9,
+            principal: None,
             surface_cols: 80,
             surface_rows: 23,
             cell_width_px: 0,
@@ -3187,6 +3198,7 @@ async fn client_shell_streams_and_targets_popup_terminal_content() {
             surface_scroll: false,
             media_capable: false,
             client_id: 12,
+            principal: None,
             surface_cols: 80,
             surface_rows: 23,
             cell_width_px: 10,
@@ -4071,6 +4083,7 @@ fn terminal_clients_store_known_cell_geometry_independently_of_pixel_mouse() {
         cell_width_px: 0,
         cell_height_px: 0,
         pixel_mouse: true,
+        principal: None,
         writer,
     }));
     assert!(!server.clients[&7].pixel_mouse);
@@ -4082,6 +4095,7 @@ fn terminal_clients_store_known_cell_geometry_independently_of_pixel_mouse() {
     let (writer, _control_rx, _render_rx) = test_client_writer();
     assert!(!server.handle_server_event(ServerEvent::ClientConnected {
         client_id: 8,
+        principal: None,
         cols: 80,
         rows: 24,
         cell_width_px: 10,
@@ -4112,6 +4126,7 @@ fn terminal_attach_rejects_missing_terminal_and_removes_client() {
         cell_height_px: 0,
         pixel_mouse: false,
         writer,
+        principal: None,
     }));
     assert!(matches!(
         server.clients.get(&7).map(|client| &client.mode),
@@ -4168,6 +4183,7 @@ fn terminal_observers_wait_for_synchronized_output_with_or_without_baseline() {
             let (writer, _control, render) = test_client_writer();
             assert!(!server.handle_server_event(ServerEvent::ClientConnected {
                 client_id,
+                principal: None,
                 cols: 80,
                 rows: 24,
                 cell_width_px: 0,
@@ -4226,6 +4242,7 @@ fn connect_pending_terminal_client_with_control_rx(
     let (writer, control_rx, _render_rx) = test_client_writer();
     assert!(!server.handle_server_event(ServerEvent::ClientConnected {
         client_id,
+        principal: None,
         cols: 100,
         rows: 30,
         cell_width_px: 0,
@@ -4397,6 +4414,7 @@ fn backpressured_observer_skips_runtime_access_and_recovers_without_new_output()
         let (writer, control, frames) = test_client_writer();
         server.handle_server_event(ServerEvent::ClientConnected {
             client_id: 7,
+            principal: None,
             cols: 80,
             rows: 24,
             cell_width_px: 0,
@@ -5053,6 +5071,7 @@ fn terminal_attach_client_exits_when_worktree_runtime_restore_fails() {
         cell_width_px: 0,
         cell_height_px: 0,
         pixel_mouse: false,
+        principal: None,
         writer,
     }));
     assert!(
@@ -5128,6 +5147,7 @@ fn terminal_attach_client_exits_when_worktree_remove_succeeds() {
         cell_width_px: 0,
         cell_height_px: 0,
         pixel_mouse: false,
+        principal: None,
         writer,
     }));
     assert!(
@@ -5223,6 +5243,7 @@ fn terminal_attach_scroll_moves_attached_runtime_viewport() {
         None,
         None,
         0,
+        crate::pty::input_consumer::InputSource::Unknown,
     )
     .expect("scroll up");
     let metrics = runtime.scroll_metrics().expect("scroll metrics");
@@ -5236,6 +5257,7 @@ fn terminal_attach_scroll_moves_attached_runtime_viewport() {
         None,
         None,
         0,
+        crate::pty::input_consumer::InputSource::Unknown,
     )
     .expect("scroll down");
     let metrics = runtime.scroll_metrics().expect("scroll metrics");
@@ -5276,6 +5298,7 @@ fn client_pane_pixel_mouse_uses_runtime_pixel_encoding() {
             modifiers: 0,
             lines: 3,
         }],
+        crate::pty::input_consumer::InputSource::Unknown,
     )
     .expect("pixel mouse input");
     assert_eq!(
@@ -5318,6 +5341,7 @@ fn client_pane_pixel_mouse_stays_pixel_scaled_when_sgr_is_reasserted() {
             modifiers: 0,
             lines: 1,
         }],
+        crate::pty::input_consumer::InputSource::Unknown,
     )
     .expect("pixel mouse input");
     assert_eq!(
@@ -5360,6 +5384,7 @@ fn client_pane_pixel_mouse_falls_back_to_canonical_cell_position() {
             modifiers: 0,
             lines: 3,
         }],
+        crate::pty::input_consumer::InputSource::Unknown,
     )
     .expect("cell mouse fallback");
     assert_eq!(
@@ -5397,11 +5422,13 @@ fn client_pane_wheel_input_accumulates_scrollback_offset() {
     apply_client_pane_input_events(
         &runtime,
         &[scroll(crate::protocol::ClientMouseKind::ScrollUp)],
+        crate::pty::input_consumer::InputSource::Unknown,
     )
     .expect("first scroll up");
     apply_client_pane_input_events(
         &runtime,
         &[scroll(crate::protocol::ClientMouseKind::ScrollUp)],
+        crate::pty::input_consumer::InputSource::Unknown,
     )
     .expect("second scroll up");
     assert_eq!(
@@ -5415,6 +5442,7 @@ fn client_pane_wheel_input_accumulates_scrollback_offset() {
     apply_client_pane_input_events(
         &runtime,
         &[scroll(crate::protocol::ClientMouseKind::ScrollDown)],
+        crate::pty::input_consumer::InputSource::Unknown,
     )
     .expect("scroll down");
     assert_eq!(
@@ -5435,6 +5463,7 @@ fn client_pane_wheel_input_accumulates_scrollback_offset() {
             modifiers: 0,
             lines: 3,
         }],
+        crate::pty::input_consumer::InputSource::Unknown,
     )
     .expect("reported mouse motion");
     assert_eq!(
@@ -5458,6 +5487,7 @@ fn client_pane_wheel_input_accumulates_scrollback_offset() {
             modifiers: 0,
             lines: 3,
         }],
+        crate::pty::input_consumer::InputSource::Unknown,
     )
     .expect("mouse button");
     assert_eq!(
@@ -5501,7 +5531,12 @@ fn terminal_attach_input_resets_scrolled_viewport() {
         4
     );
 
-    apply_terminal_attach_input(&runtime, b"x".to_vec()).expect("attach input");
+    apply_terminal_attach_input(
+        &runtime,
+        b"x".to_vec(),
+        crate::pty::input_consumer::InputSource::Unknown,
+    )
+    .expect("attach input");
     assert_eq!(
         runtime
             .scroll_metrics()
@@ -5559,6 +5594,7 @@ fn apply_terminal_attach_page_up(runtime: &crate::terminal::TerminalRuntime) {
         None,
         None,
         0,
+        crate::pty::input_consumer::InputSource::Unknown,
     )
     .expect("page key");
 }
@@ -5591,6 +5627,7 @@ fn client_plain_page_keys_scroll_shell_transcript_by_pane_height() {
                 crossterm::event::KeyModifiers::empty(),
                 crate::protocol::ClientKeyKind::Press,
             )],
+            crate::pty::input_consumer::InputSource::Unknown,
         )
         .expect("pane PageUp");
         assert_eq!(
@@ -5608,6 +5645,7 @@ fn client_plain_page_keys_scroll_shell_transcript_by_pane_height() {
                 crossterm::event::KeyModifiers::empty(),
                 crate::protocol::ClientKeyKind::Release,
             )],
+            crate::pty::input_consumer::InputSource::Unknown,
         )
         .expect("pane PageUp release");
         assert_eq!(
@@ -5625,6 +5663,7 @@ fn client_plain_page_keys_scroll_shell_transcript_by_pane_height() {
                 crossterm::event::KeyModifiers::empty(),
                 crate::protocol::ClientKeyKind::Press,
             )],
+            crate::pty::input_consumer::InputSource::Unknown,
         )
         .expect("pane PageDown");
         assert_eq!(
@@ -5648,6 +5687,7 @@ fn client_page_keys_forward_when_modified_or_owned_by_application() {
                 crossterm::event::KeyModifiers::CONTROL,
                 crate::protocol::ClientKeyKind::Press,
             )],
+            crate::pty::input_consumer::InputSource::Unknown,
         )
         .expect("modified pane PageUp");
         assert!(
@@ -5671,6 +5711,7 @@ fn client_page_keys_forward_when_modified_or_owned_by_application() {
                 crossterm::event::KeyModifiers::empty(),
                 crate::protocol::ClientKeyKind::Press,
             )],
+            crate::pty::input_consumer::InputSource::Unknown,
         )
         .expect("application PageUp");
         assert_eq!(
@@ -5697,6 +5738,7 @@ fn client_popup_plain_page_key_remains_popup_input() {
                 crossterm::event::KeyModifiers::empty(),
                 crate::protocol::ClientKeyKind::Press,
             )],
+            crate::pty::input_consumer::InputSource::Unknown,
         )
         .expect("popup PageUp");
         assert_eq!(
@@ -5716,8 +5758,12 @@ fn client_popup_plain_page_key_remains_popup_input() {
 #[test]
 fn terminal_attach_paste_uses_plain_text_when_runtime_did_not_enable_brackets() {
     with_terminal_attach_runtime(b"", 0, |runtime, input_rx| {
-        apply_terminal_attach_input(runtime, b"\x1b[200~line one\nline two\x1b[201~".to_vec())
-            .expect("attach paste");
+        apply_terminal_attach_input(
+            runtime,
+            b"\x1b[200~line one\nline two\x1b[201~".to_vec(),
+            crate::pty::input_consumer::InputSource::Unknown,
+        )
+        .expect("attach paste");
 
         assert_eq!(
             input_rx.try_recv().expect("forwarded paste"),
@@ -5733,8 +5779,12 @@ fn terminal_attach_paste_uses_plain_text_when_runtime_did_not_enable_brackets() 
 #[test]
 fn terminal_attach_paste_preserves_brackets_when_runtime_enabled_them() {
     with_terminal_attach_runtime(b"\x1b[?2004h", 0, |runtime, input_rx| {
-        apply_terminal_attach_input(runtime, b"\x1b[200~line one\nline two\x1b[201~".to_vec())
-            .expect("attach paste");
+        apply_terminal_attach_input(
+            runtime,
+            b"\x1b[200~line one\nline two\x1b[201~".to_vec(),
+            crate::pty::input_consumer::InputSource::Unknown,
+        )
+        .expect("attach paste");
 
         assert_eq!(
             input_rx.try_recv().expect("forwarded paste"),

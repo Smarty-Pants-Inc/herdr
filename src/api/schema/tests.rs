@@ -46,6 +46,78 @@ fn protocol_schema_document() -> serde_json::Value {
 }
 
 #[test]
+fn input_consumer_local_methods_are_registered_and_not_endpoint_methods() {
+    for (name, params) in [
+        (
+            "pane.input_consumer.enroll",
+            serde_json::json!({"pane_id":"p1"}),
+        ),
+        (
+            "pane.input_consumer.cut",
+            serde_json::json!({"epoch":"e", "epoch_key":"k", "seq":1, "token":"t", "cut":2, "digest":"d", "kind":"submit"}),
+        ),
+        (
+            "pane.input_consumer.release",
+            serde_json::json!({"epoch":"e", "epoch_key":"k"}),
+        ),
+    ] {
+        let value = serde_json::json!({"id":"consumer", "method":name, "params":params});
+        let request: Request =
+            serde_json::from_value(value.clone()).expect("local consumer method must decode");
+        assert_eq!(crate::api::api_method_name(&request.method), name);
+        assert!(!crate::api::request_changes_ui(&request));
+        assert!(!crate::server::client_commands::supports_client_shell_method_name(name));
+        assert_eq!(serde_json::to_value(request).unwrap(), value);
+    }
+}
+
+#[test]
+fn input_consumer_params_require_capabilities_and_exclusive_end_counts() {
+    let params = serde_json::json!({
+        "epoch": "epoch", "epoch_key": "key", "seq": 1, "token": "token",
+        "cut": 2, "digest": "digest", "kind": "submit"
+    });
+    let cut: PaneInputConsumerCutParams = serde_json::from_value(params.clone()).unwrap();
+    assert_eq!(cut.cut, 2); // a\r is two post-marker bytes, not byte index 1.
+    assert_eq!(cut.kind, InputConsumerCutKind::Submit);
+    assert_eq!(serde_json::to_value(&cut).unwrap(), params);
+    for field in [
+        "epoch",
+        "epoch_key",
+        "seq",
+        "token",
+        "cut",
+        "digest",
+        "kind",
+    ] {
+        let mut missing = params.clone();
+        missing.as_object_mut().unwrap().remove(field);
+        assert!(serde_json::from_value::<PaneInputConsumerCutParams>(missing).is_err());
+    }
+    let mut attributed = params.clone();
+    attributed["pane_id"] = "p1".into();
+    assert!(serde_json::from_value::<PaneInputConsumerCutParams>(attributed).is_err());
+    let mut discard = params;
+    discard["kind"] = "discard".into();
+    assert_eq!(
+        serde_json::from_value::<PaneInputConsumerCutParams>(discard.clone())
+            .unwrap()
+            .kind,
+        InputConsumerCutKind::Discard
+    );
+    discard["kind"] = "keyboard".into();
+    assert!(serde_json::from_value::<PaneInputConsumerCutParams>(discard).is_err());
+    assert!(serde_json::from_value::<PaneInputConsumerReleaseParams>(
+        serde_json::json!({"epoch": "e"})
+    )
+    .is_err());
+    assert!(serde_json::from_value::<PaneInputConsumerReleaseParams>(
+        serde_json::json!({"epoch": "e", "epoch_key": "k", "pane_id": "p1"})
+    )
+    .is_err());
+}
+
+#[test]
 fn resume_report_cross_pane_opt_in_defaults_false() {
     for method in ["pane.report_agent", "pane.report_agent_session"] {
         let mut value = serde_json::json!({
@@ -563,6 +635,7 @@ fn old_server_capabilities_do_not_advertise_expected_terminal_guard() {
     let caps: ServerCapabilities =
         serde_json::from_value(serde_json::json!({"live_handoff": false})).unwrap();
     assert!(!caps.expected_terminal_guard);
+    assert!(!caps.input_consumer);
 }
 
 #[test]
@@ -904,6 +977,7 @@ fn success_response_round_trips() {
                 ssh_agent_registration: false,
                 guarded_live_handoff: true,
                 expected_terminal_guard: true,
+                input_consumer: false,
             }),
         },
     };
