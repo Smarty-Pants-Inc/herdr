@@ -443,12 +443,17 @@ impl App {
     }
 
     pub(crate) fn open_workspace_idx_for_checkout(&self, checkout_path: &Path) -> Option<usize> {
-        let canonical_checkout = crate::worktree::canonical_or_original(checkout_path);
+        // A create checks before Git makes the checkout: canonicalize its
+        // existing ancestor so an aliased spelling still finds its workspace.
+        let canonical_checkout = crate::worktree::canonical_or_ancestor(checkout_path);
         let checkout_key = canonical_checkout.display().to_string();
+        let original_key = crate::worktree::canonical_or_original(checkout_path)
+            .display()
+            .to_string();
         self.state.workspaces.iter().position(|ws| {
             if let Some(space) = ws.worktree_space() {
                 // Explicit checkout provenance must not be overridden by shell navigation.
-                return crate::worktree::canonical_or_original(&space.checkout_path)
+                return crate::worktree::canonical_or_ancestor(&space.checkout_path)
                     == canonical_checkout;
             }
 
@@ -457,17 +462,16 @@ impl App {
                     .as_deref()
                     .and_then(crate::workspace::git_space_metadata)
             });
-            if git_space
-                .as_ref()
-                .is_some_and(|metadata| metadata.checkout_key == checkout_key)
-            {
+            if git_space.as_ref().is_some_and(|metadata| {
+                metadata.checkout_key == checkout_key || metadata.checkout_key == original_key
+            }) {
                 return true;
             }
 
             ws.resolved_identity_cwd_from(&self.state.terminals, &self.terminal_runtimes)
                 .as_deref()
                 .is_some_and(|cwd| {
-                    crate::worktree::canonical_or_original(cwd) == canonical_checkout
+                    crate::worktree::canonical_or_ancestor(cwd) == canonical_checkout
                 })
         })
     }
@@ -1080,9 +1084,11 @@ mod tests {
                 label: None,
                 focus: false,
                 allow_project_change: false,
+                branch: "feature".into(),
+                trust_repository: false,
                 respond_to,
             }),
-            result: Ok(()),
+            result: Ok(None),
         });
 
         let response = response_rx

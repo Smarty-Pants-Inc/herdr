@@ -154,7 +154,7 @@ impl App {
                 &branch,
             ),
         };
-        let checkout_key = crate::worktree::canonical_or_original(&checkout_path);
+        let checkout_key = crate::worktree::canonical_or_ancestor(&checkout_path);
         if self
             .pending_api_worktree_creates
             .contains_key(&checkout_key)
@@ -215,6 +215,8 @@ impl App {
             label: params.label,
             focus: params.focus,
             allow_project_change,
+            branch: branch.clone(),
+            trust_repository: params.trust_repository,
             respond_to,
         };
         let path = checkout_path;
@@ -312,7 +314,7 @@ impl App {
         }
 
         let workspace_internal_id = self.state.workspaces[ws_idx].id.clone();
-        let checkout_key = crate::worktree::canonical_or_original(&space.checkout_path);
+        let checkout_key = crate::worktree::canonical_or_ancestor(&space.checkout_path);
         if self
             .pending_api_worktree_removes
             .contains_key(&workspace_internal_id)
@@ -421,13 +423,16 @@ impl App {
         }
         self.pending_api_worktree_creates.remove(&checkout_key);
 
-        if let Err(err) = result.result {
-            Self::send_api_response(
-                api.respond_to,
-                encode_error(api.id, "worktree_create_failed", err),
-            );
-            return;
-        }
+        let created_commit = match result.result {
+            Ok(created_commit) => created_commit,
+            Err(err) => {
+                Self::send_api_response(
+                    api.respond_to,
+                    encode_error(api.id, "worktree_create_failed", err),
+                );
+                return;
+            }
+        };
 
         let source_workspace_idx = self.api_create_source_workspace_idx(&api);
         let mut source = WorktreeSource {
@@ -447,6 +452,45 @@ impl App {
         ) {
             Ok(changes) => changes,
             Err(message) => {
+                // Topology changed while Git ran. Undo this operation's checkout
+                // and branch so an orphan cannot block a retry. ponytail: run
+                // on the event loop (two Git calls on a rare path) so no other
+                // operation can claim the checkout between refusal and rollback.
+                // A workspace already using the checkout keeps it.
+                let rollback = if already_open.is_some() {
+                    Err(crate::worktree::WorktreeRollbackFailure::CheckoutKept(
+                        "a workspace already uses it".to_string(),
+                    ))
+                } else {
+                    crate::worktree::rollback_worktree_add(
+                        &source.source_checkout_path,
+                        &result.path,
+                        &api.branch,
+                        created_commit.as_deref(),
+                        api.trust_repository,
+                    )
+                };
+                let message = match rollback {
+                    Ok(()) => message,
+                    // A create retry would fail on the kept path: point to open.
+                    Err(crate::worktree::WorktreeRollbackFailure::CheckoutKept(reason)) => {
+                        format!(
+                            "{}\nthe created worktree {} was kept ({reason}); open it with \
+                             `herdr worktree open --allow-project-change`",
+                            message.replace(
+                                "worktree.create_project_checked",
+                                "worktree.open_project_checked"
+                            ),
+                            result.path.display()
+                        )
+                    }
+                    Err(crate::worktree::WorktreeRollbackFailure::BranchKept(err)) => format!(
+                        "{message}\nthe created worktree {} was removed, but branch {} was \
+                         kept ({err}); a create retry reuses it",
+                        result.path.display(),
+                        api.branch
+                    ),
+                };
                 Self::send_api_response(
                     api.respond_to,
                     encode_error(api.id, "project_change_refused", message),

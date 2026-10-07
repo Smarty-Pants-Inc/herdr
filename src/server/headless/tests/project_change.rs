@@ -24,6 +24,7 @@ fn project_server() -> HeadlessServer {
 struct WorktreeRepinFixture {
     server: HeadlessServer,
     directory: std::path::PathBuf,
+    alias: std::path::PathBuf,
     repo: std::path::PathBuf,
     checkout: std::path::PathBuf,
     old_project: std::path::PathBuf,
@@ -51,8 +52,20 @@ fn worktree_repin_fixture(create: bool, target: bool, unchanged: bool) -> Worktr
             .unwrap()
             .as_nanos()
     ));
-    let repo = directory.join("repo");
-    let checkout = directory.join("checkout");
+    std::fs::create_dir_all(directory.join("real")).unwrap();
+    // Windows CI spells temp_dir with an 8.3 alias (RUNNER~1) while canonical
+    // paths are verbatim. Give Unix the same alias class with a symlink so the
+    // assertions below must compare canonical paths on every platform.
+    #[cfg(unix)]
+    let alias = {
+        let alias = directory.join("alias");
+        std::os::unix::fs::symlink(directory.join("real"), &alias).unwrap();
+        alias
+    };
+    #[cfg(not(unix))]
+    let alias = directory.join("real");
+    let repo = alias.join("repo");
+    let checkout = alias.join("checkout");
     std::fs::create_dir_all(&repo).unwrap();
     worktree_repin_git(&repo, &["init", "--quiet"]);
     worktree_repin_git(
@@ -94,9 +107,9 @@ fn worktree_repin_fixture(create: bool, target: bool, unchanged: bool) -> Worktr
         // A workspace may already track the checkout when create finishes.
         // Cached Git identity lets it be found independently of the Pi cwd.
         child.cached_git_space = Some(crate::workspace::GitSpaceMetadata {
-            checkout_key: crate::worktree::canonical_or_original(&checkout)
-                .display()
-                .to_string(),
+            // The create checkout is still absent: canonicalize its parent, as
+            // Git discovery would report the checkout once it exists.
+            checkout_key: canonical_path(&checkout).display().to_string(),
             repo_root: checkout.clone(),
             is_linked_worktree: true,
             ..space
@@ -116,7 +129,7 @@ fn worktree_repin_fixture(create: bool, target: bool, unchanged: bool) -> Worktr
             repo.clone()
         }
     } else {
-        directory.join("old-project")
+        alias.join("old-project")
     };
     // Create the unchanged target directory only for open. A create target must
     // remain absent so Git creates it through the actual worker.
@@ -142,6 +155,7 @@ fn worktree_repin_fixture(create: bool, target: bool, unchanged: bool) -> Worktr
     WorktreeRepinFixture {
         server,
         directory,
+        alias,
         repo,
         checkout,
         old_project,
@@ -149,6 +163,16 @@ fn worktree_repin_fixture(create: bool, target: bool, unchanged: bool) -> Worktr
         pane,
         session,
     }
+}
+
+fn canonical_path(path: &std::path::Path) -> std::path::PathBuf {
+    crate::worktree::canonical_or_ancestor(path)
+}
+
+/// Messages echo a path as given or as canonicalized; accept either spelling.
+fn mentions_path(text: &str, path: &std::path::Path) -> bool {
+    text.contains(&path.display().to_string())
+        || text.contains(&canonical_path(path).display().to_string())
 }
 
 fn worktree_repin_git(repo: &std::path::Path, args: &[&str]) {
@@ -219,14 +243,16 @@ async fn worktree_repin_request(
             if let Ok(response) = response_rx.try_recv() {
                 return decode_response(&response);
             }
-            let event = fixture
-                .server
-                .app
-                .event_rx
-                .recv()
-                .await
-                .expect("deferred worktree event");
-            fixture.server.handle_internal_event_with_forwarding(event);
+            // A refused create answers from its rollback thread, without an event.
+            if let Ok(event) = tokio::time::timeout(
+                Duration::from_millis(50),
+                fixture.server.app.event_rx.recv(),
+            )
+            .await
+            {
+                let event = event.expect("deferred worktree event");
+                fixture.server.handle_internal_event_with_forwarding(event);
+            }
         }
     })
     .await
@@ -269,7 +295,7 @@ async fn assert_worktree_repin(create: bool, target: bool, outcome: &str) {
     let combined_session = if outcome == "combined" {
         assert!(target);
         let source_pane = root(&fixture.server, 0, 0);
-        let source_project = fixture.directory.join("old-source-project");
+        let source_project = fixture.alias.join("old-source-project");
         std::fs::create_dir_all(&source_project).unwrap();
         cwd(&mut fixture.server, source_pane, &source_project);
         Some(session(
@@ -317,12 +343,23 @@ async fn assert_worktree_repin(create: bool, target: bool, outcome: &str) {
         .with_writer(move || LogWriter(writer.clone()))
         .finish();
     let guard = tracing::subscriber::set_default(subscriber);
-    let result = worktree_repin_request(
-        &mut fixture,
-        create,
-        (matches!(outcome, "allow" | "combined") || unchanged).then_some(true),
-    )
-    .await;
+    let result = if create && outcome == "refuse" {
+        // A create refused before any Git work answers at once, not as a
+        // completion refusal that must roll a checkout back.
+        let response_rx = worktree_repin_start(&mut fixture, create, None);
+        decode_response(
+            &response_rx
+                .try_recv()
+                .expect("refusal answers before the Git worker runs"),
+        )
+    } else {
+        worktree_repin_request(
+            &mut fixture,
+            create,
+            (matches!(outcome, "allow" | "combined") || unchanged).then_some(true),
+        )
+        .await
+    };
     if outcome == "refuse" {
         assert!(
             result.is_err(),
@@ -330,16 +367,18 @@ async fn assert_worktree_repin(create: bool, target: bool, outcome: &str) {
         );
         let error = result.unwrap_err();
         assert_eq!(error.error.code, "project_change_refused");
-        for text in [
-            old_pane.as_str(),
-            "Path",
-            fixture.session.as_str(),
-            fixture.old_project.to_str().unwrap(),
-            repinned.to_str().unwrap(),
-        ] {
+        for text in [old_pane.as_str(), "Path", fixture.session.as_str()] {
             assert!(
                 error.error.message.contains(text),
                 "missing {text}: {}",
+                error.error.message
+            );
+        }
+        for path in [&fixture.old_project, &repinned] {
+            assert!(
+                mentions_path(&error.error.message, path),
+                "missing {}: {}",
+                path.display(),
                 error.error.message
             );
         }
@@ -416,11 +455,13 @@ async fn assert_worktree_repin(create: bool, target: bool, outcome: &str) {
             "existing workspace reused"
         );
         assert_eq!(
-            fixture.server.app.state.workspaces[fixture.workspace]
-                .worktree_space()
-                .unwrap()
-                .checkout_path,
-            crate::worktree::canonical_or_original(&repinned)
+            canonical_path(
+                &fixture.server.app.state.workspaces[fixture.workspace]
+                    .worktree_space()
+                    .unwrap()
+                    .checkout_path
+            ),
+            canonical_path(&repinned)
         );
     }
     if outcome == "combined" {
@@ -448,14 +489,15 @@ async fn assert_worktree_repin(create: bool, target: bool, outcome: &str) {
         "{logs}"
     );
     if expected == 1 {
-        for text in [
-            old_pane.as_str(),
-            "Path",
-            fixture.session.as_str(),
-            fixture.old_project.to_str().unwrap(),
-            repinned.to_str().unwrap(),
-        ] {
+        for text in [old_pane.as_str(), "Path", fixture.session.as_str()] {
             assert!(audits[0].contains(text), "missing {text}: {logs}");
+        }
+        for path in [&fixture.old_project, &repinned] {
+            assert!(
+                mentions_path(audits[0], path),
+                "missing {}: {logs}",
+                path.display()
+            );
         }
     }
     if let Some(combined_session) = combined_session {
@@ -464,7 +506,7 @@ async fn assert_worktree_repin(create: bool, target: bool, outcome: &str) {
             "source session absent: {logs}"
         );
         assert!(
-            audits[0].contains(fixture.repo.to_str().unwrap()),
+            mentions_path(audits[0], &fixture.repo),
             "source target absent: {logs}"
         );
         assert_eq!(
@@ -633,8 +675,41 @@ worktree_repin_tests!(
 #[tokio::test]
 async fn project_change_worktree_4551_create_completion_rechecks_topology_drift() {
     for target_drift in [false, true] {
-        for allow in [false, true] {
+        // A refusal rolls back only what this create made: a branch that
+        // existed before the request must survive (P2 on 16224428). A checkout
+        // that gained files while Git ran is kept, and the hint says open.
+        // An ignored file counts: a clean `git worktree remove` deletes it.
+        // A post-checkout hook commit on the new branch is not ours: the
+        // checkout goes, the branch stays.
+        for (allow, existing_branch, new_file, hook) in [
+            (false, false, None, false),
+            (false, true, None, false),
+            (false, false, Some("agent-notes.txt"), false),
+            (false, false, Some("local.env"), false),
+            (false, false, None, true),
+            (true, false, None, false),
+        ] {
             let mut fixture = worktree_repin_fixture(true, false, true);
+            if hook {
+                let hook_path = fixture.repo.join(".git/hooks/post-checkout");
+                std::fs::create_dir_all(hook_path.parent().unwrap()).unwrap();
+                std::fs::write(
+                    &hook_path,
+                    "#!/bin/sh\ngit -c user.name=Hook -c user.email=hook@example.invalid \
+                     commit --quiet --allow-empty -m hook\n",
+                )
+                .unwrap();
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&hook_path, std::fs::Permissions::from_mode(0o755))
+                        .unwrap();
+                }
+            }
+            let branch_before = existing_branch.then(|| {
+                worktree_repin_git(&fixture.repo, &["branch", "repin"]);
+                worktree_repin_rev(&fixture.repo, "refs/heads/repin").unwrap()
+            });
             // Initial source project equals its proposed pin; no rejection at
             // start. Delay consuming the actual Git completion, not the worker.
             let response_rx = worktree_repin_start(&mut fixture, true, allow.then_some(true));
@@ -651,6 +726,13 @@ async fn project_change_worktree_4551_create_completion_rechecks_topology_drift(
                 fixture.checkout.exists(),
                 "Git already created the checkout"
             );
+            std::fs::write(fixture.repo.join(".git/info/exclude"), "local.env\n").unwrap();
+            let kept_file = fixture.checkout.join(new_file.unwrap_or("absent"));
+            if new_file.is_some() {
+                std::fs::write(&kept_file, "written while Git ran").unwrap();
+            }
+            // A workspace that arrived on the checkout keeps it, too.
+            let kept = !allow && (new_file.is_some() || target_drift);
             let drift_workspace = if target_drift {
                 let mut workspace = crate::workspace::Workspace::test_new("arrived-during-Git");
                 workspace.identity_cwd = fixture.checkout.clone();
@@ -663,7 +745,7 @@ async fn project_change_worktree_4551_create_completion_rechecks_topology_drift(
                 0
             };
             let pane = root(&fixture.server, drift_workspace, 0);
-            let drift_project = fixture.directory.join("async-drift-project");
+            let drift_project = fixture.alias.join("async-drift-project");
             std::fs::create_dir_all(&drift_project).unwrap();
             cwd(&mut fixture.server, pane, &drift_project);
             let drift_session = session(
@@ -688,7 +770,12 @@ async fn project_change_worktree_4551_create_completion_rechecks_topology_drift(
                 fixture.server.handle_internal_event_with_forwarding(event);
             });
             let response =
-                decode_response(&response_rx.recv_timeout(Duration::from_secs(2)).unwrap());
+                decode_response(&response_rx.recv_timeout(Duration::from_secs(30)).unwrap());
+            let refusal = response
+                .as_ref()
+                .err()
+                .map(|error| error.error.message.clone())
+                .unwrap_or_default();
             if allow {
                 assert!(matches!(
                     response.unwrap(),
@@ -699,10 +786,11 @@ async fn project_change_worktree_4551_create_completion_rechecks_topology_drift(
                 let error = response.unwrap_err();
                 assert_eq!(error.error.code, "project_change_refused");
                 assert!(error.error.message.contains(&drift_session));
-                assert!(error
-                    .error
-                    .message
-                    .contains(drift_project.to_str().unwrap()));
+                assert!(
+                    mentions_path(&error.error.message, &drift_project),
+                    "{}",
+                    error.error.message
+                );
                 assert_eq!(fingerprint(&fixture.server), before);
                 assert_eq!(fixture.server.app.state.workspaces.len(), count);
                 assert!(fixture
@@ -712,6 +800,77 @@ async fn project_change_worktree_4551_create_completion_rechecks_topology_drift(
                     .workspaces
                     .iter()
                     .all(|ws| ws.worktree_space().is_none()));
+                let list = std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&fixture.repo)
+                    .args(["worktree", "list", "--porcelain"])
+                    .output()
+                    .unwrap();
+                let list = String::from_utf8_lossy(&list.stdout).replace('\\', "/");
+                if kept {
+                    // Never forced: the file survives, and the hint must not
+                    // send the user to a create that fails on the existing path.
+                    assert_eq!(kept_file.exists(), new_file.is_some());
+                    assert!(fixture.checkout.exists());
+                    assert_eq!(list.matches("worktree ").count(), 2, "{list}");
+                    assert!(worktree_repin_rev(&fixture.repo, "refs/heads/repin").is_some());
+                    for text in [
+                        "was kept",
+                        "herdr worktree open --allow-project-change",
+                        "worktree.open_project_checked",
+                    ] {
+                        assert!(
+                            error.error.message.contains(text),
+                            "{}",
+                            error.error.message
+                        );
+                    }
+                    assert!(
+                        !error.error.message.contains("create_project_checked"),
+                        "{}",
+                        error.error.message
+                    );
+                } else {
+                    assert!(
+                        error
+                            .error
+                            .message
+                            .contains("worktree.create_project_checked"),
+                        "{}",
+                        error.error.message
+                    );
+                }
+            }
+            if !allow && !kept {
+                // Git and filesystem state are back to before the request.
+                assert!(!fixture.checkout.exists(), "refused checkout removed");
+                let list = std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&fixture.repo)
+                    .args(["worktree", "list", "--porcelain"])
+                    .output()
+                    .unwrap();
+                let list = String::from_utf8_lossy(&list.stdout).replace('\\', "/");
+                assert_eq!(
+                    list.matches("worktree ").count(),
+                    1,
+                    "only the main checkout remains: {list}"
+                );
+                if hook {
+                    let hook_tip = worktree_repin_rev(&fixture.repo, "refs/heads/repin");
+                    assert!(hook_tip.is_some(), "a hook commit is never deleted");
+                    assert_ne!(hook_tip, worktree_repin_rev(&fixture.repo, "HEAD"));
+                    assert!(
+                        refusal.contains("was removed, but branch repin was kept"),
+                        "{refusal}"
+                    );
+                } else {
+                    assert_eq!(
+                        worktree_repin_rev(&fixture.repo, "refs/heads/repin"),
+                        branch_before,
+                        "a branch this create made is deleted; a pre-existing one is untouched"
+                    );
+                }
             }
             let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
             assert_eq!(
@@ -735,8 +894,44 @@ async fn project_change_worktree_4551_create_completion_rechecks_topology_drift(
             assert!(fixture.server.app.terminal_runtimes.get(terminal).is_some());
             assert!(fixture.server.app.pending_api_worktree_creates.is_empty());
             fixture.server.app.state.assert_invariants_for_test();
+            if kept {
+                // The hinted open succeeds on the kept checkout.
+                let retry = worktree_repin_request(&mut fixture, false, Some(true)).await;
+                assert!(
+                    matches!(retry, Ok(ResponseResult::WorktreeOpened { .. })),
+                    "hinted open of the kept checkout: {retry:?}"
+                );
+                assert_eq!(kept_file.exists(), new_file.is_some());
+            } else if !allow {
+                // Nothing orphaned blocks a retry of the same create.
+                let retry = worktree_repin_request(&mut fixture, true, Some(true)).await;
+                assert!(
+                    matches!(retry, Ok(ResponseResult::WorktreeCreated { .. })),
+                    "retry after rollback: {retry:?}"
+                );
+                assert!(fixture.checkout.exists());
+                if let Some(branch_before) = &branch_before {
+                    assert_eq!(
+                        worktree_repin_rev(&fixture.repo, "refs/heads/repin").as_ref(),
+                        Some(branch_before)
+                    );
+                }
+            }
         }
     }
+}
+
+fn worktree_repin_rev(repo: &std::path::Path, reference: &str) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "--verify", "--quiet", reference])
+        .output()
+        .unwrap();
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 fn public_method(

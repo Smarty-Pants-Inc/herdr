@@ -23,6 +23,8 @@ pub struct ApiWorktreeAddRequest {
     pub label: Option<String>,
     pub focus: bool,
     pub allow_project_change: bool,
+    pub branch: String,
+    pub trust_repository: bool,
     pub respond_to: std::sync::mpsc::Sender<String>,
 }
 
@@ -30,7 +32,8 @@ pub struct ApiWorktreeAddRequest {
 pub struct WorktreeAddResult {
     pub path: std::path::PathBuf,
     pub api_request: Option<ApiWorktreeAddRequest>,
-    pub result: Result<(), String>,
+    /// `Ok(Some(commit))` when the add created its branch at `commit`.
+    pub result: Result<Option<String>, String>,
 }
 
 #[derive(Debug)]

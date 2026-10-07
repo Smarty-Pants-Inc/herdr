@@ -151,6 +151,21 @@ pub(crate) fn canonical_or_original(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
+/// Like `canonical_or_original`, but a path that does not exist yet (a checkout
+/// before `git worktree add`) gets its nearest existing ancestor canonicalized,
+/// so an alias spelling (symlink, Windows 8.3 name) matches the created path.
+pub(crate) fn canonical_or_ancestor(path: &Path) -> PathBuf {
+    if let Ok(canonical) = std::fs::canonicalize(path) {
+        return canonical;
+    }
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) if !parent.as_os_str().is_empty() => {
+            canonical_or_ancestor(parent).join(name)
+        }
+        _ => path.to_path_buf(),
+    }
+}
+
 fn repository_git_command(repo_root: &Path, trust_repository: bool) -> std::process::Command {
     let mut command = crate::noninteractive_process::command("git");
     command.args(repository_git_args(repo_root, trust_repository));
@@ -306,19 +321,99 @@ fn local_branch_exists(
     }
 }
 
+/// Returns the starting commit of the branch when this call created it, so a
+/// caller that refuses the result can delete only what it made.
 pub(crate) fn run_worktree_add_command(
     repo_root: &Path,
     path: &Path,
     branch: &str,
     base: &str,
     trust_repository: bool,
-) -> Result<(), String> {
-    let command = if local_branch_exists(repo_root, branch, trust_repository)? {
-        build_worktree_add_existing_branch_command(repo_root, path, branch, trust_repository)
-    } else {
-        build_worktree_add_new_branch_command(repo_root, path, branch, base, trust_repository)
+) -> Result<Option<String>, String> {
+    if local_branch_exists(repo_root, branch, trust_repository)? {
+        let command =
+            build_worktree_add_existing_branch_command(repo_root, path, branch, trust_repository);
+        return run_worktree_command(&command).map(|()| None);
+    }
+    // Resolve the start before the add: the branch tip afterwards may already
+    // carry commits from a hook or another writer, which are not ours.
+    let start = repository_git_command(repo_root, trust_repository)
+        .args(["rev-parse", "--verify", "--quiet"])
+        .arg(format!("{base}^{{commit}}"))
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string());
+    run_worktree_command(&build_worktree_add_new_branch_command(
+        repo_root,
+        path,
+        branch,
+        base,
+        trust_repository,
+    ))?;
+    Ok(start)
+}
+
+/// Why `rollback_worktree_add` could not undo everything.
+#[derive(Debug)]
+pub(crate) enum WorktreeRollbackFailure {
+    /// Nothing was removed; the checkout and its branch remain.
+    CheckoutKept(String),
+    /// The checkout was removed; the branch this add created remains.
+    BranchKept(String),
+}
+
+/// Undo a refused `run_worktree_add_command`: remove the checkout it created
+/// only while it holds no untracked or ignored files (never forced), and delete
+/// the branch only when this add created it and it still points at its start.
+pub(crate) fn rollback_worktree_add(
+    repo_root: &Path,
+    path: &Path,
+    branch: &str,
+    created_start: Option<&str>,
+    trust_repository: bool,
+) -> Result<(), WorktreeRollbackFailure> {
+    use WorktreeRollbackFailure::{BranchKept, CheckoutKept};
+    // A clean `git worktree remove` still deletes ignored files (.env, builds).
+    let status = repository_git_command(path, trust_repository)
+        .args([
+            "status",
+            "--porcelain",
+            "--ignored",
+            "--untracked-files=all",
+        ])
+        .output()
+        .map_err(|err| CheckoutKept(err.to_string()))?;
+    if !status.status.success() {
+        return Err(CheckoutKept(
+            String::from_utf8_lossy(&status.stderr).trim().to_string(),
+        ));
+    }
+    if !status.stdout.is_empty() {
+        return Err(CheckoutKept("it has new files".to_string()));
+    }
+    run_worktree_command(&build_worktree_remove_command(
+        repo_root,
+        path,
+        false,
+        trust_repository,
+    ))
+    .map_err(CheckoutKept)?;
+    let Some(start) = created_start else {
+        return Ok(());
     };
-    run_worktree_command(&command)
+    let mut args = repository_git_args(repo_root, trust_repository);
+    args.extend([
+        "update-ref".to_string(),
+        "-d".to_string(),
+        format!("refs/heads/{branch}"),
+        start.to_string(),
+    ]);
+    run_worktree_command(&WorktreeCommand {
+        program: "git".to_string(),
+        args,
+    })
+    .map_err(BranchKept)
 }
 
 pub(crate) fn run_worktree_command(command: &WorktreeCommand) -> Result<(), String> {
