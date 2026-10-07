@@ -102,8 +102,10 @@ jobs:
         if: github.event_name == 'push'
         run: python3 scripts/conventional_commits.py --range "${{ github.event.before }}..${{ github.event.after }}"
 
+      # Queue drafts carry Mergify's own merge commits; each PR's commits were
+      # already checked in that PR's own CI.
       - name: Validate PR commit subjects
-        if: github.event_name == 'pull_request'
+        if: ${{ github.event_name == 'pull_request' && (github.event.pull_request.user.id != 37929162 || startsWith(github.event.pull_request.head.ref, 'mergify/merge-queue/') == false) }}
         env:
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}

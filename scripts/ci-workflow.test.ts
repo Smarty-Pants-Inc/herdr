@@ -98,10 +98,13 @@ describe("conventional commit ranges check branch history before landing", () =>
     }
   }
 
-  test("PR range uses event base/head SHAs for all PRs, with full checkout history", () => {
+  test("PR range uses event base/head SHAs for non-queue PRs, with full checkout history", () => {
     const check = conventional.steps.find((candidate) => candidate.name === "Validate PR commit subjects");
     expect(check).toBeDefined();
-    expect(check!.if).toBe("github.event_name == 'pull_request'");
+    // Mergify's queue drafts carry its own "Merge of #N" commits; each PR's commits
+    // were already checked in that PR's own CI (queue draft #190 failed on them).
+    const queueExempt = "${{ github.event_name == 'pull_request' && (github.event.pull_request.user.id != 37929162 || startsWith(github.event.pull_request.head.ref, 'mergify/merge-queue/') == false) }}";
+    expect(check!.if).toBe(queueExempt);
     expect(check!.env).toEqual({
       PR_BASE_SHA: "${{ github.event.pull_request.base.sha }}",
       PR_HEAD_SHA: "${{ github.event.pull_request.head.sha }}",
@@ -112,7 +115,7 @@ describe("conventional commit ranges check branch history before landing", () =>
     expect(push.if).toBe("github.event_name == 'push'");
     expect(push.run).toBe('python3 scripts/conventional_commits.py --range "${{ github.event.before }}..${{ github.event.after }}"');
     const title = conventional.steps.find((candidate) => candidate.name === "Validate PR title")!;
-    expect(title.if).toBe("${{ github.event_name == 'pull_request' && (github.event.pull_request.user.id != 37929162 || startsWith(github.event.pull_request.head.ref, 'mergify/merge-queue/') == false) }}");
+    expect(title.if).toBe(queueExempt);
     expect(title.run).toBe('python3 scripts/conventional_commits.py "$PR_TITLE"');
   });
 
