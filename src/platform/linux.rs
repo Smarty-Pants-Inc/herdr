@@ -33,6 +33,7 @@ mod config_file_tests;
 
 pub(super) mod client_identity;
 pub(super) mod input_consumer;
+pub(super) mod server_key;
 
 mod shutdown;
 pub(crate) use shutdown::monitor_host_shutdown;

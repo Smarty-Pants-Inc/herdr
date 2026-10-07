@@ -1361,6 +1361,7 @@ dependencies = [
  "portable-pty",
  "ratatui",
  "regex",
+ "ring",
  "schemars",
  "serde",
  "serde_ignored",

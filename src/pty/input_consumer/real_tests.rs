@@ -210,6 +210,7 @@ fn input_consumer_real_pty_enroll_waits_for_active_delayed_submission() {
             epoch,
             epoch_key,
             nonce,
+            ..
         } => (epoch, epoch_key, nonce),
         _ => panic!("not enrolled"),
     };

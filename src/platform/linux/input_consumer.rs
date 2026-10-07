@@ -164,6 +164,20 @@ fn full_alive(fd: RawFd, s: &InputConsumerSnapshot) -> bool {
 pub(crate) fn unchanged(fd: RawFd, s: &InputConsumerSnapshot) -> bool {
     full_alive(fd, s) && semantic_termios(fd).ok().as_ref() == Some(&s.termios)
 }
+pub(crate) fn pane_tty_identity(master: RawFd) -> io::Result<(u64, u64)> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::os::unix::fs::MetadataExt;
+    let flags = libc::O_RDONLY | libc::O_NOCTTY | libc::O_CLOEXEC | libc::O_NONBLOCK;
+    // SAFETY: TIOCGPTPEER takes open flags and returns a new slave descriptor.
+    let raw = unsafe { libc::ioctl(master, libc::TIOCGPTPEER, flags) };
+    if raw < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the ioctl returned a new descriptor that nothing else owns.
+    let slave = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(raw) });
+    let meta = slave.metadata()?;
+    Ok((meta.dev(), meta.ino()))
+}
 pub(crate) fn random_bytes(bytes: &mut [u8]) -> io::Result<()> {
     use std::io::Read;
     std::fs::File::open("/dev/urandom")?.read_exact(bytes)

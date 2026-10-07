@@ -50,7 +50,7 @@ fn input_consumer_local_methods_are_registered_and_not_endpoint_methods() {
     for (name, params) in [
         (
             "pane.input_consumer.enroll",
-            serde_json::json!({"pane_id":"p1"}),
+            serde_json::json!({"pane_id":"p1", "challenge":"00"}),
         ),
         (
             "pane.input_consumer.cut",

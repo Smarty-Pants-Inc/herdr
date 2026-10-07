@@ -151,7 +151,8 @@ fn default_capabilities() -> Option<ServerCapabilities> {
         ssh_agent_registration: false,
         guarded_live_handoff: crate::platform::capabilities().live_handoff,
         expected_terminal_guard: true,
-        input_consumer: crate::platform::input_consumer_supported(),
+        input_consumer: crate::platform::input_consumer_supported()
+            && crate::platform::server_key_available(),
     })
 }
 
@@ -1391,9 +1392,12 @@ mod tests {
     use interprocess::local_socket::traits::Listener as _;
 
     #[test]
-    fn input_consumer_capability_is_advertised_only_on_linux() {
+    fn input_consumer_capability_requires_linux_and_the_server_key() {
         let caps = default_capabilities().expect("capabilities");
-        assert_eq!(caps.input_consumer, cfg!(target_os = "linux"));
+        assert_eq!(
+            caps.input_consumer,
+            cfg!(target_os = "linux") && crate::platform::server_key_available()
+        );
     }
     use std::collections::HashMap;
     use std::io::{BufRead, BufReader, Read};

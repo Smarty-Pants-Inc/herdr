@@ -511,6 +511,9 @@ fn finish_cli(outcome: io::Result<cli::CommandOutcome>) -> io::Result<()> {
 }
 
 fn main() -> io::Result<()> {
+    // Before anything reads config or the environment: the server takes its attestation
+    // key, and every mode drops a setgid group (smarty-dev#2636 r4 conditions 1-2).
+    platform::acquire_server_key(&std::env::args_os().collect::<Vec<_>>());
     let raw_args: Vec<String> = match args_as_utf8(std::env::args_os()) {
         Ok(args) => args,
         Err(err) => {

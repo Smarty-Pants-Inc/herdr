@@ -232,7 +232,7 @@ mod tests {
         assert_eq!(record["kind"], "submit");
         assert_eq!(
             record["result"],
-            serde_json::json!({"source":"client", "principal":null})
+            serde_json::json!({"result":"client", "principal":null})
         );
         assert_eq!(record.as_object().unwrap().len(), 7);
         for forbidden in ["raw", "epoch_key", "nonce", "text"] {

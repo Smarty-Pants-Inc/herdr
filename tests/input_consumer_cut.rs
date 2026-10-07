@@ -6,7 +6,7 @@ mod cut_support;
 pub mod support;
 #[path = "support/command.rs"]
 pub mod test_command;
-use cut_support::{classification, client_text, unknown, Fixture};
+use cut_support::{classification, client_text, request, unknown, Fixture};
 use serde_json::json;
 use std::thread;
 use std::time::Duration;
@@ -49,12 +49,12 @@ fn input_cut_client_token_joins_private_durable_log_and_retry_is_once() {
     let mut response = f.cut(json!({"token":token,"cut":input.len()}));
     // The child's _request is the actual RPC parameters, not a reconstructed
     // expected record. Keep the bearer capability out of assertion diagnostics.
+    assert_eq!(classification(&response), "client");
     let params = response
         .as_object_mut()
         .unwrap()
         .remove("_request")
         .unwrap();
-    assert_eq!(classification(&response), "client");
     assert_eq!(response["result"]["principal"], serde_json::Value::Null);
     assert_eq!(params["epoch"], enrollment["epoch"]);
     assert_eq!(params["token"], token);
@@ -71,7 +71,10 @@ fn input_cut_client_token_joins_private_durable_log_and_retry_is_once() {
     for field in ["epoch", "seq", "token", "cut", "digest", "kind"] {
         assert_eq!(record[field], params[field], "audit join field {field}");
     }
-    assert_eq!(record["result"], response["result"]);
+    // The log keeps the answer Pi verified, without its per-epoch MAC.
+    let mut answered = response["result"].clone();
+    answered.as_object_mut().unwrap().remove("mac");
+    assert_eq!(record["result"], answered);
     let metadata = std::fs::metadata(f.consumer_audit_path()).unwrap();
     assert!(metadata.is_file());
     assert_eq!(metadata.permissions().mode() & 0o7777, 0o600);
@@ -480,4 +483,52 @@ fn input_cut_host_appearance_reply_contains_no_reserved_introducer() {
     assert!(!f.bytes().windows(7).any(|w| w == b"\x1b_herdr"));
     // Appearance reports are not on the explicit neutral reply allow-list.
     unknown(&f.cut(json!({})));
+}
+
+#[test]
+fn input_cut_server_without_key_fails_closed_and_advertises_false() {
+    let mut f = Fixture::new_without_key();
+    let ping = request(&f.api, "ping", json!({}));
+    assert_eq!(
+        ping["result"]["capabilities"]["input_consumer"], false,
+        "{ping}"
+    );
+    let r = f.command(json!({"op":"enroll"}));
+    assert_eq!(r["error"]["code"], "server_key_unavailable", "{r}");
+    assert!(r.get("result").is_none(), "no unsigned fallback: {r}");
+}
+#[test]
+fn input_cut_keyed_server_advertises_and_rejects_malformed_challenge() {
+    let mut f = Fixture::new();
+    let ping = request(&f.api, "ping", json!({}));
+    assert_eq!(
+        ping["result"]["capabilities"]["input_consumer"], true,
+        "{ping}"
+    );
+    for challenge in ["", "AB", &"AB".repeat(32), &"0".repeat(63)] {
+        let r = f.command(json!({"op":"enroll","challenge":challenge}));
+        assert_eq!(r["error"]["code"], "invalid_params", "{challenge:?}: {r}");
+    }
+    // The counterpart: a well-formed challenge still enrolls and verifies.
+    f.enroll();
+}
+#[test]
+fn input_cut_pane_children_and_server_never_hold_another_group() {
+    // A child of the server must carry only the real gid (r4 condition 1). Without root the
+    // test binary cannot be setgid; this pins the observable outcome on every run.
+    let f = Fixture::new();
+    let gids = |pid: &str| -> Vec<String> {
+        std::fs::read_to_string(format!("/proc/{pid}/status"))
+            .unwrap()
+            .lines()
+            .find_map(|l| l.strip_prefix("Gid:"))
+            .unwrap()
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect()
+    };
+    let consumer = f.file("ready")["pid"].to_string();
+    let own = gids("self");
+    assert_eq!(gids(&consumer), own);
+    assert!(own.iter().all(|g| g == &own[0]), "{own:?}");
 }

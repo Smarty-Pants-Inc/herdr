@@ -107,7 +107,15 @@ fn enroll(actor: &crate::pty::actor::PtyIoActorHandle, peer: &Peer) -> (String, 
             epoch,
             epoch_key,
             nonce,
-        } => (epoch, epoch_key, nonce),
+            tty,
+        } => {
+            use std::os::unix::fs::MetadataExt;
+            // The consumer's own stdin is the slave the server signs for.
+            let own =
+                std::fs::metadata(format!("/proc/{}/fd/0", peer.identity.pid)).expect("peer stdin");
+            assert_eq!(tty, (own.dev(), own.ino()));
+            (epoch, epoch_key, nonce)
+        }
         ConsumerResponse::Refused { reason } => {
             panic!("real raw peer enrollment refused: {reason}")
         }

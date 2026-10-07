@@ -2745,12 +2745,17 @@
         "PaneInputConsumerEnrollParams": {
           "additionalProperties": false,
           "properties": {
+            "challenge": {
+              "description": "Fresh 256-bit consumer challenge as 64 lowercase hex characters; the\nanswer's Ed25519 `sig` covers it.",
+              "type": "string"
+            },
             "pane_id": {
               "type": "string"
             }
           },
           "required": [
-            "pane_id"
+            "pane_id",
+            "challenge"
           ],
           "type": "object"
         },

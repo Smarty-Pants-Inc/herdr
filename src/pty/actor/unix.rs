@@ -731,11 +731,15 @@ impl PtyIoActorRunner {
                             }
                         } else {
                             let mut entropy = [0u8; 80];
-                            match crate::platform::input_consumer_random(&mut entropy) {
-                                Err(_) => ConsumerResponse::Refused {
+                            let tty = crate::platform::pane_tty_identity(self.file.as_raw_fd());
+                            match (crate::platform::input_consumer_random(&mut entropy), tty) {
+                                (Err(_), _) => ConsumerResponse::Refused {
                                     reason: "entropy_unavailable".into(),
                                 },
-                                Ok(()) => {
+                                (_, Err(_)) => ConsumerResponse::Refused {
+                                    reason: "tty_unavailable".into(),
+                                },
+                                (Ok(()), Ok(tty)) => {
                                     fn hex(bytes: &[u8]) -> String {
                                         bytes.iter().map(|b| format!("{b:02x}")).collect()
                                     }
@@ -767,6 +771,7 @@ impl PtyIoActorRunner {
                                             epoch,
                                             epoch_key,
                                             nonce,
+                                            tty,
                                         },
                                     ));
                                     return;

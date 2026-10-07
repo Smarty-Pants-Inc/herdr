@@ -34,7 +34,7 @@ pub(crate) struct CutRequest {
     pub kind: CutKind,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "source", rename_all = "lowercase")]
+#[serde(tag = "result", rename_all = "lowercase")]
 pub(crate) enum CutResult {
     Client { principal: Option<Principal> },
     Api,
@@ -58,6 +58,8 @@ pub(crate) enum ConsumerResponse {
         epoch: String,
         epoch_key: String,
         nonce: String,
+        /// (st_dev, st_ino) of this pane's slave, from the actor's own master.
+        tty: (u64, u64),
     },
     Cut(CutResult),
     Released,
