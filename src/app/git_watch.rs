@@ -21,13 +21,16 @@ enum WatchTarget {
     Refs(PathBuf),
     Marker(PathBuf),
     ConfigFile { file: PathBuf, directory: PathBuf },
+    // A vanished HEAD of a previously discovered git dir; installed only while
+    // missing, so restoring it invalidates negative discovery.
+    Restore { file: PathBuf, directory: PathBuf },
 }
 
 impl WatchTarget {
     fn directory(&self) -> &Path {
         match self {
             Self::Metadata(path) | Self::Refs(path) | Self::Marker(path) => path,
-            Self::ConfigFile { directory, .. } => directory,
+            Self::ConfigFile { directory, .. } | Self::Restore { directory, .. } => directory,
         }
     }
 
@@ -42,7 +45,7 @@ impl WatchTarget {
 
     fn matches(&self, path: &Path) -> bool {
         let directory = self.directory();
-        if let Self::ConfigFile { file, .. } = self {
+        if let Self::ConfigFile { file, .. } | Self::Restore { file, .. } = self {
             // Parents are watched non-recursively so rename-over and creation
             // of a previously missing dependency are observed without HOME scans.
             return path == file || file.starts_with(path);
@@ -61,7 +64,7 @@ impl WatchTarget {
                 path.parent() == Some(directory)
                     && path.file_name().is_some_and(|name| name == ".git")
             }
-            Self::ConfigFile { .. } => false, // handled above
+            Self::ConfigFile { .. } | Self::Restore { .. } => false, // handled above
             Self::Metadata(_) => {
                 path.parent() == Some(directory)
                     && path.file_name().is_some_and(|name| {
@@ -96,7 +99,20 @@ fn relevant_event(event: &Event, targets: &[WatchTarget]) -> bool {
 
 fn structural_event(event: &Event, targets: &[WatchTarget]) -> bool {
     use notify::event::{CreateKind, ModifyKind, RemoveKind};
+    // Narrower than relevance: the missing file itself, or a missing component
+    // created beneath the watched ancestor. Directory-level notifications for
+    // unrelated children (e.g. `.git/index` while HEAD is absent) do not count.
+    let restored = !matches!(event.kind, EventKind::Access(_))
+        && event.paths.iter().any(|path| {
+            targets.iter().any(|target| match target {
+                WatchTarget::Restore { file, directory } => {
+                    path == file || (file.starts_with(path) && !directory.starts_with(path))
+                }
+                _ => false,
+            })
+        });
     event.need_rescan()
+        || restored
         || (matches!(
             event.kind,
             EventKind::Create(CreateKind::Any)
@@ -122,7 +138,11 @@ pub(super) struct GitWatches {
     roots: HashSet<PathBuf>,
     // Sentinels belong to consumers, not path ancestry: a linked checkout's
     // common .git may live beside (or entirely outside) its workspace CWD.
+    // Holds Marker sentinels plus Restore HEAD files of past discoveries.
     root_markers: HashMap<PathBuf, Vec<WatchTarget>>,
+    // Raw .git pointer, and that git dir's raw `commondir` content, read when
+    // each root's sentinels were last stored.
+    root_pointers: HashMap<PathBuf, (PathBuf, Option<String>)>,
     watched: HashMap<PathBuf, RecursiveMode>,
     targets: Arc<RwLock<Vec<WatchTarget>>>,
     wakeup_pending: Arc<AtomicBool>,
@@ -182,6 +202,7 @@ impl GitWatches {
             watcher,
             roots: HashSet::new(),
             root_markers: HashMap::new(),
+            root_pointers: HashMap::new(),
             watched: HashMap::new(),
             targets,
             wakeup_pending,
@@ -228,28 +249,79 @@ impl GitWatches {
         self.topology_dirty = false;
         self.root_markers
             .retain(|root, _| self.roots.contains(root));
+        self.root_pointers
+            .retain(|root, _| self.roots.contains(root));
         let mut targets = HashSet::new();
         for root in &self.roots {
             let discovered = targets_for_root(root);
             if !discovered.is_empty() {
                 // Successful discovery replaces this consumer's sentinels.
                 // Store native paths while they exist, before a removal gap.
-                self.root_markers.insert(
-                    root.clone(),
-                    discovered
-                        .iter()
-                        .filter(|target| matches!(target, WatchTarget::Marker(_)))
-                        .cloned()
-                        .map(native_target)
-                        .collect(),
-                );
+                // Still-missing Restore files survive an ancestor fallback only
+                // while the raw .git pointer is unchanged since they were
+                // stored; one pointer yields at most two HEAD sentinels.
+                let previous = self.root_markers.remove(root).unwrap_or_default();
+                // The key also includes G/commondir: a retargeted common dir
+                // with an unchanged pointer must not carry old common HEADs.
+                // While it is unreadable (G vanished), the stored value is kept
+                // so a later readable value is compared against it.
+                let previous_key = self.root_pointers.remove(root);
+                let pointer = current_git_dir_pointer(root);
+                let commondir = pointer.as_deref().and_then(read_commondir);
+                let same_pointer = match (&previous_key, &pointer) {
+                    (Some((previous, stored)), Some(current)) => {
+                        previous == current && (commondir.is_none() || commondir == *stored)
+                    }
+                    _ => false,
+                };
+                let mut sentinels = Vec::new();
+                let candidates = discovered
+                    .iter()
+                    .filter(|target| {
+                        matches!(target, WatchTarget::Marker(_) | WatchTarget::Restore { .. })
+                    })
+                    .cloned()
+                    .map(native_target)
+                    .chain(previous.into_iter().filter(|target| {
+                        same_pointer
+                            && matches!(target, WatchTarget::Restore { file, .. }
+                                if std::fs::symlink_metadata(file).is_err())
+                    }));
+                for target in candidates {
+                    if !sentinels.contains(&target) {
+                        sentinels.push(target);
+                    }
+                }
+                targets.extend(sentinels.iter().filter_map(missing_restore));
+                self.root_markers.insert(root.clone(), sentinels);
+                if let Some(pointer) = pointer {
+                    let commondir = commondir.or_else(|| {
+                        previous_key
+                            .filter(|(previous, _)| *previous == pointer)
+                            .and_then(|(_, stored)| stored)
+                    });
+                    self.root_pointers
+                        .insert(root.clone(), (pointer, commondir));
+                }
             } else if let Some(markers) = self.root_markers.get(root) {
                 // Keep only this current consumer's own exact .git sentinels,
                 // including its non-ancestor common directory. New/missing
                 // roots cannot borrow markers from another or a removed root.
-                targets.extend(markers.iter().cloned());
+                targets.extend(
+                    markers
+                        .iter()
+                        .filter(|target| matches!(target, WatchTarget::Marker(_)))
+                        .cloned(),
+                );
+                targets.extend(markers.iter().filter_map(missing_restore));
             }
-            targets.extend(discovered);
+            // Restore sentinels are never installed while their file exists,
+            // so ordinary atomic HEAD writes stay non-structural.
+            targets.extend(
+                discovered
+                    .into_iter()
+                    .filter(|target| !matches!(target, WatchTarget::Restore { .. })),
+            );
         }
         for file in &self.config_dependencies {
             // Preserve logical symlink invalidation, including directory links:
@@ -352,21 +424,60 @@ fn native_target(target: WatchTarget) -> WatchTarget {
     let native = directory
         .canonicalize()
         .unwrap_or_else(|_| directory.to_path_buf());
+    let leaf = |file: PathBuf, directory: &Path| {
+        file.strip_prefix(directory)
+            .map(|suffix| native.join(suffix))
+            .unwrap_or(file.clone())
+    };
     match target {
         WatchTarget::Metadata(_) => WatchTarget::Metadata(native),
         WatchTarget::Refs(_) => WatchTarget::Refs(native),
         WatchTarget::Marker(_) => WatchTarget::Marker(native),
-        WatchTarget::ConfigFile { file, directory } => {
-            let file = file
-                .strip_prefix(&directory)
-                .map(|suffix| native.join(suffix))
-                .unwrap_or(file.clone());
-            WatchTarget::ConfigFile {
-                file,
-                directory: native,
-            }
-        }
+        WatchTarget::ConfigFile { file, directory } => WatchTarget::ConfigFile {
+            file: leaf(file, &directory),
+            directory: native.clone(),
+        },
+        WatchTarget::Restore { file, directory } => WatchTarget::Restore {
+            file: leaf(file, &directory),
+            directory: native.clone(),
+        },
     }
+}
+
+/// The consumer's raw git dir pointer, neither normalized nor canonicalized:
+/// the nearest ancestor with a `.git` entry, resolved like discovery does.
+fn current_git_dir_pointer(root: &Path) -> Option<PathBuf> {
+    let repo_root = root
+        .ancestors()
+        .find(|path| std::fs::symlink_metadata(path.join(".git")).is_ok())?;
+    crate::workspace::git_dir_for_repo_root(repo_root)
+}
+
+/// Trimmed raw `commondir` content of a git dir, if readable.
+fn read_commondir(git_dir: &Path) -> Option<String> {
+    std::fs::read_to_string(git_dir.join("commondir"))
+        .ok()
+        .map(|content| content.trim().to_string())
+}
+
+/// Installable form of a stored Restore sentinel whose file is missing,
+/// watching the nearest existing ancestor of its parent non-recursively.
+// ponytail: a permanently missing repo keeps one non-recursive parent watch,
+// filtered to the exact path, as missing config dependencies already do.
+fn missing_restore(target: &WatchTarget) -> Option<WatchTarget> {
+    let WatchTarget::Restore { file, .. } = target else {
+        return None;
+    };
+    if std::fs::symlink_metadata(file).is_ok() {
+        return None;
+    }
+    let directory = file
+        .parent()
+        .and_then(|parent| parent.ancestors().find(|path| path.is_dir()))?;
+    Some(WatchTarget::Restore {
+        file: file.clone(),
+        directory: directory.to_path_buf(),
+    })
 }
 
 fn targets_for_root(root: &Path) -> Vec<WatchTarget> {
@@ -382,6 +493,20 @@ fn targets_for_root(root: &Path) -> Vec<WatchTarget> {
     ];
     if marker.exists() {
         targets.push(WatchTarget::Marker(info.repo_root));
+    }
+    // Restoration sentinels, captured while each HEAD exists; sync never
+    // installs them directly.
+    for dir in [&git_dir, &common] {
+        let file = dir.join("HEAD");
+        if std::fs::symlink_metadata(&file).is_ok() {
+            let target = WatchTarget::Restore {
+                file,
+                directory: dir.clone(),
+            };
+            if !targets.contains(&target) {
+                targets.push(target);
+            }
+        }
     }
     if common.file_name().is_some_and(|name| name == ".git") {
         if let Some(parent) = common.parent() {
