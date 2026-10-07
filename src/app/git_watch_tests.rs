@@ -75,6 +75,11 @@ fn watched_app(root: &Path) -> crate::app::App {
     app
 }
 
+// Waits for the observed native event and its refresh. The bound only stops a
+// hung test; it stays far below the 60 s safety refresh, which these tests
+// also assert did not run. The 1 s product target is not a CI wall clock.
+const NATIVE_EVENT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
 #[track_caller]
 fn native_app_refresh(app: &mut crate::app::App, require_discovery: bool) {
     let start = std::time::Instant::now();
@@ -82,8 +87,9 @@ fn native_app_refresh(app: &mut crate::app::App, require_discovery: bool) {
     let mut discovery_seen = false;
     loop {
         assert!(
-            start.elapsed() < std::time::Duration::from_secs(1),
-            "native restoration/refresh exceeded 1s (require_discovery={require_discovery})"
+            start.elapsed() < NATIVE_EVENT_DEADLINE,
+            "native restoration/refresh not observed within {NATIVE_EVENT_DEADLINE:?} \
+             (require_discovery={require_discovery})"
         );
         app.sync_git_watches();
         app.start_git_status_refresh_if_due(std::time::Instant::now());
@@ -125,7 +131,7 @@ fn quiet_native_app(app: &mut crate::app::App) {
     let mut quiet = start;
     loop {
         assert!(
-            start.elapsed() < std::time::Duration::from_secs(3),
+            start.elapsed() < NATIVE_EVENT_DEADLINE,
             "native hints did not settle"
         );
         app.sync_git_watches();
@@ -142,6 +148,19 @@ fn quiet_native_app(app: &mut crate::app::App) {
         }
         std::thread::sleep(std::time::Duration::from_millis(2));
     }
+}
+
+/// Reconciles the removal of an external common dir that has no watched parent.
+/// Windows reports no event when a watched directory itself is renamed (notify
+/// has no `IN_MOVE_SELF` there), so production notices that removal at the
+/// safety refresh. An explicit identity refresh stands in for it, without
+/// moving the safety clock. The restoration that follows stays native on
+/// every platform: the Restore sentinel watches the nearest existing parent.
+#[track_caller]
+fn external_common_removal_refresh(app: &mut crate::app::App) {
+    #[cfg(windows)]
+    app.request_git_identity_refresh(std::time::Instant::now());
+    native_app_refresh(app, false);
 }
 
 fn external_common_fixture(name: &str, common_name: &str) -> (PathBuf, PathBuf) {
@@ -175,7 +194,7 @@ fn git_watch_gap_external_common_entry_restoration_and_refs() {
     assert_eq!(app.state.workspaces[0].git_ahead_behind(), Some((1, 0)));
     let retired = root.join("retired-metadata");
     std::fs::rename(&common, &retired).unwrap();
-    native_app_refresh(&mut app, false);
+    external_common_removal_refresh(&mut app);
     quiet_native_app(&mut app);
     assert_eq!(app.state.workspaces[0].cached_git_branch, None);
     let missing = app
@@ -217,7 +236,7 @@ fn git_watch_gap_nested_linked_fallback_retains_nearer_restoration() {
     );
     let retired = root.join("retired-metadata");
     std::fs::rename(&common, &retired).unwrap();
-    native_app_refresh(&mut app, false);
+    external_common_removal_refresh(&mut app);
     quiet_native_app(&mut app);
     assert_eq!(
         crate::workspace::git_worktree_info(&linked)
