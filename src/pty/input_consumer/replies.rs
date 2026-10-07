@@ -49,6 +49,10 @@ fn allowed(frame: &[u8]) -> bool {
         {
             return v.len() == 3;
         }
+        // Cell size report (reply to CSI 16 t): CSI 6 ; height ; width t.
+        if let Some(v) = csi.strip_suffix('t').and_then(numbers) {
+            return v.len() == 3 && v[0] == 6 && v[1] > 0 && v[2] > 0;
+        }
         if let Some(v) = csi.strip_suffix('R').and_then(numbers) {
             return v.len() == 2 && v.iter().all(|n| *n > 0);
         }
@@ -139,6 +143,9 @@ mod tests {
             "\x1b[0n",
             "\x1b[12;4R",
             "\x1b[?997;1n",
+            "\x1b[?997;2n",
+            "\x1b[6;18;9t",
+            "\x1b[6;1;1t",
             "\x1b[?25;1$y",
             "\x1b[?31u",
             "\x1bP>|libghostty\x1b\\",
@@ -156,6 +163,15 @@ mod tests {
             "\x1b[?32u",
             "\x1b[3n",
             "\x1b[21t",
+            "\x1b[6;0;9t",
+            "\x1b[6;18t",
+            "\x1b[6;18;9;1t",
+            "\x1b[4;600;800t",
+            "\x1b[8;24;80t",
+            "\x1b[6;18;9tX",
+            "\x1b[6;-1;9t",
+            "\x1b[?997;3n",
+            "\x1b[?997n",
             "\x1b]12;rgb:ffff/0000/0000\x07",
             "\x1b]4;256;rgb:ffff/0000/0000\x07",
             "\x1b[0nJUNK",
@@ -164,6 +180,9 @@ mod tests {
         ] {
             assert!(!allowed(reply.as_bytes()), "{reply:?}");
         }
+        let pi = classify_replies(Bytes::from_static(b"\x1b[6;18;9t\x1b[?997;2n"));
+        assert_eq!(pi.len(), 2);
+        assert!(pi.iter().all(|(_, s)| *s == InputSource::Neutral));
         let mixed = classify_replies(Bytes::from_static(b"\x1b[0n\x1b]52;c;evil\x07\x1b[1;2R"));
         assert_eq!(
             mixed.iter().map(|(_, s)| s.clone()).collect::<Vec<_>>(),
