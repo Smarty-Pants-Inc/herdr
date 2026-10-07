@@ -2367,10 +2367,25 @@ mod tests {
     #[test]
     fn deferred_api_worktree_create_rejects_checkout_with_remove_in_flight() {
         let repo = create_committed_repo("api-worktree-create-remove-in-flight-repo");
-        let checkout = unique_temp_path("api-worktree-create-remove-in-flight-checkout");
+        // The remove reserved the checkout while it existed (canonical spelling);
+        // Git has already deleted it when the create arrives through an alias
+        // (Windows 8.3 temp names; a symlink on Unix).
+        let root = unique_temp_path("api-worktree-create-remove-in-flight");
+        std::fs::create_dir_all(root.join("real")).unwrap();
+        #[cfg(unix)]
+        let alias = {
+            let alias = root.join("alias");
+            std::os::unix::fs::symlink(root.join("real"), &alias).unwrap();
+            alias
+        };
+        #[cfg(not(unix))]
+        let alias = root.join("real");
+        let checkout = alias.join("checkout");
+        let reserved = std::fs::canonicalize(root.join("real"))
+            .unwrap()
+            .join("checkout");
         let mut app = test_app();
-        app.pending_api_worktree_remove_paths
-            .insert(crate::worktree::canonical_or_original(&checkout), 7);
+        app.pending_api_worktree_remove_paths.insert(reserved, 7);
         let (respond_to, response_rx) = response_channel();
 
         assert!(app.handle_deferred_worktree_api_request(
@@ -2398,6 +2413,7 @@ mod tests {
         assert_eq!(error.error.code, "worktree_operation_in_progress");
         assert!(app.event_rx.try_recv().is_err());
         let _ = std::fs::remove_dir_all(repo);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

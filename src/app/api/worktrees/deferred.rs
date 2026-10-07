@@ -502,6 +502,9 @@ impl App {
             Self::send_api_response(api.respond_to, encode_error(api.id, err.code, err.message));
             return;
         }
+        // The source repin is written now, so audit it now: a later failure to
+        // open the target workspace does not undo it.
+        Self::log_project_changes_with_context(&project_changes, "worktree.create_project_checked");
 
         let (ws_idx, created_workspace) = if let Some(ws_idx) = already_open {
             if api.focus {
@@ -567,7 +570,6 @@ impl App {
                 worktree,
             },
         );
-        Self::log_project_changes_with_context(&project_changes, "worktree.create_project_checked");
         Self::send_api_response(api.respond_to, response);
     }
 

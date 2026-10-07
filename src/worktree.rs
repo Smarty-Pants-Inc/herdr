@@ -373,9 +373,82 @@ pub(crate) fn rollback_worktree_add(
     created_start: Option<&str>,
     trust_repository: bool,
 ) -> Result<(), WorktreeRollbackFailure> {
+    rollback_worktree_add_with(
+        repo_root,
+        path,
+        branch,
+        created_start,
+        trust_repository,
+        &|| {},
+    )
+}
+
+/// `before_remove` lets a test write between the file check and the removal.
+fn rollback_worktree_add_with(
+    repo_root: &Path,
+    path: &Path,
+    branch: &str,
+    created_start: Option<&str>,
+    trust_repository: bool,
+    before_remove: &dyn Fn(),
+) -> Result<(), WorktreeRollbackFailure> {
     use WorktreeRollbackFailure::{BranchKept, CheckoutKept};
+    // An asynchronous post-checkout hook may still write into the checkout
+    // after any check: keep the checkout rather than race it.
+    let hook = repository_git_command(path, trust_repository)
+        .args(["rev-parse", "--git-path", "hooks/post-checkout"])
+        .output()
+        .map_err(|err| CheckoutKept(err.to_string()))?;
+    let hook = PathBuf::from(String::from_utf8_lossy(&hook.stdout).trim());
+    if !hook.as_os_str().is_empty() && path.join(&hook).is_file() {
+        return Err(CheckoutKept(
+            "a post-checkout hook may still write to it".to_string(),
+        ));
+    }
+    // Move the checkout to a private sibling name first (one rename), so a
+    // writer that opens the original path later cannot reach what is checked
+    // and deleted below; its files land in a new directory that is kept.
+    let file_name = path.file_name().map_or_else(
+        || "checkout".to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    let quarantine = path.with_file_name(format!(
+        ".{file_name}.herdr-rollback-{}",
+        std::process::id()
+    ));
+    let mut args = repository_git_args(repo_root, trust_repository);
+    args.extend([
+        "worktree".to_string(),
+        "move".to_string(),
+        path.display().to_string(),
+        quarantine.display().to_string(),
+    ]);
+    run_worktree_command(&WorktreeCommand {
+        program: "git".to_string(),
+        args,
+    })
+    .map_err(CheckoutKept)?;
+    let keep = |reason: String| {
+        let mut args = repository_git_args(repo_root, trust_repository);
+        args.extend([
+            "worktree".to_string(),
+            "move".to_string(),
+            quarantine.display().to_string(),
+            path.display().to_string(),
+        ]);
+        match run_worktree_command(&WorktreeCommand {
+            program: "git".to_string(),
+            args,
+        }) {
+            Ok(()) => CheckoutKept(reason),
+            Err(err) => CheckoutKept(format!(
+                "{reason}; it is at {} because moving it back failed: {err}",
+                quarantine.display()
+            )),
+        }
+    };
     // A clean `git worktree remove` still deletes ignored files (.env, builds).
-    let status = repository_git_command(path, trust_repository)
+    let status = match repository_git_command(&quarantine, trust_repository)
         .args([
             "status",
             "--porcelain",
@@ -383,22 +456,26 @@ pub(crate) fn rollback_worktree_add(
             "--untracked-files=all",
         ])
         .output()
-        .map_err(|err| CheckoutKept(err.to_string()))?;
+    {
+        Ok(status) => status,
+        Err(err) => return Err(keep(err.to_string())),
+    };
     if !status.status.success() {
-        return Err(CheckoutKept(
+        return Err(keep(
             String::from_utf8_lossy(&status.stderr).trim().to_string(),
         ));
     }
     if !status.stdout.is_empty() {
-        return Err(CheckoutKept("it has new files".to_string()));
+        return Err(keep("it has new files".to_string()));
     }
+    before_remove();
     run_worktree_command(&build_worktree_remove_command(
         repo_root,
-        path,
+        &quarantine,
         false,
         trust_repository,
     ))
-    .map_err(CheckoutKept)?;
+    .map_err(keep)?;
     let Some(start) = created_start else {
         return Ok(());
     };
@@ -873,6 +950,68 @@ prunable stale
             expand_tilde_path_from_env(r"~\.herdr\worktrees", true, env),
             PathBuf::from(r"C:\Users\herdr\.herdr\worktrees")
         );
+    }
+
+    // A rolled-back create must never delete a file written while it rolls
+    // back (review P2 on 17c786af): a writer that races the file check.
+    #[test]
+    fn rollback_keeps_a_file_written_after_its_check() {
+        let repo = create_committed_repo("worktree-rollback-race-repo");
+        std::fs::write(repo.join(".git/info/exclude"), "local.env\n").unwrap();
+        let checkout = unique_temp_path("worktree-rollback-race-checkout");
+        let start = run_worktree_add_command(&repo, &checkout, "rollback-race", "HEAD", false)
+            .unwrap()
+            .expect("new branch start");
+        let late = checkout.join("local.env");
+        let result = rollback_worktree_add_with(
+            &repo,
+            &checkout,
+            "rollback-race",
+            Some(&start),
+            false,
+            &|| {
+                std::fs::create_dir_all(&checkout).unwrap();
+                std::fs::write(&late, "written during rollback").unwrap();
+            },
+        );
+        assert_eq!(
+            std::fs::read_to_string(&late).ok().as_deref(),
+            Some("written during rollback"),
+            "rollback deleted a late write ({result:?})"
+        );
+        let _ = std::fs::remove_dir_all(&checkout);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    // An asynchronous post-checkout hook may still be writing: keep it all.
+    #[test]
+    fn rollback_keeps_a_checkout_when_a_post_checkout_hook_exists() {
+        let repo = create_committed_repo("worktree-rollback-hook-repo");
+        let hooks = repo.join(".git/hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        std::fs::write(hooks.join("post-checkout"), "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                hooks.join("post-checkout"),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        }
+        let checkout = unique_temp_path("worktree-rollback-hook-checkout");
+        let start =
+            run_worktree_add_command(&repo, &checkout, "rollback-hook", "HEAD", false).unwrap();
+        let result =
+            rollback_worktree_add(&repo, &checkout, "rollback-hook", start.as_deref(), false);
+        assert!(
+            matches!(result, Err(WorktreeRollbackFailure::CheckoutKept(_))),
+            "{result:?}"
+        );
+        assert!(checkout.join(".git").exists());
+        assert!(local_branch_exists(&repo, "rollback-hook", false).unwrap());
+        let _ = std::fs::remove_dir_all(&checkout);
+        let _ = std::fs::remove_dir_all(&repo);
     }
 
     #[test]

@@ -679,15 +679,17 @@ async fn project_change_worktree_4551_create_completion_rechecks_topology_drift(
         // existed before the request must survive (P2 on 16224428). A checkout
         // that gained files while Git ran is kept, and the hint says open.
         // An ignored file counts: a clean `git worktree remove` deletes it.
-        // A post-checkout hook commit on the new branch is not ours: the
-        // checkout goes, the branch stays.
-        for (allow, existing_branch, new_file, hook) in [
-            (false, false, None, false),
-            (false, true, None, false),
-            (false, false, Some("agent-notes.txt"), false),
-            (false, false, Some("local.env"), false),
-            (false, false, None, true),
-            (true, false, None, false),
+        // A post-checkout hook may still write: the checkout and its branch
+        // stay. A commit made on the new branch after the add is not ours:
+        // the clean checkout goes, the branch stays.
+        for (allow, existing_branch, new_file, hook, advance) in [
+            (false, false, None, false, false),
+            (false, true, None, false, false),
+            (false, false, Some("agent-notes.txt"), false, false),
+            (false, false, Some("local.env"), false, false),
+            (false, false, None, true, false),
+            (false, false, None, false, true),
+            (true, false, None, false, false),
         ] {
             let mut fixture = worktree_repin_fixture(true, false, true);
             if hook {
@@ -731,8 +733,24 @@ async fn project_change_worktree_4551_create_completion_rechecks_topology_drift(
             if new_file.is_some() {
                 std::fs::write(&kept_file, "written while Git ran").unwrap();
             }
+            if advance {
+                worktree_repin_git(
+                    &fixture.checkout,
+                    &[
+                        "-c",
+                        "user.name=User",
+                        "-c",
+                        "user.email=user@example.invalid",
+                        "commit",
+                        "--quiet",
+                        "--allow-empty",
+                        "-m",
+                        "user",
+                    ],
+                );
+            }
             // A workspace that arrived on the checkout keeps it, too.
-            let kept = !allow && (new_file.is_some() || target_drift);
+            let kept = !allow && (new_file.is_some() || hook || target_drift);
             let drift_workspace = if target_drift {
                 let mut workspace = crate::workspace::Workspace::test_new("arrived-during-Git");
                 workspace.identity_cwd = fixture.checkout.clone();
@@ -813,6 +831,13 @@ async fn project_change_worktree_4551_create_completion_rechecks_topology_drift(
                     assert_eq!(kept_file.exists(), new_file.is_some());
                     assert!(fixture.checkout.exists());
                     assert_eq!(list.matches("worktree ").count(), 2, "{list}");
+                    if hook && !target_drift {
+                        assert!(
+                            error.error.message.contains("post-checkout hook"),
+                            "{}",
+                            error.error.message
+                        );
+                    }
                     assert!(worktree_repin_rev(&fixture.repo, "refs/heads/repin").is_some());
                     for text in [
                         "was kept",
@@ -841,6 +866,20 @@ async fn project_change_worktree_4551_create_completion_rechecks_topology_drift(
                     );
                 }
             }
+            if !allow {
+                // No rollback quarantine is left behind either way.
+                let leftovers: Vec<_> = std::fs::read_dir(&fixture.alias)
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    .filter(|entry| {
+                        entry
+                            .file_name()
+                            .to_string_lossy()
+                            .contains("herdr-rollback")
+                    })
+                    .collect();
+                assert!(leftovers.is_empty(), "{leftovers:?}");
+            }
             if !allow && !kept {
                 // Git and filesystem state are back to before the request.
                 assert!(!fixture.checkout.exists(), "refused checkout removed");
@@ -856,9 +895,9 @@ async fn project_change_worktree_4551_create_completion_rechecks_topology_drift(
                     1,
                     "only the main checkout remains: {list}"
                 );
-                if hook {
+                if advance {
                     let hook_tip = worktree_repin_rev(&fixture.repo, "refs/heads/repin");
-                    assert!(hook_tip.is_some(), "a hook commit is never deleted");
+                    assert!(hook_tip.is_some(), "a later commit is never deleted");
                     assert_ne!(hook_tip, worktree_repin_rev(&fixture.repo, "HEAD"));
                     assert!(
                         refusal.contains("was removed, but branch repin was kept"),
@@ -919,6 +958,48 @@ async fn project_change_worktree_4551_create_completion_rechecks_topology_drift(
             }
         }
     }
+}
+
+// Review P3 on 17c786af: an allowed create repins the source workspace before
+// it opens the target. If opening the target fails, the repin stays, so its
+// audit must be written, once.
+#[tokio::test]
+async fn project_change_worktree_4551_create_target_open_failure_still_audits_repin() {
+    let mut fixture = worktree_repin_fixture(true, false, false);
+    fixture.server.app.state.default_shell = fixture
+        .directory
+        .join("missing-shell")
+        .display()
+        .to_string();
+    let logs = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let writer = logs.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::INFO)
+        .with_writer(move || LogWriter(writer.clone()))
+        .finish();
+    let guard = tracing::subscriber::set_default(subscriber);
+    let result = worktree_repin_request(&mut fixture, true, Some(true)).await;
+    drop(guard);
+    let error = result.expect_err("the target workspace cannot open");
+    assert_eq!(error.error.code, "worktree_open_failed", "{error:?}");
+    assert_eq!(
+        canonical_path(
+            &fixture.server.app.state.workspaces[0]
+                .worktree_space()
+                .expect("the source repin persisted")
+                .checkout_path
+        ),
+        canonical_path(&fixture.repo)
+    );
+    let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+    assert_eq!(
+        logs.matches("intentional project change allowed").count(),
+        1,
+        "{logs}"
+    );
+    assert!(logs.contains(&fixture.session), "{logs}");
 }
 
 fn worktree_repin_rev(repo: &std::path::Path, reference: &str) -> Option<String> {
