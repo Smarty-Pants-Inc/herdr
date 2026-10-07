@@ -212,12 +212,35 @@ fn input_consumer_ledger_poisoned_replay_logs_its_changed_answer() {
         assert_eq!(logged[1].token, "one");
         assert_eq!(logged[1].result, unknown("termios_changed"));
     }
-    // A failed log fails closed even on replay.
+    // Review #188 r2: the same replay again is stable and appends nothing.
+    for _ in 0..3 {
+        assert_eq!(
+            result(ledger.cut(req.clone(), Some(&audit), now)),
+            unknown("termios_changed")
+        );
+    }
+    assert_eq!(records.lock().unwrap().len(), 2, "no amplification");
+    // A failed log fails closed even on replay, and stores nothing.
+    let mut ledger = Ledger::new("epoch".into(), "secret".into());
+    ledger.record(b"x\r", &client(1), now);
+    assert_eq!(result(ledger.cut(req.clone(), Some(&audit), now)), first);
+    ledger.poison("termios_changed");
     let failing: AuditSink = Arc::new(|_: &AuditRecord| Err(io::Error::other("disk")));
     assert_eq!(
-        result(ledger.cut(req, Some(&failing), now)),
+        result(ledger.cut(req.clone(), Some(&failing), now)),
         unknown("input_log_unavailable")
     );
+    // The next replay with a working log records the new poisoned answer once.
+    let before = records.lock().unwrap().len();
+    assert_eq!(
+        result(ledger.cut(req.clone(), Some(&audit), now)),
+        unknown("input_log_unavailable")
+    );
+    assert_eq!(
+        result(ledger.cut(req, Some(&audit), now)),
+        unknown("input_log_unavailable")
+    );
+    assert_eq!(records.lock().unwrap().len(), before + 1);
 }
 #[test]
 fn input_consumer_ledger_audit_failure_and_missing_sink_poison_no_attribution() {

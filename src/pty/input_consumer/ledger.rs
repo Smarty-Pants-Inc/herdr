@@ -135,7 +135,12 @@ impl Ledger {
                 reason: "invalid_epoch".into(),
             };
         }
-        if let Some(old) = self.replays.iter().find(|r| r.request.token == req.token) {
+        if let Some(index) = self
+            .replays
+            .iter()
+            .position(|r| r.request.token == req.token)
+        {
+            let old = &self.replays[index];
             let mut comparison = req.clone();
             comparison.epoch_key.clear();
             if old.request != comparison {
@@ -144,12 +149,17 @@ impl Ledger {
                 };
             }
             // A poisoned epoch answers `unknown` even for a stored token. That answer differs
-            // from the logged one, so it is durably logged first (review #188 P2); an
-            // unchanged answer is not logged again.
+            // from the logged one, so it is durably logged first (review #188 P2) and then
+            // becomes the stored answer, so the next exact replay is stable and not logged
+            // again. A failed log stores nothing and fails closed.
             let stored = old.result.clone();
             return match self.poison.clone() {
                 Some(reason) if stored != unknown(&reason) => {
-                    self.refuse_logged(&req, &reason, audit)
+                    let response = self.refuse_logged(&req, &reason, audit);
+                    if matches!(&response, ConsumerResponse::Cut(r) if *r == unknown(&reason)) {
+                        self.replays[index].result = unknown(&reason);
+                    }
+                    response
                 }
                 _ => ConsumerResponse::Cut(stored),
             };

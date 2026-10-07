@@ -160,6 +160,19 @@ fn load_with<K>(
     read(Path::new(KEY_PATH), Some(effective_gid))
 }
 
+/// `next` yields each account's primary gid, or `Err(errno)` when getpwent returned NULL.
+/// errno 0 or ENOENT is the end; anything else is an error and means "cannot tell".
+fn scan_primary(gid: u32, mut next: impl FnMut() -> Result<u32, i32>) -> Option<bool> {
+    loop {
+        match next() {
+            Ok(primary) if primary == gid => return Some(true),
+            Ok(_) => {}
+            Err(0) | Err(libc::ENOENT) => return Some(false),
+            Err(_) => return None,
+        }
+    }
+}
+
 /// The system account databases through NSS (files, LDAP, sssd alike).
 struct Nss;
 
@@ -196,24 +209,23 @@ impl GroupDb for Nss {
     }
     fn is_primary_of_any_user(&mut self, gid: u32) -> Option<bool> {
         // The startup thread is single; getpwent's static cursor is not shared yet.
-        let mut found = false;
+        // getpwent returns NULL both at the end and on error, so errno decides: an error
+        // (EINTR, EIO, ENOMEM, an NSS backend failure) is "cannot tell", never "no".
         // SAFETY: setpwent/getpwent/endpwent iterate the password database; each entry is
-        // read before the next call.
-        unsafe {
-            libc::setpwent();
-            loop {
-                let entry = libc::getpwent();
-                if entry.is_null() {
-                    break;
-                }
-                if (*entry).pw_gid == gid {
-                    found = true;
-                    break;
-                }
+        // read before the next call; errno is this thread's.
+        unsafe { libc::setpwent() };
+        let found = scan_primary(gid, || unsafe {
+            *libc::__errno_location() = 0;
+            let entry = libc::getpwent();
+            if entry.is_null() {
+                Err(*libc::__errno_location())
+            } else {
+                Ok((*entry).pw_gid)
             }
-            libc::endpwent();
-        }
-        Some(found)
+        });
+        // SAFETY: closes the enumeration opened above.
+        unsafe { libc::endpwent() };
+        found
     }
 }
 
@@ -538,12 +550,33 @@ mod tests {
     }
 
     #[test]
+    fn server_key_passwd_scan_error_is_not_a_clean_end() {
+        // Review #188 r2: getpwent NULL with an error errno must not authorize loading.
+        for errno in [libc::EINTR, libc::EIO, libc::ENOMEM, libc::ERANGE] {
+            let mut entries = vec![Ok(1000), Ok(1001), Err(errno)].into_iter();
+            assert_eq!(
+                scan_primary(990, || entries.next().unwrap()),
+                None,
+                "{errno}"
+            );
+        }
+        for end in [0, libc::ENOENT] {
+            let mut entries = vec![Ok(1000), Err(end)].into_iter();
+            assert_eq!(scan_primary(990, || entries.next().unwrap()), Some(false));
+        }
+        let mut entries = vec![Ok(1000), Ok(990)].into_iter();
+        assert_eq!(scan_primary(990, || entries.next().unwrap()), Some(true));
+    }
+
+    #[test]
     fn server_key_real_nss_sees_this_users_primary_group() {
         // SAFETY: getgid takes no arguments and cannot fail.
         let gid = unsafe { libc::getgid() };
         assert_eq!(Nss.is_primary_of_any_user(gid), Some(true));
         assert!(Nss.members(gid).is_some());
         assert_eq!(Nss.members(u32::MAX - 7), None);
+        // Counterpart for the errno check: a full clean scan ends as "no", not "cannot tell".
+        assert_eq!(Nss.is_primary_of_any_user(u32::MAX - 7), Some(false));
     }
 
     #[test]
