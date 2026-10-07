@@ -23,13 +23,25 @@ pub(crate) enum PeerEvent {
         muted: bool,
         detail: Option<String>,
     },
-    /// The peer ended on its own (device loss, ICE or DTLS failure). It has already released
-    /// the microphone and speaker. `code` is one of `protocol::media::close_code`.
+    /// The peer ended on its own (device loss, ICE or DTLS failure). This initiates
+    /// controller cleanup, but is not post-join completion evidence.
+    /// `code` is one of `protocol::media::close_code`.
     Closed {
         session_id: String,
         code: &'static str,
         message: String,
     },
+    /// Native teardown result, after joining all openers and dropping their guards.
+    /// Failure (including timeout) is diagnostic only, never completion evidence.
+    Teardown {
+        session_id: String,
+        acquired: bool,
+        success: bool,
+    },
+    /// A client-owned factory invocation scope. Native peers still emit bare events to the
+    /// supplied sink; the controller wraps that sink per start so delayed callbacks cannot
+    /// adopt another endpoint's reused session id.
+    Scoped { owner: u64, event: Box<PeerEvent> },
 }
 
 pub(crate) type PeerEventSink = Arc<dyn Fn(PeerEvent) + Send + Sync>;
@@ -58,7 +70,10 @@ pub(crate) const NATIVE_PEER_AVAILABLE: bool =
 /// Endpoint hello capabilities this client build advertises.
 pub(crate) fn advertised_capabilities() -> Vec<String> {
     if NATIVE_PEER_AVAILABLE {
-        vec![crate::protocol::media::MEDIA_WEBRTC_CAPABILITY.to_owned()]
+        vec![
+            crate::protocol::media::MEDIA_WEBRTC_CAPABILITY.to_owned(),
+            crate::protocol::media::MEDIA_ENDED_CAPABILITY.to_owned(),
+        ]
     } else {
         Vec::new()
     }
@@ -86,6 +101,16 @@ mod tests {
     fn capability_is_advertised_only_where_the_native_peer_works() {
         let expected = cfg!(all(feature = "native-media", target_os = "macos"));
         assert_eq!(NATIVE_PEER_AVAILABLE, expected);
-        assert_eq!(!advertised_capabilities().is_empty(), expected);
+        assert_eq!(
+            advertised_capabilities(),
+            if expected {
+                vec![
+                    crate::protocol::media::MEDIA_WEBRTC_CAPABILITY.to_owned(),
+                    crate::protocol::media::MEDIA_ENDED_CAPABILITY.to_owned(),
+                ]
+            } else {
+                Vec::<String>::new()
+            }
+        );
     }
 }

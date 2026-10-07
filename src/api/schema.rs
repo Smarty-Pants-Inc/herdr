@@ -296,7 +296,9 @@ pub enum Method {
     #[serde(rename = "plugin.pane.close")]
     PluginPaneClose(PluginPaneCloseParams),
     #[serde(rename = "pane.media_open")]
-    PaneMediaOpen(PaneTarget),
+    PaneMediaOpen(MediaOpenParams),
+    #[serde(rename = "pane.media_preflight")]
+    PaneMediaPreflight(PaneTarget),
     #[serde(rename = "media.answer")]
     MediaAnswer(MediaAnswerParams),
     #[serde(rename = "media.mute")]
@@ -304,7 +306,7 @@ pub enum Method {
     #[serde(rename = "media.state")]
     MediaState(MediaSessionTarget),
     #[serde(rename = "media.close")]
-    MediaClose(MediaSessionTarget),
+    MediaClose(MediaCloseParams),
 }
 
 #[cfg(test)]

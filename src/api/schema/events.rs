@@ -82,6 +82,10 @@ pub enum Subscription {
     PaneScrollChanged { pane_id: String },
     #[serde(rename = "layout.updated")]
     LayoutUpdated {},
+    #[serde(rename = "media.ended")]
+    MediaEnded {},
+    #[serde(rename = "media.teardown_stuck")]
+    MediaTeardownStuck {},
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -218,6 +222,10 @@ pub enum EventKind {
     PaneAgentDetected,
     PaneAgentStatusChanged,
     LayoutUpdated,
+    #[serde(rename = "media.ended")]
+    MediaEnded,
+    #[serde(rename = "media.teardown_stuck")]
+    MediaTeardownStuck,
 }
 
 impl EventKind {
@@ -249,6 +257,8 @@ impl EventKind {
             EventKind::PaneAgentDetected => "pane.agent_detected",
             EventKind::PaneAgentStatusChanged => "pane.agent_status_changed",
             EventKind::LayoutUpdated => "layout.updated",
+            EventKind::MediaEnded => "media.ended",
+            EventKind::MediaTeardownStuck => "media.teardown_stuck",
         }
     }
 }
@@ -281,6 +291,8 @@ pub const KNOWN_EVENT_KINDS: &[EventKind] = &[
     EventKind::PaneAgentDetected,
     EventKind::PaneAgentStatusChanged,
     EventKind::LayoutUpdated,
+    EventKind::MediaEnded,
+    EventKind::MediaTeardownStuck,
 ];
 
 pub const PLUGIN_HOOK_EVENT_KINDS: &[EventKind] = &[
@@ -345,6 +357,104 @@ mod known_event_name_tests {
             from_kind, known,
             "known_event_names() out of sync with EventKind"
         );
+    }
+
+    #[test]
+    fn media_event_envelopes_have_exact_frozen_untagged_data() {
+        use super::super::media::{MediaEndOrigin, MediaEndedReceipt, MediaTeardownStuckEvent};
+        for request_id in [None, Some("r1".to_owned())] {
+            let receipt = MediaEndedReceipt {
+                session_id: "m1".into(),
+                pane_id: "w1:p2".into(),
+                client: 7,
+                generation: "g1".into(),
+                attempt: "a1".into(),
+                origin: MediaEndOrigin::Requested,
+                request_id: request_id.clone(),
+                acquired: true,
+            };
+            let envelope = EventEnvelope {
+                event: EventKind::MediaEnded,
+                data: EventData::MediaEnded(receipt),
+            };
+            let mut expected = serde_json::json!({"event": "media.ended", "data": {
+                "session_id": "m1", "pane_id": "w1:p2", "client": 7,
+                "generation": "g1", "attempt": "a1", "origin": "requested", "acquired": true
+            }});
+            if let Some(id) = request_id {
+                expected["data"]["request_id"] = id.into();
+            }
+            assert_eq!(serde_json::to_value(&envelope).unwrap(), expected);
+            assert_eq!(
+                serde_json::from_value::<EventEnvelope>(expected).unwrap(),
+                envelope
+            );
+        }
+        let stuck = EventEnvelope {
+            event: EventKind::MediaTeardownStuck,
+            data: EventData::MediaTeardownStuck(MediaTeardownStuckEvent {
+                session_id: "m1".into(),
+                pane_id: "w1:p2".into(),
+                client: 7,
+                generation: "g1".into(),
+                attempt: "a1".into(),
+            }),
+        };
+        let expected = serde_json::json!({"event": "media.teardown_stuck", "data": {
+            "session_id": "m1", "pane_id": "w1:p2", "client": 7,
+            "generation": "g1", "attempt": "a1"
+        }});
+        assert_eq!(serde_json::to_value(&stuck).unwrap(), expected);
+        assert_eq!(
+            serde_json::from_value::<EventEnvelope>(expected).unwrap(),
+            stuck
+        );
+
+        // Existing event data remains internally tagged.
+        let legacy = EventEnvelope {
+            event: EventKind::WorkspaceFocused,
+            data: EventData::WorkspaceFocused {
+                workspace_id: "w1".into(),
+            },
+        };
+        let expected = serde_json::json!({"event": "workspace_focused", "data": {
+            "type": "workspace_focused", "workspace_id": "w1"
+        }});
+        assert_eq!(serde_json::to_value(&legacy).unwrap(), expected);
+        assert_eq!(
+            serde_json::from_value::<EventEnvelope>(expected).unwrap(),
+            legacy
+        );
+        let schema = schemars::schema_for!(EventEnvelope);
+        let schema_json = serde_json::to_string(&schema).unwrap();
+        assert!(schema_json.contains("MediaEndedReceipt"));
+        assert!(schema_json.contains("MediaTeardownStuckEvent"));
+    }
+
+    #[test]
+    fn media_event_subscriptions_and_dot_names_are_registered() {
+        for (subscription, kind, name) in [
+            (
+                Subscription::MediaEnded {},
+                EventKind::MediaEnded,
+                "media.ended",
+            ),
+            (
+                Subscription::MediaTeardownStuck {},
+                EventKind::MediaTeardownStuck,
+                "media.teardown_stuck",
+            ),
+        ] {
+            let json = serde_json::json!({"type": name});
+            assert_eq!(serde_json::to_value(&subscription).unwrap(), json);
+            assert_eq!(
+                serde_json::from_value::<Subscription>(json).unwrap(),
+                subscription
+            );
+            assert_eq!(serde_json::to_value(kind).unwrap(), name);
+            assert_eq!(kind.dot_name(), name);
+            assert!(known_event_names().contains(&name));
+        }
     }
 
     #[test]
@@ -553,4 +663,10 @@ pub enum EventData {
     LayoutUpdated {
         layout: super::panes::PaneLayoutSnapshot,
     },
+    // These two frozen media payloads have no type tag; existing variants stay tagged.
+    // Keep untagged variants last so serde can first decode the existing tagged shape.
+    #[serde(untagged)]
+    MediaEnded(super::media::MediaEndedReceipt),
+    #[serde(untagged)]
+    MediaTeardownStuck(super::media::MediaTeardownStuckEvent),
 }

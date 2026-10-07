@@ -16,8 +16,8 @@ use self::peer::{MediaPeer, PeerEvent, PeerEventSink, PeerFactory};
 use super::endpoint::ClientEndpointId;
 use crate::config::MediaMode;
 use crate::protocol::media::{
-    close_code, MediaClose, MediaControl, MediaOpen, MediaSdp, MediaStateUpdate,
-    MAX_MEDIA_TEXT_BYTES, MEDIA_INPUT_WINDOW,
+    close_code, MediaClose, MediaControl, MediaEndOrigin, MediaEnded, MediaOpen, MediaSdp,
+    MediaStateUpdate, MediaTeardownStuck, MAX_MEDIA_TEXT_BYTES, MEDIA_INPUT_WINDOW,
 };
 
 /// The consent prompt declines on its own after this long.
@@ -42,6 +42,7 @@ pub(super) enum MediaEffect {
 struct MediaSession {
     endpoint_id: ClientEndpointId,
     session_id: String,
+    owner: u64,
     /// The pane this call is for, so a renewal of it can be recognised (smarty-voice#133).
     pane_id: String,
     /// The mute last applied to this call's peer: a renewal's new peer starts with it (herdr#102 security pass).
@@ -56,6 +57,19 @@ struct PendingConsent {
     deadline: Instant,
 }
 
+/// Receipt custody outlives the current prompt/peer. Session ids are unique only within
+/// one endpoint connection; settled entries fence duplicates there, not on other endpoints.
+struct MediaAttempt {
+    owner: Option<u64>,
+    endpoint_id: ClientEndpointId,
+    generation: String,
+    attempt: String,
+    origin: Option<MediaEndOrigin>,
+    request_id: Option<String>,
+    started: bool,
+    settled: bool,
+}
+
 pub(super) struct ClientMedia {
     mode: MediaMode,
     peer_available: bool,
@@ -67,6 +81,10 @@ pub(super) struct ClientMedia {
     allowed: bool,
     pending: Option<PendingConsent>,
     session: Option<MediaSession>,
+    attempts: HashMap<(ClientEndpointId, String), MediaAttempt>,
+    /// Immutable factory invocation bindings, including legacy peers without receipts.
+    owners: HashMap<u64, (ClientEndpointId, String)>,
+    next_owner: u64,
     effects: Vec<MediaEffect>,
 }
 
@@ -81,6 +99,9 @@ impl ClientMedia {
             allowed: false,
             pending: None,
             session: None,
+            attempts: HashMap::new(),
+            owners: HashMap::new(),
+            next_owner: 1,
             effects: Vec::new(),
         }
     }
@@ -163,6 +184,20 @@ impl ClientMedia {
                 }
             }
             MediaControl::Close(close) => {
+                // Closing predecessors still own receipt custody. A stale or wrong endpoint
+                // must not change the reason/correlation of a different attempt.
+                if self
+                    .attempts
+                    .get(&(endpoint_id.clone(), close.session_id.clone()))
+                    .is_some_and(|attempt| &attempt.endpoint_id == endpoint_id && !attempt.settled)
+                {
+                    self.mark_end(
+                        endpoint_id,
+                        &close.session_id,
+                        close.origin.unwrap_or(MediaEndOrigin::Natural),
+                        close.request_id,
+                    );
+                }
                 if self.owned_session(endpoint_id, &close.session_id).is_some() {
                     self.end_session("Voice call ended");
                 } else if self.pending.as_ref().is_some_and(|pending| {
@@ -172,7 +207,10 @@ impl ClientMedia {
                 }
             }
             // Client-to-server kinds; a server never sends them.
-            MediaControl::Offer(_) | MediaControl::State(_) => {}
+            MediaControl::Offer(_)
+            | MediaControl::State(_)
+            | MediaControl::Ended(_)
+            | MediaControl::TeardownStuck(_) => {}
         }
     }
 
@@ -187,17 +225,35 @@ impl ClientMedia {
         let MediaOpen {
             session_id,
             pane_id,
+            generation,
+            attempt,
         } = open;
         let duplicate = self
-            .session
-            .as_ref()
-            .is_some_and(|session| session.session_id == session_id)
-            || self
-                .pending
-                .as_ref()
-                .is_some_and(|pending| pending.session_id == session_id);
+            .attempts
+            .contains_key(&(endpoint_id.clone(), session_id.clone()))
+            || self.session.as_ref().is_some_and(|session| {
+                &session.endpoint_id == endpoint_id && session.session_id == session_id
+            })
+            || self.pending.as_ref().is_some_and(|pending| {
+                &pending.endpoint_id == endpoint_id && pending.session_id == session_id
+            });
         if duplicate {
             return;
+        }
+        if let (Some(generation), Some(attempt)) = (generation, attempt) {
+            self.attempts.insert(
+                (endpoint_id.clone(), session_id.clone()),
+                MediaAttempt {
+                    owner: None,
+                    endpoint_id: endpoint_id.clone(),
+                    generation,
+                    attempt,
+                    origin: None,
+                    request_id: None,
+                    started: false,
+                    settled: false,
+                },
+            );
         }
         if !endpoint_shown {
             return self.refuse(
@@ -254,8 +310,17 @@ impl ClientMedia {
         if self.mode == MediaMode::Auto || self.allowed {
             return self.start(endpoint_id.clone(), session_id, pane_id);
         }
+        // `&mut self` is the opener guard: consent, close and start are serialized
+        // by the client loop. Removing the prompt seals it before publishing completion.
         // A newer request supersedes an unanswered prompt.
         if let Some(previous) = self.pending.take() {
+            let origin = successor_origin(
+                &previous.endpoint_id,
+                &previous.pane_id,
+                endpoint_id,
+                &pane_id,
+            );
+            self.mark_end(&previous.endpoint_id, &previous.session_id, origin, None);
             self.effects.push(MediaEffect::CancelConsent {
                 session_id: previous.session_id.clone(),
             });
@@ -315,14 +380,66 @@ impl ClientMedia {
 
     /// Handle one event from the live peer.
     pub(super) fn handle_peer_event(&mut self, event: PeerEvent) {
-        let Some((endpoint_id, current)) = self
-            .session
-            .as_ref()
-            .map(|session| (session.endpoint_id.clone(), session.session_id.clone()))
-        else {
+        let PeerEvent::Scoped { owner, event } = event else {
+            // Bare events have no endpoint or factory lineage and cannot adopt custody.
             return;
         };
-        match event {
+        let Some((endpoint_id, current)) = self.owners.get(&owner).cloned() else {
+            return;
+        };
+        let event_session = match event.as_ref() {
+            PeerEvent::Offer { session_id, .. }
+            | PeerEvent::State { session_id, .. }
+            | PeerEvent::Closed { session_id, .. }
+            | PeerEvent::Teardown { session_id, .. } => session_id,
+            PeerEvent::Scoped { .. } => return,
+        };
+        if event_session != &current {
+            return;
+        }
+        // A replaced peer retains its original receipt custody, but never the successor's.
+        if let PeerEvent::Teardown {
+            acquired, success, ..
+        } = *event
+        {
+            if self
+                .attempts
+                .get(&(endpoint_id.clone(), current.clone()))
+                .is_some_and(|attempt| attempt.started && attempt.owner == Some(owner))
+            {
+                self.complete_attempt(&endpoint_id, &current, acquired, success);
+            }
+            self.owners.remove(&owner);
+            // NEW-01: a stuck teardown of the live peer retires it. The attempt is
+            // already settled by the diagnostic, so the close can never send Ended.
+            if !success
+                && self.session.as_ref().is_some_and(|session| {
+                    session.owner == owner
+                        && session.endpoint_id == endpoint_id
+                        && session.session_id == current
+                })
+            {
+                if let Some(mut session) = self.session.take() {
+                    session.peer.close();
+                }
+                self.send_close(
+                    endpoint_id,
+                    current,
+                    close_code::DEVICE_ERROR,
+                    "media teardown did not finish",
+                );
+                self.notice("Voice call ended: media device did not stop");
+            }
+            return;
+        }
+        if !self.session.as_ref().is_some_and(|session| {
+            session.owner == owner
+                && session.endpoint_id == endpoint_id
+                && session.session_id == current
+        }) {
+            return;
+        }
+        match *event {
             PeerEvent::Offer { session_id, sdp } if session_id == current => {
                 self.effects.push(MediaEffect::Send(
                     endpoint_id,
@@ -350,8 +467,12 @@ impl ClientMedia {
                 code,
                 message,
             } if session_id == current => {
-                // The peer already released the devices; dropping it is idempotent.
-                self.session = None;
+                // Closed is not join evidence. Initiate idempotent close/reaping and
+                // retain the attempt independently until Teardown arrives.
+                self.mark_end(&endpoint_id, &session_id, MediaEndOrigin::Natural, None);
+                if let Some(mut session) = self.session.take() {
+                    session.peer.close();
+                }
                 self.send_close(endpoint_id, session_id, code, &message);
                 self.notice("Voice call ended");
             }
@@ -363,6 +484,15 @@ impl ClientMedia {
     /// The endpoint's connection ended or was replaced: release its session without a message.
     pub(super) fn endpoint_gone(&mut self, endpoint_id: &ClientEndpointId) {
         self.last_input.remove(endpoint_id);
+        // Disconnect is unknown, never completion. Clear custody before closing peers
+        // or prompts, so neither synchronous cleanup nor queued teardown can send proof.
+        self.attempts
+            .retain(|_, attempt| &attempt.endpoint_id != endpoint_id);
+        self.owners
+            .retain(|_, (endpoint, _)| endpoint != endpoint_id);
+        self.effects.retain(
+            |effect| !matches!(effect, MediaEffect::Send(endpoint, _) if endpoint == endpoint_id),
+        );
         if self
             .session
             .as_ref()
@@ -380,11 +510,48 @@ impl ClientMedia {
     }
 
     fn start(&mut self, endpoint_id: ClientEndpointId, session_id: String, pane_id: String) {
+        // A policy reload from Ask to Auto can leave an older prompt outstanding.
+        // Seal that opener too before starting the successor.
+        if let Some(previous) = self.pending.take() {
+            let origin = successor_origin(
+                &previous.endpoint_id,
+                &previous.pane_id,
+                &endpoint_id,
+                &pane_id,
+            );
+            self.mark_end(&previous.endpoint_id, &previous.session_id, origin, None);
+            self.effects.push(MediaEffect::CancelConsent {
+                session_id: previous.session_id.clone(),
+            });
+            self.send_close(
+                previous.endpoint_id,
+                previous.session_id,
+                close_code::REPLACED,
+                "a newer media request replaced this one",
+            );
+        }
+        // This serialized transition happens before scheduling any factory opener.
+        if let Some(attempt) = self
+            .attempts
+            .get_mut(&(endpoint_id.clone(), session_id.clone()))
+        {
+            if attempt.settled || attempt.origin.is_some() {
+                return;
+            }
+            attempt.started = true;
+        }
         // A renewal of the same call keeps its mute from the first sample (closed before the new peer opens).
         let keep_muted = self.session.as_ref().is_some_and(|previous| {
             previous.muted && previous.endpoint_id == endpoint_id && previous.pane_id == pane_id
         });
         if let Some(mut previous) = self.session.take() {
+            let origin = successor_origin(
+                &previous.endpoint_id,
+                &previous.pane_id,
+                &endpoint_id,
+                &pane_id,
+            );
+            self.mark_end(&previous.endpoint_id, &previous.session_id, origin, None);
             previous.peer.close();
             self.send_close(
                 previous.endpoint_id,
@@ -393,7 +560,29 @@ impl ClientMedia {
                 "a newer media session replaced this one",
             );
         }
-        match (self.factory)(session_id.clone(), self.sink.clone()) {
+        // Never recycle a local token, even after disconnect or a factory error.
+        let owner = self.next_owner;
+        let Some(next_owner) = owner.checked_add(1) else {
+            self.notice("Voice call failed: media peer identities exhausted");
+            return;
+        };
+        self.next_owner = next_owner;
+        self.owners
+            .insert(owner, (endpoint_id.clone(), session_id.clone()));
+        if let Some(attempt) = self
+            .attempts
+            .get_mut(&(endpoint_id.clone(), session_id.clone()))
+        {
+            attempt.owner = Some(owner);
+        }
+        let sink = self.sink.clone();
+        let scoped_sink: PeerEventSink = std::sync::Arc::new(move |event| {
+            sink(PeerEvent::Scoped {
+                owner,
+                event: Box::new(event),
+            });
+        });
+        match (self.factory)(session_id.clone(), scoped_sink) {
             Ok(mut peer) => {
                 if keep_muted {
                     peer.set_muted(true);
@@ -401,6 +590,7 @@ impl ClientMedia {
                 self.session = Some(MediaSession {
                     endpoint_id,
                     session_id,
+                    owner,
                     pane_id,
                     muted: keep_muted,
                     peer,
@@ -408,6 +598,8 @@ impl ClientMedia {
                 self.notice("Voice call started");
             }
             Err(error) => {
+                // A generic factory Err does not prove no worker/opener was scheduled.
+                // Preserve custody for its teardown; never infer acquired:false here.
                 self.notice(&format!("Voice call failed: {error}"));
                 self.send_close(endpoint_id, session_id, close_code::DEVICE_ERROR, &error);
             }
@@ -434,8 +626,9 @@ impl ClientMedia {
     fn cancel_pending(&mut self) {
         if let Some(pending) = self.pending.take() {
             self.effects.push(MediaEffect::CancelConsent {
-                session_id: pending.session_id,
+                session_id: pending.session_id.clone(),
             });
+            self.complete_attempt(&pending.endpoint_id, &pending.session_id, false, true);
         }
     }
 
@@ -459,6 +652,67 @@ impl ClientMedia {
         self.send_close(endpoint_id.clone(), session_id, code, message);
     }
 
+    fn mark_end(
+        &mut self,
+        endpoint_id: &ClientEndpointId,
+        session_id: &str,
+        origin: MediaEndOrigin,
+        request_id: Option<String>,
+    ) {
+        if let Some(attempt) = self
+            .attempts
+            .get_mut(&(endpoint_id.clone(), session_id.to_owned()))
+        {
+            if !attempt.settled && attempt.origin.is_none() {
+                attempt.origin = Some(origin);
+                attempt.request_id = if origin == MediaEndOrigin::Requested {
+                    request_id
+                } else {
+                    None
+                };
+            }
+        }
+    }
+
+    /// The only completion path: callers either positively sealed a never-started
+    /// attempt under serialized ownership, or received the native post-join result.
+    fn complete_attempt(
+        &mut self,
+        endpoint_id: &ClientEndpointId,
+        session_id: &str,
+        acquired: bool,
+        success: bool,
+    ) {
+        let Some(attempt) = self
+            .attempts
+            .get_mut(&(endpoint_id.clone(), session_id.to_owned()))
+        else {
+            return;
+        };
+        if attempt.settled {
+            return;
+        }
+        attempt.settled = true;
+        let control = if success {
+            MediaControl::Ended(MediaEnded {
+                session_id: session_id.to_owned(),
+                generation: attempt.generation.clone(),
+                attempt: attempt.attempt.clone(),
+                origin: attempt.origin.unwrap_or(MediaEndOrigin::Natural),
+                request_id: attempt.request_id.clone(),
+                acquired,
+            })
+        } else {
+            MediaControl::TeardownStuck(MediaTeardownStuck {
+                session_id: session_id.to_owned(),
+                generation: attempt.generation.clone(),
+                attempt: attempt.attempt.clone(),
+            })
+        };
+        self.effects
+            .push(MediaEffect::Send(attempt.endpoint_id.clone(), control));
+    }
+
     fn send_close(
         &mut self,
         endpoint_id: ClientEndpointId,
@@ -466,14 +720,40 @@ impl ClientMedia {
         code: &str,
         message: &str,
     ) {
+        // Client-first refusals and local policy/device ends are natural unless a
+        // server close or explicit successor transition already supplied the reason.
+        self.mark_end(&endpoint_id, &session_id, MediaEndOrigin::Natural, None);
         self.effects.push(MediaEffect::Send(
-            endpoint_id,
-            MediaControl::Close(MediaClose::new(session_id, code, bounded(message))),
+            endpoint_id.clone(),
+            MediaControl::Close(MediaClose::new(session_id.clone(), code, bounded(message))),
         ));
+        if self
+            .attempts
+            .get(&(endpoint_id.clone(), session_id.clone()))
+            .is_some_and(|attempt| !attempt.started)
+        {
+            self.complete_attempt(&endpoint_id, &session_id, false, true);
+        }
     }
 
     fn notice(&mut self, message: &str) {
         self.effects.push(MediaEffect::Notice(message.to_owned()));
+    }
+}
+
+/// Client-first origin for a predecessor retired by a successor. Only a same-endpoint,
+/// same-pane renewal can carry the server's `replaces` proof; anything else is natural.
+/// `mark_end` keeps an origin a server close already recorded.
+fn successor_origin(
+    previous_endpoint: &ClientEndpointId,
+    previous_pane: &str,
+    endpoint_id: &ClientEndpointId,
+    pane_id: &str,
+) -> MediaEndOrigin {
+    if previous_endpoint == endpoint_id && previous_pane == pane_id {
+        MediaEndOrigin::Replaced
+    } else {
+        MediaEndOrigin::Natural
     }
 }
 
@@ -505,7 +785,47 @@ mod tests {
         Close(String),
     }
 
-    type Calls = Arc<Mutex<Vec<PeerCall>>>;
+    #[derive(Clone, Default)]
+    struct Calls {
+        calls: Arc<Mutex<Vec<PeerCall>>>,
+        sinks: Arc<Mutex<Vec<(String, PeerEventSink)>>>,
+        events: Arc<Mutex<Vec<PeerEvent>>>,
+    }
+
+    impl std::ops::Deref for Calls {
+        type Target = Mutex<Vec<PeerCall>>;
+        fn deref(&self) -> &Self::Target {
+            &self.calls
+        }
+    }
+
+    impl Calls {
+        fn emit(&self, media: &mut ClientMedia, event: PeerEvent) {
+            let sid = match &event {
+                PeerEvent::Offer { session_id, .. }
+                | PeerEvent::State { session_id, .. }
+                | PeerEvent::Closed { session_id, .. }
+                | PeerEvent::Teardown { session_id, .. } => session_id,
+                PeerEvent::Scoped { .. } => panic!("factory fixtures emit bare native events"),
+            };
+            let sinks = self.sinks.lock().unwrap();
+            // Unknown/stale session fixtures still use a real factory sink, which must
+            // reject the mismatched wire id instead of bypassing owner checks.
+            let sink = sinks
+                .iter()
+                .rev()
+                .find(|(id, _)| id == sid)
+                .or_else(|| sinks.last())
+                .expect("a factory was invoked")
+                .1
+                .clone();
+            drop(sinks);
+            sink(event);
+            for event in std::mem::take(&mut *self.events.lock().unwrap()) {
+                media.handle_peer_event(event);
+            }
+        }
+    }
 
     struct FakePeer {
         session_id: String,
@@ -539,7 +859,12 @@ mod tests {
         let calls = Calls::default();
         let factory_calls = calls.clone();
         let factory: PeerFactory = Box::new(
-            move |session_id: String, _sink: PeerEventSink| -> Result<Box<dyn MediaPeer>, String> {
+            move |session_id: String, sink: PeerEventSink| -> Result<Box<dyn MediaPeer>, String> {
+                factory_calls
+                    .sinks
+                    .lock()
+                    .unwrap()
+                    .push((session_id.clone(), sink));
                 factory_calls
                     .lock()
                     .unwrap()
@@ -553,7 +878,14 @@ mod tests {
                 }) as Box<dyn MediaPeer>)
             },
         );
-        let mut media = ClientMedia::new(mode, factory, Arc::new(|_: PeerEvent| {}));
+        let events = calls.events.clone();
+        let mut media = ClientMedia::new(
+            mode,
+            factory,
+            Arc::new(move |event| {
+                events.lock().unwrap().push(event);
+            }),
+        );
         media.peer_available = true;
         (media, calls)
     }
@@ -562,12 +894,262 @@ mod tests {
         ClientEndpointId::Local
     }
 
+    #[derive(Default, Clone)]
+    struct PeerHarness {
+        sinks: Arc<Mutex<Vec<PeerEventSink>>>,
+        events: Arc<Mutex<Vec<PeerEvent>>>,
+    }
+
+    impl PeerHarness {
+        fn controller(&self) -> ClientMedia {
+            let sinks = self.sinks.clone();
+            let calls = Calls::default();
+            let factory: PeerFactory = Box::new(move |session_id, sink| {
+                sinks.lock().unwrap().push(sink);
+                Ok(Box::new(FakePeer {
+                    session_id,
+                    calls: calls.clone(),
+                }))
+            });
+            let events = self.events.clone();
+            let mut media = ClientMedia::new(
+                MediaMode::Auto,
+                factory,
+                Arc::new(move |event| {
+                    events.lock().unwrap().push(event);
+                }),
+            );
+            media.peer_available = true;
+            media
+        }
+
+        fn emit(&self, media: &mut ClientMedia, index: usize, event: PeerEvent) {
+            let sink = self.sinks.lock().unwrap()[index].clone();
+            sink(event);
+            let events = std::mem::take(&mut *self.events.lock().unwrap());
+            for event in events {
+                media.handle_peer_event(event);
+            }
+        }
+    }
+
+    fn other_endpoint() -> ClientEndpointId {
+        ClientEndpointId::Ssh(
+            crate::client::endpoint::ProfileId::parse("0123456789abcdef0123456789abcdef").unwrap(),
+        )
+    }
+
+    fn bound_open(media: &mut ClientMedia, endpoint: &ClientEndpointId, sid: &str, identity: &str) {
+        let now = Instant::now();
+        media.note_pane_input(endpoint, "pane_1", now);
+        media.handle_server_control(endpoint, receipt_control("media.open.v1", serde_json::json!({
+            "session_id": sid, "pane_id": "pane_1",
+            "generation": format!("generation:{identity}"), "attempt": format!("attempt:{identity}"),
+        })), true, |_| Some("pane".into()), now);
+    }
+
+    fn teardown(sid: &str) -> PeerEvent {
+        PeerEvent::Teardown {
+            session_id: sid.into(),
+            acquired: true,
+            success: true,
+        }
+    }
+
+    #[test]
+    fn receipt_370_old_factory_sink_cannot_complete_reused_id_after_disconnect() {
+        let harness = PeerHarness::default();
+        let mut media = harness.controller();
+        bound_open(&mut media, &local(), "m", "A");
+        media.endpoint_gone(&local());
+        bound_open(&mut media, &other_endpoint(), "m", "B");
+        assert_eq!(harness.sinks.lock().unwrap().len(), 2);
+        media.take_effects();
+        harness.emit(&mut media, 0, teardown("m"));
+        assert_no_completion(&media.take_effects());
+        for event in [
+            PeerEvent::Offer {
+                session_id: "m".into(),
+                sdp: "old A".into(),
+            },
+            PeerEvent::State {
+                session_id: "m".into(),
+                state: MediaPeerState::Connected,
+                muted: true,
+                detail: None,
+            },
+            PeerEvent::Closed {
+                session_id: "m".into(),
+                code: close_code::DEVICE_ERROR,
+                message: "old A".into(),
+            },
+        ] {
+            harness.emit(&mut media, 0, event);
+            assert!(media.take_effects().is_empty(), "old A cannot mutate B");
+        }
+        assert_eq!(
+            media.session.as_ref().unwrap().endpoint_id,
+            other_endpoint()
+        );
+        assert!(
+            !media
+                .attempts
+                .get(&(other_endpoint(), "m".into()))
+                .unwrap()
+                .settled
+        );
+        harness.emit(&mut media, 1, teardown("m"));
+        assert_eq!(
+            completion_controls(&media.take_effects(), "media.ended.v1"),
+            vec![(
+                other_endpoint(),
+                serde_json::json!({
+                    "session_id": "m", "generation": "generation:B", "attempt": "attempt:B",
+                    "origin": "natural", "acquired": true,
+                })
+            )]
+        );
+        harness.emit(&mut media, 1, teardown("m"));
+        assert!(media.take_effects().is_empty());
+    }
+
+    #[test]
+    fn receipt_370_reconnect_invalidates_old_owner_even_on_same_endpoint() {
+        let harness = PeerHarness::default();
+        let mut media = harness.controller();
+        bound_open(&mut media, &local(), "m", "A");
+        media.endpoint_gone(&local());
+        bound_open(&mut media, &local(), "m", "B");
+        media.take_effects();
+        harness.emit(&mut media, 0, teardown("m"));
+        assert!(media.take_effects().is_empty());
+        assert!(!media.attempts.get(&(local(), "m".into())).unwrap().settled);
+        assert_eq!(media.session.as_ref().unwrap().session_id, "m");
+        harness.emit(&mut media, 1, teardown("m"));
+        let receipts = completion_controls(&media.take_effects(), "media.ended.v1");
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].0, local());
+        assert_eq!(receipts[0].1["generation"], "generation:B");
+        assert_eq!(receipts[0].1["attempt"], "attempt:B");
+    }
+
+    #[test]
+    fn receipt_370_unscoped_events_cannot_adopt_live_owner() {
+        let harness = PeerHarness::default();
+        let mut media = harness.controller();
+        bound_open(&mut media, &local(), "m", "A");
+        media.take_effects();
+        for event in [
+            PeerEvent::Offer {
+                session_id: "m".into(),
+                sdp: "bare".into(),
+            },
+            PeerEvent::State {
+                session_id: "m".into(),
+                state: MediaPeerState::Connected,
+                muted: true,
+                detail: None,
+            },
+            PeerEvent::Closed {
+                session_id: "m".into(),
+                code: close_code::DEVICE_ERROR,
+                message: "bare".into(),
+            },
+            teardown("m"),
+        ] {
+            media.handle_peer_event(event);
+            assert!(media.take_effects().is_empty());
+        }
+        assert_eq!(media.session.as_ref().unwrap().session_id, "m");
+        assert!(!media.attempts.get(&(local(), "m".into())).unwrap().settled);
+        harness.emit(&mut media, 0, teardown("m"));
+        let receipts = completion_controls(&media.take_effects(), "media.ended.v1");
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].1["attempt"], "attempt:A");
+    }
+
+    #[test]
+    fn receipt_370_live_cross_endpoint_reused_ids_have_independent_custody() {
+        let harness = PeerHarness::default();
+        let mut media = harness.controller();
+        bound_open(&mut media, &local(), "m", "A");
+        bound_open(&mut media, &other_endpoint(), "m", "B");
+        assert_eq!(
+            harness.sinks.lock().unwrap().len(),
+            2,
+            "duplicate suppression is endpoint-local"
+        );
+        media.take_effects();
+        harness.emit(&mut media, 0, teardown("m"));
+        let effects = media.take_effects();
+        let receipts = completion_controls(&effects, "media.ended.v1");
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].0, local());
+        assert_eq!(receipts[0].1["attempt"], "attempt:A");
+        assert_eq!(
+            media.session.as_ref().unwrap().endpoint_id,
+            other_endpoint()
+        );
+        harness.emit(&mut media, 1, teardown("m"));
+        let receipts = completion_controls(&media.take_effects(), "media.ended.v1");
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].0, other_endpoint());
+        assert_eq!(receipts[0].1["attempt"], "attempt:B");
+    }
+
+    #[test]
+    fn receipt_370_replaced_same_endpoint_factory_sink_completes_original_identity() {
+        let harness = PeerHarness::default();
+        let mut media = harness.controller();
+        bound_open(&mut media, &local(), "old", "A");
+        bound_open(&mut media, &local(), "new", "B");
+        media.take_effects();
+        // Neither the predecessor's genuine id nor a mislabelled successor id may
+        // publish or close the successor through that predecessor's captured sink.
+        for sid in ["old", "new"] {
+            for event in [
+                PeerEvent::Offer {
+                    session_id: sid.into(),
+                    sdp: "late old".into(),
+                },
+                PeerEvent::State {
+                    session_id: sid.into(),
+                    state: MediaPeerState::Connected,
+                    muted: true,
+                    detail: None,
+                },
+                PeerEvent::Closed {
+                    session_id: sid.into(),
+                    code: close_code::DEVICE_ERROR,
+                    message: "late old".into(),
+                },
+            ] {
+                harness.emit(&mut media, 0, event);
+                assert!(media.take_effects().is_empty());
+                assert_eq!(media.session.as_ref().unwrap().session_id, "new");
+            }
+        }
+        harness.emit(&mut media, 0, teardown("new"));
+        assert!(media.take_effects().is_empty());
+        harness.emit(&mut media, 0, teardown("old"));
+        let receipts = completion_controls(&media.take_effects(), "media.ended.v1");
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].0, local());
+        assert_eq!(receipts[0].1["session_id"], "old");
+        assert_eq!(receipts[0].1["generation"], "generation:A");
+        assert_eq!(receipts[0].1["attempt"], "attempt:A");
+        assert_eq!(receipts[0].1["origin"], "replaced");
+        assert_eq!(media.session.as_ref().unwrap().session_id, "new");
+    }
+
     fn open(media: &mut ClientMedia, session_id: &str, pane_id: &str, now: Instant) {
         media.handle_server_control(
             &local(),
             MediaControl::Open(MediaOpen {
                 session_id: session_id.into(),
                 pane_id: pane_id.into(),
+                generation: None,
+                attempt: None,
             }),
             true,
             |pane| (pane == "pane_1" || pane == "pane_2").then(|| format!("label {pane}")),
@@ -595,6 +1177,536 @@ mod tests {
         }
     }
 
+    // #370 exercises the real named-control JSON boundary so receipt metadata is not
+    // accidentally lost between decoding, consent and the teardown effect.
+    fn receipt_control(kind: &str, data: serde_json::Value) -> MediaControl {
+        MediaControl::decode(kind, &data.to_string())
+            .expect("known media control")
+            .expect("valid receipt-bearing control")
+    }
+
+    fn receipt_open(media: &mut ClientMedia, session_id: &str, now: Instant) {
+        media.handle_server_control(
+            &local(),
+            receipt_control(
+                "media.open.v1",
+                serde_json::json!({
+                    "session_id": session_id,
+                    "pane_id": "pane_1",
+                    "generation": format!("generation:{session_id}"),
+                    "attempt": format!("attempt:{session_id}"),
+                }),
+            ),
+            true,
+            |_| Some("label pane_1".into()),
+            now,
+        );
+    }
+
+    fn receipt_close(media: &mut ClientMedia, session_id: &str, origin: &str) {
+        let mut data = serde_json::json!({
+            "session_id": session_id,
+            "code": "closed",
+            "origin": origin,
+        });
+        if origin == "requested" {
+            data["request_id"] = serde_json::json!("request:close-370");
+        }
+        media.handle_server_control(
+            &local(),
+            receipt_control("media.close.v1", data),
+            true,
+            |_| None,
+            Instant::now(),
+        );
+    }
+
+    fn completion_controls(
+        effects: &[MediaEffect],
+        kind: &str,
+    ) -> Vec<(ClientEndpointId, serde_json::Value)> {
+        effects
+            .iter()
+            .filter_map(|effect| match effect {
+                MediaEffect::Send(endpoint, control) if control.kind() == kind => {
+                    let crate::protocol::ClientMessage::EndpointControl { data, .. } =
+                        control.client_message().expect("encode client control")
+                    else {
+                        panic!("media completion must use the endpoint control envelope");
+                    };
+                    Some((endpoint.clone(), serde_json::from_str(&data).unwrap()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn expected_receipt(session_id: &str, origin: &str, acquired: bool) -> serde_json::Value {
+        let mut data = serde_json::json!({
+            "session_id": session_id,
+            "generation": format!("generation:{session_id}"),
+            "attempt": format!("attempt:{session_id}"),
+            "origin": origin,
+            "acquired": acquired,
+        });
+        if origin == "requested" {
+            data["request_id"] = serde_json::json!("request:close-370");
+        }
+        data
+    }
+
+    fn assert_receipt_close_pending_consent(origin: &str) {
+        let (mut media, calls) = media(MediaMode::Ask, false);
+        let now = Instant::now();
+        media.note_pane_input(&local(), "pane_1", now);
+        receipt_open(&mut media, "m1", now);
+        assert!(media.take_effects().contains(&MediaEffect::AskConsent {
+            session_id: "m1".into(),
+            pane_label: "label pane_1".into(),
+        }));
+        assert!(calls.lock().unwrap().is_empty(), "consent holds the opener");
+
+        receipt_close(&mut media, "m1", origin);
+        let effects = media.take_effects();
+        assert!(effects.contains(&MediaEffect::CancelConsent {
+            session_id: "m1".into(),
+        }));
+        assert_eq!(media.deadline(), None);
+        // An already queued UI answer cannot start an opener after the close fence.
+        media.consent("m1", true);
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "late consent cannot acquire"
+        );
+        assert!(
+            media.take_effects().is_empty(),
+            "late consent cannot send again"
+        );
+        assert_eq!(
+            completion_controls(&effects, "media.ended.v1"),
+            vec![(local(), expected_receipt("m1", origin, false))],
+            "sealed pending consent needs exactly one never-acquired receipt"
+        );
+        receipt_close(&mut media, "m1", origin);
+        media.consent("m1", true);
+        assert!(completion_controls(&media.take_effects(), "media.ended.v1").is_empty());
+    }
+
+    #[test]
+    fn receipt_370_close_pending_consent_seals_opener_before_late_accept() {
+        assert_receipt_close_pending_consent("cancelled");
+    }
+
+    #[test]
+    fn receipt_370_requested_close_pending_consent_preserves_request_id() {
+        assert_receipt_close_pending_consent("requested");
+    }
+
+    #[test]
+    fn receipt_370_replaced_pending_consent_completes_only_the_old_attempt() {
+        let (mut media, calls) = media(MediaMode::Ask, false);
+        let now = Instant::now();
+        media.note_pane_input(&local(), "pane_1", now);
+        receipt_open(&mut media, "m1", now);
+        media.take_effects();
+        receipt_open(&mut media, "m2", now);
+        let effects = media.take_effects();
+        assert!(effects.contains(&MediaEffect::CancelConsent {
+            session_id: "m1".into()
+        }));
+        assert!(effects.contains(&MediaEffect::AskConsent {
+            session_id: "m2".into(),
+            pane_label: "label pane_1".into(),
+        }));
+        media.consent("m1", true);
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "old prompt answer is sealed"
+        );
+        assert!(media.take_effects().is_empty());
+        assert_eq!(
+            completion_controls(&effects, "media.ended.v1"),
+            vec![(local(), expected_receipt("m1", "replaced", false))],
+            "replacement must preserve the predecessor identity, not complete m2"
+        );
+        media.consent("m2", true);
+        assert_eq!(*calls.lock().unwrap(), vec![PeerCall::Start("m2".into())]);
+    }
+
+    fn receipt_started() -> (ClientMedia, Calls) {
+        let (mut media, calls) = media(MediaMode::Auto, false);
+        let now = Instant::now();
+        media.note_pane_input(&local(), "pane_1", now);
+        receipt_open(&mut media, "m1", now);
+        assert_eq!(*calls.lock().unwrap(), vec![PeerCall::Start("m1".into())]);
+        assert!(completion_controls(&media.take_effects(), "media.ended.v1").is_empty());
+        (media, calls)
+    }
+
+    fn assert_no_completion(effects: &[MediaEffect]) {
+        assert!(
+            completion_controls(effects, "media.ended.v1").is_empty(),
+            "close admission, peer Closed and a held teardown are not receipts: {effects:?}"
+        );
+        assert!(completion_controls(effects, "media.teardown_stuck.v1").is_empty());
+    }
+
+    // The fake peer's close records cancellation but deliberately does not emit Teardown.
+    // The test holds completion at the real peer-event seam until the explicit join result.
+    #[test]
+    fn receipt_370_requested_close_waits_for_held_teardown_and_sends_once() {
+        let (mut media, calls) = receipt_started();
+        receipt_close(&mut media, "m1", "requested");
+        assert!(calls
+            .lock()
+            .unwrap()
+            .contains(&PeerCall::Close("m1".into())));
+        assert_no_completion(&media.take_effects());
+        receipt_close(&mut media, "m1", "requested");
+        calls.emit(
+            &mut media,
+            PeerEvent::Closed {
+                session_id: "m1".into(),
+                code: close_code::DEVICE_ERROR,
+                message: "late error".into(),
+            },
+        );
+        calls.emit(
+            &mut media,
+            PeerEvent::Teardown {
+                session_id: "unknown".into(),
+                acquired: true,
+                success: true,
+            },
+        );
+        assert_no_completion(&media.take_effects());
+
+        calls.emit(
+            &mut media,
+            PeerEvent::Teardown {
+                session_id: "m1".into(),
+                acquired: true,
+                success: true,
+            },
+        );
+        assert_eq!(
+            completion_controls(&media.take_effects(), "media.ended.v1"),
+            vec![(local(), expected_receipt("m1", "requested", true))],
+            "late Closed must not replace the requested origin/correlation"
+        );
+        calls.emit(
+            &mut media,
+            PeerEvent::Teardown {
+                session_id: "m1".into(),
+                acquired: true,
+                success: true,
+            },
+        );
+        assert!(
+            media.take_effects().is_empty(),
+            "duplicate join result cannot send twice"
+        );
+    }
+
+    #[test]
+    fn receipt_370_replaced_running_peer_retains_old_attempt_until_teardown() {
+        let (mut media, calls) = receipt_started();
+        let now = Instant::now();
+        receipt_open(&mut media, "m2", now);
+        assert!(calls
+            .lock()
+            .unwrap()
+            .contains(&PeerCall::Close("m1".into())));
+        assert!(calls
+            .lock()
+            .unwrap()
+            .contains(&PeerCall::Start("m2".into())));
+        assert_no_completion(&media.take_effects());
+        // m1 is no longer current, but its join result is still authoritative for m1.
+        calls.emit(
+            &mut media,
+            PeerEvent::Teardown {
+                session_id: "m1".into(),
+                acquired: true,
+                success: true,
+            },
+        );
+        assert_eq!(
+            completion_controls(&media.take_effects(), "media.ended.v1"),
+            vec![(local(), expected_receipt("m1", "replaced", true))]
+        );
+        assert_eq!(media.session.as_ref().unwrap().session_id, "m2");
+        // Nor may m1's late offer mutate the successor or restart its predecessor.
+        calls.emit(
+            &mut media,
+            PeerEvent::Offer {
+                session_id: "m1".into(),
+                sdp: "late".into(),
+            },
+        );
+        calls.emit(
+            &mut media,
+            PeerEvent::Teardown {
+                session_id: "m1".into(),
+                acquired: true,
+                success: true,
+            },
+        );
+        assert!(media.take_effects().is_empty());
+    }
+
+    #[test]
+    fn receipt_370_natural_closed_waits_for_join_after_current_session_is_removed() {
+        let (mut media, calls) = receipt_started();
+        calls.emit(
+            &mut media,
+            PeerEvent::Closed {
+                session_id: "m1".into(),
+                code: close_code::DEVICE_ERROR,
+                message: "device lost".into(),
+            },
+        );
+        let effects = media.take_effects();
+        assert_eq!(
+            closes(&effects),
+            vec![("m1".into(), Some(close_code::DEVICE_ERROR.into()))]
+        );
+        assert_no_completion(&effects);
+        assert!(media.session.is_none());
+        calls.emit(
+            &mut media,
+            PeerEvent::Teardown {
+                session_id: "m1".into(),
+                acquired: true,
+                success: true,
+            },
+        );
+        assert_eq!(
+            completion_controls(&media.take_effects(), "media.ended.v1"),
+            vec![(local(), expected_receipt("m1", "natural", true))]
+        );
+        calls.emit(
+            &mut media,
+            PeerEvent::Teardown {
+                session_id: "m1".into(),
+                acquired: true,
+                success: true,
+            },
+        );
+        assert!(media.take_effects().is_empty());
+    }
+
+    #[test]
+    fn receipt_370_failed_join_is_diagnostic_only_not_never_acquired() {
+        let (mut media, calls) = receipt_started();
+        receipt_close(&mut media, "m1", "requested");
+        assert_no_completion(&media.take_effects());
+        calls.emit(
+            &mut media,
+            PeerEvent::Teardown {
+                session_id: "m1".into(),
+                acquired: false,
+                success: false,
+            },
+        );
+        let effects = media.take_effects();
+        assert!(
+            completion_controls(&effects, "media.ended.v1").is_empty(),
+            "missing peer/acquisition information on a failed join is not never-acquired proof"
+        );
+        assert_eq!(
+            completion_controls(&effects, "media.teardown_stuck.v1"),
+            vec![(
+                local(),
+                serde_json::json!({
+                    "session_id": "m1", "generation": "generation:m1", "attempt": "attempt:m1",
+                })
+            )]
+        );
+        calls.emit(
+            &mut media,
+            PeerEvent::Teardown {
+                session_id: "m1".into(),
+                acquired: false,
+                success: false,
+            },
+        );
+        assert!(
+            media.take_effects().is_empty(),
+            "one diagnostic per attempt"
+        );
+    }
+
+    // NEW-01: a stuck teardown of the live peer (e.g. an expired opening deadline) retires
+    // that session: close the peer, tell the server, and never send Ended for it.
+    #[test]
+    fn receipt_370_stuck_teardown_retires_live_session_without_ended() {
+        let (mut media, calls) = receipt_started();
+        calls.emit(
+            &mut media,
+            PeerEvent::Teardown {
+                session_id: "m1".into(),
+                acquired: true,
+                success: false,
+            },
+        );
+        let effects = media.take_effects();
+        assert!(completion_controls(&effects, "media.ended.v1").is_empty());
+        assert_eq!(
+            completion_controls(&effects, "media.teardown_stuck.v1").len(),
+            1
+        );
+        assert_eq!(
+            closes(&effects),
+            vec![("m1".into(), Some(close_code::DEVICE_ERROR.into()))]
+        );
+        assert!(media.session.is_none(), "stuck session is retired");
+        assert!(calls
+            .lock()
+            .unwrap()
+            .contains(&PeerCall::Close("m1".into())));
+        // Late peer events and a server close cannot revive it or publish a receipt.
+        for event in [
+            PeerEvent::Offer {
+                session_id: "m1".into(),
+                sdp: "late".into(),
+            },
+            PeerEvent::Closed {
+                session_id: "m1".into(),
+                code: close_code::DEVICE_ERROR,
+                message: "late".into(),
+            },
+            teardown("m1"),
+        ] {
+            calls.emit(&mut media, event);
+            assert!(media.take_effects().is_empty());
+        }
+        receipt_close(&mut media, "m1", "requested");
+        assert_no_completion(&media.take_effects());
+        assert!(media.session.is_none());
+    }
+
+    #[test]
+    fn receipt_370_wrong_endpoint_and_stale_controls_do_not_close_successor() {
+        let (mut media, calls) = receipt_started();
+        let other = ClientEndpointId::Ssh(
+            crate::client::endpoint::ProfileId::parse("0123456789abcdef0123456789abcdef").unwrap(),
+        );
+        let now = Instant::now();
+        let close = receipt_control(
+            "media.close.v1",
+            serde_json::json!({
+                "session_id": "m1", "origin": "requested", "request_id": "wrong:endpoint",
+            }),
+        );
+        media.handle_server_control(&other, close, true, |_| None, now);
+        assert_eq!(*calls.lock().unwrap(), vec![PeerCall::Start("m1".into())]);
+        assert!(media.take_effects().is_empty());
+        receipt_open(&mut media, "m2", now);
+        media.take_effects();
+        receipt_close(&mut media, "m1", "requested");
+        calls.emit(
+            &mut media,
+            PeerEvent::Teardown {
+                session_id: "m1".into(),
+                acquired: true,
+                success: true,
+            },
+        );
+        assert_eq!(
+            completion_controls(&media.take_effects(), "media.ended.v1"),
+            vec![(local(), expected_receipt("m1", "replaced", true))]
+        );
+        assert_eq!(media.session.as_ref().unwrap().session_id, "m2");
+        assert!(!calls
+            .lock()
+            .unwrap()
+            .contains(&PeerCall::Close("m2".into())));
+    }
+
+    #[test]
+    fn receipt_370_disconnect_drops_custody_without_delivering_completion() {
+        let (mut media, calls) = receipt_started();
+        media.endpoint_gone(&local());
+        calls.emit(
+            &mut media,
+            PeerEvent::Teardown {
+                session_id: "m1".into(),
+                acquired: true,
+                success: true,
+            },
+        );
+        assert_no_completion(&media.take_effects());
+        assert!(media.attempts.is_empty());
+        assert!(calls
+            .lock()
+            .unwrap()
+            .contains(&PeerCall::Close("m1".into())));
+
+        let (mut pending, _) = media_for_disconnect();
+        receipt_close(&mut pending, "m1", "cancelled");
+        // Even already-queued proof cannot be delivered onto a disconnected endpoint.
+        pending.endpoint_gone(&local());
+        assert_no_completion(&pending.take_effects());
+        assert!(pending.attempts.is_empty());
+    }
+
+    fn media_for_disconnect() -> (ClientMedia, Calls) {
+        let (mut media, calls) = media(MediaMode::Ask, false);
+        let now = Instant::now();
+        media.note_pane_input(&local(), "pane_1", now);
+        receipt_open(&mut media, "m1", now);
+        media.take_effects();
+        (media, calls)
+    }
+
+    #[test]
+    fn receipt_370_factory_error_is_not_positive_never_acquired_evidence() {
+        let (mut media, calls) = media(MediaMode::Auto, true);
+        let now = Instant::now();
+        media.note_pane_input(&local(), "pane_1", now);
+        receipt_open(&mut media, "m1", now);
+        assert_no_completion(&media.take_effects());
+        receipt_close(&mut media, "m1", "requested");
+        assert_no_completion(&media.take_effects());
+        calls.emit(
+            &mut media,
+            PeerEvent::Teardown {
+                session_id: "m1".into(),
+                acquired: true,
+                success: true,
+            },
+        );
+        assert_eq!(
+            completion_controls(&media.take_effects(), "media.ended.v1"),
+            vec![(local(), expected_receipt("m1", "natural", true))]
+        );
+    }
+
+    #[test]
+    fn receipt_370_refused_renewal_preserves_live_predecessor() {
+        let (mut media, calls) = receipt_started();
+        media.handle_server_control(
+            &local(),
+            receipt_control(
+                "media.open.v1",
+                serde_json::json!({
+                    "session_id": "m2", "pane_id": "pane_1",
+                    "generation": "generation:m2", "attempt": "attempt:m2",
+                }),
+            ),
+            true,
+            |_| None,
+            Instant::now(),
+        );
+        assert_eq!(*calls.lock().unwrap(), vec![PeerCall::Start("m1".into())]);
+        assert_eq!(
+            completion_controls(&media.take_effects(), "media.ended.v1"),
+            vec![(local(), expected_receipt("m2", "natural", false))]
+        );
+        assert_eq!(media.session.as_ref().unwrap().session_id, "m1");
+    }
+
     #[test]
     fn open_from_an_endpoint_the_client_does_not_show_is_wrong_endpoint() {
         let (mut media, calls) = media(MediaMode::Auto, false);
@@ -605,6 +1717,8 @@ mod tests {
             MediaControl::Open(MediaOpen {
                 session_id: "m1".into(),
                 pane_id: "pane_1".into(),
+                generation: None,
+                attempt: None,
             }),
             false,
             |_| Some("label".into()),
@@ -765,20 +1879,29 @@ mod tests {
         assert_eq!(*calls.lock().unwrap(), vec![PeerCall::Start("m1".into())]);
         assert!(closes(&media.take_effects()).is_empty());
 
-        media.handle_peer_event(PeerEvent::Offer {
-            session_id: "m1".into(),
-            sdp: "v=0".into(),
-        });
-        media.handle_peer_event(PeerEvent::State {
-            session_id: "m1".into(),
-            state: MediaPeerState::Connected,
-            muted: false,
-            detail: None,
-        });
-        media.handle_peer_event(PeerEvent::Offer {
-            session_id: "stale".into(),
-            sdp: "v=0".into(),
-        });
+        calls.emit(
+            &mut media,
+            PeerEvent::Offer {
+                session_id: "m1".into(),
+                sdp: "v=0".into(),
+            },
+        );
+        calls.emit(
+            &mut media,
+            PeerEvent::State {
+                session_id: "m1".into(),
+                state: MediaPeerState::Connected,
+                muted: false,
+                detail: None,
+            },
+        );
+        calls.emit(
+            &mut media,
+            PeerEvent::Offer {
+                session_id: "stale".into(),
+                sdp: "v=0".into(),
+            },
+        );
         assert_eq!(
             media.take_effects(),
             vec![
@@ -833,6 +1956,142 @@ mod tests {
                 PeerCall::Close("m1".into()),
                 PeerCall::Start("m2".into()),
             ]
+        );
+    }
+
+    /// SEC-370-05: two real brokers; A's pending prompt is retired by B's open on another
+    /// endpoint. `ask_to_auto` reloads the policy first, so `start` seals A instead.
+    fn cross_endpoint_pending_retirement(ask_to_auto: bool) {
+        let now = Instant::now();
+        let pane = crate::layout::PaneId::from_raw(7);
+        let mut broker_a = crate::server::media::MediaBroker::new();
+        broker_a.client_connected(1, true);
+        broker_a.set_client_ended_receipt(1, true);
+        broker_a.note_pane_input(1, pane, "pane_1", now);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let actions = broker_a.open_with_receipt(
+            "open:A".into(),
+            tx,
+            pane,
+            Some("generation:A".into()),
+            Some("attempt:A".into()),
+            |_| true,
+            now,
+        );
+        let (mut client, calls) = media(MediaMode::Ask, false);
+        client.note_pane_input(&local(), "pane_1", now);
+        deliver(&mut client, actions, now);
+        let old_sid = client.pending.as_ref().unwrap().session_id.clone();
+        client.take_effects();
+        if ask_to_auto {
+            client.set_mode(MediaMode::Auto);
+        }
+        let mut broker_b = crate::server::media::MediaBroker::new();
+        broker_b.client_connected(1, true);
+        broker_b.set_client_ended_receipt(1, true);
+        broker_b.note_pane_input(1, pane, "pane_1", now);
+        let (tx, _rx_b) = std::sync::mpsc::channel();
+        let (controls, _) = to_client(broker_b.open_with_receipt(
+            "open:B".into(),
+            tx,
+            pane,
+            Some("generation:B".into()),
+            Some("attempt:B".into()),
+            |_| true,
+            now,
+        ));
+        client.note_pane_input(&other_endpoint(), "pane_1", now);
+        for control in controls {
+            client.handle_server_control(
+                &other_endpoint(),
+                control,
+                true,
+                |_| Some("B pane".into()),
+                now,
+            );
+        }
+        if ask_to_auto {
+            assert_eq!(calls.lock().unwrap().len(), 1, "Auto starts B only");
+        } else {
+            assert!(
+                calls.lock().unwrap().is_empty(),
+                "both are actual pending consent openers"
+            );
+        }
+        let effects = client.take_effects();
+        let ended = completion_controls(&effects, "media.ended.v1");
+        assert_eq!(ended.len(), 1);
+        assert_eq!(ended[0].0, local());
+        assert_eq!(ended[0].1["attempt"], "attempt:A");
+        assert_eq!(ended[0].1["acquired"], false);
+        assert_eq!(ended[0].1["origin"], "natural");
+        let mut publications = 0;
+        for effect in effects {
+            if let MediaEffect::Send(endpoint, control) = effect {
+                if endpoint == local() {
+                    let actions = broker_a.client_control(1, control, now);
+                    publications += actions
+                        .iter()
+                        .filter(|a| matches!(a, crate::server::media::MediaAction::Publish(_)))
+                        .count();
+                    to_client(actions);
+                }
+            }
+        }
+        assert_eq!(
+            publications, 1,
+            "A's broker accepts the original receipt once"
+        );
+        assert!(
+            broker_a.state(&old_sid).unwrap().ended.is_some(),
+            "cross-endpoint retirement has no successor proof on A; it must be natural"
+        );
+    }
+
+    #[test]
+    fn cross_endpoint_pending_replacement_must_complete_original_broker() {
+        cross_endpoint_pending_retirement(false);
+    }
+
+    #[test]
+    fn ask_to_auto_cross_endpoint_pending_retirement_completes_original_broker() {
+        cross_endpoint_pending_retirement(true);
+    }
+
+    #[test]
+    fn genuine_new_prompt_answer_starts_its_new_attempt() {
+        let (mut media, calls) = media(MediaMode::Ask, false);
+        bound_open(&mut media, &local(), "m", "A");
+        media.take_effects();
+        media.handle_server_control(
+            &local(),
+            receipt_control(
+                "media.close.v1",
+                serde_json::json!({"session_id":"m", "origin":"cancelled"}),
+            ),
+            true,
+            |_| None,
+            Instant::now(),
+        );
+        media.take_effects();
+        bound_open(&mut media, &other_endpoint(), "m", "B");
+        let key_b = media
+            .take_effects()
+            .into_iter()
+            .find_map(|effect| match effect {
+                MediaEffect::AskConsent { session_id, .. } => Some(session_id),
+                _ => None,
+            })
+            .expect("actual B prompt");
+        media.consent(&key_b, true);
+        assert_eq!(*calls.lock().unwrap(), vec![PeerCall::Start("m".into())]);
+        assert_eq!(
+            media.session.as_ref().unwrap().endpoint_id,
+            other_endpoint()
+        );
+        assert_eq!(
+            media.attempts[&(other_endpoint(), "m".into())].attempt,
+            "attempt:B"
         );
     }
 
@@ -930,6 +2189,7 @@ mod tests {
         for action in actions {
             match action {
                 crate::server::media::MediaAction::Send { control, .. } => controls.push(control),
+                crate::server::media::MediaAction::Publish(_) => {}
                 crate::server::media::MediaAction::Respond {
                     respond_to,
                     response,
@@ -988,10 +2248,13 @@ mod tests {
                 _ => None,
             })
             .unwrap();
-        client.handle_peer_event(PeerEvent::Offer {
-            session_id: old.clone(),
-            sdp: "v=0".into(),
-        });
+        calls.emit(
+            &mut client,
+            PeerEvent::Offer {
+                session_id: old.clone(),
+                sdp: "v=0".into(),
+            },
+        );
         for control in to_broker(&mut client) {
             to_client(broker.client_control(1, control, now));
         }
@@ -1047,10 +2310,13 @@ mod tests {
             to_client(broker.client_control(1, control, later)); // Its close of the old peer, as replaced.
         }
         // 3. The client's offer (its acknowledgement) completes the handover; the caller gets the new offer.
-        client.handle_peer_event(PeerEvent::Offer {
-            session_id: new.clone(),
-            sdp: "v=0 new".into(),
-        });
+        calls.emit(
+            &mut client,
+            PeerEvent::Offer {
+                session_id: new.clone(),
+                sdp: "v=0 new".into(),
+            },
+        );
         for control in to_broker(&mut client) {
             to_client(broker.client_control(1, control, later));
         }
@@ -1293,12 +2559,15 @@ mod tests {
 
     #[test]
     fn peer_closed_event_reports_its_code_and_drops_the_session() {
-        let (mut media, _) = started(MediaMode::Auto);
-        media.handle_peer_event(PeerEvent::Closed {
-            session_id: "m1".into(),
-            code: close_code::DEVICE_ERROR,
-            message: "x".repeat(MAX_MEDIA_TEXT_BYTES + 10),
-        });
+        let (mut media, calls) = started(MediaMode::Auto);
+        calls.emit(
+            &mut media,
+            PeerEvent::Closed {
+                session_id: "m1".into(),
+                code: close_code::DEVICE_ERROR,
+                message: "x".repeat(MAX_MEDIA_TEXT_BYTES + 10),
+            },
+        );
         let effects = media.take_effects();
         assert_eq!(
             closes(&effects),

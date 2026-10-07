@@ -42,6 +42,8 @@ impl App {
         correlation_id: &str,
     ) -> PluginInvocationContext {
         match &event.data {
+            EventData::MediaEnded(_) => empty_plugin_context(correlation_id),
+            EventData::MediaTeardownStuck(_) => empty_plugin_context(correlation_id),
             EventData::WorkspaceCreated { workspace }
             | EventData::WorkspaceUpdated { workspace }
             | EventData::WorkspaceMetadataUpdated { workspace }
@@ -406,5 +408,97 @@ fn empty_plugin_context(correlation_id: &str) -> PluginInvocationContext {
         correlation_id: Some(correlation_id.to_string()),
         clicked_url: None,
         link_handler_id: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::schema::{
+        EventEnvelope, EventKind, MediaEndedReceipt, MediaTeardownStuckEvent,
+    };
+
+    fn focused_app_with_other_pane() -> (App, String) {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &crate::config::Config::default(),
+            crate::app::AppPolicy::TEST,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        app.state.workspaces = vec![
+            crate::workspace::Workspace::test_new("focused"),
+            crate::workspace::Workspace::test_new("media"),
+        ];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        let pane = app.state.workspaces[1].tabs[0].root_pane;
+        let media_pane = app.public_pane_id(1, pane).unwrap();
+        let current = app.current_plugin_context("current");
+        assert!(current.workspace_id.is_some());
+        assert!(current.tab_id.is_some());
+        assert!(current.focused_pane_id.is_some());
+        assert_ne!(
+            current.focused_pane_id.as_deref(),
+            Some(media_pane.as_str())
+        );
+        (app, media_pane)
+    }
+
+    fn assert_media_context_empty(app: &App, event: EventEnvelope) {
+        let context = app.plugin_context_for_event(&event, "media-correlation");
+        // The empty API context retains its source marker, but no attribution.
+        assert_eq!(
+            serde_json::to_value(context).unwrap(),
+            serde_json::json!({
+                "invocation_source": "api",
+                "correlation_id": "media-correlation"
+            })
+        );
+        let hooks = crate::api::schema::plugin_hook_event_names();
+        assert!(!hooks.contains(&"media.ended"));
+        assert!(!hooks.contains(&"media.teardown_stuck"));
+        assert!(hooks.contains(&"pane.moved"));
+    }
+
+    #[test]
+    fn media_event_context_ended_has_no_focus_attribution() {
+        let (app, pane_id) = focused_app_with_other_pane();
+        assert_media_context_empty(
+            &app,
+            EventEnvelope {
+                event: EventKind::MediaEnded,
+                data: EventData::MediaEnded(MediaEndedReceipt {
+                    session_id: "session".into(),
+                    pane_id,
+                    client: 7,
+                    generation: "generation".into(),
+                    attempt: "attempt".into(),
+                    origin: crate::protocol::media::MediaEndOrigin::Natural,
+                    request_id: None,
+                    acquired: true,
+                }),
+            },
+        );
+    }
+
+    #[test]
+    fn media_event_context_teardown_stuck_has_no_focus_attribution() {
+        let (app, pane_id) = focused_app_with_other_pane();
+        assert_media_context_empty(
+            &app,
+            EventEnvelope {
+                event: EventKind::MediaTeardownStuck,
+                data: EventData::MediaTeardownStuck(MediaTeardownStuckEvent {
+                    session_id: "session".into(),
+                    pane_id,
+                    client: 7,
+                    generation: "generation".into(),
+                    attempt: "attempt".into(),
+                }),
+            },
+        );
     }
 }

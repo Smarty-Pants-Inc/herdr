@@ -106,7 +106,30 @@ herdr pane read w1:p2 --source recent --lines 50
 | 事件 | `events.subscribe`、`events.wait` |
 | 集成 | `integration.install`、`integration.uninstall` |
 | 插件 | `plugin.link`、`plugin.list`、`plugin.unlink`、`plugin.enable`、`plugin.disable`、`plugin.action.list`、`plugin.action.invoke`、`plugin.log.list`、`plugin.pane.open`、`plugin.pane.focus`、`plugin.pane.close` |
-| 媒体 | `pane.media_open`、`media.answer`、`media.mute`、`media.state`、`media.close` |
+| 媒体 | `pane.media_preflight`、`pane.media_open`、`media.answer`、`media.mute`、`media.state`、`media.close` |
+
+**客户端本地媒体**
+
+`pane.media_open` 请求在 10 秒内最后向该窗格输入的已连接 Herdr 客户端充当该窗格的 WebRTC 音频对端：麦克风采集和回复播放都在用户机器上进行，服务器只传递 SDP 和控制信息。它只路由到该客户端，且要求其公布原生媒体能力 `media.webrtc.v1`。响应为 `media_offer`，包含 `session_id` 和客户端的 SDP offer。用 `media.answer` 提交远端 answer，用 `media.mute` 静音，用 `media.state` 查询状态（`opening`、`offered`、`connecting`、`connected`、`failed` 或带 `code` 的 `closed`），用 `media.close` 请求拆除。错误包括 `media_no_client`（没有近期输入的已连接客户端）、`media_unsupported_client`（最后输入的客户端不支持媒体）、`media_refused`（客户端拒绝；消息以 `declined`、`disabled`、`not_viewed` 或 `stale_input` 等代码开头）和 `media_timeout`。客户端设置 `media = "off" | "ask" | "auto"` 控制同意方式；默认的 `ask` 在每次客户端运行期间询问一次。
+
+`pane.media_preflight` 接受 `pane_id`，返回 `type: "media_preflight"` 及 `bound`、`client`（数字连接 id 或 `null`）、`webrtc`、`ended_receipt` 和 `refusal`（当前 open 拒绝代码或 `null`）。它只是参考信息：资格取决于窗格是否被查看，以及是否在 10 秒的媒体输入窗口内有输入；open 前绑定可能改变。preflight 不向任何客户端发送消息，不弹出同意提示，也不接触设备。
+
+需要完成回执的 open 应同时提供可选的 `generation` 和 `attempt`；同时省略两者则保留旧版 open 语义，不提供完成回执。这两个标识及可选的 `media.close.request_id` 都是不透明 ASCII 字符串，长度为 1–128 字节，仅允许 `[A-Za-z0-9._:-]`。只提供标识对中的一个或提供无效值都会被拒绝。Herdr 原样返回标识，不解释代次，也不管理调用方的清单或释放决策。绑定的端点必须在 `media.webrtc.v1` 之外公布 `media.ended.v1`。缺少回执能力时，要求回执的 open 立即以关闭代码 `receipt_unsupported` 失败，发生在创建会话、提示同意或获取设备之前；因此可以确定该尝试从未打开。preflight 不能代替这一权威的 open 检查。
+
+```json
+{"id":"preflight","method":"pane.media_preflight","params":{"pane_id":"w1:p1"}}
+{"id":"open","method":"pane.media_open","params":{"pane_id":"w1:p1","generation":"grant-1","attempt":"attempt-1"}}
+{"id":"close","method":"media.close","params":{"session_id":"media_1","request_id":"stop-1"}}
+{"id":"receipts","method":"events.subscribe","params":{"subscriptions":[{"type":"media.ended"},{"type":"media.teardown_stuck"}]}}
+```
+
+在 `events.subscribe` 上，`media.ended` 携带已验证的完成数据：`session_id`、`pane_id`、数字 `client`、`generation`、`attempt`、`origin`、可选的 `request_id` 和 `acquired`。origin 可为 `requested`（API close；调用方提供 request id 时包含它）、`cancelled`（窗格关闭或 offer 前的 open 超时）、`replaced`（后继会话）或 `natural`（客户端主动结束）。未知 origin 会被拒绝。服务器从会话记录补充窗格和客户端绑定，只接受来自收到 open 的同一端点连接、且会话/代次/尝试及关闭原因/关联信息匹配的回执。第一个已验证回执生效，重复回执被忽略。
+
+只有在所有待定同意/设备打开操作都已结束、不可能再有迟到的获取、对端线程已 join 且资源已释放后，才算完成。`acquired: false` 明确表示该尝试从未获取任何设备或对端；缺少对端 id 或超时都不是这一证明。`media.teardown_stuck` 携带 `session_id`、`pane_id`、`client`、`generation` 和 `attempt`，只用于诊断，绝不是完成。之后仍可接受有效的 ended 回执。代理的 `closed`、close RPC 成功、端点丢失及拆除卡住都不是完成证据。
+
+错过事件后，用 `session_id` 重新查询 `media.state`：可选的 `ended` 对象包含与 `media.ended` 相同的已验证回执标识和数据。记录在回执后保留 10 分钟，但端点断开、服务器重启或每端点 64 条记录上限下最旧记录被淘汰，会使该尝试变为没有 `ended` 的 `unknown`。缺少证据意味着继续持有，而非已经结束；回执不会跨服务器重启持久保存。
+
+续期保持现有顺序：后继开始前被拒绝时，保留仍运行的前驱；同一窗格上的后继开始时，客户端拆除前驱，代理在 Offer 后发送 Close(`replaced`)。只有服务器在 open 时记录了同一端点后继的 `replaces` 关系，才接受客户端先发的 `replaced`；没有此关系时，客户端主动结束必须为 `natural`。之后服务器对已处于关闭过程中的前驱发送 Close(`replaced`)，不会改变回执。
 
 `agent.wait` 由服务器拥有并由事件驱动。它会固定到已解析的窗格占用者,因此替换后的智能体不能满足该等待。`agent.prompt` 接受可选的 `wait` 对象,其中包含 `until` 和 `timeout_ms`;这样可在一个请求中提交提示并开始等待,避免两个独立调用之间的竞态。如果解析出的智能体已经是 `blocked`,`agent.prompt` 不会发送输入或开始等待,而是返回 `agent_blocked`。
 

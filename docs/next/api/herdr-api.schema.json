@@ -80,7 +80,7 @@
           "type": "string"
         },
         "EventData": {
-          "oneOf": [
+          "anyOf": [
             {
               "properties": {
                 "type": {
@@ -723,6 +723,12 @@
                 "layout"
               ],
               "type": "object"
+            },
+            {
+              "$ref": "#/schemas/event/$defs/MediaEndedReceipt"
+            },
+            {
+              "$ref": "#/schemas/event/$defs/MediaTeardownStuckEvent"
             }
           ]
         },
@@ -753,9 +759,96 @@
             "pane_exited",
             "pane_agent_detected",
             "pane_agent_status_changed",
-            "layout_updated"
+            "layout_updated",
+            "media.ended",
+            "media.teardown_stuck"
           ],
           "type": "string"
+        },
+        "MediaEndOrigin": {
+          "enum": [
+            "requested",
+            "cancelled",
+            "replaced",
+            "natural"
+          ],
+          "type": "string"
+        },
+        "MediaEndedReceipt": {
+          "additionalProperties": false,
+          "description": "A validated completion with binding supplied only by the server's session record.",
+          "properties": {
+            "acquired": {
+              "type": "boolean"
+            },
+            "attempt": {
+              "type": "string"
+            },
+            "client": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "generation": {
+              "type": "string"
+            },
+            "origin": {
+              "$ref": "#/schemas/event/$defs/MediaEndOrigin"
+            },
+            "pane_id": {
+              "type": "string"
+            },
+            "request_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "session_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "session_id",
+            "pane_id",
+            "client",
+            "generation",
+            "attempt",
+            "origin",
+            "acquired"
+          ],
+          "type": "object"
+        },
+        "MediaTeardownStuckEvent": {
+          "additionalProperties": false,
+          "description": "Diagnostic only: this is never proof of completed teardown.",
+          "properties": {
+            "attempt": {
+              "type": "string"
+            },
+            "client": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "generation": {
+              "type": "string"
+            },
+            "pane_id": {
+              "type": "string"
+            },
+            "session_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "session_id",
+            "pane_id",
+            "client",
+            "generation",
+            "attempt"
+          ],
+          "type": "object"
         },
         "PaneInfo": {
           "properties": {
@@ -2424,6 +2517,23 @@
           ],
           "type": "object"
         },
+        "MediaCloseParams": {
+          "properties": {
+            "request_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "session_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "session_id"
+          ],
+          "type": "object"
+        },
         "MediaMuteParams": {
           "properties": {
             "muted": {
@@ -2436,6 +2546,29 @@
           "required": [
             "session_id",
             "muted"
+          ],
+          "type": "object"
+        },
+        "MediaOpenParams": {
+          "properties": {
+            "attempt": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "generation": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "pane_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pane_id"
           ],
           "type": "object"
         },
@@ -4463,6 +4596,30 @@
               "properties": {
                 "type": {
                   "const": "layout.updated",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
+                  "const": "media.ended",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
+                  "const": "media.teardown_stuck",
                   "type": "string"
                 }
               },
@@ -6728,6 +6885,22 @@
               "type": "string"
             },
             "params": {
+              "$ref": "#/schemas/request/$defs/MediaOpenParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "pane.media_preflight",
+              "type": "string"
+            },
+            "params": {
               "$ref": "#/schemas/request/$defs/PaneTarget"
             }
           },
@@ -6792,7 +6965,7 @@
               "type": "string"
             },
             "params": {
-              "$ref": "#/schemas/request/$defs/MediaSessionTarget"
+              "$ref": "#/schemas/request/$defs/MediaCloseParams"
             }
           },
           "required": [
@@ -7281,7 +7454,7 @@
           "type": "string"
         },
         "EventData": {
-          "oneOf": [
+          "anyOf": [
             {
               "properties": {
                 "type": {
@@ -7924,6 +8097,12 @@
                 "layout"
               ],
               "type": "object"
+            },
+            {
+              "$ref": "#/schemas/success_response/$defs/MediaEndedReceipt"
+            },
+            {
+              "$ref": "#/schemas/success_response/$defs/MediaTeardownStuckEvent"
             }
           ]
         },
@@ -7969,7 +8148,9 @@
             "pane_exited",
             "pane_agent_detected",
             "pane_agent_status_changed",
-            "layout_updated"
+            "layout_updated",
+            "media.ended",
+            "media.teardown_stuck"
           ],
           "type": "string"
         },
@@ -8262,6 +8443,60 @@
             }
           ]
         },
+        "MediaEndOrigin": {
+          "enum": [
+            "requested",
+            "cancelled",
+            "replaced",
+            "natural"
+          ],
+          "type": "string"
+        },
+        "MediaEndedReceipt": {
+          "additionalProperties": false,
+          "description": "A validated completion with binding supplied only by the server's session record.",
+          "properties": {
+            "acquired": {
+              "type": "boolean"
+            },
+            "attempt": {
+              "type": "string"
+            },
+            "client": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "generation": {
+              "type": "string"
+            },
+            "origin": {
+              "$ref": "#/schemas/success_response/$defs/MediaEndOrigin"
+            },
+            "pane_id": {
+              "type": "string"
+            },
+            "request_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "session_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "session_id",
+            "pane_id",
+            "client",
+            "generation",
+            "attempt",
+            "origin",
+            "acquired"
+          ],
+          "type": "object"
+        },
         "MediaSessionState": {
           "enum": [
             "opening",
@@ -8272,6 +8507,37 @@
             "closed"
           ],
           "type": "string"
+        },
+        "MediaTeardownStuckEvent": {
+          "additionalProperties": false,
+          "description": "Diagnostic only: this is never proof of completed teardown.",
+          "properties": {
+            "attempt": {
+              "type": "string"
+            },
+            "client": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "generation": {
+              "type": "string"
+            },
+            "pane_id": {
+              "type": "string"
+            },
+            "session_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "session_id",
+            "pane_id",
+            "client",
+            "generation",
+            "attempt"
+          ],
+          "type": "object"
         },
         "NotificationShowReason": {
           "enum": [
@@ -10986,11 +11252,60 @@
               "type": "object"
             },
             {
+              "description": "Advisory only: binding can change before the authoritative open gate.",
+              "properties": {
+                "bound": {
+                  "type": "boolean"
+                },
+                "client": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "ended_receipt": {
+                  "type": "boolean"
+                },
+                "refusal": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "type": {
+                  "const": "media_preflight",
+                  "type": "string"
+                },
+                "webrtc": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "type",
+                "bound",
+                "webrtc",
+                "ended_receipt"
+              ],
+              "type": "object"
+            },
+            {
               "properties": {
                 "code": {
                   "type": [
                     "string",
                     "null"
+                  ]
+                },
+                "ended": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/schemas/success_response/$defs/MediaEndedReceipt"
+                    },
+                    {
+                      "type": "null"
+                    }
                   ]
                 },
                 "message": {

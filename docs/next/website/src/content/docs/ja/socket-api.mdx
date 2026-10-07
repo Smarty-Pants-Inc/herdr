@@ -106,6 +106,30 @@ herdr pane read w1:p2 --source recent --lines 50
 | イベント | `events.subscribe`、`events.wait` |
 | インテグレーション | `integration.install`、`integration.uninstall` |
 | プラグイン | `plugin.link`、`plugin.list`、`plugin.unlink`、`plugin.enable`、`plugin.disable`、`plugin.action.list`、`plugin.action.invoke`、`plugin.log.list`、`plugin.pane.open`、`plugin.pane.focus`、`plugin.pane.close` |
+| メディア | `pane.media_preflight`、`pane.media_open`、`media.answer`、`media.mute`、`media.state`、`media.close` |
+
+**クライアントローカルのメディア**
+
+`pane.media_open` は、10 秒以内にそのペインへ最後に入力した接続中の Herdr クライアントを、そのペインの WebRTC 音声ピアにします。マイクの取得と応答の再生はユーザーのマシンで行い、サーバーは SDP と制御だけを中継します。対象はそのクライアントだけで、ネイティブメディア対応能力 `media.webrtc.v1` が必要です。レスポンスは `session_id` とクライアントの SDP offer を含む `media_offer` です。`media.answer` で相手の answer を送り、`media.mute` でミュートし、`media.state` で状態（`opening`、`offered`、`connecting`、`connected`、`failed`、または `code` 付きの `closed`）を確認し、`media.close` で終了処理を要求します。エラーは `media_no_client`（最近入力した接続クライアントがない）、`media_unsupported_client`（最後に入力したクライアントがメディア非対応）、`media_refused`（拒否。メッセージは `declined`、`disabled`、`not_viewed`、`stale_input` などのコードで始まる）、`media_timeout` です。同意はクライアント設定 `media = "off" | "ask" | "auto"` で制御します。既定の `ask` はクライアントの実行ごとに一度確認します。
+
+`pane.media_preflight` は `pane_id` を受け取り、`type: "media_preflight"` と `bound`、`client`（数値の接続 id または `null`）、`webrtc`、`ended_receipt`、`refusal`（現在の open 拒否コードまたは `null`）を返します。これは参考情報です。対象になるにはペインが表示中で、10 秒のメディア入力ウィンドウ内の入力が必要であり、open までに対象が変わる場合があります。preflight はクライアントへ何も送らず、同意の確認を開かず、デバイスに触れません。
+
+完了受領証を伴う open では、省略可能な `generation` と `attempt` を両方指定します。両方省略すると、完了受領証のない従来の open 動作を維持します。これらと省略可能な `media.close.request_id` は不透明な ASCII 文字列で、1〜128 バイト、使用可能な文字は `[A-Za-z0-9._:-]` のみです。片方だけの指定や不正な値は拒否されます。Herdr は識別子をそのまま返し、世代を解釈したり呼び出し元のマニフェストや解放判断を管理したりしません。対象エンドポイントは `media.webrtc.v1` とともに `media.ended.v1` を通知する必要があります。受領証対応能力がない場合、受領証付き open はセッション作成、同意確認、デバイス取得より前に、終了コード `receipt_unsupported` で即座に失敗します。その試行は一度も開かれていないと確定できます。preflight は、この確定的な open 時の検査の代わりにはなりません。
+
+```json
+{"id":"preflight","method":"pane.media_preflight","params":{"pane_id":"w1:p1"}}
+{"id":"open","method":"pane.media_open","params":{"pane_id":"w1:p1","generation":"grant-1","attempt":"attempt-1"}}
+{"id":"close","method":"media.close","params":{"session_id":"media_1","request_id":"stop-1"}}
+{"id":"receipts","method":"events.subscribe","params":{"subscriptions":[{"type":"media.ended"},{"type":"media.teardown_stuck"}]}}
+```
+
+`events.subscribe` の `media.ended` は、検証済みの完了データ `session_id`、`pane_id`、数値の `client`、`generation`、`attempt`、`origin`、省略可能な `request_id`、`acquired` を送ります。origin は `requested`（API close。呼び出し元が指定した場合は request id を含む）、`cancelled`（ペインのクローズ、または offer 前の open タイムアウト）、`replaced`（後続セッション）、`natural`（クライアントによる終了）です。未知の origin は拒否します。サーバーはペインとクライアントの対応をセッションレコードから補い、open を受け取った同じエンドポイント接続からの受領証だけを、セッション・世代・試行と終了理由・相関情報の一致を検証して受け入れます。最初の検証済み受領証が有効で、重複は無視します。
+
+完了は、待機中の同意確認・デバイス取得処理がすべて終了し、後から取得する可能性がなくなり、ピアスレッドの join とリソース解放が終わった後です。`acquired: false` は、その試行でデバイスもピアも一度も取得しなかったことを明確に示します。ピア id がないことやタイムアウトは、その証明ではありません。`media.teardown_stuck` は `session_id`、`pane_id`、`client`、`generation`、`attempt` を送りますが、診断専用であり完了ではありません。その後の有効な ended 受領証は受け入れられます。ブローカーの `closed`、close RPC の成功、エンドポイント切断、終了処理の停滞は完了の証拠ではありません。
+
+イベントを受け損ねた場合、`session_id` で `media.state` を再照会します。省略可能な `ended` オブジェクトは `media.ended` と同じ検証済みの識別情報とデータを含みます。レコードは受領証から 10 分間保持されますが、エンドポイント切断、サーバー再起動、またはエンドポイントごとの 64 レコード上限による最古レコードの削除で、試行は `ended` のない `unknown` になります。証拠がなければ保留であり、終了済みではありません。受領証は再起動をまたいで保持されません。
+
+更新の順序は従来どおりです。後続の開始前に拒否されれば稼働中の先行セッションを維持し、同じペインで後続が開始するとクライアントは先行セッションを終了処理し、ブローカーは Offer 後に Close(`replaced`) を送ります。クライアントが先に送る `replaced` は、サーバーが open 時に同じエンドポイントの後続セッションの `replaces` 関係を記録している場合だけ受け入れます。関係がなければクライアント起点の終了は `natural` でなければなりません。すでに終了処理中の先行セッションへの後続のサーバー Close(`replaced`) は、受領証について何も変更しません。
 
 `agent.wait` はサーバー所有でイベント駆動です。解決したペイン占有者に固定されるため、置換されたエージェントが待機を満たすことはありません。`agent.prompt` は `until` と `timeout_ms` を持つ省略可能な `wait` オブジェクトを受け付けます。これにより、プロンプト送信と待機開始を 1 つのリクエストで行い、別々の呼び出し間の競合を避けられます。解決したエージェントがすでに `blocked` の場合、`agent.prompt` は入力を送信せず、待機も開始せずに `agent_blocked` を返します。
 
