@@ -26,7 +26,12 @@ static KEY: OnceLock<LockedKey> = OnceLock::new();
 pub(crate) trait GidOps {
     fn getresgid(&mut self) -> (u32, u32, u32);
     fn setresgid(&mut self, gid: u32) -> bool;
-    fn set_non_dumpable(&mut self);
+    /// The gid drop resets dumpability to `fs.suid_dumpable`. Only `1` (same-user ptrace
+    /// and /proc/<pid>/mem) would expose the key in the instant before the re-assert.
+    fn suid_dumpable_safe(&mut self) -> bool;
+    /// Sets the process non-dumpable and proves it: `PR_GET_DUMPABLE` is 0 and no tracer is
+    /// attached. False means the key must be discarded.
+    fn make_non_dumpable(&mut self) -> bool;
 }
 
 struct Kernel;
@@ -47,9 +52,22 @@ impl GidOps for Kernel {
         // SAFETY: setresgid takes plain integers.
         unsafe { libc::setresgid(gid, gid, gid) == 0 }
     }
-    fn set_non_dumpable(&mut self) {
+    fn suid_dumpable_safe(&mut self) -> bool {
+        std::fs::read_to_string("/proc/sys/fs/suid_dumpable")
+            .is_ok_and(|v| matches!(v.trim(), "0" | "2"))
+    }
+    fn make_non_dumpable(&mut self) -> bool {
         // SAFETY: prctl with integer arguments only.
-        unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) };
+        let set = unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } == 0;
+        // SAFETY: as above; PR_GET_DUMPABLE returns the current mode.
+        let mode = unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) };
+        let untraced = std::fs::read_to_string("/proc/self/status").is_ok_and(|status| {
+            status
+                .lines()
+                .find_map(|l| l.strip_prefix("TracerPid:"))
+                .is_some_and(|pid| pid.trim() == "0")
+        });
+        set && mode == 0 && untraced
     }
 }
 
@@ -67,8 +85,9 @@ fn acquire_with<K>(
 ) -> Option<K> {
     let (real, effective, saved) = ops.getresgid();
     let setgid = effective != real || saved != real;
-    // The key is read before the drop: afterwards the process can no longer open it.
-    let key = if is_server_invocation(args) {
+    // The key is read before the drop: afterwards the process can no longer open it. A
+    // setgid exec starts non-dumpable; refuse the key if the drop could make it ptraceable.
+    let key = if is_server_invocation(args) && (!setgid || ops.suid_dumpable_safe()) {
         load(setgid, effective)
     } else {
         None
@@ -78,11 +97,9 @@ fn acquire_with<K>(
         eprintln!("herdr: could not drop the setgid group; refusing to run");
         std::process::exit(1);
     }
-    if key.is_some() {
-        // Re-assert after the credential change.
-        ops.set_non_dumpable();
-    }
-    key
+    // Re-assert after the credential change and verify it; otherwise discard the key
+    // (fail closed: capability false, no enrollment).
+    key.filter(|_| ops.make_non_dumpable())
 }
 
 /// `herdr [--session S] server` and its live-handoff import forms. Nothing else loads the key.
@@ -118,9 +135,73 @@ fn load(setgid: bool, effective_gid: u32) -> Option<LockedKey> {
     read_key(Path::new(KEY_PATH), Some(effective_gid))
 }
 
+/// A heap buffer pinned in RAM before any secret byte is written to it; wiped on drop.
+struct LockedBuf(Vec<u8>);
+
+impl LockedBuf {
+    fn new(len: usize) -> Option<Self> {
+        let buf = vec![0u8; len];
+        // SAFETY: mlock pins the pages of this live, initialized allocation.
+        (unsafe { libc::mlock(buf.as_ptr().cast(), len) } == 0).then_some(Self(buf))
+    }
+}
+
+impl Drop for LockedBuf {
+    fn drop(&mut self) {
+        wipe(&mut self.0);
+        // SAFETY: unlocks the range locked in `new`; the allocation is still live.
+        unsafe { libc::munlock(self.0.as_ptr().cast(), self.0.len()) };
+    }
+}
+
+impl Drop for LockedKey {
+    fn drop(&mut self) {
+        let size = std::mem::size_of::<Ed25519KeyPair>();
+        let bytes = (&mut *self.0 as *mut Ed25519KeyPair).cast::<u8>();
+        for i in 0..size {
+            // SAFETY: the key pair is plain data with no drop glue that reads its bytes;
+            // zeroing it before the Box frees it only erases the secret.
+            unsafe { std::ptr::write_volatile(bytes.add(i), 0) };
+        }
+    }
+}
+
+/// Reads and parses on a thread whose whole stack is locked first, into locked buffers,
+/// so no copy of the key (file bytes, base64, DER, parsed scalar) can reach swap.
+fn read_key(path: &Path, group: Option<u32>) -> Option<LockedKey> {
+    let path = path.to_owned();
+    std::thread::Builder::new()
+        .name("herdr-server-key".into())
+        .stack_size(256 * 1024)
+        .spawn(move || {
+            lock_own_stack()
+                .then(|| read_key_locked(&path, group))
+                .flatten()
+        })
+        .ok()?
+        .join()
+        .ok()
+        .flatten()
+}
+
+fn lock_own_stack() -> bool {
+    let mut attr = std::mem::MaybeUninit::<libc::pthread_attr_t>::uninit();
+    // SAFETY: pthread_getattr_np initializes attr for the calling thread on success.
+    if unsafe { libc::pthread_getattr_np(libc::pthread_self(), attr.as_mut_ptr()) } != 0 {
+        return false;
+    }
+    let (mut base, mut size) = (std::ptr::null_mut(), 0usize);
+    // SAFETY: attr was initialized above; outputs are valid pointers.
+    let got = unsafe { libc::pthread_attr_getstack(attr.as_ptr(), &mut base, &mut size) } == 0;
+    // SAFETY: destroys the attr initialized above.
+    unsafe { libc::pthread_attr_destroy(attr.as_mut_ptr()) };
+    // SAFETY: locks this thread's own mapped stack range.
+    got && unsafe { libc::mlock(base, size) } == 0
+}
+
 /// `group` is the required owning group in production (`None` only for the test seam, which
 /// requires an owner-only file instead).
-fn read_key(path: &Path, group: Option<u32>) -> Option<LockedKey> {
+fn read_key_locked(path: &Path, group: Option<u32>) -> Option<LockedKey> {
     if group.is_some() {
         let dir = std::fs::metadata(path.parent()?).ok()?;
         if dir.uid() != 0 || dir.mode() & 0o022 != 0 {
@@ -140,33 +221,48 @@ fn read_key(path: &Path, group: Option<u32>) -> Option<LockedKey> {
     if !meta.is_file() || !mode_ok || meta.len() > KEY_LIMIT {
         return None;
     }
-    let mut pem = Vec::with_capacity(KEY_LIMIT as usize);
-    let read = file.by_ref().take(KEY_LIMIT + 1).read_to_end(&mut pem);
-    let key = read.ok().and_then(|_| parse_pem(&pem));
-    wipe(&mut pem);
-    key
+    let mut pem = LockedBuf::new(KEY_LIMIT as usize + 1)?;
+    let mut len = 0;
+    loop {
+        match file.read(&mut pem.0[len..]) {
+            Ok(0) => break,
+            Ok(n) => len += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return None,
+        }
+        if len > KEY_LIMIT as usize {
+            return None;
+        }
+    }
+    parse_pem(&pem.0[..len])
 }
 
 fn parse_pem(pem: &[u8]) -> Option<LockedKey> {
     use base64::Engine as _;
-    let text = std::str::from_utf8(pem).ok()?;
-    let body = text
-        .trim()
-        .strip_prefix("-----BEGIN PRIVATE KEY-----")?
-        .strip_suffix("-----END PRIVATE KEY-----")?;
-    let mut compact: Vec<u8> = body.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
-    let der = base64::engine::general_purpose::STANDARD.decode(&compact);
-    wipe(&mut compact);
-    let mut der = der.ok()?;
-    let pair = Ed25519KeyPair::from_pkcs8_maybe_unchecked(&der);
-    wipe(&mut der);
-    let boxed = Box::new(pair.ok()?);
+    const BEGIN: &[u8] = b"-----BEGIN PRIVATE KEY-----";
+    const END: &[u8] = b"-----END PRIVATE KEY-----";
+    let text = pem.trim_ascii();
+    let body = text.strip_prefix(BEGIN)?.strip_suffix(END)?;
+    let mut compact = LockedBuf::new(body.len())?;
+    let mut used = 0;
+    for &b in body.iter().filter(|b| !b.is_ascii_whitespace()) {
+        compact.0[used] = b;
+        used += 1;
+    }
+    let mut der = LockedBuf::new(used.div_ceil(4) * 3 + 3)?;
+    let der_len = base64::engine::general_purpose::STANDARD
+        .decode_slice(&compact.0[..used], &mut der.0)
+        .ok()?;
+    let mut slot = Box::<Ed25519KeyPair>::new_uninit();
     let size = std::mem::size_of::<Ed25519KeyPair>();
-    // SAFETY: mlock pins the pages of this live allocation, which is never freed.
-    if unsafe { libc::mlock((&*boxed as *const Ed25519KeyPair).cast(), size) } != 0 {
+    // SAFETY: pins the slot before the parsed key is written into it; never freed while live.
+    if unsafe { libc::mlock(slot.as_ptr().cast(), size) } != 0 {
         return None;
     }
-    Some(LockedKey(boxed))
+    let pair = Ed25519KeyPair::from_pkcs8_maybe_unchecked(&der.0[..der_len]).ok()?;
+    slot.write(pair);
+    // SAFETY: written just above.
+    Some(LockedKey(unsafe { slot.assume_init() }))
 }
 
 fn wipe(bytes: &mut [u8]) {
@@ -189,11 +285,23 @@ pub(crate) fn sign(message: &[u8]) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
 
-    #[derive(Default)]
     struct Fake {
         ids: (u32, u32, u32),
         drop_ok: bool,
+        suid_safe: bool,
+        nodump_ok: bool,
         calls: Vec<String>,
+    }
+    impl Default for Fake {
+        fn default() -> Self {
+            Self {
+                ids: (0, 0, 0),
+                drop_ok: true,
+                suid_safe: true,
+                nodump_ok: true,
+                calls: Vec::new(),
+            }
+        }
     }
     impl GidOps for Fake {
         fn getresgid(&mut self) -> (u32, u32, u32) {
@@ -207,8 +315,13 @@ mod tests {
             }
             self.drop_ok
         }
-        fn set_non_dumpable(&mut self) {
+        fn suid_dumpable_safe(&mut self) -> bool {
+            self.calls.push("suid".into());
+            self.suid_safe
+        }
+        fn make_non_dumpable(&mut self) -> bool {
             self.calls.push("nodump".into());
+            self.nodump_ok
         }
     }
     struct TempDir(std::path::PathBuf);
@@ -235,7 +348,7 @@ mod tests {
         });
         assert_eq!(key, Some(()));
         assert_eq!(seen, Some((true, 990)));
-        assert_eq!(fake.calls, ["get", "set 1000", "get", "nodump"]);
+        assert_eq!(fake.calls, ["get", "suid", "set 1000", "get", "nodump"]);
         assert_eq!(fake.ids, (1000, 1000, 1000));
     }
 
@@ -261,6 +374,41 @@ mod tests {
             assert_eq!(fake.ids, (1000, 1000, 1000), "{argv:?}");
             assert!(!fake.calls.contains(&"nodump".to_string()));
         }
+    }
+
+    #[test]
+    fn server_key_unsafe_suid_dumpable_never_loads_but_still_drops() {
+        let mut fake = Fake {
+            ids: (1000, 990, 990),
+            suid_safe: false,
+            ..Fake::default()
+        };
+        let key = acquire_with(
+            &args(&["herdr", "server"]),
+            &mut fake,
+            |_, _| -> Option<()> {
+                panic!("must not read the key when the drop could make it ptraceable")
+            },
+        );
+        assert_eq!(key, None);
+        assert_eq!(fake.ids, (1000, 1000, 1000));
+    }
+
+    #[test]
+    fn server_key_unverified_non_dumpable_discards_the_key() {
+        // Review r3 F1: a refused or unverified PR_SET_DUMPABLE keeps no key.
+        let mut fake = Fake {
+            ids: (1000, 990, 990),
+            nodump_ok: false,
+            ..Fake::default()
+        };
+        let key = acquire_with(&args(&["herdr", "server"]), &mut fake, |_, _| Some(()));
+        assert_eq!(key, None);
+        assert_eq!(fake.calls.last().map(String::as_str), Some("nodump"));
+        // Counterpart: the real kernel path succeeds for this unprivileged test process.
+        assert!(Kernel.make_non_dumpable());
+        // SAFETY: restores the default so later tests in this process are unaffected.
+        unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0) };
     }
 
     #[test]
