@@ -140,9 +140,9 @@ pub(super) struct GitWatches {
     // common .git may live beside (or entirely outside) its workspace CWD.
     // Holds Marker sentinels plus Restore HEAD files of past discoveries.
     root_markers: HashMap<PathBuf, Vec<WatchTarget>>,
-    // Raw .git pointer, and that git dir's raw `commondir` content, read when
-    // each root's sentinels were last stored.
-    root_pointers: HashMap<PathBuf, (PathBuf, Option<String>)>,
+    // Raw .git pointer, and that git dir's resolved identity, read when each
+    // root's sentinels were last stored.
+    root_pointers: HashMap<PathBuf, (PathBuf, PointerIdentity)>,
     watched: HashMap<PathBuf, RecursiveMode>,
     targets: Arc<RwLock<Vec<WatchTarget>>>,
     wakeup_pending: Arc<AtomicBool>,
@@ -261,27 +261,36 @@ impl GitWatches {
                 // while the raw .git pointer is unchanged since they were
                 // stored; one pointer yields at most two HEAD sentinels.
                 let previous = self.root_markers.remove(root).unwrap_or_default();
-                // The key also includes G/commondir: a retargeted common dir
-                // with an unchanged pointer must not carry old common HEADs.
-                // While it is unreadable (G vanished), the stored value is kept
-                // so a later readable value is compared against it.
+                // The key also includes G/commondir and the resolved git and
+                // common dirs: a retargeted common dir or symlink alias with an
+                // unchanged raw pointer must not carry old HEADs. While a
+                // component is unresolvable (G vanished or dangles), the stored
+                // value is kept so a later resolved value is compared to it.
                 let previous_key = self.root_pointers.remove(root);
                 let pointer = current_git_dir_pointer(root);
-                let commondir = pointer.as_deref().and_then(read_commondir);
-                let same_pointer = match (&previous_key, &pointer) {
-                    (Some((previous, stored)), Some(current)) => {
-                        previous == current && (commondir.is_none() || commondir == *stored)
+                let identity = pointer.as_deref().map(PointerIdentity::read);
+                let same_pointer = match (&previous_key, &pointer, &identity) {
+                    (Some((previous, stored)), Some(current), Some(identity)) => {
+                        previous == current && identity.compatible_with(stored)
                     }
                     _ => false,
                 };
-                let mut sentinels = Vec::new();
-                let candidates = discovered
+                let native_root = root.canonicalize().unwrap_or_else(|_| root.clone());
+                let discovered_sentinels: Vec<_> = discovered
                     .iter()
                     .filter(|target| {
                         matches!(target, WatchTarget::Marker(_) | WatchTarget::Restore { .. })
                     })
                     .cloned()
                     .map(native_target)
+                    .collect();
+                // Decided once, from this discovery, and used for both storage
+                // and installation (no second filesystem read can split them).
+                let carried = carried_markers(&previous, &discovered_sentinels, root, &native_root);
+                let mut sentinels = Vec::new();
+                let candidates = discovered_sentinels
+                    .into_iter()
+                    .chain(carried.iter().cloned())
                     .chain(previous.into_iter().filter(|target| {
                         same_pointer
                             && matches!(target, WatchTarget::Restore { file, .. }
@@ -293,15 +302,14 @@ impl GitWatches {
                     }
                 }
                 targets.extend(sentinels.iter().filter_map(missing_restore));
+                targets.extend(carried);
                 self.root_markers.insert(root.clone(), sentinels);
-                if let Some(pointer) = pointer {
-                    let commondir = commondir.or_else(|| {
-                        previous_key
-                            .filter(|(previous, _)| *previous == pointer)
-                            .and_then(|(_, stored)| stored)
-                    });
+                if let (Some(pointer), Some(identity)) = (pointer, identity) {
+                    let stored = previous_key
+                        .filter(|(previous, _)| *previous == pointer)
+                        .map(|(_, stored)| stored);
                     self.root_pointers
-                        .insert(root.clone(), (pointer, commondir));
+                        .insert(root.clone(), (pointer, identity.merged(stored)));
                 }
             } else if let Some(markers) = self.root_markers.get(root) {
                 // Keep only this current consumer's own exact .git sentinels,
@@ -451,6 +459,80 @@ fn current_git_dir_pointer(root: &Path) -> Option<PathBuf> {
         .ancestors()
         .find(|path| std::fs::symlink_metadata(path.join(".git")).is_ok())?;
     crate::workspace::git_dir_for_repo_root(repo_root)
+}
+
+/// Previous `.git` Markers on the consumer's ancestor chain that are nearer than
+/// every chain Marker of the current discovery: a nested repository's vanished
+/// `.git` survives an ancestor fallback, so recreating it wakes natively. Pure
+/// (no filesystem read), bounded to the chain, and retired once discovery
+/// reaches that depth again.
+fn carried_markers(
+    previous: &[WatchTarget],
+    discovered: &[WatchTarget],
+    root: &Path,
+    native_root: &Path,
+) -> Vec<WatchTarget> {
+    let on_chain = |dir: &Path| root.starts_with(dir) || native_root.starts_with(dir);
+    let discovered_depth = discovered
+        .iter()
+        .filter_map(|target| match target {
+            WatchTarget::Marker(dir) if on_chain(dir) => Some(dir.components().count()),
+            _ => None,
+        })
+        .max();
+    previous
+        .iter()
+        .filter(|target| {
+            matches!(target, WatchTarget::Marker(dir)
+                if on_chain(dir)
+                    && !matches!(discovered_depth, Some(depth)
+                        if dir.components().count() <= depth))
+        })
+        .cloned()
+        .collect()
+}
+
+/// Raw `commondir` plus resolved git/common dir identities of a raw pointer.
+/// `None` means unreadable or unresolvable (e.g. a dangling alias).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct PointerIdentity {
+    commondir: Option<String>,
+    canonical_git_dir: Option<PathBuf>,
+    canonical_common: Option<PathBuf>,
+}
+
+impl PointerIdentity {
+    fn read(git_dir: &Path) -> Self {
+        let commondir = read_commondir(git_dir);
+        let common = commondir
+            .as_deref()
+            .map_or_else(|| git_dir.to_path_buf(), |raw| git_dir.join(raw));
+        Self {
+            commondir,
+            canonical_git_dir: git_dir.canonicalize().ok(),
+            canonical_common: common.canonicalize().ok(),
+        }
+    }
+
+    /// Each currently resolvable component must equal the stored one.
+    fn compatible_with(&self, stored: &Self) -> bool {
+        fn same<T: PartialEq>(current: &Option<T>, stored: &Option<T>) -> bool {
+            current.is_none() || current == stored
+        }
+        same(&self.commondir, &stored.commondir)
+            && same(&self.canonical_git_dir, &stored.canonical_git_dir)
+            && same(&self.canonical_common, &stored.canonical_common)
+    }
+
+    /// Keeps stored components that are currently unresolvable.
+    fn merged(self, stored: Option<Self>) -> Self {
+        let stored = stored.unwrap_or_default();
+        Self {
+            commondir: self.commondir.or(stored.commondir),
+            canonical_git_dir: self.canonical_git_dir.or(stored.canonical_git_dir),
+            canonical_common: self.canonical_common.or(stored.canonical_common),
+        }
+    }
 }
 
 /// Trimmed raw `commondir` content of a git dir, if readable.

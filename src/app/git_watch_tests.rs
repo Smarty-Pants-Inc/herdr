@@ -733,6 +733,141 @@ fn git_watch_gap_symlinked_metadata_keeps_restore_sentinel_while_dangling() {
 }
 
 #[test]
+fn git_watch_carried_marker_is_decided_by_discovery_not_a_later_filesystem_read() {
+    // Race: discovery fell back to the ancestor while nested/.git was missing,
+    // then .git was restored before reconciliation. The nested Marker must
+    // still be carried (and installed), or the restoration event finds no
+    // filter and waits for the safety refresh.
+    let ancestor = repository("carried-marker-race");
+    let nested = ancestor.join("nested");
+    std::fs::create_dir_all(nested.join(".git")).unwrap(); // restored already
+    let root = nested.join("sub");
+    let elsewhere = ancestor.with_extension("elsewhere");
+    let previous = [
+        WatchTarget::Marker(nested.clone()),
+        WatchTarget::Marker(elsewhere), // not on the consumer's chain
+        WatchTarget::Marker(ancestor.clone()),
+    ];
+    let fallback = [WatchTarget::Marker(ancestor.clone())];
+    assert_eq!(
+        carried_markers(&previous, &fallback, &root, &root),
+        vec![WatchTarget::Marker(nested.clone())]
+    );
+    // Retired once discovery reaches the nested repository again.
+    let healthy = [WatchTarget::Marker(nested.clone())];
+    assert!(carried_markers(&previous, &healthy, &root, &root).is_empty());
+    std::fs::remove_dir_all(ancestor).unwrap();
+}
+
+#[test]
+fn git_watch_gap_nested_repo_marker_survives_ancestor_fallback() {
+    let ancestor = repository("nested-marker-ancestor");
+    fixture_commit(&ancestor);
+    fixture_git(&ancestor, &["switch", "-c", "ancestor"]);
+    let nested = ancestor.join("nested");
+    std::fs::create_dir(&nested).unwrap();
+    fixture_git(&nested, &["init"]);
+    fixture_git(&nested, &["switch", "-c", "nested"]);
+    fixture_commit(&nested);
+    let consumer = nested.join("sub");
+    std::fs::create_dir(&consumer).unwrap();
+    let mut app = watched_app(&consumer);
+    assert_eq!(
+        app.state.workspaces[0].cached_git_branch.as_deref(),
+        Some("nested")
+    );
+    let retired = nested.join("retired-metadata");
+    std::fs::rename(nested.join(".git"), &retired).unwrap();
+    native_app_refresh(&mut app, false);
+    quiet_native_app(&mut app);
+    assert_eq!(
+        crate::workspace::git_worktree_info(&consumer)
+            .unwrap()
+            .repo_root,
+        ancestor
+    );
+    assert_eq!(
+        app.state.workspaces[0].cached_git_branch.as_deref(),
+        Some("ancestor")
+    );
+    let native_nested = nested.canonicalize().unwrap();
+    let watches = app.git_watches.as_ref().unwrap();
+    assert!(watches
+        .targets
+        .read()
+        .unwrap()
+        .contains(&WatchTarget::Marker(native_nested.clone())));
+    assert!(watches.watched.contains_key(&native_nested));
+    std::fs::rename(&retired, nested.join(".git")).unwrap();
+    native_app_refresh(&mut app, true);
+    assert_eq!(
+        app.state.workspaces[0].cached_git_branch.as_deref(),
+        Some("nested")
+    );
+    drop(app);
+    std::fs::remove_dir_all(ancestor).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn git_watch_retargeted_symlink_alias_keeps_restore_sentinels_bounded() {
+    let base = std::env::temp_dir().join(format!(
+        "herdr-git-watch-registry-alias-retarget-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let consumer = base.join("consumer");
+    let store = base.join("store");
+    std::fs::create_dir_all(&consumer).unwrap();
+    std::fs::create_dir_all(&store).unwrap();
+    let metadata: Vec<_> = (0..=3).map(|i| store.join(format!("t{i}.git"))).collect();
+    for (i, dir) in metadata.iter().enumerate() {
+        let scratch = base.join(format!("scratch-{i}"));
+        std::fs::create_dir_all(&scratch).unwrap();
+        fixture_git(
+            &scratch,
+            &["init", &format!("--separate-git-dir={}", dir.display())],
+        );
+    }
+    // The raw pointer stays the alias; only the alias target changes.
+    let alias = store.join("alias.git");
+    std::fs::write(
+        consumer.join(".git"),
+        format!("gitdir: {}\n", alias.display()),
+    )
+    .unwrap();
+    let retarget = |i: usize| {
+        let _ = std::fs::remove_file(&alias);
+        std::os::unix::fs::symlink(&metadata[i], &alias).unwrap();
+    };
+    retarget(0);
+    let (tx, _rx) = mpsc::channel(256);
+    let mut watches = GitWatches::new(tx).unwrap();
+    watches.sync(HashSet::from([consumer.clone()]));
+    let restores = |watches: &GitWatches| {
+        watches.root_markers[&consumer]
+            .iter()
+            .filter(|target| matches!(target, WatchTarget::Restore { .. }))
+            .count()
+    };
+    let mut baseline = None;
+    for i in 1..=3 {
+        retarget(i);
+        std::fs::remove_file(metadata[i - 1].join("HEAD")).unwrap();
+        watches.topology_dirty = true;
+        watches.sync(HashSet::from([consumer.clone()]));
+        let counts = (restores(&watches), watches.watched.len());
+        assert!(counts.0 <= 2, "iteration {i}: {counts:?}");
+        assert_eq!(*baseline.get_or_insert(counts), counts, "iteration {i}");
+    }
+    drop(watches);
+    std::fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
 fn git_watch_healthy_head_and_index_replacements_stay_non_structural() {
     use notify::event::{ModifyKind, RenameMode};
     let root = repository("healthy-head");
