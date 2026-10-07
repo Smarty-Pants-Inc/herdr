@@ -21,13 +21,16 @@ enum WatchTarget {
     Refs(PathBuf),
     Marker(PathBuf),
     ConfigFile { file: PathBuf, directory: PathBuf },
+    // A vanished HEAD of a previously discovered git dir; installed only while
+    // missing, so restoring it invalidates negative discovery.
+    Restore { file: PathBuf, directory: PathBuf },
 }
 
 impl WatchTarget {
     fn directory(&self) -> &Path {
         match self {
             Self::Metadata(path) | Self::Refs(path) | Self::Marker(path) => path,
-            Self::ConfigFile { directory, .. } => directory,
+            Self::ConfigFile { directory, .. } | Self::Restore { directory, .. } => directory,
         }
     }
 
@@ -42,7 +45,7 @@ impl WatchTarget {
 
     fn matches(&self, path: &Path) -> bool {
         let directory = self.directory();
-        if let Self::ConfigFile { file, .. } = self {
+        if let Self::ConfigFile { file, .. } | Self::Restore { file, .. } = self {
             // Parents are watched non-recursively so rename-over and creation
             // of a previously missing dependency are observed without HOME scans.
             return path == file || file.starts_with(path);
@@ -61,7 +64,7 @@ impl WatchTarget {
                 path.parent() == Some(directory)
                     && path.file_name().is_some_and(|name| name == ".git")
             }
-            Self::ConfigFile { .. } => false, // handled above
+            Self::ConfigFile { .. } | Self::Restore { .. } => false, // handled above
             Self::Metadata(_) => {
                 path.parent() == Some(directory)
                     && path.file_name().is_some_and(|name| {
@@ -96,7 +99,14 @@ fn relevant_event(event: &Event, targets: &[WatchTarget]) -> bool {
 
 fn structural_event(event: &Event, targets: &[WatchTarget]) -> bool {
     use notify::event::{CreateKind, ModifyKind, RemoveKind};
+    let restored = !matches!(event.kind, EventKind::Access(_))
+        && event.paths.iter().any(|path| {
+            targets
+                .iter()
+                .any(|target| matches!(target, WatchTarget::Restore { .. }) && target.matches(path))
+        });
     event.need_rescan()
+        || restored
         || (matches!(
             event.kind,
             EventKind::Create(CreateKind::Any)
@@ -122,6 +132,7 @@ pub(super) struct GitWatches {
     roots: HashSet<PathBuf>,
     // Sentinels belong to consumers, not path ancestry: a linked checkout's
     // common .git may live beside (or entirely outside) its workspace CWD.
+    // Holds Marker sentinels plus Restore HEAD files of past discoveries.
     root_markers: HashMap<PathBuf, Vec<WatchTarget>>,
     watched: HashMap<PathBuf, RecursiveMode>,
     targets: Arc<RwLock<Vec<WatchTarget>>>,
@@ -234,22 +245,41 @@ impl GitWatches {
             if !discovered.is_empty() {
                 // Successful discovery replaces this consumer's sentinels.
                 // Store native paths while they exist, before a removal gap.
-                self.root_markers.insert(
-                    root.clone(),
-                    discovered
-                        .iter()
-                        .filter(|target| matches!(target, WatchTarget::Marker(_)))
-                        .cloned()
-                        .map(native_target)
-                        .collect(),
-                );
+                // Still-missing Restore files survive an ancestor fallback.
+                let previous = self.root_markers.remove(root).unwrap_or_default();
+                let sentinels = discovered
+                    .iter()
+                    .filter(|target| {
+                        matches!(target, WatchTarget::Marker(_) | WatchTarget::Restore { .. })
+                    })
+                    .cloned()
+                    .map(native_target)
+                    .chain(previous.into_iter().filter(|target| {
+                        matches!(target, WatchTarget::Restore { file, .. }
+                            if std::fs::symlink_metadata(file).is_err())
+                    }))
+                    .collect::<Vec<_>>();
+                targets.extend(sentinels.iter().filter_map(missing_restore));
+                self.root_markers.insert(root.clone(), sentinels);
             } else if let Some(markers) = self.root_markers.get(root) {
                 // Keep only this current consumer's own exact .git sentinels,
                 // including its non-ancestor common directory. New/missing
                 // roots cannot borrow markers from another or a removed root.
-                targets.extend(markers.iter().cloned());
+                targets.extend(
+                    markers
+                        .iter()
+                        .filter(|target| matches!(target, WatchTarget::Marker(_)))
+                        .cloned(),
+                );
+                targets.extend(markers.iter().filter_map(missing_restore));
             }
-            targets.extend(discovered);
+            // Restore sentinels are never installed while their file exists,
+            // so ordinary atomic HEAD writes stay non-structural.
+            targets.extend(
+                discovered
+                    .into_iter()
+                    .filter(|target| !matches!(target, WatchTarget::Restore { .. })),
+            );
         }
         for file in &self.config_dependencies {
             // Preserve logical symlink invalidation, including directory links:
@@ -352,21 +382,44 @@ fn native_target(target: WatchTarget) -> WatchTarget {
     let native = directory
         .canonicalize()
         .unwrap_or_else(|_| directory.to_path_buf());
+    let leaf = |file: PathBuf, directory: &Path| {
+        file.strip_prefix(directory)
+            .map(|suffix| native.join(suffix))
+            .unwrap_or(file.clone())
+    };
     match target {
         WatchTarget::Metadata(_) => WatchTarget::Metadata(native),
         WatchTarget::Refs(_) => WatchTarget::Refs(native),
         WatchTarget::Marker(_) => WatchTarget::Marker(native),
-        WatchTarget::ConfigFile { file, directory } => {
-            let file = file
-                .strip_prefix(&directory)
-                .map(|suffix| native.join(suffix))
-                .unwrap_or(file.clone());
-            WatchTarget::ConfigFile {
-                file,
-                directory: native,
-            }
-        }
+        WatchTarget::ConfigFile { file, directory } => WatchTarget::ConfigFile {
+            file: leaf(file, &directory),
+            directory: native.clone(),
+        },
+        WatchTarget::Restore { file, directory } => WatchTarget::Restore {
+            file: leaf(file, &directory),
+            directory: native.clone(),
+        },
     }
+}
+
+/// Installable form of a stored Restore sentinel whose file is missing,
+/// watching the nearest existing ancestor of its parent non-recursively.
+// ponytail: a permanently missing repo keeps one non-recursive parent watch,
+// filtered to the exact path, as missing config dependencies already do.
+fn missing_restore(target: &WatchTarget) -> Option<WatchTarget> {
+    let WatchTarget::Restore { file, .. } = target else {
+        return None;
+    };
+    if std::fs::symlink_metadata(file).is_ok() {
+        return None;
+    }
+    let directory = file
+        .parent()
+        .and_then(|parent| parent.ancestors().find(|path| path.is_dir()))?;
+    Some(WatchTarget::Restore {
+        file: file.clone(),
+        directory: directory.to_path_buf(),
+    })
 }
 
 fn targets_for_root(root: &Path) -> Vec<WatchTarget> {
@@ -382,6 +435,20 @@ fn targets_for_root(root: &Path) -> Vec<WatchTarget> {
     ];
     if marker.exists() {
         targets.push(WatchTarget::Marker(info.repo_root));
+    }
+    // Restoration sentinels, captured while each HEAD exists; sync never
+    // installs them directly.
+    for dir in [&git_dir, &common] {
+        let file = dir.join("HEAD");
+        if std::fs::symlink_metadata(&file).is_ok() {
+            let target = WatchTarget::Restore {
+                file,
+                directory: dir.clone(),
+            };
+            if !targets.contains(&target) {
+                targets.push(target);
+            }
+        }
     }
     if common.file_name().is_some_and(|name| name == ".git") {
         if let Some(parent) = common.parent() {

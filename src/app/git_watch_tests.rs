@@ -22,6 +22,260 @@ fn repository(name: &str) -> PathBuf {
     root
 }
 
+// These regressions use the registry's existing repository helper, then drive
+// the real App sync -> native hint -> worker -> apply path (no forced refresh
+// after initial setup). A quiet boundary excludes leftover removal hints.
+fn fixture_git(root: &Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args([
+            "-c",
+            "user.name=Watch Test",
+            "-c",
+            "user.email=watch@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+        ])
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+fn fixture_commit(root: &Path) {
+    fixture_git(root, &["commit", "--allow-empty", "-m", "initial"]);
+}
+
+fn watched_app(root: &Path) -> crate::app::App {
+    let mut config = crate::config::Config::default();
+    config.ui.sidebar.spaces.rows = vec![vec![
+        crate::config::SpaceSidebarToken::Branch,
+        crate::config::SpaceSidebarToken::GitStatus,
+    ]];
+    let mut app = crate::app::App::new(
+        &config,
+        crate::app::AppPolicy::TEST,
+        None,
+        mpsc::unbounded_channel().1,
+        crate::api::EventHub::default(),
+    );
+    let mut workspace = crate::workspace::Workspace::test_new("restoration");
+    workspace.tabs.clear();
+    workspace.identity_cwd = root.to_path_buf();
+    app.state.workspaces.push(workspace);
+    app.mark_git_status_refresh_due(std::time::Instant::now());
+    native_app_refresh(&mut app, false);
+    quiet_native_app(&mut app);
+    app
+}
+
+#[track_caller]
+fn native_app_refresh(app: &mut crate::app::App, require_discovery: bool) {
+    let start = std::time::Instant::now();
+    let safety = app.last_git_repo_discovery_refresh;
+    let mut discovery_seen = false;
+    loop {
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(1),
+            "native restoration/refresh exceeded 1s (require_discovery={require_discovery})"
+        );
+        app.sync_git_watches();
+        app.start_git_status_refresh_if_due(std::time::Instant::now());
+        while let Ok(event) = app.event_rx.try_recv() {
+            if matches!(event, AppEvent::GitFilesChanged) {
+                discovery_seen |= app
+                    .git_watches
+                    .as_ref()
+                    .unwrap()
+                    .discovery_dirty
+                    .load(Ordering::Acquire);
+            }
+            let completed = matches!(event, AppEvent::GitStatusRefreshed { .. });
+            app.handle_internal_event(event);
+            if completed {
+                assert_eq!(
+                    app.last_git_repo_discovery_refresh, safety,
+                    "safety discovery cannot satisfy native regression"
+                );
+                assert!(
+                    !require_discovery || discovery_seen,
+                    "restoration must invalidate discovery, not only wake the app"
+                );
+                eprintln!(
+                    "native App refresh: {:?}, discovery={discovery_seen}",
+                    start.elapsed()
+                );
+                return;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+}
+
+#[track_caller]
+fn quiet_native_app(app: &mut crate::app::App) {
+    let start = std::time::Instant::now();
+    let safety = app.last_git_repo_discovery_refresh;
+    let mut quiet = start;
+    loop {
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(3),
+            "native hints did not settle"
+        );
+        app.sync_git_watches();
+        app.start_git_status_refresh_if_due(std::time::Instant::now());
+        while let Ok(event) = app.event_rx.try_recv() {
+            app.handle_internal_event(event);
+            quiet = std::time::Instant::now();
+        }
+        if app.git_refresh_in_flight || app.git_watch_refresh_deadline.is_some() {
+            quiet = std::time::Instant::now();
+        } else if quiet.elapsed() >= std::time::Duration::from_millis(150) {
+            assert_eq!(app.last_git_repo_discovery_refresh, safety);
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+}
+
+fn external_common_fixture(name: &str, common_name: &str) -> (PathBuf, PathBuf) {
+    let root = repository(name);
+    let common = root.join(common_name);
+    fixture_git(
+        &root,
+        &["init", &format!("--separate-git-dir={}", common.display())],
+    );
+    fixture_commit(&root);
+    (root, common)
+}
+
+fn linked_fixture(root: &Path, linked: &Path) -> String {
+    fixture_git(root, &["branch", "upstream"]);
+    fixture_git(
+        root,
+        &["worktree", "add", "-b", "linked", linked.to_str().unwrap()],
+    );
+    fixture_git(linked, &["branch", "--set-upstream-to=upstream", "linked"]);
+    fixture_commit(linked);
+    fixture_git(linked, &["rev-parse", "HEAD"])
+}
+
+#[test]
+fn git_watch_gap_external_common_entry_restoration_and_refs() {
+    let (root, common) = external_common_fixture("external-common", "repo.git");
+    let linked = root.with_extension("linked");
+    let tip = linked_fixture(&root, &linked);
+    let mut app = watched_app(&linked); // Only the linked checkout is a consumer.
+    assert_eq!(app.state.workspaces[0].git_ahead_behind(), Some((1, 0)));
+    let retired = root.join("retired-metadata");
+    std::fs::rename(&common, &retired).unwrap();
+    native_app_refresh(&mut app, false);
+    quiet_native_app(&mut app);
+    assert_eq!(app.state.workspaces[0].cached_git_branch, None);
+    let missing = app
+        .git_status_cache
+        .get(&app.state.workspaces[0].cached_git_status_key)
+        .unwrap();
+    assert!(missing.fingerprint.is_none());
+    assert!(missing.config_dependency_paths().is_empty());
+    std::fs::rename(&retired, &common).unwrap();
+    native_app_refresh(&mut app, true);
+    assert_eq!(
+        app.state.workspaces[0].cached_git_branch.as_deref(),
+        Some("linked")
+    );
+    quiet_native_app(&mut app);
+    fixture_git(&root, &["update-ref", "refs/heads/upstream", &tip]);
+    native_app_refresh(&mut app, false);
+    assert_eq!(app.state.workspaces[0].git_ahead_behind(), Some((0, 0)));
+    drop(app);
+    fixture_git(
+        &root,
+        &["worktree", "remove", "--force", linked.to_str().unwrap()],
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn git_watch_gap_nested_linked_fallback_retains_nearer_restoration() {
+    let ancestor = repository("ancestor-fallback");
+    fixture_commit(&ancestor);
+    fixture_git(&ancestor, &["switch", "-c", "ancestor"]);
+    let (root, common) = external_common_fixture("nested-common", ".bare");
+    let linked = ancestor.join("nested-linked");
+    let tip = linked_fixture(&root, &linked);
+    let mut app = watched_app(&linked);
+    assert_eq!(
+        app.state.workspaces[0].cached_git_branch.as_deref(),
+        Some("linked")
+    );
+    let retired = root.join("retired-metadata");
+    std::fs::rename(&common, &retired).unwrap();
+    native_app_refresh(&mut app, false);
+    quiet_native_app(&mut app);
+    assert_eq!(
+        crate::workspace::git_worktree_info(&linked)
+            .unwrap()
+            .repo_root,
+        ancestor
+    );
+    assert_eq!(
+        app.state.workspaces[0].cached_git_branch.as_deref(),
+        Some("ancestor")
+    );
+    std::fs::rename(&retired, &common).unwrap();
+    native_app_refresh(&mut app, true);
+    assert_eq!(
+        app.state.workspaces[0].cached_git_branch.as_deref(),
+        Some("linked")
+    );
+    quiet_native_app(&mut app);
+    fixture_git(&root, &["update-ref", "refs/heads/upstream", &tip]);
+    native_app_refresh(&mut app, false);
+    assert_eq!(app.state.workspaces[0].git_ahead_behind(), Some((0, 0)));
+    drop(app);
+    fixture_git(
+        &root,
+        &["worktree", "remove", "--force", linked.to_str().unwrap()],
+    );
+    std::fs::remove_dir_all(root).unwrap();
+    std::fs::remove_dir_all(ancestor).unwrap();
+}
+
+#[test]
+fn git_watch_gap_head_only_restoration_invalidates_negative_discovery() {
+    let root = repository("head-only");
+    fixture_commit(&root);
+    fixture_git(&root, &["switch", "-c", "restored-head"]);
+    let mut app = watched_app(&root);
+    let head = root.join(".git/HEAD");
+    let content = std::fs::read(&head).unwrap();
+    std::fs::remove_file(&head).unwrap();
+    native_app_refresh(&mut app, false);
+    quiet_native_app(&mut app);
+    assert_eq!(app.state.workspaces[0].cached_git_branch, None);
+    assert!(app
+        .git_status_cache
+        .get(&app.state.workspaces[0].cached_git_status_key)
+        .unwrap()
+        .fingerprint
+        .is_none());
+    std::fs::write(&head, content).unwrap();
+    native_app_refresh(&mut app, true);
+    assert_eq!(
+        app.state.workspaces[0].cached_git_branch.as_deref(),
+        Some("restored-head")
+    );
+    drop(app);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn git_watch_registry_releases_native_watches_over_100_add_remove_cycles() {
     let root = repository("cycles");
@@ -138,6 +392,18 @@ fn git_watch_linked_missing_roots_keep_only_their_own_shared_native_sentinels() 
             .cloned()
             .collect::<HashSet<_>>(),
         HashSet::from([
+            // Exact restoration dependencies share the root's marker watch.
+            WatchTarget::Restore {
+                file: native_root
+                    .join(".git/worktrees")
+                    .join(second.file_name().unwrap())
+                    .join("HEAD"),
+                directory: native_root.clone(),
+            },
+            WatchTarget::Restore {
+                file: native_root.join(".git/HEAD"),
+                directory: native_root.clone(),
+            },
             WatchTarget::Marker(native_root),
             WatchTarget::Marker(native_second)
         ])
@@ -252,6 +518,30 @@ fn git_watch_structural_filter_accepts_directory_recreation_events() {
     assert!(structural_event(&create_any, &targets));
     assert!(structural_event(&create_folder, &targets));
     assert!(structural_event(&remove_folder, &targets));
+}
+
+#[test]
+fn git_watch_healthy_head_and_index_replacements_stay_non_structural() {
+    use notify::event::{ModifyKind, RenameMode};
+    let root = repository("healthy-head");
+    let (tx, _rx) = mpsc::channel(8);
+    let mut watches = GitWatches::new(tx).unwrap();
+    watches.sync(HashSet::from([root.clone()]));
+    let targets = watches.targets.read().unwrap().clone();
+    // Restoration sentinels are stored, but installed only while missing.
+    assert!(!targets
+        .iter()
+        .any(|target| matches!(target, WatchTarget::Restore { .. })));
+    let git_dir = root.canonicalize().unwrap().join(".git");
+    for name in ["HEAD", "index"] {
+        let replacement = Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
+            .add_path(git_dir.join(format!("{name}.lock")))
+            .add_path(git_dir.join(name));
+        assert!(relevant_event(&replacement, &targets), "{name}");
+        assert!(!structural_event(&replacement, &targets), "{name}");
+    }
+    drop(watches);
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
