@@ -80,6 +80,20 @@ fn watched_app(root: &Path) -> crate::app::App {
 // also assert did not run. The 1 s product target is not a CI wall clock.
 const NATIVE_EVENT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Polls until the watcher enqueues its event. Load may delay delivery, so
+/// only the hang watchdog bounds the wait, not a latency target.
+#[track_caller]
+fn wait_for_native_event(rx: &mpsc::Receiver<AppEvent>) {
+    let start = std::time::Instant::now();
+    while rx.is_empty() {
+        assert!(
+            start.elapsed() < NATIVE_EVENT_DEADLINE,
+            "native event not observed within {NATIVE_EVENT_DEADLINE:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+}
+
 #[track_caller]
 fn native_app_refresh(app: &mut crate::app::App, require_discovery: bool) {
     let start = std::time::Instant::now();
@@ -525,11 +539,7 @@ fn git_watch_directory_aliases_share_registration_after_partial_removal() {
     assert_eq!(watches.watched, registrations);
     std::fs::write(canonical.join(".git/HEAD.new"), "ref: refs/heads/other\n").unwrap();
     std::fs::rename(canonical.join(".git/HEAD.new"), canonical.join(".git/HEAD")).unwrap();
-    let start = std::time::Instant::now();
-    while rx.is_empty() {
-        assert!(start.elapsed() < std::time::Duration::from_secs(1));
-        std::thread::sleep(std::time::Duration::from_millis(2));
-    }
+    wait_for_native_event(&rx);
     assert!(matches!(rx.try_recv().unwrap(), AppEvent::GitFilesChanged));
     watches.sync(HashSet::new());
     assert!(watches.watched.is_empty());
@@ -1044,11 +1054,7 @@ fn git_watch_native_burst_enqueues_one_nonblocking_app_event() {
     for i in 0..100 {
         std::fs::write(root.join(".git/index"), i.to_string()).unwrap();
     }
-    let start = std::time::Instant::now();
-    while rx.is_empty() {
-        assert!(start.elapsed() < std::time::Duration::from_secs(1));
-        std::thread::sleep(std::time::Duration::from_millis(2));
-    }
+    wait_for_native_event(&rx);
     std::thread::sleep(std::time::Duration::from_millis(100));
     assert_eq!(rx.len(), 1);
     assert!(matches!(rx.try_recv().unwrap(), AppEvent::GitFilesChanged));
