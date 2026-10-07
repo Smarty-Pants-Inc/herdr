@@ -105,6 +105,87 @@ fn failed_direct_ack_composition_restores_graphics_for_inline_retry() {
     assert!(String::from_utf8_lossy(&retry.graphics.into_inline_bytes()).contains("a=t"));
 }
 
+impl ClientShellState {
+    /// A composable shell whose pane shows one image the host has not received yet.
+    pub(crate) fn test_with_fresh_image() -> Self {
+        let mut state = Self::new(ClientShellConfig::from_config(&Config::default()));
+        state.set_snapshot(Box::new(snapshot()));
+        let mut pane = surface();
+        let (asset, placement) = image(
+            SurfaceGraphicsTarget::Pane {
+                pane_id: "pane_1".into(),
+            },
+            0,
+            0,
+            73,
+        );
+        pane.graphics.assets.push(asset);
+        pane.graphics.placements.push(placement);
+        state.set_pane_surface(pane);
+        state
+    }
+
+    /// Composes a frame and treats it as presented, as the client does on success.
+    pub(crate) fn test_compose_presented(
+        &mut self,
+        cols: u16,
+        rows: u16,
+    ) -> Option<crate::client::frame_output::ComposedFrame> {
+        let frame = self.compose(cols, rows)?;
+        self.finish_graphics_delivery(frame.graphics_delivery, true);
+        Some(frame)
+    }
+
+    pub(crate) fn test_uploads_image(frame: &crate::client::frame_output::ComposedFrame) -> bool {
+        frame
+            .graphics
+            .operations
+            .iter()
+            .any(|operation| match operation {
+                crate::kitty_graphics::GraphicsOperation::Upload { .. } => true,
+                crate::kitty_graphics::GraphicsOperation::Bytes(bytes) => {
+                    String::from_utf8_lossy(bytes).contains("a=t")
+                }
+            })
+    }
+}
+
+use ClientShellState as Shell;
+fn uploads_image(frame: &crate::client::frame_output::ComposedFrame) -> bool {
+    Shell::test_uploads_image(frame)
+}
+
+#[test]
+fn failed_presentation_keeps_fresh_image_upload_for_retry() {
+    let mut state = ClientShellState::test_with_fresh_image();
+    let failed = state.compose(106, 20).expect("frame");
+    assert!(uploads_image(&failed));
+    state.finish_graphics_delivery(failed.graphics_delivery, false);
+
+    let retry = state.compose(106, 20).expect("retry frame");
+    assert!(
+        uploads_image(&retry),
+        "retry must upload the missing pixels"
+    );
+    state.finish_graphics_delivery(retry.graphics_delivery, true);
+
+    let steady = state.compose(106, 20).expect("steady frame");
+    assert!(
+        !uploads_image(&steady),
+        "a presented upload is not repeated"
+    );
+}
+
+#[test]
+fn dropped_composition_does_not_advance_graphics_delivery() {
+    let mut state = ClientShellState::test_with_fresh_image();
+    let dropped = state.compose(106, 20).expect("frame");
+    assert!(uploads_image(&dropped));
+    drop(dropped);
+    let next = state.compose(106, 20).expect("next frame");
+    assert!(uploads_image(&next), "an unpresented upload is repeated");
+}
+
 fn is_placed(bytes: &[u8], point: (u16, u16)) -> bool {
     String::from_utf8_lossy(bytes).contains(&format!("\x1b[{};{}H", point.1 + 1, point.0 + 1))
 }
@@ -125,7 +206,7 @@ fn assert_graphics_cover(state: &mut ClientShellState, covered: Rect, cols: u16,
     add_main_image(&mut surface, layout, outside, 1);
     add_main_image(&mut surface, layout, inside, 2);
     state.set_pane_surface(surface);
-    let frame = state.compose(cols, rows).unwrap();
+    let frame = state.test_compose_presented(cols, rows).unwrap();
     assert!(
         is_placed(&frame.graphics.clone().into_inline_bytes(), outside),
         "outside={outside:?} cover={covered:?}"
@@ -323,7 +404,7 @@ fn every_dialog_and_menu_occludes_its_panel_not_the_whole_screen() {
         let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
         state.set_snapshot(Box::new(snapshot()));
         state.set_pane_surface(surface());
-        state.compose(106, 40).unwrap();
+        state.test_compose_presented(106, 40).unwrap();
         let layout = state.layout(106, 40);
         let mut buffer = Buffer::empty(Rect::new(0, 0, 106, 40));
         let snapshot = state.snapshot.as_deref().unwrap();
@@ -366,9 +447,9 @@ fn every_dialog_and_menu_occludes_its_panel_not_the_whole_screen() {
             add_main_image(&mut surface, layout, border, 2);
         }
         state.set_pane_surface(surface);
-        state.compose(106, 40).unwrap();
+        state.test_compose_presented(106, 40).unwrap();
         state.overlay = Some(overlay);
-        let frame = state.compose(106, 40).unwrap();
+        let frame = state.test_compose_presented(106, 40).unwrap();
         assert!(
             is_placed(&frame.graphics.clone().into_inline_bytes(), outside),
             "{:?}",
@@ -386,7 +467,7 @@ fn every_dialog_and_menu_occludes_its_panel_not_the_whole_screen() {
             );
         }
         state.overlay = None;
-        let restored = state.compose(106, 40).unwrap();
+        let restored = state.test_compose_presented(106, 40).unwrap();
         assert!(is_placed(
             &restored.graphics.clone().into_inline_bytes(),
             outside
@@ -421,7 +502,7 @@ fn selection_copy_cursor_and_search_hide_only_the_highlighted_images() {
         add_main_image(&mut surface, layout, *point, id as u32 + 1);
     }
     state.set_pane_surface(surface);
-    state.compose(106, 20).unwrap();
+    state.test_compose_presented(106, 20).unwrap();
     assert!(state.enter_copy_mode(&mut ClientShellInput::default()));
     state.selection = Some(crate::selection::Selection::absolute_range(
         "pane_1".into(),
@@ -437,7 +518,7 @@ fn selection_copy_cursor_and_search_hide_only_the_highlighted_images() {
             start: crate::api::schema::PaneTextPoint { row: 0, col: 2 },
             end: crate::api::schema::PaneTextPoint { row: 0, col: 2 },
         });
-    let frame = state.compose(106, 20).unwrap();
+    let frame = state.test_compose_presented(106, 20).unwrap();
     for point in &points[..3] {
         assert!(
             !is_placed(&frame.graphics.clone().into_inline_bytes(), *point),
@@ -451,7 +532,7 @@ fn selection_copy_cursor_and_search_hide_only_the_highlighted_images() {
     state.mode = ClientShellMode::Terminal;
     state.copy_mode = None;
     state.selection = None;
-    let frame = state.compose(106, 20).unwrap();
+    let frame = state.test_compose_presented(106, 20).unwrap();
     for point in points {
         assert!(is_placed(
             &frame.graphics.clone().into_inline_bytes(),
@@ -470,13 +551,13 @@ fn mobile_switcher_still_hides_the_entire_underlying_surface() {
     let mut surface = surface();
     add_main_image(&mut surface, layout, point, 1);
     state.set_pane_surface(surface);
-    let frame = state.compose(40, 24).unwrap();
+    let frame = state.test_compose_presented(40, 24).unwrap();
     assert!(is_placed(
         &frame.graphics.clone().into_inline_bytes(),
         point
     ));
     state.mode = ClientShellMode::Navigate;
-    let frame = state.compose(40, 24).unwrap();
+    let frame = state.test_compose_presented(40, 24).unwrap();
     assert!(!is_placed(
         &frame.graphics.clone().into_inline_bytes(),
         point
@@ -485,7 +566,7 @@ fn mobile_switcher_still_hides_the_entire_underlying_surface() {
         String::from_utf8_lossy(&frame.graphics.clone().into_inline_bytes()).contains("a=d,d=i")
     );
     state.mode = ClientShellMode::Terminal;
-    let frame = state.compose(40, 24).unwrap();
+    let frame = state.test_compose_presented(40, 24).unwrap();
     assert!(is_placed(
         &frame.graphics.clone().into_inline_bytes(),
         point
@@ -498,7 +579,7 @@ fn popup_terminal_keeps_own_graphics_and_hides_only_background_overlap() {
     let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
     state.set_snapshot(Box::new(snapshot()));
     state.set_pane_surface(surface_with_popup());
-    state.compose(106, 20).unwrap();
+    state.test_compose_presented(106, 20).unwrap();
     let popup = state.hits.popup.clone().unwrap();
     let layout = state.layout(106, 20);
     let outside = (layout.pane_surface.x, layout.pane_surface.y);
@@ -518,7 +599,7 @@ fn popup_terminal_keeps_own_graphics_and_hides_only_background_overlap() {
     surface.graphics.assets.push(asset);
     surface.graphics.placements.push(placement);
     state.set_pane_surface(surface);
-    let frame = state.compose(106, 20).unwrap();
+    let frame = state.test_compose_presented(106, 20).unwrap();
     assert!(is_placed(
         &frame.graphics.clone().into_inline_bytes(),
         outside
@@ -532,7 +613,7 @@ fn popup_terminal_keeps_own_graphics_and_hides_only_background_overlap() {
         inside
     ));
     state.overlay = Some(ClientShellOverlay::Onboarding);
-    let frame = state.compose(106, 20).unwrap();
+    let frame = state.test_compose_presented(106, 20).unwrap();
     assert!(is_placed(
         &frame.graphics.clone().into_inline_bytes(),
         outside
@@ -542,7 +623,7 @@ fn popup_terminal_keeps_own_graphics_and_hides_only_background_overlap() {
         inside
     ));
     state.overlay = None;
-    let frame = state.compose(106, 20).unwrap();
+    let frame = state.test_compose_presented(106, 20).unwrap();
     assert!(is_placed(
         &frame.graphics.clone().into_inline_bytes(),
         inside
