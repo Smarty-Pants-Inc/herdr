@@ -5939,6 +5939,9 @@ fn headless_scheduled_tasks_clears_disabled_agent_manifest_update_deadline() {
 #[tokio::test]
 async fn headless_scheduled_tasks_start_pending_agent_resume_without_foreground_client() {
     let mut server = test_headless_server();
+    // Resume types its command into the default shell, so that shell must stay
+    // alive; the fixture's exiting command can close the PTY before the write.
+    server.app.state.default_shell = "/bin/sh".into();
     let workspace = crate::workspace::Workspace::test_new("restored");
     let pane_id = workspace.tabs[0].root_pane;
     let terminal_id = workspace.terminal_id(pane_id).cloned().unwrap();
