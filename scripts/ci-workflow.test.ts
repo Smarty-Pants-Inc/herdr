@@ -292,3 +292,27 @@ describe("CI workflow job boundaries", () => {
     expect(aggregate.steps.indexOf(publisher)).toBeGreaterThan(aggregate.steps.indexOf(gate));
   });
 });
+
+describe("handoff failure bundles reach the run's artifacts", () => {
+  // Rust test support writes failing-run bundles here (tests/support/mod.rs).
+  const bundleRoot = "target/tmp/herdr-handoff-failures";
+  test("test support and the upload step name the same root", () => {
+    const support = readFileSync(new URL("../tests/support/mod.rs", import.meta.url), "utf8");
+    expect(support).toContain('join("herdr-handoff-failures")');
+  });
+  test("check uploads bundles only when a Unix job fails", () => {
+    const steps = jobs.check.steps as (Step & { uses?: string; with?: Record<string, string | number> })[];
+    const uploads = steps.filter((candidate) => candidate.uses?.startsWith("actions/upload-artifact@"));
+    expect(uploads).toHaveLength(1);
+    const upload = uploads[0];
+    expect(upload.if).toBe("failure() && matrix.kind == 'unix'");
+    expect(upload.with?.path).toBe(`${bundleRoot}/`);
+    // One artifact per matrix job and attempt; an attempt never overwrites another.
+    expect(upload.with?.name).toBe("handoff-failures-${{ matrix.os }}-${{ github.run_attempt }}");
+    expect(upload.with?.["if-no-files-found"]).toBe("ignore");
+    expect(upload.with?.["retention-days"]).toBe(14);
+    const tests = steps.findIndex((candidate) => candidate.name === "Run Linux tests");
+    const mac = steps.findIndex((candidate) => candidate.name === "Run macOS checks");
+    expect(steps.indexOf(upload)).toBeGreaterThan(Math.max(tests, mac));
+  });
+});

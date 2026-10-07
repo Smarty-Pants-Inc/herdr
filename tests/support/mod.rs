@@ -106,6 +106,10 @@ pub struct ScopedHandoffServer {
     socket_identity: Option<(u64, u64)>,
     owners: Vec<(u32, String)>,
     importer_records: Vec<PathBuf>,
+    diagnostics: Option<PathBuf>,
+    importer_env: Vec<(String, String)>,
+    importer_target: PathBuf,
+    captures: Vec<StderrCapture>,
 }
 
 fn process_start_identity(pid: u32) -> std::io::Result<Option<String>> {
@@ -146,7 +150,28 @@ impl ScopedHandoffServer {
             socket_identity: None,
             owners: Vec::new(),
             importer_records: Vec::new(),
+            diagnostics: None,
+            importer_env: Vec::new(),
+            importer_target: PathBuf::from(env!("CARGO_BIN_EXE_herdr")),
+            captures: Vec::new(),
         }
+    }
+
+    /// Writes each later importer's stderr and start receipt into `dir`, which
+    /// lives outside the fixture so it survives cleanup (see `HandoffFailureBundle`).
+    pub fn set_diagnostics(&mut self, dir: &Path) {
+        fs::create_dir_all(dir).unwrap();
+        self.diagnostics = Some(dir.to_path_buf());
+    }
+
+    /// Environment the wrapper exports before exec, for tests of failure capture.
+    pub fn set_importer_env(&mut self, key: &str, value: &str) {
+        self.importer_env.push((key.to_owned(), value.to_owned()));
+    }
+
+    /// Program the wrapper execs instead of Herdr, for tests of the capture itself.
+    pub fn set_importer_target(&mut self, target: &Path) {
+        self.importer_target = target.to_path_buf();
     }
 
     pub fn track_original(&mut self, pid: u32) {
@@ -172,10 +197,35 @@ impl ScopedHandoffServer {
             |path: &Path| format!("'{}'", path.display().to_string().replace('\'', "'\\''"));
         // Register the path before spawning: failure cleanup also reads it.
         self.importer_records.push(record.clone());
+        let mut diagnostics = String::new();
+        if let Some(dir) = &self.diagnostics {
+            // stderr (wrapper errors, panics, the importer's returned error) goes to a
+            // per-importer file; exec keeps the importer PID equal to the spawned child.
+            // A drainer thread in this test process keeps only the first
+            // IMPORTER_STDERR_CAP_BYTES and discards the rest, so a noisy importer
+            // neither fills the disk nor blocks. It is outside the importer's process
+            // group, so a rollback SIGKILL cannot discard bytes already written.
+            let start = dir.join(format!("importer-{index}.start"));
+            let fifo = self.base.join(format!("importer-{index}.stderr.fifo"));
+            // A wrapper without bounded capture would break the cap; fail loudly.
+            let capture =
+                spawn_capped_capture(&fifo, &dir.join(format!("importer-{index}.stderr")))
+                    .expect("create bounded importer stderr capture");
+            self.captures.push(capture);
+            diagnostics = format!(
+                "up=unavailable; {{ read -r up _ < /proc/uptime; }} 2>/dev/null || :; printf 'pid=%s\\nuptime=%s\\n' \"$$\" \"$up\" > {start}\n",
+                start = quote(&start),
+            );
+            // Read-write never blocks, even if the drainer has not opened it yet.
+            diagnostics.push_str(&format!("exec 2<> {}\n", quote(&fifo)));
+        }
+        for (key, value) in &self.importer_env {
+            diagnostics.push_str(&format!("export {key}={}\n", quote(Path::new(value))));
+        }
         fs::write(&wrapper, format!(
-            "#!/bin/sh\nset -eu\n{{ printf '%s\\n' \"$$\"; LC_ALL=C /bin/ps -p \"$$\" -o lstart=; }} > {}\nmv {} {}\nexec {} \"$@\"\n",
+            "#!/bin/sh\nset -eu\n{{ printf '%s\\n' \"$$\"; LC_ALL=C /bin/ps -p \"$$\" -o lstart=; }} > {}\nmv {} {}\n{diagnostics}exec {} \"$@\"\n",
             quote(&record.with_extension("tmp")), quote(&record.with_extension("tmp")),
-            quote(&record), quote(Path::new(env!("CARGO_BIN_EXE_herdr")))
+            quote(&record), quote(&self.importer_target)
         )).unwrap();
         fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).unwrap();
         wrapper
@@ -234,7 +284,33 @@ impl ScopedHandoffServer {
                 );
             }
         }
-        for (pid, identity) in &self.owners {
+        // A wrapper may publish its record while earlier owners are stopped; rescan
+        // until no new owner appears, so none is left running when paths are removed.
+        let mut stopped = 0;
+        loop {
+            self.terminate_owners(stopped)?;
+            stopped = self.owners.len();
+            self.read_importers()?;
+            if self.owners.len() == stopped {
+                break;
+            }
+        }
+        self.owners.clear();
+        self.importer_records.clear();
+        // Every owner is gone: complete each capture before its bundle is read.
+        for capture in self.captures.drain(..) {
+            capture.finish();
+        }
+        unregister_runtime_dir(&self.base.join("runtime"));
+        if self.base.exists() {
+            fs::remove_dir_all(&self.base)?;
+        }
+        Ok(())
+    }
+
+    /// Stops `owners[from..]`, each only while its recorded start identity holds.
+    fn terminate_owners(&self, from: usize) -> std::io::Result<()> {
+        for (pid, identity) in &self.owners[from..] {
             for signal in [libc::SIGTERM, libc::SIGKILL] {
                 if process_start_identity(*pid)?.as_ref() != Some(identity) {
                     break;
@@ -257,12 +333,6 @@ impl ScopedHandoffServer {
             }
             eprintln!("verified owned server pid={pid} terminated before runtime removal");
         }
-        self.owners.clear();
-        self.importer_records.clear();
-        unregister_runtime_dir(&self.base.join("runtime"));
-        if self.base.exists() {
-            fs::remove_dir_all(&self.base)?;
-        }
         Ok(())
     }
 }
@@ -274,6 +344,486 @@ impl Drop for ScopedHandoffServer {
             eprintln!("scoped handoff cleanup failed: {error}");
         }
     }
+}
+
+struct StderrCapture {
+    fifo: PathBuf,
+    drainer: thread::JoinHandle<()>,
+}
+
+impl StderrCapture {
+    /// Unblocks a drainer whose wrapper never ran, then joins it once every
+    /// writer has closed. A descendant that still holds stderr is reported, not
+    /// waited for indefinitely.
+    fn finish(self) {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Opening the write end releases a reader blocked in open(); it then reads
+        // EOF. ENXIO means no reader is in open() yet, so retry until it finishes;
+        // NotFound means it already opened the FIFO and removed the name.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !self.drainer.is_finished() && Instant::now() < deadline {
+            drop(
+                fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(&self.fifo),
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        if self.drainer.is_finished() {
+            let _ = self.drainer.join();
+        } else {
+            eprintln!(
+                "importer stderr capture {} still has a writer after cleanup",
+                self.fifo.display()
+            );
+        }
+    }
+}
+
+/// Copies at most `IMPORTER_STDERR_CAP_BYTES` from a new FIFO at `fifo` into
+/// `out`, then drains the rest until every writer closes.
+fn spawn_capped_capture(fifo: &Path, out: &Path) -> std::io::Result<StderrCapture> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(fifo.as_os_str().as_bytes())?;
+    if unsafe { libc::mkfifo(path.as_ptr(), 0o600) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut file = fs::File::create(out)?;
+    let path = fifo.to_path_buf();
+    let fifo = path.clone();
+    let drainer = thread::Builder::new()
+        .name("importer-stderr-capture".into())
+        .spawn(move || {
+            // Blocks until the wrapper opens it; then the name is no longer needed.
+            let Ok(reader) = fs::File::open(&fifo) else {
+                return;
+            };
+            let _ = fs::remove_file(&fifo);
+            let _ = std::io::copy(&mut (&reader).take(IMPORTER_STDERR_CAP_BYTES), &mut file);
+            let _ = std::io::copy(&mut &reader, &mut std::io::sink());
+        })?;
+    Ok(StderrCapture {
+        fifo: path,
+        drainer,
+    })
+}
+
+/// Root for retained failure bundles/// Root for retained failure bundles: `HERDR_TEST_FAILURE_ARTIFACT_DIR`, else
+/// `target/tmp/herdr-handoff-failures` (CI uploads it only when a job fails).
+pub fn failure_artifact_root() -> PathBuf {
+    std::env::var_os("HERDR_TEST_FAILURE_ARTIFACT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| Path::new(env!("CARGO_TARGET_TMPDIR")).join("herdr-handoff-failures"))
+}
+
+/// Failure-only evidence for a live-handoff fixture. Declare it after every
+/// process it observes so it drops first: on a panic it snapshots socket files,
+/// listener owners, related processes and logs before cleanup kills or removes
+/// anything; on success it deletes its directory. It only reads process tables;
+/// it never signals or unlinks anything outside its own directory.
+pub struct HandoffFailureBundle {
+    state: std::rc::Rc<std::cell::RefCell<BundleState>>,
+}
+
+struct BundleState {
+    dir: PathBuf,
+    fixtures: Vec<BundleFixture>,
+    log_dirs: Vec<PathBuf>,
+    snapshotted: bool,
+}
+
+thread_local! {
+    // The panic hook kills this thread's registered servers before unwinding
+    // reaches any Drop, so it snapshots the thread's bundles first.
+    static ACTIVE_BUNDLES: std::cell::RefCell<Vec<std::rc::Rc<std::cell::RefCell<BundleState>>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn snapshot_active_bundles() {
+    let _ = ACTIVE_BUNDLES.try_with(|bundles| {
+        let Ok(bundles) = bundles.try_borrow() else {
+            return;
+        };
+        for bundle in bundles.iter() {
+            if let Ok(mut state) = bundle.try_borrow_mut() {
+                state.snapshot();
+            }
+        }
+    });
+}
+
+struct BundleFixture {
+    label: String,
+    base: PathBuf,
+    runtime: PathBuf,
+    original: Option<u32>,
+}
+
+const BUNDLE_LOG_TAIL_BYTES: u64 = 1 << 20;
+/// Keeps the head of importer stderr: the startup banner and the earliest error.
+pub const IMPORTER_STDERR_CAP_BYTES: u64 = 1 << 20;
+
+impl HandoffFailureBundle {
+    /// A fresh directory per process and nextest attempt; never reused.
+    pub fn new(root: &Path, test: &str) -> Self {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let run = std::env::var("NEXTEST_RUN_ID").unwrap_or_else(|_| "local".into());
+        let attempt = std::env::var("NEXTEST_ATTEMPT").unwrap_or_else(|_| "1".into());
+        let dir = root.join(format!(
+            "{test}-run-{run}-attempt-{attempt}-pid-{}-{nanos}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        ensure_cleanup_hooks();
+        let state = std::rc::Rc::new(std::cell::RefCell::new(BundleState {
+            dir,
+            fixtures: Vec::new(),
+            log_dirs: Vec::new(),
+            snapshotted: false,
+        }));
+        ACTIVE_BUNDLES.with(|bundles| bundles.borrow_mut().push(state.clone()));
+        let bundle = Self { state };
+        bundle.note(&format!(
+            "bundle created test={test} run={run} attempt={attempt}"
+        ));
+        bundle
+    }
+
+    pub fn dir(&self) -> PathBuf {
+        self.state.borrow().dir.clone()
+    }
+
+    /// Observes a `ScopedHandoffServer` fixture and routes its importer stderr here.
+    pub fn watch(&mut self, label: &str, server: &mut ScopedHandoffServer, original: Option<u32>) {
+        let mut state = self.state.borrow_mut();
+        server.set_diagnostics(&state.dir.join(label));
+        state.fixtures.push(BundleFixture {
+            label: label.to_owned(),
+            base: server.base.clone(),
+            runtime: server.base.join("runtime"),
+            original,
+        });
+    }
+
+    /// Copies the tail of every `*.log*` file in `dir` on failure.
+    pub fn copy_logs_from(&mut self, dir: &Path) {
+        self.state.borrow_mut().log_dirs.push(dir.to_path_buf());
+    }
+
+    /// Appends an ordered, timestamped phase receipt.
+    pub fn note(&self, text: &str) {
+        self.state.borrow().note(text);
+    }
+}
+
+impl BundleState {
+    fn note(&self, text: &str) {
+        let line = format!("{} {text}\n", clock_stamp());
+        let _ = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.dir.join("receipts.txt"))
+            .and_then(|mut file| file.write_all(line.as_bytes()));
+    }
+
+    fn snapshot(&mut self) {
+        if std::mem::replace(&mut self.snapshotted, true) {
+            return;
+        }
+        let mut report = format!(
+            "{} failure snapshot (before scoped cleanup)\n",
+            clock_stamp()
+        );
+        let mut runtimes = Vec::new();
+        for fixture in &self.fixtures {
+            let importers = recorded_importers(&fixture.base);
+            report.push_str(&format!(
+                "\n[{}] runtime={} original={:?} intended_importers={importers:?}\n",
+                fixture.label,
+                fixture.runtime.display(),
+                fixture
+                    .original
+                    .map(|pid| (pid, process_start_identity(pid).ok().flatten())),
+            ));
+            for (pid, identity) in &importers {
+                let live = process_start_identity(*pid).ok().flatten();
+                report.push_str(&format!(
+                    "importer pid={pid} recorded_start={identity:?} now={}\n",
+                    match live {
+                        Some(now) if &now == identity => "alive (same start identity)".into(),
+                        Some(now) => format!("pid reused by start={now:?}"),
+                        None => "exited (exit status: see source server log 'reaped')".into(),
+                    }
+                ));
+            }
+            report.push_str(&runtime_socket_files(&fixture.runtime));
+            runtimes.push(fixture.runtime.clone());
+            let _ = copy_dir_files(&fixture.base, &self.dir.join(&fixture.label), |name| {
+                name.starts_with("importer-") && name.ends_with(".owner")
+            });
+        }
+        report.push_str(&listener_attribution(&runtimes, &self.fixtures));
+        report.push_str(&related_processes(&runtimes));
+        let _ = fs::write(self.dir.join("attribution.txt"), report);
+        for (index, dir) in self.log_dirs.iter().enumerate() {
+            let _ = copy_dir_files(dir, &self.dir.join(format!("logs-{index}")), |name| {
+                name.contains(".log")
+            });
+            self.note(&format!("logs-{index} copied from {}", dir.display()));
+        }
+    }
+}
+
+impl Drop for HandoffFailureBundle {
+    fn drop(&mut self) {
+        let _ = ACTIVE_BUNDLES.try_with(|bundles| {
+            bundles
+                .borrow_mut()
+                .retain(|bundle| !std::rc::Rc::ptr_eq(bundle, &self.state));
+        });
+        let mut state = self.state.borrow_mut();
+        if thread::panicking() {
+            state.snapshot();
+            eprintln!("handoff failure bundle retained: {}", state.dir.display());
+        } else {
+            let _ = fs::remove_dir_all(&state.dir);
+        }
+    }
+}
+
+/// `uptime` shares the clock with the importer wrapper's `/proc/uptime` receipt.
+fn clock_stamp() -> String {
+    let epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    let uptime = fs::read_to_string("/proc/uptime")
+        .ok()
+        .and_then(|text| text.split_whitespace().next().map(str::to_owned))
+        .unwrap_or_else(|| "unavailable".into());
+    format!("epoch={epoch:.6} uptime={uptime}")
+}
+
+fn recorded_importers(base: &Path) -> Vec<(u32, String)> {
+    let mut importers = Vec::new();
+    for index in 0.. {
+        let Ok(text) = fs::read_to_string(base.join(format!("importer-{index}.owner"))) else {
+            if base.join(format!("importer-{index}.sh")).exists() {
+                continue;
+            }
+            break;
+        };
+        if let Some((pid, identity)) = text.split_once('\n') {
+            if let Ok(pid) = pid.parse() {
+                importers.push((pid, identity.trim().to_owned()));
+            }
+        }
+    }
+    importers
+}
+
+fn runtime_socket_files(runtime: &Path) -> String {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let mut out = String::from("runtime entries (public, parked .handoff-*, .recover):\n");
+    let Ok(entries) = fs::read_dir(runtime) else {
+        out.push_str("  unavailable: runtime directory missing\n");
+        return out;
+    };
+    let mut lines: Vec<String> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let meta = fs::symlink_metadata(entry.path()).ok()?;
+            let kind = if meta.file_type().is_socket() {
+                "socket"
+            } else if meta.is_dir() {
+                "dir"
+            } else {
+                "file"
+            };
+            Some(format!(
+                "  {} {kind} dev={} ino={}\n",
+                entry.path().display(),
+                meta.dev(),
+                meta.ino()
+            ))
+        })
+        .collect();
+    lines.sort();
+    out.extend(lines);
+    out
+}
+
+#[cfg(target_os = "linux")]
+fn listener_attribution(runtimes: &[PathBuf], fixtures: &[BundleFixture]) -> String {
+    let mut out = String::from(
+        "\nlisteners bound under the runtimes (/proc/net/unix; path is the bind-time name):\n",
+    );
+    let Ok(table) = fs::read_to_string("/proc/net/unix") else {
+        out.push_str("  unavailable: cannot read /proc/net/unix\n");
+        return out;
+    };
+    let mut sockets = Vec::new();
+    for line in table.lines().skip(1) {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 8 || !runtimes.iter().any(|r| Path::new(fields[7]).starts_with(r)) {
+            continue;
+        }
+        // Flags 00010000 is __SO_ACCEPTCON: a listening socket.
+        let listening = u32::from_str_radix(fields[3], 16).is_ok_and(|f| f & 0x10000 != 0);
+        sockets.push((fields[6].to_owned(), fields[7].to_owned(), listening));
+    }
+    let mut holders: HashMap<String, Vec<u32>> = HashMap::new();
+    if let Ok(procs) = fs::read_dir("/proc") {
+        for entry in procs.flatten() {
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|n| n.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            let Ok(fds) = fs::read_dir(entry.path().join("fd")) else {
+                continue;
+            };
+            for fd in fds.flatten() {
+                if let Ok(target) = fs::read_link(fd.path()) {
+                    let target = target.to_string_lossy();
+                    if let Some(inode) = target
+                        .strip_prefix("socket:[")
+                        .and_then(|t| t.strip_suffix(']'))
+                    {
+                        if sockets.iter().any(|(i, _, _)| i == inode) {
+                            let pids = holders.entry(inode.to_owned()).or_default();
+                            if !pids.contains(&pid) {
+                                pids.push(pid);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for (inode, path, listening) in sockets {
+        let state = if listening { "LISTEN" } else { "conn" };
+        let pids = holders.get(&inode).cloned().unwrap_or_default();
+        if pids.is_empty() {
+            out.push_str(&format!(
+                "  {state} sock_inode={inode} {path} holder=unattributed (no readable fd)\n"
+            ));
+        }
+        for pid in pids {
+            let role = fixtures
+                .iter()
+                .find_map(|f| {
+                    if f.original == Some(pid) {
+                        return Some(format!("original source server ({})", f.label));
+                    }
+                    recorded_importers(&f.base)
+                        .iter()
+                        .any(|(p, id)| {
+                            *p == pid
+                                && process_start_identity(pid).ok().flatten().as_ref() == Some(id)
+                        })
+                        .then(|| format!("intended importer ({})", f.label))
+                })
+                .unwrap_or_else(|| "OTHER process (not an owned server/importer)".into());
+            out.push_str(&format!(
+                "  {state} sock_inode={inode} {path} pid={pid} role={role} {}\n",
+                process_summary(pid)
+            ));
+        }
+    }
+    out
+}
+
+#[cfg(not(target_os = "linux"))]
+fn listener_attribution(_runtimes: &[PathBuf], _fixtures: &[BundleFixture]) -> String {
+    "\nlistener attribution unavailable: no /proc/net/unix on this platform\n".into()
+}
+
+#[cfg(target_os = "linux")]
+fn process_summary(pid: u32) -> String {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+    // Fields after the parenthesized command: state ppid pgrp ...
+    let rest: Vec<&str> = stat
+        .rsplit_once(')')
+        .map(|(_, rest)| rest.split_whitespace().collect())
+        .unwrap_or_default();
+    let cmdline = fs::read(format!("/proc/{pid}/cmdline"))
+        .map(|bytes| {
+            let mut args: Vec<String> = bytes
+                .split(|byte| *byte == 0)
+                .filter(|arg| !arg.is_empty())
+                .map(|arg| String::from_utf8_lossy(arg).into_owned())
+                .collect();
+            // `--handoff-import <socket> <token>`: never record the token.
+            if let Some(at) = args.iter().position(|arg| arg == "--handoff-import") {
+                if let Some(token) = args.get_mut(at + 2) {
+                    *token = "<token redacted>".into();
+                }
+            }
+            args.join(" ")
+        })
+        .unwrap_or_else(|_| "unavailable".into());
+    format!(
+        "state={} ppid={} pgid={} start={:?} cmd={cmdline}",
+        rest.first().unwrap_or(&"?"),
+        rest.get(1).unwrap_or(&"?"),
+        rest.get(2).unwrap_or(&"?"),
+        process_start_identity(pid).ok().flatten()
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn related_processes(runtimes: &[PathBuf]) -> String {
+    let mut out = String::from("\nprocesses whose XDG_RUNTIME_DIR/HERDR_SOCKET_PATH is a watched runtime (servers, importers, bridges, auto-started daemons):\n");
+    let Ok(procs) = fs::read_dir("/proc") else {
+        out.push_str("  unavailable: cannot read /proc\n");
+        return out;
+    };
+    let mut pids: Vec<u32> = procs
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.parse().ok())
+        .filter(|pid| {
+            process_runtime_dir(*pid)
+                .ok()
+                .flatten()
+                .is_some_and(|dir| runtimes.contains(&dir))
+        })
+        .collect();
+    pids.sort_unstable();
+    for pid in pids {
+        out.push_str(&format!("  pid={pid} {}\n", process_summary(pid)));
+    }
+    out
+}
+
+#[cfg(not(target_os = "linux"))]
+fn related_processes(_runtimes: &[PathBuf]) -> String {
+    "\nrelated process listing unavailable: no /proc on this platform\n".into()
+}
+
+/// Copies the bounded tail of matching regular files; never follows into subdirectories.
+fn copy_dir_files(from: &Path, to: &Path, keep: impl Fn(&str) -> bool) -> std::io::Result<()> {
+    use std::io::{Seek, SeekFrom};
+    fs::create_dir_all(to)?;
+    for entry in fs::read_dir(from)?.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !keep(&name) || !entry.file_type()?.is_file() {
+            continue;
+        }
+        let mut file = fs::File::open(entry.path())?;
+        let len = file.metadata()?.len();
+        file.seek(SeekFrom::Start(len.saturating_sub(BUNDLE_LOG_TAIL_BYTES)))?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        fs::write(to.join(name), bytes)?;
+    }
+    Ok(())
 }
 
 pub fn wait_for_socket(path: &Path, timeout: Duration) {
@@ -766,6 +1316,8 @@ fn ensure_cleanup_hooks() {
         std::panic::set_hook(Box::new(move |panic_info| {
             // Even a caught panic runs this hook. Clean only this thread's registrations;
             // other tests may still own live servers. Process-exit hooks still drain all.
+            // Failure bundles snapshot first, while the failing processes still exist.
+            snapshot_active_bundles();
             cleanup_registered_herdr_pids_for_thread(Some(thread::current().id()));
             previous_hook(panic_info);
         }));

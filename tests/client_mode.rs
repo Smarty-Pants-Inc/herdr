@@ -1248,6 +1248,236 @@ fn detached_handoff_importer_is_stopped_before_runtime_removal() {
 }
 
 #[test]
+fn importer_stderr_capture_is_capped_and_never_blocks_the_importer() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let base = unique_test_dir();
+    let artifacts = base.join("artifacts");
+    let mut cleanup = support::ScopedHandoffServer::new(&base.join("fixture"));
+    cleanup.set_diagnostics(&artifacts);
+    // Writes three times the cap to stderr, then proves it ran to completion.
+    let noisy = base.join("noisy.sh");
+    let done = base.join("done");
+    fs::write(
+        &noisy,
+        "#!/bin/sh\nhead -c 3145728 /dev/zero | tr '\\0' x >&2\nprintf done > \"$1\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&noisy, fs::Permissions::from_mode(0o700)).unwrap();
+    cleanup.set_importer_target(&noisy);
+    let wrapper = cleanup.importer_exe();
+    let status = std::process::Command::new(&wrapper)
+        .arg(&done)
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "importer must not fail on a full capture: {status}"
+    );
+    assert_eq!(fs::read_to_string(&done).unwrap(), "done");
+    let captured = fs::metadata(artifacts.join("importer-0.stderr"))
+        .unwrap()
+        .len();
+    assert!(
+        captured > 0 && captured <= support::IMPORTER_STDERR_CAP_BYTES,
+        "importer stderr capture must be capped: {captured} bytes"
+    );
+    cleanup.stop_and_cleanup().unwrap();
+    let _ = fs::remove_dir_all(&base);
+}
+
+#[cfg(target_os = "linux")]
+fn capture_threads() -> usize {
+    fs::read_dir("/proc/self/task")
+        .unwrap()
+        .flatten()
+        .filter(|task| {
+            fs::read_to_string(task.path().join("comm"))
+                .is_ok_and(|comm| comm.trim() == "importer-stderr")
+        })
+        .count()
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn unused_importer_stderr_capture_is_joined_by_cleanup() {
+    let base = unique_test_dir();
+    let before = capture_threads();
+    let mut cleanup = support::ScopedHandoffServer::new(&base.join("fixture"));
+    cleanup.set_diagnostics(&base.join("artifacts"));
+    // The CLI fails before it spawns the importer: the wrapper never runs.
+    let wrapper = cleanup.importer_exe();
+    // The thread names itself after it starts; wait for that, boundedly.
+    assert!(
+        wait_until(Duration::from_secs(5), Duration::from_millis(10), || {
+            capture_threads() > before
+        }),
+        "drainer waits for the wrapper"
+    );
+    // The owner record is published before any stderr setup, so teardown
+    // between the two can still find and stop the wrapper's PID.
+    let script = fs::read_to_string(&wrapper).unwrap();
+    let published = script.find(".owner'\n").expect("owner record publish");
+    let capture = script.find("exec 2<>").expect("stderr capture");
+    assert!(published < capture, "{script}");
+    cleanup.stop_and_cleanup().unwrap();
+    assert!(
+        wait_until(Duration::from_secs(1), Duration::from_millis(10), || {
+            capture_threads() == before
+        }),
+        "cleanup must unblock and join a drainer whose wrapper never ran"
+    );
+    let _ = fs::remove_dir_all(&base);
+}
+
+#[test]
+fn importer_stderr_capture_setup_failure_is_not_silent() {
+    let base = unique_test_dir();
+    let fixture = base.join("fixture");
+    let mut cleanup = support::ScopedHandoffServer::new(&fixture);
+    cleanup.set_diagnostics(&base.join("artifacts"));
+    // An existing name makes mkfifo fail.
+    fs::create_dir_all(&fixture).unwrap();
+    fs::write(fixture.join("importer-0.stderr.fifo"), "").unwrap();
+    let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cleanup.importer_exe()));
+    assert!(
+        built.is_err(),
+        "a wrapper without bounded stderr capture must not be produced"
+    );
+    cleanup.stop_and_cleanup().unwrap();
+    let _ = fs::remove_dir_all(&base);
+}
+
+#[test]
+fn handoff_failure_bundle_retains_importer_failure_and_socket_owners() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let fixture = base.join("fixture");
+    let artifacts = base.join("artifacts");
+    let config = fixture.join("config");
+    let runtime = fixture.join("runtime");
+    let api = runtime.join("herdr.sock");
+    let mut cleanup = support::ScopedHandoffServer::new(&fixture);
+    // A passing body leaves no artifacts behind.
+    let passing = support::HandoffFailureBundle::new(&artifacts, "passing");
+    let passing_dir = passing.dir();
+    drop(passing);
+    assert!(
+        !passing_dir.exists(),
+        "passing run must not retain a bundle"
+    );
+
+    let original = spawn_server(&config, &runtime, &api, &runtime.join("herdr-client.sock"));
+    wait_for_socket(&api, Duration::from_secs(10));
+    let original_pid = original.child.process_id().unwrap();
+    cleanup.track_original(original_pid);
+    // A live pane makes the handoff carry a real PTY descriptor.
+    let created = send_json_request(
+        &api,
+        &serde_json::json!({"id": "w", "method": "workspace.create", "params": {"cwd": base}})
+            .to_string(),
+    );
+    assert!(created.get("error").is_none(), "{created}");
+    // The importer reports `restored`, then exits with an error: the source sees the
+    // incident's `handoff stream closed while reading line` and rolls back.
+    cleanup.set_importer_env("HERDR_TEST_HANDOFF_IMPORT_FAIL", "after_restored");
+    let mut bundle_dir = None;
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut bundle = support::HandoffFailureBundle::new(&artifacts, "failing");
+        bundle_dir = Some(bundle.dir());
+        bundle.watch("handoff", &mut cleanup, Some(original_pid));
+        bundle.copy_logs_from(&config.join(app_dir_name()));
+        let importer = cleanup.importer_exe();
+        bundle.note("cli live-handoff start");
+        let output = crate::test_command::herdr_command()
+            .args([
+                "server",
+                "live-handoff",
+                "--import-exe",
+                importer.to_str().unwrap(),
+            ])
+            .env("HOME", runtime.join("home"))
+            .env("TMPDIR", runtime.join("tmp"))
+            .env("XDG_CONFIG_HOME", &config)
+            .env("XDG_STATE_HOME", runtime.join("state"))
+            .env("XDG_RUNTIME_DIR", &runtime)
+            .env("HERDR_SOCKET_PATH", &api)
+            .output()
+            .unwrap();
+        bundle.note(&format!("cli live-handoff exit={}", output.status));
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }));
+    assert!(
+        failed.is_err(),
+        "the injected importer failure must fail the handoff"
+    );
+    let dir = bundle_dir.unwrap();
+    let read = |name: &str| fs::read_to_string(dir.join(name)).unwrap_or_default();
+    // Snapshotted by the panic hook while the source still serves; cleanup then
+    // stops the source and joins the stderr drainer, completing the capture.
+    let attribution = read("attribution.txt");
+    drop(original);
+    cleanup.stop_and_cleanup().unwrap();
+    let stderr = read("handoff/importer-0.stderr");
+    let server_log = read("logs-0/herdr-server.log");
+    // The importer prints its returned error only after its stream closes; the
+    // source's rollback may SIGKILL it first. Either outcome must be on record.
+    assert!(
+        dir.join("handoff/importer-0.stderr").is_file()
+            && (stderr.contains("test handoff import failure after restored")
+                || server_log.contains("status=signal: 9")),
+        "importer stderr must keep its error unless rollback killed it first: {stderr:?}\n{server_log}"
+    );
+    let start = read("handoff/importer-0.start");
+    assert!(
+        start.starts_with("pid=") && start.contains("uptime="),
+        "{start}"
+    );
+    let owner = read("handoff/importer-0.owner");
+    assert!(
+        start.contains(&format!("pid={}", owner.lines().next().unwrap_or("?"))),
+        "{owner}"
+    );
+    let receipts = read("receipts.txt");
+    assert!(receipts.contains("cli live-handoff exit="), "{receipts}");
+    assert!(
+        server_log.contains("reaped during rollback"),
+        "source log must carry the importer's observed exit: {server_log}"
+    );
+    assert!(
+        attribution.contains("intended_importers=[(") && attribution.contains("importer pid="),
+        "{attribution}"
+    );
+    // Snapshotted by the panic hook before it kills this thread's servers: the
+    // source has restored its public listeners and still holds them.
+    assert!(
+        attribution.contains(&format!("{} socket dev=", api.display())),
+        "{attribution}"
+    );
+    if cfg!(target_os = "linux") {
+        for socket in [&api, &runtime.join("herdr-client.sock")] {
+            assert!(
+                attribution.lines().any(|line| line.starts_with("  LISTEN")
+                    && line.contains(&format!(
+                        " {} pid={original_pid} role=original source server",
+                        socket.display()
+                    ))),
+                "public listener must be attributed to the source: {attribution}"
+            );
+        }
+        assert!(
+            attribution.contains(&format!("  pid={original_pid} ")),
+            "{attribution}"
+        );
+    }
+    let _ = fs::remove_dir_all(&base);
+}
+
+#[test]
 fn federated_saved_machines_recover_snapshots_after_live_handoff() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -1284,6 +1514,16 @@ fn federated_saved_machines_recover_snapshots_after_live_handoff() {
     wait_for_socket(&handoff_api, Duration::from_secs(10));
     steady_cleanup.track_original(steady.child.process_id().unwrap());
     handoff_cleanup.track_original(handoff.child.process_id().unwrap());
+    // The support panic hook snapshots it before killing this thread's servers.
+    let mut failure_bundle = support::HandoffFailureBundle::new(
+        &support::failure_artifact_root(),
+        "federated-live-handoff",
+    );
+    failure_bundle.watch("handoff", &mut handoff_cleanup, handoff.child.process_id());
+    failure_bundle.watch("steady", &mut steady_cleanup, steady.child.process_id());
+    for dir in [&handoff_config, &steady_config, &config] {
+        failure_bundle.copy_logs_from(&dir.join(app_dir_name()));
+    }
     let create = |socket: &PathBuf, label: &str| {
         let response = send_json_request(
             socket,
@@ -1599,6 +1839,10 @@ fn federated_saved_machines_recover_snapshots_after_live_handoff() {
         save_evidence(&format!("before-{workspaces}"));
         let log_watermark = client_log().len();
         let importer_exe = handoff_cleanup.importer_exe();
+        failure_bundle.note(&format!(
+            "cli live-handoff start workspaces={workspaces} importer={}",
+            importer_exe.display()
+        ));
         let handoff_result = cli(
             &handoff_config,
             &handoff_runtime,
@@ -1610,7 +1854,10 @@ fn federated_saved_machines_recover_snapshots_after_live_handoff() {
                 importer_exe.to_str().unwrap(),
             ],
         );
-        handoff_cleanup.track_importer();
+        let importer_pid = handoff_cleanup.track_importer();
+        failure_bundle.note(&format!(
+            "cli live-handoff succeeded workspaces={workspaces} importer_pid={importer_pid}"
+        ));
         eprintln!(
             "actual CLI live-handoff workspaces={workspaces} binary={} result={}",
             env!("CARGO_BIN_EXE_herdr"),

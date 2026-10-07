@@ -234,6 +234,16 @@ jobs:
         if: runner.os == 'macOS'
         run: CARGO_INCREMENTAL=1 just ci '${{ matrix.nextest_filter }}'
 
+      # Failing live-handoff tests retain bounded bundles (tests/support/mod.rs).
+      - name: Upload handoff failure bundles
+        if: failure() && matrix.kind == 'unix'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: handoff-failures-${{ matrix.os }}-${{ github.run_attempt }}
+          path: target/tmp/herdr-handoff-failures/
+          if-no-files-found: ignore
+          retention-days: 14
+
       # The native media peer is feature-gated; its unit tests use a fake audio device.
       - name: Test native media peer
         if: matrix.kind == 'unix'
