@@ -594,7 +594,7 @@ fn main() -> io::Result<()> {
         match update::self_update(options) {
             Ok(_) => return Ok(()),
             Err(e) => {
-                if e.starts_with("self-update is disabled") {
+                if e.starts_with("self-update is disabled") || e == update::SMARTY_INSTALL_REFUSAL {
                     eprintln!("{e}");
                 } else {
                     eprintln!("update failed: {e}");

@@ -2113,7 +2113,27 @@ fn homebrew_cellar_keg_root(path: &Path) -> Option<PathBuf> {
 // ---------------------------------------------------------------------------
 
 /// Manual self-update command (`herdr update`).
+/// Exact refusal for a smarty-install install (herdr-lead ruling, smarty-dev#2636).
+pub(crate) const SMARTY_INSTALL_REFUSAL: &str = "this herdr is installed by smarty-install (setgid herdr for the server key); update it with smarty-install herdr <sha>";
+
+/// A setgid or root-owned binary belongs to smarty-install: replacing it here would drop
+/// `root:herdr 2755`, and the next server could not read its attestation key.
+#[cfg(unix)]
+fn is_smarty_install_managed_exe(exe: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    fs::metadata(exe).is_ok_and(|m| m.mode() & 0o2000 != 0 || m.uid() == 0)
+}
+
+#[cfg(not(unix))]
+fn is_smarty_install_managed_exe(_exe: &Path) -> bool {
+    false
+}
+
 pub fn self_update(options: SelfUpdateOptions) -> Result<Version, String> {
+    // Before any config read, download or write.
+    if env::current_exe().is_ok_and(|exe| is_smarty_install_managed_exe(&exe)) {
+        return Err(SMARTY_INSTALL_REFUSAL.into());
+    }
     let channel = UpdateChannel::configured();
 
     if is_homebrew_managed_install() {
@@ -2988,6 +3008,31 @@ mod tests {
         assert!(running_inside_herdr_env(Some(crate::HERDR_ENV_VALUE)));
         assert!(!running_inside_herdr_env(None));
         assert!(!running_inside_herdr_env(Some("0")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn smarty_install_managed_exe_is_setgid_or_root_owned() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("herdr-upd-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("herdr");
+        std::fs::write(&exe, b"").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            !is_smarty_install_managed_exe(&exe),
+            "a user's own 0755 binary updates"
+        );
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o2755)).unwrap();
+        assert!(
+            is_smarty_install_managed_exe(&exe),
+            "setgid binary is refused"
+        );
+        assert!(
+            is_smarty_install_managed_exe(Path::new("/bin/sh")),
+            "root-owned is refused"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
