@@ -24,13 +24,19 @@ enum WatchTarget {
     // A vanished HEAD of a previously discovered git dir; installed only while
     // missing, so restoring it invalidates negative discovery.
     Restore { file: PathBuf, directory: PathBuf },
+    // A consumer's raw git dir pointer while it is a symlink alias or missing:
+    // creating, removing or retargeting it changes discovery even while the
+    // old resolved git dir and its HEAD stay intact.
+    Pointer { file: PathBuf, directory: PathBuf },
 }
 
 impl WatchTarget {
     fn directory(&self) -> &Path {
         match self {
             Self::Metadata(path) | Self::Refs(path) | Self::Marker(path) => path,
-            Self::ConfigFile { directory, .. } | Self::Restore { directory, .. } => directory,
+            Self::ConfigFile { directory, .. }
+            | Self::Restore { directory, .. }
+            | Self::Pointer { directory, .. } => directory,
         }
     }
 
@@ -45,7 +51,10 @@ impl WatchTarget {
 
     fn matches(&self, path: &Path) -> bool {
         let directory = self.directory();
-        if let Self::ConfigFile { file, .. } | Self::Restore { file, .. } = self {
+        if let Self::ConfigFile { file, .. }
+        | Self::Restore { file, .. }
+        | Self::Pointer { file, .. } = self
+        {
             // Parents are watched non-recursively so rename-over and creation
             // of a previously missing dependency are observed without HOME scans.
             return path == file || file.starts_with(path);
@@ -64,7 +73,7 @@ impl WatchTarget {
                 path.parent() == Some(directory)
                     && path.file_name().is_some_and(|name| name == ".git")
             }
-            Self::ConfigFile { .. } | Self::Restore { .. } => false, // handled above
+            Self::ConfigFile { .. } | Self::Restore { .. } | Self::Pointer { .. } => false, // handled above
             Self::Metadata(_) => {
                 path.parent() == Some(directory)
                     && path.file_name().is_some_and(|name| {
@@ -105,7 +114,8 @@ fn structural_event(event: &Event, targets: &[WatchTarget]) -> bool {
     let restored = !matches!(event.kind, EventKind::Access(_))
         && event.paths.iter().any(|path| {
             targets.iter().any(|target| match target {
-                WatchTarget::Restore { file, directory } => {
+                WatchTarget::Restore { file, directory }
+                | WatchTarget::Pointer { file, directory } => {
                     path == file || (file.starts_with(path) && !directory.starts_with(path))
                 }
                 _ => false,
@@ -330,6 +340,9 @@ impl GitWatches {
                     .into_iter()
                     .filter(|target| !matches!(target, WatchTarget::Restore { .. })),
             );
+            // Stateless: read every sync, whatever discovery found, so an
+            // ancestor fallback or a negative discovery keeps it installed.
+            targets.extend(pointer_sentinel(root));
         }
         for file in &self.config_dependencies {
             // Preserve logical symlink invalidation, including directory links:
@@ -449,7 +462,29 @@ fn native_target(target: WatchTarget) -> WatchTarget {
             file: leaf(file, &directory),
             directory: native.clone(),
         },
+        WatchTarget::Pointer { file, directory } => WatchTarget::Pointer {
+            file: leaf(file, &directory),
+            directory: native.clone(),
+        },
     }
+}
+
+/// Exact sentinel for the consumer's raw git dir pointer while that path is a
+/// symlink alias or missing, watching the nearest existing ancestor of its
+/// parent non-recursively. A real directory needs none: its Metadata watch
+/// sees removal, and a Restore sentinel sees recreation.
+// ponytail: at most one per root, filtered to the exact path, as missing
+// config dependencies already do.
+fn pointer_sentinel(root: &Path) -> Option<WatchTarget> {
+    let file = current_git_dir_pointer(root)?;
+    if std::fs::symlink_metadata(&file).is_ok_and(|metadata| !metadata.file_type().is_symlink()) {
+        return None;
+    }
+    let directory = file
+        .parent()
+        .and_then(|parent| parent.ancestors().find(|path| path.is_dir()))?
+        .to_path_buf();
+    Some(WatchTarget::Pointer { file, directory })
 }
 
 /// The consumer's raw git dir pointer, neither normalized nor canonicalized:

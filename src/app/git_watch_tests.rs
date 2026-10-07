@@ -402,6 +402,13 @@ fn git_watch_linked_missing_roots_keep_only_their_own_shared_native_sentinels() 
         watches.watched.keys().cloned().collect::<HashSet<_>>(),
         HashSet::from([native_root.clone(), native_second.clone()])
     );
+    // The consumer's own raw pointer, missing with the common .git.
+    let second_pointer = WatchTarget::Pointer {
+        file: native_root
+            .join(".git/worktrees")
+            .join(second.file_name().unwrap()),
+        directory: native_root.clone(),
+    };
     assert_eq!(
         watches
             .targets
@@ -423,7 +430,8 @@ fn git_watch_linked_missing_roots_keep_only_their_own_shared_native_sentinels() 
                 file: native_root.join(".git/HEAD"),
                 directory: native_root.clone(),
             },
-            WatchTarget::Marker(native_root),
+            second_pointer.clone(),
+            WatchTarget::Marker(native_root.clone()),
             WatchTarget::Marker(native_second)
         ])
     );
@@ -432,9 +440,13 @@ fn git_watch_linked_missing_roots_keep_only_their_own_shared_native_sentinels() 
     assert!(watches.watched.is_empty());
     assert!(watches.targets.read().unwrap().is_empty());
     // A removed root cannot reacquire its own former markers during the gap.
+    // Only the exact missing pointer its existing .git file names is current.
     watches.sync(HashSet::from([second.clone()]));
-    assert!(watches.watched.is_empty());
-    assert!(watches.targets.read().unwrap().is_empty());
+    assert_eq!(
+        watches.watched.keys().cloned().collect::<HashSet<_>>(),
+        HashSet::from([native_root.clone()])
+    );
+    assert_eq!(*watches.targets.read().unwrap(), vec![second_pointer]);
     drop(watches);
     std::fs::rename(retired, root.join(".git")).unwrap();
     for path in [first, second] {
@@ -730,6 +742,102 @@ fn git_watch_gap_symlinked_metadata_keeps_restore_sentinel_while_dangling() {
     drop(app);
     std::fs::remove_dir_all(store).unwrap();
     std::fs::remove_dir_all(ancestor).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn git_watch_gap_pointer_alias_removal_recreation_and_retarget_are_structural() {
+    // The old resolved git dir and its HEAD stay intact throughout, so only an
+    // exact sentinel on the raw alias can notice these changes natively.
+    let ancestor = repository("pointer-alias-ancestor");
+    fixture_commit(&ancestor);
+    fixture_git(&ancestor, &["switch", "-c", "ancestor"]);
+    let consumer = ancestor.join("consumer");
+    std::fs::create_dir(&consumer).unwrap();
+    let store = ancestor.with_extension("pointer-store");
+    std::fs::create_dir(&store).unwrap();
+    let other = store.join("other.git");
+    let scratch = store.join("scratch");
+    std::fs::create_dir(&scratch).unwrap();
+    fixture_git(
+        &scratch,
+        &["init", &format!("--separate-git-dir={}", other.display())],
+    );
+    fixture_git(&scratch, &["switch", "-c", "retargeted"]);
+    fixture_commit(&scratch);
+    let real = store.join("real.git");
+    fixture_git(
+        &consumer,
+        &["init", &format!("--separate-git-dir={}", real.display())],
+    );
+    fixture_git(&consumer, &["switch", "-c", "aliased"]);
+    fixture_commit(&consumer);
+    let alias = store.join("alias.git");
+    std::os::unix::fs::symlink(&real, &alias).unwrap();
+    std::fs::write(
+        consumer.join(".git"),
+        format!("gitdir: {}\n", alias.display()),
+    )
+    .unwrap();
+    let mut app = watched_app(&consumer);
+    let branch = |app: &crate::app::App| app.state.workspaces[0].cached_git_branch.clone();
+    assert_eq!(branch(&app).as_deref(), Some("aliased"));
+    let sentinel = WatchTarget::Pointer {
+        file: store.canonicalize().unwrap().join("alias.git"),
+        directory: store.canonicalize().unwrap(),
+    };
+    let installed = |app: &crate::app::App| {
+        let watches = app.git_watches.as_ref().unwrap();
+        watches.targets.read().unwrap().contains(&sentinel)
+            && watches.watched.contains_key(sentinel.directory())
+    };
+    assert!(installed(&app));
+    // Remove the alias; real.git/HEAD stays, discovery falls back.
+    std::fs::remove_file(&alias).unwrap();
+    native_app_refresh(&mut app, true);
+    quiet_native_app(&mut app);
+    assert_eq!(branch(&app).as_deref(), Some("ancestor"));
+    assert!(installed(&app));
+    // Recreate it.
+    std::os::unix::fs::symlink(&real, &alias).unwrap();
+    native_app_refresh(&mut app, true);
+    quiet_native_app(&mut app);
+    assert_eq!(branch(&app).as_deref(), Some("aliased"));
+    // Retarget it by atomic rename-over; the old target stays intact.
+    let staged = store.join("alias.tmp");
+    std::os::unix::fs::symlink(&other, &staged).unwrap();
+    std::fs::rename(&staged, &alias).unwrap();
+    native_app_refresh(&mut app, true);
+    quiet_native_app(&mut app);
+    assert_eq!(branch(&app).as_deref(), Some("retargeted"));
+    assert!(real.join("HEAD").exists());
+    drop(app);
+    std::fs::remove_dir_all(store).unwrap();
+    std::fs::remove_dir_all(ancestor).unwrap();
+}
+
+#[test]
+fn git_watch_pointer_sentinel_is_exact() {
+    use notify::event::{CreateKind, DataChange, ModifyKind, RemoveKind, RenameMode};
+    let store = PathBuf::from("store");
+    let targets = vec![WatchTarget::Pointer {
+        file: store.join("alias.git"),
+        directory: store.clone(),
+    }];
+    for kind in [
+        EventKind::Create(CreateKind::File),
+        EventKind::Remove(RemoveKind::File),
+        EventKind::Modify(ModifyKind::Name(RenameMode::To)),
+    ] {
+        let event = Event::new(kind).add_path(store.join("alias.git"));
+        assert!(relevant_event(&event, &targets), "{kind:?}");
+        assert!(structural_event(&event, &targets), "{kind:?}");
+    }
+    // Sibling entries and the watched directory itself are not the alias.
+    for path in [store.join("real.git"), store.clone()] {
+        let event = Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Any))).add_path(path);
+        assert!(!structural_event(&event, &targets));
+    }
 }
 
 #[test]
