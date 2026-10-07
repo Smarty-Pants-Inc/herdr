@@ -395,11 +395,12 @@ impl MediaBroker {
         let ended_receipt = client
             .and_then(|id| self.clients.get(&id))
             .is_some_and(|entry| entry.ended_receipt);
+        // Same priority as a receipt-bearing open, the caller this preflight serves.
         let refusal = match client {
             None => Some(close_code::STALE_INPUT.to_owned()),
+            Some(_) if !ended_receipt => Some(close_code::RECEIPT_UNSUPPORTED.to_owned()),
             Some(_) if !webrtc => Some(close_code::UNSUPPORTED.to_owned()),
             Some(id) if !views(id) => Some(close_code::NOT_VIEWED.to_owned()),
-            Some(_) if !ended_receipt => Some(close_code::RECEIPT_UNSUPPORTED.to_owned()),
             Some(_) => None,
         };
         ResponseResult::MediaPreflight {
@@ -451,6 +452,24 @@ impl MediaBroker {
             });
             return actions;
         };
+        // A receipt-bearing open must be refused with the distinct positively-never-opened
+        // code before any other client refusal, even when WebRTC is missing too.
+        if generation.is_some()
+            && !self
+                .clients
+                .get(&client_id)
+                .is_some_and(|client| client.ended_receipt)
+        {
+            actions.push(MediaAction::Respond {
+                respond_to,
+                response: error_response(
+                    request_id,
+                    error_code::REFUSED,
+                    close_code::RECEIPT_UNSUPPORTED,
+                ),
+            });
+            return actions;
+        }
         if !capable {
             // ponytail: never fall through to another client. The user is at the client that
             // typed last; opening a microphone on a different machine would surprise them.
@@ -474,23 +493,6 @@ impl MediaBroker {
                         "{}: the client no longer shows this pane",
                         close_code::NOT_VIEWED
                     ),
-                ),
-            });
-            return actions;
-        }
-
-        if generation.is_some()
-            && !self
-                .clients
-                .get(&client_id)
-                .is_some_and(|client| client.ended_receipt)
-        {
-            actions.push(MediaAction::Respond {
-                respond_to,
-                response: error_response(
-                    request_id,
-                    error_code::REFUSED,
-                    close_code::RECEIPT_UNSUPPORTED,
                 ),
             });
             return actions;
@@ -687,9 +689,28 @@ impl MediaBroker {
                 .map(|record| &record.session)
         });
         let Some(session) = session else {
+            // A retained completed record is a replay: stay quiet and idempotent. Anything
+            // else is unknown/expired/evicted evidence; never log the untrusted id itself.
+            if !self
+                .receipts
+                .iter()
+                .any(|record| record.view.session_id == id && record.view.ended.is_some())
+            {
+                tracing::warn!(
+                    client_id,
+                    reason = "unknown_session",
+                    session_id_len = id.len(),
+                    "dropped media teardown evidence"
+                );
+            }
             return Vec::new();
         };
         let Some(identity) = session.receipt.as_ref() else {
+            tracing::warn!(
+                client_id,
+                reason = "no_receipt_identity",
+                "dropped media teardown evidence"
+            );
             return Vec::new();
         };
         let (generation, attempt) = match &control {
@@ -2101,6 +2122,200 @@ mod tests {
             );
             assert!(receipt_state(&broker, &old)["ended"].is_null());
         }
+    }
+
+    // SEC-370-01: receipt_unsupported outranks the generic WebRTC refusal.
+    #[test]
+    fn receipt_broker_no_capability_client_gets_receipt_unsupported() {
+        let now = Instant::now();
+        let mut observed = Vec::new();
+        for after_preflight in [false, true] {
+            let mut broker = receipt_broker(now);
+            if after_preflight {
+                let preflight =
+                    serde_json::to_value(broker.preflight(pane(7), |_| true, now)).unwrap();
+                assert_eq!(preflight["client"], 1);
+                assert_eq!(preflight["ended_receipt"], true);
+                assert!(preflight["refusal"].is_null());
+            }
+            broker.client_connected(2, false); // no WebRTC, no ended receipt
+            broker.note_pane_input(2, pane(7), "w1:p7", now);
+            // Advisory preflight now reports what the receipt-bearing open will get.
+            let rebound = serde_json::to_value(broker.preflight(pane(7), |_| true, now)).unwrap();
+            assert_eq!(rebound["client"], 2);
+            assert_eq!(rebound["refusal"], close_code::RECEIPT_UNSUPPORTED);
+            let before_next_id = broker.next_id;
+            let (tx, rx) = mpsc::channel();
+            let actions = broker.open_with_receipt(
+                "required".into(),
+                tx,
+                pane(7),
+                Some("floor.B".into()),
+                Some("attempt.B".into()),
+                |_| true,
+                now,
+            );
+            assert!(
+                actions
+                    .iter()
+                    .all(|a| matches!(a, MediaAction::Respond { .. })),
+                "no Open, consent, publication or device work"
+            );
+            run(actions);
+            let value = response(&rx);
+            assert!(!broker.has_sessions());
+            assert!(broker.receipts.is_empty());
+            assert!(broker.closed.is_empty());
+            assert_eq!(broker.next_id, before_next_id);
+            eprintln!("C2_CAPABILITY_PRIORITY after_preflight={after_preflight}: {value}");
+            observed.push(value["error"]["message"].as_str().unwrap().to_owned());
+        }
+        assert!(observed.iter().all(|message| message.contains(close_code::RECEIPT_UNSUPPORTED)),
+            "receipt-bearing open must report receipt_unsupported when the bound client lacks ended receipts, including when it lacks WebRTC too");
+    }
+
+    #[test]
+    fn receipt_broker_legacy_open_on_no_capability_client_keeps_unsupported_client() {
+        let now = Instant::now();
+        let mut broker = MediaBroker::new();
+        broker.client_connected(2, false);
+        broker.note_pane_input(2, pane(7), "w1:p7", now);
+        let (sent, rx) = open(&mut broker, pane(7), now);
+        assert!(sent.is_empty());
+        assert_eq!(
+            response(&rx)["error"]["code"],
+            error_code::UNSUPPORTED_CLIENT
+        );
+        assert!(!broker.has_sessions());
+        assert!(broker.receipts.is_empty());
+    }
+
+    // SEC-370-02: non-replay teardown evidence rejections are logged.
+    #[derive(Clone, Default)]
+    struct SecurityLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for SecurityLog {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl SecurityLog {
+        fn take(&self) -> String {
+            String::from_utf8(std::mem::take(&mut *self.0.lock().unwrap())).unwrap()
+        }
+    }
+
+    #[test]
+    fn receipt_broker_non_replay_rejections_are_logged() {
+        let log = SecurityLog::default();
+        let writer = log.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(move || writer.clone())
+            .finish();
+        let observations = tracing::subscriber::with_default(subscriber, || {
+            let now = Instant::now();
+            let mut broker = receipt_broker(now);
+            let (live, _rx) = receipt_open(&mut broker, now);
+            assert!(
+                accept_receipt(&mut broker, 2, receipt_json(&live, "natural", None), now)
+                    .is_empty()
+            );
+            assert!(
+                log.take()
+                    .contains("dropped unbound media teardown evidence"),
+                "positive logging control proves the tracing capture is connected"
+            );
+            let mut observations = Vec::new();
+            assert!(accept_receipt(
+                &mut broker,
+                1,
+                receipt_json("media_nonexistent", "natural", None),
+                now
+            )
+            .is_empty());
+            observations.push(("unmatched", log.take()));
+            let mut legacy = receipt_broker(now);
+            let (sent, _rx) = open(&mut legacy, pane(7), now);
+            let (_, legacy_id, _) = opened_session(&sent);
+            assert!(accept_receipt(
+                &mut legacy,
+                1,
+                receipt_json(&legacy_id, "natural", None),
+                now
+            )
+            .is_empty());
+            observations.push(("live legacy without receipt identity", log.take()));
+            assert_eq!(
+                published_media_events(&accept_receipt(
+                    &mut broker,
+                    1,
+                    receipt_json(&live, "natural", None),
+                    now
+                )),
+                1
+            );
+            log.take();
+            let later = now + RECEIPT_RETENTION;
+            broker.expire(later, |_| true);
+            assert!(broker.state(&live).is_none());
+            assert!(
+                accept_receipt(&mut broker, 1, receipt_json(&live, "natural", None), later)
+                    .is_empty()
+            );
+            observations.push(("expired record", log.take()));
+            let mut capped = receipt_broker(now);
+            let (first, _rx) = receipt_open(&mut capped, now);
+            run(capped.close_with_request(&first, None, now));
+            for _ in 0..MAX_RECEIPT_RECORDS_PER_ENDPOINT {
+                let (id, _rx) = receipt_open(&mut capped, now);
+                run(capped.close_with_request(&id, None, now));
+            }
+            assert!(capped.state(&first).is_none());
+            assert!(
+                accept_receipt(&mut capped, 1, receipt_json(&first, "requested", None), now)
+                    .is_empty()
+            );
+            observations.push(("cap-evicted record", log.take()));
+            observations
+        });
+        eprintln!("NON_REPLAY_REJECTION_LOGS: {observations:?}");
+        assert!(observations.iter().all(|(_, text)| !text.is_empty()),
+            "freeze requires invalid receipts dropped AND logged, not silent unmatched/legacy returns");
+    }
+
+    #[test]
+    fn receipt_broker_valid_completion_and_replay_publish_once_quietly() {
+        let log = SecurityLog::default();
+        let writer = log.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let now = Instant::now();
+            let mut broker = receipt_broker(now);
+            let (id, _rx) = receipt_open(&mut broker, now);
+            let good = receipt_json(&id, "natural", None);
+            assert_eq!(
+                published_media_events(&accept_receipt(&mut broker, 1, good.clone(), now)),
+                1
+            );
+            let before = receipt_state(&broker, &id);
+            assert!(accept_receipt(&mut broker, 1, good, now).is_empty());
+            assert_eq!(receipt_state(&broker, &id), before);
+            assert!(
+                log.take().is_empty(),
+                "valid completion and replay may be quiet"
+            );
+        });
     }
 
     #[test]

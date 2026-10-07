@@ -314,12 +314,13 @@ impl ClientMedia {
         // by the client loop. Removing the prompt seals it before publishing completion.
         // A newer request supersedes an unanswered prompt.
         if let Some(previous) = self.pending.take() {
-            self.mark_end(
+            let origin = successor_origin(
                 &previous.endpoint_id,
-                &previous.session_id,
-                MediaEndOrigin::Replaced,
-                None,
+                &previous.pane_id,
+                endpoint_id,
+                &pane_id,
             );
+            self.mark_end(&previous.endpoint_id, &previous.session_id, origin, None);
             self.effects.push(MediaEffect::CancelConsent {
                 session_id: previous.session_id.clone(),
             });
@@ -492,12 +493,13 @@ impl ClientMedia {
         // A policy reload from Ask to Auto can leave an older prompt outstanding.
         // Seal that opener too before starting the successor.
         if let Some(previous) = self.pending.take() {
-            self.mark_end(
+            let origin = successor_origin(
                 &previous.endpoint_id,
-                &previous.session_id,
-                MediaEndOrigin::Replaced,
-                None,
+                &previous.pane_id,
+                &endpoint_id,
+                &pane_id,
             );
+            self.mark_end(&previous.endpoint_id, &previous.session_id, origin, None);
             self.effects.push(MediaEffect::CancelConsent {
                 session_id: previous.session_id.clone(),
             });
@@ -523,11 +525,12 @@ impl ClientMedia {
             previous.muted && previous.endpoint_id == endpoint_id && previous.pane_id == pane_id
         });
         if let Some(mut previous) = self.session.take() {
-            let origin = if previous.endpoint_id == endpoint_id && previous.pane_id == pane_id {
-                MediaEndOrigin::Replaced
-            } else {
-                MediaEndOrigin::Natural
-            };
+            let origin = successor_origin(
+                &previous.endpoint_id,
+                &previous.pane_id,
+                &endpoint_id,
+                &pane_id,
+            );
             self.mark_end(&previous.endpoint_id, &previous.session_id, origin, None);
             previous.peer.close();
             self.send_close(
@@ -715,6 +718,22 @@ impl ClientMedia {
 
     fn notice(&mut self, message: &str) {
         self.effects.push(MediaEffect::Notice(message.to_owned()));
+    }
+}
+
+/// Client-first origin for a predecessor retired by a successor. Only a same-endpoint,
+/// same-pane renewal can carry the server's `replaces` proof; anything else is natural.
+/// `mark_end` keeps an origin a server close already recorded.
+fn successor_origin(
+    previous_endpoint: &ClientEndpointId,
+    previous_pane: &str,
+    endpoint_id: &ClientEndpointId,
+    pane_id: &str,
+) -> MediaEndOrigin {
+    if previous_endpoint == endpoint_id && previous_pane == pane_id {
+        MediaEndOrigin::Replaced
+    } else {
+        MediaEndOrigin::Natural
     }
 }
 
@@ -1868,6 +1887,142 @@ mod tests {
                 PeerCall::Close("m1".into()),
                 PeerCall::Start("m2".into()),
             ]
+        );
+    }
+
+    /// SEC-370-05: two real brokers; A's pending prompt is retired by B's open on another
+    /// endpoint. `ask_to_auto` reloads the policy first, so `start` seals A instead.
+    fn cross_endpoint_pending_retirement(ask_to_auto: bool) {
+        let now = Instant::now();
+        let pane = crate::layout::PaneId::from_raw(7);
+        let mut broker_a = crate::server::media::MediaBroker::new();
+        broker_a.client_connected(1, true);
+        broker_a.set_client_ended_receipt(1, true);
+        broker_a.note_pane_input(1, pane, "pane_1", now);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let actions = broker_a.open_with_receipt(
+            "open:A".into(),
+            tx,
+            pane,
+            Some("generation:A".into()),
+            Some("attempt:A".into()),
+            |_| true,
+            now,
+        );
+        let (mut client, calls) = media(MediaMode::Ask, false);
+        client.note_pane_input(&local(), "pane_1", now);
+        deliver(&mut client, actions, now);
+        let old_sid = client.pending.as_ref().unwrap().session_id.clone();
+        client.take_effects();
+        if ask_to_auto {
+            client.set_mode(MediaMode::Auto);
+        }
+        let mut broker_b = crate::server::media::MediaBroker::new();
+        broker_b.client_connected(1, true);
+        broker_b.set_client_ended_receipt(1, true);
+        broker_b.note_pane_input(1, pane, "pane_1", now);
+        let (tx, _rx_b) = std::sync::mpsc::channel();
+        let (controls, _) = to_client(broker_b.open_with_receipt(
+            "open:B".into(),
+            tx,
+            pane,
+            Some("generation:B".into()),
+            Some("attempt:B".into()),
+            |_| true,
+            now,
+        ));
+        client.note_pane_input(&other_endpoint(), "pane_1", now);
+        for control in controls {
+            client.handle_server_control(
+                &other_endpoint(),
+                control,
+                true,
+                |_| Some("B pane".into()),
+                now,
+            );
+        }
+        if ask_to_auto {
+            assert_eq!(calls.lock().unwrap().len(), 1, "Auto starts B only");
+        } else {
+            assert!(
+                calls.lock().unwrap().is_empty(),
+                "both are actual pending consent openers"
+            );
+        }
+        let effects = client.take_effects();
+        let ended = completion_controls(&effects, "media.ended.v1");
+        assert_eq!(ended.len(), 1);
+        assert_eq!(ended[0].0, local());
+        assert_eq!(ended[0].1["attempt"], "attempt:A");
+        assert_eq!(ended[0].1["acquired"], false);
+        assert_eq!(ended[0].1["origin"], "natural");
+        let mut publications = 0;
+        for effect in effects {
+            if let MediaEffect::Send(endpoint, control) = effect {
+                if endpoint == local() {
+                    let actions = broker_a.client_control(1, control, now);
+                    publications += actions
+                        .iter()
+                        .filter(|a| matches!(a, crate::server::media::MediaAction::Publish(_)))
+                        .count();
+                    to_client(actions);
+                }
+            }
+        }
+        assert_eq!(
+            publications, 1,
+            "A's broker accepts the original receipt once"
+        );
+        assert!(
+            broker_a.state(&old_sid).unwrap().ended.is_some(),
+            "cross-endpoint retirement has no successor proof on A; it must be natural"
+        );
+    }
+
+    #[test]
+    fn cross_endpoint_pending_replacement_must_complete_original_broker() {
+        cross_endpoint_pending_retirement(false);
+    }
+
+    #[test]
+    fn ask_to_auto_cross_endpoint_pending_retirement_completes_original_broker() {
+        cross_endpoint_pending_retirement(true);
+    }
+
+    #[test]
+    fn genuine_new_prompt_answer_starts_its_new_attempt() {
+        let (mut media, calls) = media(MediaMode::Ask, false);
+        bound_open(&mut media, &local(), "m", "A");
+        media.take_effects();
+        media.handle_server_control(
+            &local(),
+            receipt_control(
+                "media.close.v1",
+                serde_json::json!({"session_id":"m", "origin":"cancelled"}),
+            ),
+            true,
+            |_| None,
+            Instant::now(),
+        );
+        media.take_effects();
+        bound_open(&mut media, &other_endpoint(), "m", "B");
+        let key_b = media
+            .take_effects()
+            .into_iter()
+            .find_map(|effect| match effect {
+                MediaEffect::AskConsent { session_id, .. } => Some(session_id),
+                _ => None,
+            })
+            .expect("actual B prompt");
+        media.consent(&key_b, true);
+        assert_eq!(*calls.lock().unwrap(), vec![PeerCall::Start("m".into())]);
+        assert_eq!(
+            media.session.as_ref().unwrap().endpoint_id,
+            other_endpoint()
+        );
+        assert_eq!(
+            media.attempts[&(other_endpoint(), "m".into())].attempt,
+            "attempt:B"
         );
     }
 

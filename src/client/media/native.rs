@@ -112,7 +112,19 @@ pub(crate) struct NativePeer {
     /// Admission and close share this lock; no opener can start after the seal.
     acquisition: Arc<Mutex<Acquisition>>,
     /// Wake the already-started reaper without blocking the client loop.
-    reap: Option<std_mpsc::Sender<()>>,
+    reap: Option<std_mpsc::Sender<Reap>>,
+}
+
+/// Why the reaper was woken. Only `Teardown`, a dropped sender or an expired `Opening`
+/// deadline starts the one-shot join.
+enum Reap {
+    Teardown,
+    /// The backend marked (partial) acquisition while `open` still runs. Starts the join
+    /// deadline now: a failing/unwinding backend may block in its own guard drop before
+    /// any outer notifier can drop.
+    Opening,
+    /// `open` returned its guard; cancel the `Opening` deadline.
+    Opened,
 }
 
 #[derive(Default)]
@@ -131,11 +143,11 @@ impl Acquisition {
 }
 
 /// Wake natural teardown even when the worker unwinds before sending its done result.
-struct CompletionNotify(std_mpsc::Sender<()>);
+struct CompletionNotify(std_mpsc::Sender<Reap>);
 
 impl Drop for CompletionNotify {
     fn drop(&mut self) {
-        let _ = self.0.send(());
+        let _ = self.0.send(Reap::Teardown);
     }
 }
 
@@ -227,9 +239,35 @@ pub(crate) fn start_with_audio(
         .spawn(move || {
             // Close wakes us promptly; completion/drop wakes us for natural end/panic.
             // One reaper owns the handle, so a timeout can never produce a late receipt.
-            let _ = reap_rx.recv();
-            let deadline = Instant::now() + THREAD_JOIN_TIMEOUT;
-            let done_ok = matches!(done.recv_timeout(THREAD_JOIN_TIMEOUT), Ok(true));
+            // ponytail: a backend open that is still running THREAD_JOIN_TIMEOUT after its
+            // first acquisition marker is reported stuck (diagnostic, never a receipt);
+            // backends cannot signal failure before their partial guards drop.
+            let mut deadline: Option<Instant> = None;
+            let mut opened = false;
+            loop {
+                let wake = match deadline {
+                    Some(at) => reap_rx
+                        .recv_timeout(at.saturating_duration_since(Instant::now()))
+                        .ok(),
+                    None => reap_rx.recv().ok(),
+                };
+                match wake {
+                    Some(Reap::Opening) if !opened => {
+                        deadline.get_or_insert_with(|| Instant::now() + THREAD_JOIN_TIMEOUT);
+                    }
+                    Some(Reap::Opening) => {}
+                    Some(Reap::Opened) => {
+                        opened = true;
+                        deadline = None;
+                    }
+                    Some(Reap::Teardown) | None => break,
+                }
+            }
+            let deadline = deadline.unwrap_or_else(|| Instant::now() + THREAD_JOIN_TIMEOUT);
+            let done_ok = matches!(
+                done.recv_timeout(deadline.saturating_duration_since(Instant::now())),
+                Ok(true)
+            );
             while !thread.is_finished() && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(1));
             }
@@ -301,7 +339,7 @@ impl MediaPeer for NativePeer {
             let _ = self.cancel.send(true);
         }
         let _ = self.commands.send(Command::Close);
-        let _ = reap.send(());
+        let _ = reap.send(Reap::Teardown);
     }
 }
 
@@ -316,7 +354,7 @@ struct Emitter {
     session_id: String,
     sink: PeerEventSink,
     closed: Arc<AtomicBool>,
-    reap: std_mpsc::Sender<()>,
+    reap: std_mpsc::Sender<Reap>,
 }
 
 impl Emitter {
@@ -364,10 +402,13 @@ async fn session(
     let muted = Arc::new(AtomicBool::new(false));
 
     let marker_state = Arc::clone(&acquisition);
+    let marker_reap = emitter.reap.clone();
     let acquired: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
         if let Ok(mut state) = marker_state.lock() {
             state.acquired = true;
         }
+        // Wake before the backend can drop (and block in) a partial guard on Err/unwind.
+        let _ = marker_reap.send(Reap::Opening);
     });
     let audio_guard = audio.open(audio_io(
         frames_tx,
@@ -375,6 +416,7 @@ async fn session(
         &internal_tx,
         acquired,
     ))?;
+    let _ = emitter.reap.send(Reap::Opened);
     // Declared after the guard, so early-return/unwind wakes teardown before
     // implicit guard drop. The normal path wakes it explicitly before dropping.
     let _teardown = CompletionNotify(emitter.reap.clone());
@@ -412,7 +454,7 @@ async fn session(
             },
         ) => result,
     };
-    let _ = emitter.reap.send(());
+    let _ = emitter.reap.send(Reap::Teardown);
     drop(audio_guard);
     match tokio::time::timeout(PEER_CLOSE_TIMEOUT, peer.close()).await {
         Ok(Ok(())) => {}
@@ -1321,6 +1363,113 @@ mod tests {
         assert!(devices.released.load(Ordering::SeqCst));
         peer.close();
         assert!(events.recv_timeout(Duration::from_millis(200)).is_err());
+    }
+
+    /// Release a held guard, wait for the worker to stop, then collect what follows.
+    fn release_and_drain(
+        release: &mut ReceiptRelease,
+        finished: &AtomicBool,
+        peer: &mut NativePeer,
+        events: &std_mpsc::Receiver<PeerEvent>,
+    ) -> Vec<PeerEvent> {
+        release.release();
+        assert!(wait_until(finished, Duration::from_secs(5)));
+        peer.close();
+        let mut late = Vec::new();
+        while let Ok(event) = events.recv_timeout(Duration::from_millis(300)) {
+            late.push(event);
+        }
+        late
+    }
+
+    // SEC-370-03: a backend that marked partial acquisition and then fails/unwinds while
+    // its own guard drop blocks must still get the stuck diagnostic within the deadline.
+    #[test]
+    fn receipt_370_partial_open_failure_wakes_reaper_before_held_drop() {
+        let mut h = receipt_native(false, true, true);
+        h.drop_entered
+            .recv_timeout(Duration::from_secs(5))
+            .expect("partial guard drop held");
+        assert!(h.devices.opened.load(Ordering::SeqCst));
+        assert!(!h.devices.released.load(Ordering::SeqCst));
+        let before_release = h
+            .events
+            .recv_timeout(THREAD_JOIN_TIMEOUT + Duration::from_secs(1));
+        // Clean up and join before asserting, even when RED.
+        let late = release_and_drain(
+            &mut h.drop_release,
+            &h.peer.stopped.clone(),
+            &mut h.peer,
+            &h.events,
+        );
+        assert!(h.devices.released.load(Ordering::SeqCst));
+        assert_eq!(
+            before_release,
+            Ok(PeerEvent::Teardown {
+                session_id: "media_test".into(),
+                acquired: true,
+                success: false,
+            }),
+            "partial-open error blocked in guard drop must wake the reaper"
+        );
+        assert_eq!(*h.released_at_teardown.lock().unwrap(), vec![false]);
+        assert!(
+            late.iter()
+                .all(|event| matches!(event, PeerEvent::Closed { .. })),
+            "a timed-out reaper never emits a late teardown: {late:?}"
+        );
+    }
+
+    #[test]
+    fn receipt_370_backend_unwind_wakes_reaper_before_held_drop() {
+        struct HeldPanicAudio {
+            devices: Arc<FakeDevices>,
+            hold: (std_mpsc::Sender<()>, std_mpsc::Receiver<()>),
+        }
+        impl AudioBackend for HeldPanicAudio {
+            fn open(self: Box<Self>, io: AudioIo) -> Result<Box<dyn std::any::Any>, String> {
+                self.devices.opened.store(true, Ordering::SeqCst);
+                (io.acquired)();
+                let _guard = ReceiptGuard {
+                    devices: self.devices.clone(),
+                    hold: Some(self.hold),
+                };
+                panic!("test: partial backend unwind with held guard");
+            }
+        }
+        let devices = Arc::new(FakeDevices::default());
+        let (drop_tx, entered) = std_mpsc::channel();
+        let (release_tx, release) = std_mpsc::channel();
+        let mut release_guard = ReceiptRelease(Some(release_tx));
+        let (tx, events) = std_mpsc::channel();
+        let sink: PeerEventSink = Arc::new(move |event| {
+            let _ = tx.send(event);
+        });
+        let mut peer = start_with_audio(
+            "media_test".into(),
+            sink,
+            Box::new(HeldPanicAudio {
+                devices: devices.clone(),
+                hold: (drop_tx, release),
+            }),
+        )
+        .expect("peer starts");
+        entered
+            .recv_timeout(Duration::from_secs(5))
+            .expect("unwind held in guard drop");
+        let before_release = events.recv_timeout(THREAD_JOIN_TIMEOUT + Duration::from_secs(1));
+        let late = release_and_drain(&mut release_guard, &devices.released, &mut peer, &events);
+        assert!(devices.released.load(Ordering::SeqCst));
+        assert_eq!(
+            before_release,
+            Ok(PeerEvent::Teardown {
+                session_id: "media_test".into(),
+                acquired: true,
+                success: false,
+            }),
+            "backend unwind blocked in guard drop must wake the reaper"
+        );
+        assert!(late.is_empty(), "no late teardown after timeout: {late:?}");
     }
 
     #[test]
