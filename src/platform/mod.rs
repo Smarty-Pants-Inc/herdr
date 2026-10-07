@@ -210,6 +210,23 @@ pub(crate) fn process_initial_pane_origin(peer: ProcessIdentity) -> PeerPaneOrig
         .map_or(PeerPaneOrigin::Unknown, pane_origin_from_environment)
 }
 
+/// Diagnostic only, never authorization: whether the pinned caller's environment
+/// names `HERDR_PANE_ID`, whatever its value (empty and malformed count as
+/// present). Linux and macOS read the launch environment; Windows reads the
+/// current PEB block (the same evidence as `process_initial_pane_origin`), so a
+/// caller that edits its own environment changes the answer there.
+/// `None` when the process is stale or unreadable.
+pub(crate) fn process_initial_pane_env_present(peer: ProcessIdentity) -> Option<bool> {
+    if process_identity(peer.pid) != Some(peer) {
+        return None;
+    }
+    let environment = process_initial_environment(peer);
+    if process_identity(peer.pid) != Some(peer) {
+        return None;
+    }
+    Some(environment?.iter().any(|(key, _)| key == "HERDR_PANE_ID"))
+}
+
 fn process_initial_environment(peer: ProcessIdentity) -> Option<Vec<(String, String)>> {
     #[cfg(target_os = "linux")]
     return linux::process_initial_environment(peer);
