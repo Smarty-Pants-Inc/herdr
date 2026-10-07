@@ -201,9 +201,9 @@ impl ScopedHandoffServer {
         if let Some(dir) = &self.diagnostics {
             // stderr (wrapper errors, panics, the importer's returned error) goes to a
             // per-importer file; exec keeps the importer PID equal to the spawned child.
-            // A drainer thread in this test process keeps only the first
-            // IMPORTER_STDERR_CAP_BYTES and discards the rest, so a noisy importer
-            // neither fills the disk nor blocks. It is outside the importer's process
+            // A drainer thread in this test process keeps only the last
+            // IMPORTER_STDERR_CAP_BYTES (at most twice that while it runs), so a
+            // noisy importer neither fills the disk nor blocks. It is outside the importer's process
             // group, so a rollback SIGKILL cannot discard bytes already written.
             let start = dir.join(format!("importer-{index}.start"));
             let fifo = self.base.join(format!("importer-{index}.stderr.fifo"));
@@ -381,15 +381,22 @@ impl StderrCapture {
     }
 }
 
-/// Copies at most `IMPORTER_STDERR_CAP_BYTES` from a new FIFO at `fifo` into
-/// `out`, then drains the rest until every writer closes.
+/// Streams a new FIFO at `fifo` into `out` until every writer closes, keeping
+/// only the last `IMPORTER_STDERR_CAP_BYTES` (the rule for copied logs). The
+/// file never exceeds twice the cap, and bytes are on disk as they arrive.
 fn spawn_capped_capture(fifo: &Path, out: &Path) -> std::io::Result<StderrCapture> {
     use std::os::unix::ffi::OsStrExt;
     let path = std::ffi::CString::new(fifo.as_os_str().as_bytes())?;
     if unsafe { libc::mkfifo(path.as_ptr(), 0o600) } != 0 {
         return Err(std::io::Error::last_os_error());
     }
-    let mut file = fs::File::create(out)?;
+    // Read access lets keep_tail rewrite the file in place.
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(out)?;
     let path = fifo.to_path_buf();
     let fifo = path.clone();
     let drainer = thread::Builder::new()
@@ -400,8 +407,24 @@ fn spawn_capped_capture(fifo: &Path, out: &Path) -> std::io::Result<StderrCaptur
                 return;
             };
             let _ = fs::remove_file(&fifo);
-            let _ = std::io::copy(&mut (&reader).take(IMPORTER_STDERR_CAP_BYTES), &mut file);
-            let _ = std::io::copy(&mut &reader, &mut std::io::sink());
+            let mut buf = vec![0; 64 * 1024];
+            let mut len = 0;
+            loop {
+                let n = match (&reader).read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                };
+                // On a write error keep draining: the importer must never block.
+                if file.write_all(&buf[..n]).is_ok() {
+                    len += n as u64;
+                }
+                if len >= 2 * IMPORTER_STDERR_CAP_BYTES {
+                    len = keep_tail(&mut file, len).unwrap_or(len);
+                }
+            }
+            let _ = keep_tail(&mut file, len);
         })?;
     Ok(StderrCapture {
         fifo: path,
@@ -409,7 +432,23 @@ fn spawn_capped_capture(fifo: &Path, out: &Path) -> std::io::Result<StderrCaptur
     })
 }
 
-/// Root for retained failure bundles/// Root for retained failure bundles: `HERDR_TEST_FAILURE_ARTIFACT_DIR`, else
+/// Rewrites `file` (`len` bytes, cursor at its end) to its last
+/// `IMPORTER_STDERR_CAP_BYTES`; returns the new length.
+fn keep_tail(file: &mut fs::File, len: u64) -> std::io::Result<u64> {
+    use std::io::{Seek, SeekFrom};
+    if len <= IMPORTER_STDERR_CAP_BYTES {
+        return Ok(len);
+    }
+    let mut tail = Vec::new();
+    file.seek(SeekFrom::Start(len - IMPORTER_STDERR_CAP_BYTES))?;
+    file.read_to_end(&mut tail)?;
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(&tail)?;
+    file.set_len(tail.len() as u64)?;
+    Ok(tail.len() as u64)
+}
+
+/// Root for retained failure bundles: `HERDR_TEST_FAILURE_ARTIFACT_DIR`, else
 /// `target/tmp/herdr-handoff-failures` (CI uploads it only when a job fails).
 pub fn failure_artifact_root() -> PathBuf {
     std::env::var_os("HERDR_TEST_FAILURE_ARTIFACT_DIR")
@@ -461,7 +500,7 @@ struct BundleFixture {
 }
 
 const BUNDLE_LOG_TAIL_BYTES: u64 = 1 << 20;
-/// Keeps the head of importer stderr: the startup banner and the earliest error.
+/// Keeps the tail of importer stderr: the returned error and any panic come last.
 pub const IMPORTER_STDERR_CAP_BYTES: u64 = 1 << 20;
 
 impl HandoffFailureBundle {

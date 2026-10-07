@@ -1255,12 +1255,13 @@ fn importer_stderr_capture_is_capped_and_never_blocks_the_importer() {
     let artifacts = base.join("artifacts");
     let mut cleanup = support::ScopedHandoffServer::new(&base.join("fixture"));
     cleanup.set_diagnostics(&artifacts);
-    // Writes three times the cap to stderr, then proves it ran to completion.
+    // Writes three times the cap and a final error line to stderr, then proves
+    // it ran to completion.
     let noisy = base.join("noisy.sh");
     let done = base.join("done");
     fs::write(
         &noisy,
-        "#!/bin/sh\nhead -c 3145728 /dev/zero | tr '\\0' x >&2\nprintf done > \"$1\"\n",
+        "#!/bin/sh\nhead -c 3145728 /dev/zero | tr '\\0' x >&2\necho 'error: last words' >&2\nprintf done > \"$1\"\n",
     )
     .unwrap();
     fs::set_permissions(&noisy, fs::Permissions::from_mode(0o700)).unwrap();
@@ -1275,14 +1276,18 @@ fn importer_stderr_capture_is_capped_and_never_blocks_the_importer() {
         "importer must not fail on a full capture: {status}"
     );
     assert_eq!(fs::read_to_string(&done).unwrap(), "done");
-    let captured = fs::metadata(artifacts.join("importer-0.stderr"))
-        .unwrap()
-        .len();
-    assert!(
-        captured > 0 && captured <= support::IMPORTER_STDERR_CAP_BYTES,
-        "importer stderr capture must be capped: {captured} bytes"
-    );
+    // Cleanup completes the capture; it then holds exactly the last cap bytes.
     cleanup.stop_and_cleanup().unwrap();
+    let captured = fs::read(artifacts.join("importer-0.stderr")).unwrap();
+    assert_eq!(
+        captured.len() as u64,
+        support::IMPORTER_STDERR_CAP_BYTES,
+        "importer stderr capture must be capped"
+    );
+    assert!(
+        captured.ends_with(b"xxerror: last words\n"),
+        "importer stderr capture must keep the tail"
+    );
     let _ = fs::remove_dir_all(&base);
 }
 
