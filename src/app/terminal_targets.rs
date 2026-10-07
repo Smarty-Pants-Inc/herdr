@@ -280,7 +280,7 @@ impl App {
         &self,
         peer_identity: crate::platform::ProcessIdentity,
     ) -> Option<TerminalTarget> {
-        self.checked_pane_target_for_peer_identity(peer_identity)
+        self.checked_pane_target_for_peer_identity_with_outside_proof(peer_identity, false)
             .ok()
             .flatten()
     }
@@ -504,6 +504,189 @@ mod tests {
             api_rx,
             crate::api::EventHub::default(),
         )
+    }
+
+    fn attribution_app(root: crate::platform::ProcessIdentity) -> (App, TerminalTarget) {
+        let mut app = test_app();
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("attribution")];
+        app.state.ensure_test_terminals();
+        let target = app.terminal_targets().pop().expect("one pane");
+        app.state
+            .terminals
+            .get_mut(target.terminal_id.as_str())
+            .expect("terminal")
+            .set_agent_name("imported-sender".into());
+        let (runtime, _rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        runtime.test_set_child_pid(root.pid);
+        app.state.insert_test_runtime(target.pane_id, runtime);
+        (app, target)
+    }
+
+    fn live_peer() -> crate::platform::ProcessIdentity {
+        crate::platform::process_identity(std::process::id()).expect("live test process")
+    }
+
+    fn peer_context(peer: crate::platform::ProcessIdentity) -> crate::api::ApiRequestContext {
+        crate::api::ApiRequestContext {
+            local_peer_identity: Some(peer),
+            local_peer_pane_origin: crate::platform::PeerPaneOrigin::Absent,
+        }
+    }
+
+    // These scoped OS observations model imported ancestry, not a real server
+    // replacement. Runtime root and caller instance validation still run live.
+    #[tokio::test]
+    async fn optional_attribution_maps_imported_root_outside_server_ancestry() {
+        let peer = live_peer();
+        let (app, target) = attribution_app(peer);
+        crate::platform::with_server_ancestry_for_test(peer, Some(true), || {
+            crate::platform::with_ancestry_membership_for_test(Some(true), || {
+                assert_eq!(app.pane_target_for_peer_identity(peer), Some(target));
+            });
+        });
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn optional_attribution_maps_imported_caller_outside_server_ancestry() {
+        let peer = live_peer();
+        let root = crate::platform::parent_process_identity(peer).expect("live parent");
+        assert_ne!(root, peer);
+        let (app, target) = attribution_app(root);
+        crate::platform::with_server_ancestry_for_test(peer, Some(true), || {
+            crate::platform::with_ancestry_membership_for_test(Some(true), || {
+                assert_eq!(app.pane_target_for_peer_identity(peer), Some(target));
+            });
+        });
+    }
+
+    #[tokio::test]
+    async fn optional_attribution_rebinds_stale_report_outside_server_ancestry() {
+        use crate::api::schema::{Method, PaneReleaseAgentParams, Request};
+        let peer = live_peer();
+        let (app, target) = attribution_app(peer);
+        let current = app.public_pane_id(target.ws_idx, target.pane_id).unwrap();
+        let report = |pane_id: &str| Request {
+            id: "rebind".into(),
+            method: Method::PaneReleaseAgent(PaneReleaseAgentParams {
+                pane_id: pane_id.into(),
+                source: "custom:pi".into(),
+                agent: "pi".into(),
+                seq: None,
+            }),
+        };
+        crate::platform::with_server_ancestry_for_test(peer, Some(true), || {
+            crate::platform::with_ancestry_membership_for_test(Some(true), || {
+                let mut known = report(&current);
+                app.rebind_stale_report_pane(&mut known, peer_context(peer));
+                assert_eq!(known.method, report(&current).method);
+                let mut stale = report("w42:p1F");
+                assert!(app.parse_pane_id("w42:p1F").is_none());
+                app.rebind_stale_report_pane(&mut stale, peer_context(peer));
+                assert_eq!(stale.method, report(&current).method);
+            });
+        });
+    }
+
+    #[tokio::test]
+    async fn optional_attribution_logs_api_caller_outside_server_ancestry() {
+        use crate::api::schema::{Method, PaneSendTextParams, Request};
+        let peer = live_peer();
+        let (mut app, source) = attribution_app(peer);
+        let target_pane =
+            app.state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
+        app.state.ensure_test_terminals();
+        let (runtime, mut target_rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.state.insert_test_runtime(target_pane, runtime);
+        let target_id = app.public_pane_id(0, target_pane).unwrap();
+        let source_id = app.public_pane_id(0, source.pane_id).unwrap();
+        let response = crate::platform::with_server_ancestry_for_test(peer, Some(true), || {
+            crate::platform::with_ancestry_membership_for_test(Some(true), || {
+                app.handle_api_request_with_context(
+                    Request {
+                        id: "logged".into(),
+                        method: Method::PaneSendText(PaneSendTextParams {
+                            pane_id: target_id.clone(),
+                            text: "private prompt".into(),
+                            allow_cross_pane: false,
+                        }),
+                    },
+                    peer_context(peer),
+                )
+            })
+        });
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert!(response.get("error").is_none(), "{response}");
+        assert_eq!(target_rx.try_recv().unwrap(), "private prompt");
+        let raw = std::fs::read_to_string(&app.api_input_log).unwrap();
+        std::fs::remove_file(&app.api_input_log).unwrap();
+        let lines: Vec<_> = raw.lines().collect();
+        assert_eq!(lines.len(), 1);
+        let line: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(line["method"], "pane.send_text");
+        assert_eq!(line["target_pane"], target_id);
+        assert_eq!(line["bytes"], 14);
+        assert_eq!(line["caller"]["pid"], peer.pid);
+        assert_eq!(line["caller"]["pane"], source_id);
+        assert_eq!(line["caller"]["agent"], "imported-sender");
+        assert!(!raw.contains("private prompt"));
+    }
+
+    #[tokio::test]
+    async fn optional_attribution_maps_live_pane_despite_unknown_server_ancestry() {
+        let peer = live_peer();
+        let (app, target) = attribution_app(peer);
+        crate::platform::with_server_ancestry_for_test(peer, None, || {
+            crate::platform::with_ancestry_membership_for_test(Some(true), || {
+                assert_eq!(app.pane_target_for_peer_identity(peer), Some(target));
+            });
+        });
+    }
+
+    #[tokio::test]
+    async fn optional_attribution_keeps_permission_server_ancestry_shortcut() {
+        let peer = live_peer();
+        let (app, _) = attribution_app(peer);
+        for (observation, expected) in [
+            (Some(true), InputOrigin::Ordinary),
+            (None, InputOrigin::Unknown),
+        ] {
+            crate::platform::with_server_ancestry_for_test(peer, observation, || {
+                crate::platform::with_ancestry_membership_for_test(Some(true), || {
+                    assert_eq!(app.input_origin_for_peer_identity(peer), expected);
+                    assert_eq!(app.input_origin_for_context(peer_context(peer)), expected);
+                });
+            });
+        }
+    }
+
+    #[tokio::test]
+    async fn optional_attribution_rejects_unproven_or_stale_membership() {
+        let peer = live_peer();
+        let (app, _) = attribution_app(peer);
+        crate::platform::with_server_ancestry_for_test(peer, Some(true), || {
+            for observation in [Some(false), None] {
+                crate::platform::with_ancestry_membership_for_test(observation, || {
+                    assert_eq!(app.pane_target_for_peer_identity(peer), None);
+                });
+            }
+            crate::platform::with_ancestry_membership_for_test(Some(true), || {
+                let stale = crate::platform::ProcessIdentity {
+                    start_time: peer.start_time.wrapping_add(1),
+                    ..peer
+                };
+                assert_eq!(app.pane_target_for_peer_identity(stale), None);
+                app.state
+                    .runtime_for_pane_in_workspace(
+                        &app.terminal_runtimes,
+                        0,
+                        app.state.workspaces[0].tabs[0].root_pane,
+                    )
+                    .unwrap()
+                    .test_set_child_pid(0);
+                assert_eq!(app.pane_target_for_peer_identity(peer), None);
+            });
+        });
     }
 
     /// Fake process table: pid -> parent. Pane shells are pid 100 (pane "a") and 200 (pane "b").
