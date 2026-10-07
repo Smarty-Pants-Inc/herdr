@@ -279,7 +279,7 @@ struct ClientWriterQueue {
     state: Mutex<ClientWriterQueueState>,
     ready: Condvar,
     control_limit: usize,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     overflow_stream: std::sync::OnceLock<LocalStream>,
 }
 
@@ -307,7 +307,7 @@ impl ClientWriterQueue {
 
     /// Lets an overflow end the connection even while the writer thread is
     /// blocked writing to a client that stopped reading.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn set_overflow_stream(&self, stream: LocalStream) {
         let _ = self.overflow_stream.set(stream);
     }
@@ -320,7 +320,7 @@ impl ClientWriterQueue {
             }),
             ready: Condvar::new(),
             control_limit,
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             overflow_stream: std::sync::OnceLock::new(),
         })
     }
@@ -345,8 +345,9 @@ impl ClientWriterQueue {
         if bytes > self.control_limit {
             warn!(bytes, "client control queue overflow, closing writer");
             Self::close_state(&mut state);
+            drop(state);
             self.ready.notify_all();
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             if let Some(stream) = self.overflow_stream.get() {
                 let _ = crate::platform::shutdown_client_stream(stream);
             }
@@ -945,7 +946,7 @@ pub(crate) fn handle_client_handshake(
 
     // Spawn a writer thread that forwards messages from the channels to the stream.
     let write_stream = stream.try_clone()?;
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     writer_queue.set_overflow_stream(stream.try_clone()?);
     let writer_event_tx = server_event_tx.clone();
     std::thread::spawn(move || {
@@ -2297,44 +2298,77 @@ mod tests {
         assert_eq!(queue.recv(), None, "writer thread stops after overflow");
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn control_overflow_unblocks_a_writer_stuck_on_a_non_reading_client() {
         let (mut client_stream, server_stream, _path) = local_stream_pair("client-overflow-stuck");
         let queue = ClientWriterQueue::with_control_limit(1 << 20);
         queue.set_overflow_stream(server_stream.try_clone().unwrap());
         let control = ClientControlWriter::queue(queue.clone());
-        let (server_event_tx, _server_event_rx) = mpsc::channel(4);
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let (server_event_tx, mut server_event_rx) = mpsc::channel(4);
+        // The server read loop is blocked too: this client never sends anything.
+        let read_stream = server_stream.try_clone().unwrap();
+        let read_events = server_event_tx.clone();
+        let (read_tx, read_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            client_writer_loop(server_stream, 9, queue, server_event_tx);
+            let quit = Arc::new(AtomicBool::new(false));
+            let _ = client_read_loop(read_stream, 8, &read_events, &quit);
+            let _ = read_tx.send(());
+        });
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let writer_queue = queue.clone();
+        std::thread::spawn(move || {
+            client_writer_loop(server_stream, 9, writer_queue, server_event_tx);
             let _ = done_tx.send(());
         });
 
-        // The client never reads: the writer blocks once the socket buffer fills.
+        // The client never reads, so the writer blocks once the transport buffer
+        // fills: a queued frame then stays unclaimed behind an unfinished write.
         let frame = vec![0; 64 * 1024];
-        let mut overflowed = false;
+        let mut writer_blocked = false;
         for _ in 0..1024 {
-            if control.send(frame.clone()).is_err() {
-                overflowed = true;
+            control.send(frame.clone()).expect("below the bound");
+            let deadline = std::time::Instant::now() + Duration::from_millis(200);
+            while !queue.lock_state().control.is_empty() && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            if !queue.lock_state().control.is_empty() {
+                writer_blocked = true;
                 break;
             }
         }
-        assert!(overflowed, "unread control bytes must overflow");
+        assert!(writer_blocked, "a queued frame must stay unclaimed");
+        assert!(
+            done_rx.try_recv().is_err(),
+            "the blocked writer is still running"
+        );
+        assert!(
+            control.send(vec![0; 1 << 20]).is_err(),
+            "unread control bytes must overflow"
+        );
         done_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("overflow unblocks the writer thread");
-        // The connection is shut down, so the client (and the server read
-        // loop on the same socket) reaches end of stream.
-        let (eof_tx, eof_rx) = std::sync::mpsc::channel();
+        // Only a write that failed reports this; a writer that was merely idle
+        // or finished its write exits without it. So a write was pending and
+        // the overflow cancelled it.
+        let mut write_failed = false;
+        while let Ok(event) = server_event_rx.try_recv() {
+            write_failed |= matches!(event, ServerEvent::ClientDisconnected { client_id: 9 });
+        }
+        assert!(write_failed, "overflow must cancel the pending write");
+        read_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("overflow ends the server read loop");
+        // The client sees the connection end (end of stream or a pipe error).
+        let (end_tx, end_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let mut sink = Vec::new();
-            let _ = eof_tx.send(io::Read::read_to_end(&mut client_stream, &mut sink));
+            let _ = end_tx.send(io::Read::read_to_end(&mut client_stream, &mut sink));
         });
-        eof_rx
+        let _end_of_stream_or_pipe_error = end_rx
             .recv_timeout(Duration::from_secs(5))
-            .expect("overflow ends the connection")
-            .expect("client reads to end of stream");
+            .expect("overflow ends the connection");
     }
 
     #[test]
