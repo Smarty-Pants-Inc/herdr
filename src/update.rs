@@ -2129,10 +2129,23 @@ fn is_smarty_install_managed_exe(_exe: &Path) -> bool {
     false
 }
 
+/// The refusal for a smarty-install binary, if this process is one. On Linux it checks the
+/// running inode (`/proc/self/exe`, still valid after an unlink) and fails closed when that
+/// cannot be read; it also checks the installed path. Call before any config read or write.
+pub(crate) fn smarty_install_refusal() -> Option<&'static str> {
+    #[cfg(target_os = "linux")]
+    let running = std::fs::metadata("/proc/self/exe").is_err()
+        || is_smarty_install_managed_exe(Path::new("/proc/self/exe"));
+    #[cfg(not(target_os = "linux"))]
+    let running = false;
+    let installed = env::current_exe().is_ok_and(|exe| is_smarty_install_managed_exe(&exe));
+    (running || installed).then_some(SMARTY_INSTALL_REFUSAL)
+}
+
 pub fn self_update(options: SelfUpdateOptions) -> Result<Version, String> {
     // Before any config read, download or write.
-    if env::current_exe().is_ok_and(|exe| is_smarty_install_managed_exe(&exe)) {
-        return Err(SMARTY_INSTALL_REFUSAL.into());
+    if let Some(refusal) = smarty_install_refusal() {
+        return Err(refusal.into());
     }
     let channel = UpdateChannel::configured();
 
