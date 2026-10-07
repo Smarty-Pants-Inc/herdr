@@ -143,11 +143,16 @@ impl Ledger {
                     reason: "token_conflict".into(),
                 };
             }
-            return ConsumerResponse::Cut(if let Some(reason) = &self.poison {
-                unknown(reason)
-            } else {
-                old.result.clone()
-            });
+            // A poisoned epoch answers `unknown` even for a stored token. That answer differs
+            // from the logged one, so it is durably logged first (review #188 P2); an
+            // unchanged answer is not logged again.
+            let stored = old.result.clone();
+            return match self.poison.clone() {
+                Some(reason) if stored != unknown(&reason) => {
+                    self.refuse_logged(&req, &reason, audit)
+                }
+                _ => ConsumerResponse::Cut(stored),
+            };
         }
         if req.seq != self.seq.saturating_add(1) {
             return self.refuse_logged(&req, "seq_mismatch", audit);

@@ -129,10 +129,92 @@ fn load(setgid: bool, effective_gid: u32) -> Option<LockedKey> {
         // Test-only trust root; release builds read only KEY_PATH.
         return read_key(Path::new(&path), None);
     }
-    if !setgid {
+    load_with(setgid, effective_gid, &mut Nss, read_key)
+}
+
+/// Who holds a group, so the loader can prove the key group is the server's alone.
+pub(crate) trait GroupDb {
+    /// Supplementary members of `gid`, or `None` when the group cannot be resolved.
+    fn members(&mut self, gid: u32) -> Option<Vec<String>>;
+    /// Whether any account has `gid` as its primary group (`None`: cannot tell).
+    fn is_primary_of_any_user(&mut self, gid: u32) -> Option<bool>;
+}
+
+/// The key file is `0640 root:herdr`, so every member of `herdr` could read it and forge
+/// signatures. Load only when the group has no supplementary members and is nobody's primary
+/// group: then only the setgid binary holds it (review #188 P1). Unresolvable means refuse.
+fn load_with<K>(
+    setgid: bool,
+    effective_gid: u32,
+    groups: &mut impl GroupDb,
+    read: impl FnOnce(&Path, Option<u32>) -> Option<K>,
+) -> Option<K> {
+    if !setgid
+        || groups
+            .members(effective_gid)
+            .is_none_or(|members| !members.is_empty())
+        || groups.is_primary_of_any_user(effective_gid) != Some(false)
+    {
         return None;
     }
-    read_key(Path::new(KEY_PATH), Some(effective_gid))
+    read(Path::new(KEY_PATH), Some(effective_gid))
+}
+
+/// The system account databases through NSS (files, LDAP, sssd alike).
+struct Nss;
+
+impl GroupDb for Nss {
+    fn members(&mut self, gid: u32) -> Option<Vec<String>> {
+        let mut buf = vec![0 as libc::c_char; 1 << 16];
+        let mut group = std::mem::MaybeUninit::<libc::group>::uninit();
+        let mut found = std::ptr::null_mut();
+        // SAFETY: getgrgid_r fills `group` using `buf`, both valid for the given length.
+        let rc = unsafe {
+            libc::getgrgid_r(
+                gid,
+                group.as_mut_ptr(),
+                buf.as_mut_ptr(),
+                buf.len(),
+                &mut found,
+            )
+        };
+        if rc != 0 || found.is_null() {
+            return None;
+        }
+        // SAFETY: on success `group` is initialized and gr_mem is a NULL-terminated array of
+        // C strings inside `buf`, which outlives this loop.
+        let mut cursor = unsafe { group.assume_init().gr_mem };
+        let mut members = Vec::new();
+        while !cursor.is_null() && !unsafe { *cursor }.is_null() {
+            // SAFETY: each entry is a valid C string (see above).
+            let name = unsafe { std::ffi::CStr::from_ptr(*cursor) };
+            members.push(name.to_string_lossy().into_owned());
+            // SAFETY: stays within the NULL-terminated array.
+            cursor = unsafe { cursor.add(1) };
+        }
+        Some(members)
+    }
+    fn is_primary_of_any_user(&mut self, gid: u32) -> Option<bool> {
+        // The startup thread is single; getpwent's static cursor is not shared yet.
+        let mut found = false;
+        // SAFETY: setpwent/getpwent/endpwent iterate the password database; each entry is
+        // read before the next call.
+        unsafe {
+            libc::setpwent();
+            loop {
+                let entry = libc::getpwent();
+                if entry.is_null() {
+                    break;
+                }
+                if (*entry).pw_gid == gid {
+                    found = true;
+                    break;
+                }
+            }
+            libc::endpwent();
+        }
+        Some(found)
+    }
 }
 
 /// A heap buffer pinned in RAM before any secret byte is written to it; wiped on drop.
@@ -409,6 +491,59 @@ mod tests {
         assert!(Kernel.make_non_dumpable());
         // SAFETY: restores the default so later tests in this process are unaffected.
         unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0) };
+    }
+
+    struct Groups {
+        members: Option<Vec<String>>,
+        primary: Option<bool>,
+    }
+    impl GroupDb for Groups {
+        fn members(&mut self, _: u32) -> Option<Vec<String>> {
+            self.members.clone()
+        }
+        fn is_primary_of_any_user(&mut self, _: u32) -> Option<bool> {
+            self.primary
+        }
+    }
+
+    #[test]
+    fn server_key_group_with_any_member_never_reads_the_key() {
+        // Review #188 P1: a member of the key group could read the 0640 key and forge.
+        for (members, primary) in [
+            (Some(vec!["mallory".to_string()]), Some(false)),
+            (Some(vec![]), Some(true)),
+            (None, Some(false)),
+            (Some(vec![]), None),
+        ] {
+            let mut groups = Groups { members, primary };
+            let key = load_with(true, 990, &mut groups, |_, _| -> Option<()> {
+                panic!("must not read the key")
+            });
+            assert_eq!(key, None);
+        }
+        // Counterpart: a private group (no members, nobody's primary) reads the real path.
+        let mut groups = Groups {
+            members: Some(vec![]),
+            primary: Some(false),
+        };
+        let mut read = None;
+        let key = load_with(true, 990, &mut groups, |path, gid| {
+            read = Some((path.to_owned(), gid));
+            Some(())
+        });
+        assert_eq!(key, Some(()));
+        assert_eq!(read, Some((Path::new(KEY_PATH).to_owned(), Some(990))));
+        // Not setgid: never reads.
+        assert_eq!(load_with(false, 990, &mut groups, |_, _| Some(())), None);
+    }
+
+    #[test]
+    fn server_key_real_nss_sees_this_users_primary_group() {
+        // SAFETY: getgid takes no arguments and cannot fail.
+        let gid = unsafe { libc::getgid() };
+        assert_eq!(Nss.is_primary_of_any_user(gid), Some(true));
+        assert!(Nss.members(gid).is_some());
+        assert_eq!(Nss.members(u32::MAX - 7), None);
     }
 
     #[test]

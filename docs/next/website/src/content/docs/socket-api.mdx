@@ -266,7 +266,8 @@ advertise `false` and refuse all three methods with `unsupported_platform`.
 The installed server is `root:herdr` mode `2755` and reads the Ed25519 key
 `/etc/herdr/server.key` (`0640 root:herdr`) once at startup, then drops the
 group, so no pane child runs with it and same-user processes cannot read the
-key from the file or from server memory. `sig` is Ed25519 over the fields
+key from the file or from server memory. The `herdr` group must have no
+members and be nobody's primary group, or the server does not load the key. `sig` is Ed25519 over the fields
 `herdr-enroll-v1`, `challenge`, `epoch`, SHA-256 of the decoded `epoch_key` (hex),
 `nonce`, `pane_id`, and the pane slave's `tty.dev` and `tty.ino` (decimal), each
 encoded as a u32 big-endian byte length plus UTF-8 bytes. Verify it with

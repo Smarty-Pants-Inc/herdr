@@ -159,12 +159,13 @@ fn input_consumer_ledger_exact_retry_conflict_kind_seq_and_durable_once() {
         result(ledger.cut(request(1, "one", 2, b"x\r"), Some(&audit), now)),
         unknown("termios_changed")
     );
-    // A new token on a poisoned epoch is logged too.
+    // The replay's changed answer is logged (review #188 P2), and so is a new token.
+    assert_eq!(calls.load(Ordering::SeqCst), 4);
     assert_eq!(
         result(ledger.cut(request(3, "three", 4, b""), Some(&audit), now)),
         unknown("termios_changed")
     );
-    assert_eq!(calls.load(Ordering::SeqCst), 4);
+    assert_eq!(calls.load(Ordering::SeqCst), 5);
 }
 #[test]
 fn input_consumer_ledger_early_unknown_with_failed_log_fails_closed() {
@@ -178,6 +179,43 @@ fn input_consumer_ledger_early_unknown_with_failed_log_fails_closed() {
     );
     assert_eq!(
         result(ledger.cut(request(1, "one", 2, b"x\r"), Some(&sink()), now)),
+        unknown("input_log_unavailable")
+    );
+}
+#[test]
+fn input_consumer_ledger_poisoned_replay_logs_its_changed_answer() {
+    // Review #188 P2: a replayed token on a poisoned epoch gets `unknown`, which differs from
+    // its logged answer; the new answer must be durably logged before it is returned.
+    let now = Instant::now();
+    let records = Arc::new(std::sync::Mutex::new(Vec::<AuditRecord>::new()));
+    let seen = Arc::clone(&records);
+    let audit: AuditSink = Arc::new(move |r| {
+        seen.lock().unwrap().push(r.clone());
+        Ok(())
+    });
+    let mut ledger = Ledger::new("epoch".into(), "secret".into());
+    ledger.record(b"x\r", &client(1), now);
+    let req = request(1, "one", 2, b"x\r");
+    let first = result(ledger.cut(req.clone(), Some(&audit), now));
+    assert_ne!(first, unknown("termios_changed"));
+    // Counterpart: an exact retry before poison keeps the stored answer and logs nothing new.
+    assert_eq!(result(ledger.cut(req.clone(), Some(&audit), now)), first);
+    assert_eq!(records.lock().unwrap().len(), 1);
+    ledger.poison("termios_changed");
+    assert_eq!(
+        result(ledger.cut(req.clone(), Some(&audit), now)),
+        unknown("termios_changed")
+    );
+    {
+        let logged = records.lock().unwrap();
+        assert_eq!(logged.len(), 2, "changed replay answer is logged");
+        assert_eq!(logged[1].token, "one");
+        assert_eq!(logged[1].result, unknown("termios_changed"));
+    }
+    // A failed log fails closed even on replay.
+    let failing: AuditSink = Arc::new(|_: &AuditRecord| Err(io::Error::other("disk")));
+    assert_eq!(
+        result(ledger.cut(req, Some(&failing), now)),
         unknown("input_log_unavailable")
     );
 }
