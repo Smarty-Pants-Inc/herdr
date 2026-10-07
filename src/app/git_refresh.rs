@@ -735,7 +735,8 @@ mod tests {
             ws.identity_cwd = self.0.clone();
             app.state.workspaces.push(ws);
             app.mark_git_status_refresh_due(Instant::now());
-            drive_git_watch_refresh(&mut app);
+            // Fixture setup is a forced refresh, not a native-event refresh.
+            drive_git_watch_refresh_within(&mut app, GIT_WATCH_SETUP_TIMEOUT);
             app
         }
     }
@@ -749,6 +750,7 @@ mod tests {
     // Preserve the product's 1s native-refresh bound. Do not include waiting
     // for another test's fixture setup in that latency measurement.
     const GIT_WATCH_TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+    const GIT_WATCH_SETUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
     fn run_git_watch_test_in_child(name: &str) -> bool {
         const CHILD_ENV: &str = "HERDR_TEST_GIT_WATCH_CHILD";
@@ -807,38 +809,61 @@ mod tests {
 
     /// Exercise the same sync -> scheduler -> worker -> App event application
     /// path used by a headless server with an attached app consumer.
+    /// The 1s bound starts when the fixture's git command has returned: the
+    /// fixture's own process startup (slow on Windows) is not refresh latency.
     #[track_caller]
     fn drive_git_watch_refresh(app: &mut App) -> (std::time::Duration, bool) {
+        drive_git_watch_refresh_within(app, GIT_WATCH_TEST_TIMEOUT)
+    }
+
+    #[track_caller]
+    fn drive_git_watch_refresh_within(
+        app: &mut App,
+        budget: std::time::Duration,
+    ) -> (std::time::Duration, bool) {
         let start = Instant::now();
+        let deadline = start + budget;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
         // A safety refresh must never satisfy a native-event regression, even
         // when a long-running test is close to its original safety deadline.
         let safety_refresh = app.last_git_repo_discovery_refresh;
         loop {
             let now = Instant::now();
             assert!(
-                now.duration_since(start) < GIT_WATCH_TEST_TIMEOUT,
-                "native git refresh exceeded {GIT_WATCH_TEST_TIMEOUT:?}: in_flight={}, watch_deadline={:?}",
+                now < deadline,
+                "native git refresh exceeded {budget:?}: in_flight={}, watch_deadline={:?}",
                 app.git_refresh_in_flight,
                 app.git_watch_refresh_deadline
             );
             app.sync_git_watches();
             app.start_git_status_refresh_if_due(now);
-            while let Ok(event) = app.event_rx.try_recv() {
-                let completed = matches!(event, AppEvent::GitStatusRefreshed { .. });
-                let changed = app.handle_internal_event_with_render_impact(event);
-                if completed {
-                    assert!(
-                        start.elapsed() < GIT_WATCH_TEST_TIMEOUT,
-                        "native git refresh application exceeded {GIT_WATCH_TEST_TIMEOUT:?}"
-                    );
-                    assert_eq!(
-                        app.last_git_repo_discovery_refresh, safety_refresh,
-                        "periodic safety discovery must not satisfy a native refresh wait"
-                    );
-                    return (start.elapsed(), changed);
-                }
+            // Block on the next App event, waking for the debounce deadline
+            // or the test bound instead of polling on a fixed sleep.
+            let wake = app
+                .git_refresh_deadline()
+                .map_or(deadline, |due| due.min(deadline));
+            let wait = wake.saturating_duration_since(now);
+            let Ok(Some(event)) =
+                runtime.block_on(async { tokio::time::timeout(wait, app.event_rx.recv()).await })
+            else {
+                continue;
+            };
+            let completed = matches!(event, AppEvent::GitStatusRefreshed { .. });
+            let changed = app.handle_internal_event_with_render_impact(event);
+            if completed {
+                assert!(
+                    start.elapsed() < budget,
+                    "native git refresh application exceeded {budget:?}"
+                );
+                assert_eq!(
+                    app.last_git_repo_discovery_refresh, safety_refresh,
+                    "periodic safety discovery must not satisfy a native refresh wait"
+                );
+                return (start.elapsed(), changed);
             }
-            std::thread::sleep(std::time::Duration::from_millis(2));
         }
     }
 
@@ -852,18 +877,14 @@ mod tests {
         let mut app = repo.app();
         assert_eq!(app.state.workspaces[0].git_ahead_behind(), Some((0, 0)));
 
-        let start = Instant::now();
         repo.git(&["commit", "--allow-empty", "-m", "watched"]);
         let (commit_latency, changed) = drive_git_watch_refresh(&mut app);
         assert!(changed);
-        assert!(start.elapsed() < GIT_WATCH_TEST_TIMEOUT);
         assert_eq!(app.state.workspaces[0].git_ahead_behind(), Some((1, 0)));
 
-        let start = Instant::now();
         repo.git(&["switch", "-c", "feature/nested"]);
         let (branch_latency, changed) = drive_git_watch_refresh(&mut app);
         assert!(changed);
-        assert!(start.elapsed() < GIT_WATCH_TEST_TIMEOUT);
         assert_eq!(
             app.state.workspaces[0].cached_git_branch.as_deref(),
             Some("feature/nested")
@@ -874,10 +895,8 @@ mod tests {
         std::fs::write(repo.0.join("staged.txt"), "staged\n").unwrap();
         let branch_before = app.state.workspaces[0].cached_git_branch.clone();
         let status_before = app.state.workspaces[0].git_ahead_behind();
-        let start = Instant::now();
         repo.git(&["add", "staged.txt"]);
         let (index_latency, changed) = drive_git_watch_refresh(&mut app);
-        assert!(start.elapsed() < GIT_WATCH_TEST_TIMEOUT);
         assert!(!changed);
         assert_eq!(app.state.workspaces[0].cached_git_branch, branch_before);
         assert_eq!(app.state.workspaces[0].git_ahead_behind(), status_before);
