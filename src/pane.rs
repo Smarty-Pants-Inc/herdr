@@ -1575,9 +1575,43 @@ impl PaneRuntimeIo {
         }
     }
 
-    fn try_send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::TrySendError<Bytes>> {
+    fn queue_input_consumer_operation(
+        &self,
+        operation: crate::pty::input_consumer::ConsumerOperation,
+        audit: Option<crate::pty::input_consumer::AuditSink>,
+    ) -> std::io::Result<std::sync::mpsc::Receiver<crate::pty::input_consumer::ConsumerResponse>>
+    {
         match self {
-            PaneRuntimeIo::Actor(actor) => actor.try_write_user_input(bytes),
+            Self::Actor(actor) => actor.queue_input_consumer_operation(operation, audit),
+            #[cfg(test)]
+            Self::TestChannel { .. } => {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let _ = tx.send(crate::pty::input_consumer::ConsumerResponse::Refused {
+                    reason: "unsupported".into(),
+                });
+                Ok(rx)
+            }
+        }
+    }
+    fn input_consumer_epoch_matches(&self, epoch: &str) -> bool {
+        match self {
+            Self::Actor(actor) => actor.input_consumer_epoch_matches(epoch),
+            #[cfg(test)]
+            Self::TestChannel { .. } => false,
+        }
+    }
+    // Test fixtures still exercise the conservative no-source byte alias.
+    #[cfg(test)]
+    fn try_send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::TrySendError<Bytes>> {
+        self.try_send_bytes_with_source(bytes, crate::pty::input_consumer::InputSource::Api)
+    }
+    fn try_send_bytes_with_source(
+        &self,
+        bytes: Bytes,
+        source: crate::pty::input_consumer::InputSource,
+    ) -> Result<(), mpsc::error::TrySendError<Bytes>> {
+        match self {
+            PaneRuntimeIo::Actor(actor) => actor.try_write_user_input_with_source(bytes, source),
             #[cfg(test)]
             PaneRuntimeIo::TestChannel { sender, .. } => sender.try_send(bytes),
         }
@@ -1595,21 +1629,23 @@ impl PaneRuntimeIo {
         }
     }
 
-    fn queue_user_input_submission(
+    fn queue_user_input_submission_with_source(
         &self,
         text: Bytes,
         enter: Bytes,
         delay: std::time::Duration,
         deadline: Option<std::time::Instant>,
+        source: crate::pty::input_consumer::InputSource,
     ) -> std::io::Result<std::sync::mpsc::Receiver<std::io::Result<()>>> {
         match self {
             PaneRuntimeIo::Actor(actor) => {
                 #[cfg(windows)]
-                return actor.queue_user_input_submission(text, enter, delay, deadline);
+                return actor
+                    .queue_user_input_submission_with_source(text, enter, delay, deadline, source);
                 #[cfg(unix)]
                 {
                     let _ = deadline;
-                    actor.queue_user_input_submission(text, enter, delay)
+                    actor.queue_user_input_submission_with_source(text, enter, delay, source)
                 }
             }
             #[cfg(test)]
@@ -3680,30 +3716,50 @@ impl PaneRuntime {
             .encode_terminal_key(key, self.keyboard_protocol())
     }
 
-    pub fn try_send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::TrySendError<Bytes>> {
-        self.io.try_send_bytes(bytes)
+    pub(crate) fn queue_input_consumer_operation(
+        &self,
+        operation: crate::pty::input_consumer::ConsumerOperation,
+        audit: Option<crate::pty::input_consumer::AuditSink>,
+    ) -> std::io::Result<std::sync::mpsc::Receiver<crate::pty::input_consumer::ConsumerResponse>>
+    {
+        self.io.queue_input_consumer_operation(operation, audit)
     }
-
-    pub fn queue_user_input_submission(
+    pub(crate) fn input_consumer_epoch_matches(&self, epoch: &str) -> bool {
+        self.io.input_consumer_epoch_matches(epoch)
+    }
+    pub(crate) fn try_send_bytes_with_source(
+        &self,
+        bytes: Bytes,
+        source: crate::pty::input_consumer::InputSource,
+    ) -> Result<(), mpsc::error::TrySendError<Bytes>> {
+        self.io.try_send_bytes_with_source(bytes, source.user())
+    }
+    pub(crate) fn queue_user_input_submission_with_source(
         &self,
         text: Bytes,
         enter: Bytes,
         delay: std::time::Duration,
         deadline: Option<std::time::Instant>,
+        source: crate::pty::input_consumer::InputSource,
     ) -> std::io::Result<std::sync::mpsc::Receiver<std::io::Result<()>>> {
         self.io
-            .queue_user_input_submission(text, enter, delay, deadline)
+            .queue_user_input_submission_with_source(text, enter, delay, deadline, source.user())
+    }
+    #[cfg(test)]
+    pub fn try_send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::TrySendError<Bytes>> {
+        self.io.try_send_bytes(bytes)
     }
 
-    pub(crate) fn try_send_paste(
+    pub(crate) fn try_send_paste_with_source(
         &self,
         text: String,
+        source: crate::pty::input_consumer::InputSource,
     ) -> Result<bool, mpsc::error::TrySendError<Bytes>> {
         let payload = self.paste_payload(text);
         if payload.is_empty() {
             return Ok(false);
         }
-        self.try_send_bytes(payload)?;
+        self.try_send_bytes_with_source(payload, source)?;
         Ok(true)
     }
 
@@ -3718,7 +3774,16 @@ impl PaneRuntime {
         Bytes::from(payload)
     }
 
+    // Legacy no-source alias remains only for conservative focus regressions.
+    #[cfg(test)]
     pub fn try_send_focus_event(&self, event: crate::ghostty::FocusEvent) -> bool {
+        self.try_send_focus_event_with_source(event, crate::pty::input_consumer::InputSource::Api)
+    }
+    pub(crate) fn try_send_focus_event_with_source(
+        &self,
+        event: crate::ghostty::FocusEvent,
+        source: crate::pty::input_consumer::InputSource,
+    ) -> bool {
         if !self.focus_reporting_enabled() {
             return false;
         }
@@ -3726,7 +3791,7 @@ impl PaneRuntime {
         let Ok(bytes) = crate::ghostty::encode_focus(event) else {
             return false;
         };
-        if let Err(err) = self.try_send_bytes(Bytes::from(bytes)) {
+        if let Err(err) = self.try_send_bytes_with_source(Bytes::from(bytes), source) {
             warn!(err = %err, ?event, "failed to forward pane focus event");
         }
         true

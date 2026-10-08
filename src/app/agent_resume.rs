@@ -297,7 +297,10 @@ impl App {
 
         let mut input = resume_command;
         input.push('\r');
-        if let Err(err) = runtime.try_send_bytes(Bytes::from(input)) {
+        if let Err(err) = runtime.try_send_bytes_with_source(
+            Bytes::from(input),
+            crate::pty::input_consumer::InputSource::Api,
+        ) {
             tracing::warn!(
                 pane = pane_id.raw(),
                 terminal = %terminal_id,

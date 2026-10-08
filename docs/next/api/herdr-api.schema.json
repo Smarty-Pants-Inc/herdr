@@ -2167,6 +2167,13 @@
           ],
           "type": "object"
         },
+        "InputConsumerCutKind": {
+          "enum": [
+            "submit",
+            "discard"
+          ],
+          "type": "string"
+        },
         "IntegrationInstallParams": {
           "properties": {
             "target": {
@@ -2691,6 +2698,80 @@
           },
           "required": [
             "direction"
+          ],
+          "type": "object"
+        },
+        "PaneInputConsumerCutParams": {
+          "additionalProperties": false,
+          "properties": {
+            "cut": {
+              "description": "Number of post-marker bytes through the end of this interval.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "digest": {
+              "type": "string"
+            },
+            "epoch": {
+              "type": "string"
+            },
+            "epoch_key": {
+              "type": "string"
+            },
+            "kind": {
+              "$ref": "#/schemas/request/$defs/InputConsumerCutKind"
+            },
+            "seq": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "token": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "epoch",
+            "epoch_key",
+            "seq",
+            "token",
+            "cut",
+            "digest",
+            "kind"
+          ],
+          "type": "object"
+        },
+        "PaneInputConsumerEnrollParams": {
+          "additionalProperties": false,
+          "properties": {
+            "challenge": {
+              "description": "Fresh 256-bit consumer challenge as 64 lowercase hex characters.",
+              "type": "string"
+            },
+            "pane_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pane_id",
+            "challenge"
+          ],
+          "type": "object"
+        },
+        "PaneInputConsumerReleaseParams": {
+          "additionalProperties": false,
+          "properties": {
+            "epoch": {
+              "type": "string"
+            },
+            "epoch_key": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "epoch",
+            "epoch_key"
           ],
           "type": "object"
         },
@@ -6168,6 +6249,55 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/PaneLastInputParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Local API only; the pane actor validates the kernel-pinned socket peer.",
+          "properties": {
+            "method": {
+              "const": "pane.input_consumer.enroll",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneInputConsumerEnrollParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "pane.input_consumer.cut",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneInputConsumerCutParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "pane.input_consumer.release",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneInputConsumerReleaseParams"
             }
           },
           "required": [
@@ -11051,6 +11181,11 @@
             "health_check": {
               "default": false,
               "description": "Whether this server supports endpoint health probes.",
+              "type": "boolean"
+            },
+            "input_consumer": {
+              "default": false,
+              "description": "Supports the local `pane.input_consumer.*` methods (Linux servers only).",
               "type": "boolean"
             },
             "live_handoff": {

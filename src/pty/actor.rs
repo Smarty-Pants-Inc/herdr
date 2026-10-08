@@ -78,6 +78,38 @@ mod windows {
     }
 
     impl PtyIoActorHandle {
+        pub(crate) fn input_consumer_epoch_matches(&self, _epoch: &str) -> bool {
+            false
+        }
+        pub(crate) fn queue_input_consumer_operation(
+            &self,
+            _operation: crate::pty::input_consumer::ConsumerOperation,
+            _audit: Option<crate::pty::input_consumer::AuditSink>,
+        ) -> std::io::Result<std_mpsc::Receiver<crate::pty::input_consumer::ConsumerResponse>>
+        {
+            let (tx, rx) = std_mpsc::channel();
+            let _ = tx.send(crate::pty::input_consumer::ConsumerResponse::Refused {
+                reason: "unsupported".into(),
+            });
+            Ok(rx)
+        }
+        pub(crate) fn try_write_user_input_with_source(
+            &self,
+            bytes: Bytes,
+            _source: crate::pty::input_consumer::InputSource,
+        ) -> Result<(), mpsc::error::TrySendError<Bytes>> {
+            self.try_write_user_input(bytes)
+        }
+        pub(crate) fn queue_user_input_submission_with_source(
+            &self,
+            text: Bytes,
+            enter: Bytes,
+            delay: Duration,
+            deadline: Option<Instant>,
+            _source: crate::pty::input_consumer::InputSource,
+        ) -> std::io::Result<std_mpsc::Receiver<std::io::Result<()>>> {
+            self.queue_user_input_submission(text, enter, delay, deadline)
+        }
         pub(crate) fn try_write_user_input(
             &self,
             bytes: Bytes,
@@ -293,9 +325,12 @@ mod windows {
     }
 
     fn run_writer(writer: &mut impl Write, write_rx: std_mpsc::Receiver<PtyIoWriteCommand>) {
+        let mut sanitizer = crate::pty::input_consumer::Sanitizer::default();
         for command in write_rx {
             let result = match command {
-                PtyIoWriteCommand::Write(bytes) => write_and_flush(writer, &bytes),
+                PtyIoWriteCommand::Write(bytes) => {
+                    write_and_flush(writer, &sanitizer.sanitize(bytes))
+                }
                 PtyIoWriteCommand::SubmissionPart {
                     bytes,
                     deadline,
@@ -304,7 +339,7 @@ mod windows {
                     let result = if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                         Err(input_submission_timed_out())
                     } else {
-                        write_and_flush(writer, &bytes)
+                        write_and_flush(writer, &sanitizer.sanitize(bytes))
                     };
                     let failed = result
                         .as_ref()

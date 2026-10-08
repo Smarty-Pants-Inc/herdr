@@ -11,6 +11,10 @@ use tokio::sync::mpsc::{self, error::TryRecvError as DataTryRecvError};
 use tracing::{debug, warn};
 
 use crate::pty::fd;
+use crate::pty::input_consumer::{
+    classify_replies, AuditSink, ConsumerOperation, ConsumerResponse, InputSource, Ledger,
+    Sanitizer,
+};
 
 // Actor handle methods must call wake_actor() after queuing work. The idle
 // timeout is only a fallback for missed wakes; PTY and wake readiness drive
@@ -72,8 +76,14 @@ pub(crate) struct PtyIoActorConfig {
 }
 
 enum PtyIoDataCommand {
-    WriteUserInput(Bytes),
+    WriteUserInput(Bytes, InputSource),
+    Consumer {
+        operation: ConsumerOperation,
+        audit: Option<AuditSink>,
+        reply: std_mpsc::Sender<ConsumerResponse>,
+    },
     SubmitUserInput {
+        source: InputSource,
         text: Bytes,
         enter: Bytes,
         delay: Duration,
@@ -99,6 +109,7 @@ pub(crate) struct PtyIoActorHandle {
     controls: Arc<Mutex<SharedPtyControls>>,
     response_order: Arc<Mutex<()>>,
     foreground_fd: PtyForegroundObserver,
+    consumer_epoch: Arc<Mutex<Option<String>>>,
 }
 
 #[derive(Debug)]
@@ -107,9 +118,34 @@ struct UserWriteGate {
 }
 
 impl PtyIoActorHandle {
-    pub(crate) fn try_write_user_input(
+    pub(crate) fn queue_input_consumer_operation(
+        &self,
+        operation: ConsumerOperation,
+        audit: Option<AuditSink>,
+    ) -> std::io::Result<std_mpsc::Receiver<crate::pty::input_consumer::ConsumerResponse>> {
+        let (tx, rx) = std_mpsc::channel();
+        self.data_tx
+            .try_send(PtyIoDataCommand::Consumer {
+                operation,
+                audit,
+                reply: tx,
+            })
+            .map_err(|e| match e {
+                mpsc::error::TrySendError::Full(_) => {
+                    std::io::Error::new(std::io::ErrorKind::WouldBlock, "consumer queue full")
+                }
+                mpsc::error::TrySendError::Closed(_) => {
+                    std::io::Error::new(std::io::ErrorKind::BrokenPipe, "consumer queue closed")
+                }
+            })?;
+        self.wake_actor();
+        Ok(rx)
+    }
+
+    pub(crate) fn try_write_user_input_with_source(
         &self,
         bytes: Bytes,
+        source: InputSource,
     ) -> Result<(), mpsc::error::TrySendError<Bytes>> {
         let user_writes = self
             .user_writes
@@ -120,20 +156,20 @@ impl PtyIoActorHandle {
         }
         match self
             .data_tx
-            .try_send(PtyIoDataCommand::WriteUserInput(bytes))
+            .try_send(PtyIoDataCommand::WriteUserInput(bytes, source.user()))
         {
             Ok(()) => {
                 self.wake_actor();
                 Ok(())
             }
             Err(mpsc::error::TrySendError::Full(command)) => {
-                let PtyIoDataCommand::WriteUserInput(bytes) = command else {
+                let PtyIoDataCommand::WriteUserInput(bytes, _) = command else {
                     unreachable!("queued write returned another command")
                 };
                 Err(mpsc::error::TrySendError::Full(bytes))
             }
             Err(mpsc::error::TrySendError::Closed(command)) => {
-                let PtyIoDataCommand::WriteUserInput(bytes) = command else {
+                let PtyIoDataCommand::WriteUserInput(bytes, _) = command else {
                     unreachable!("queued write returned another command")
                 };
                 Err(mpsc::error::TrySendError::Closed(bytes))
@@ -141,11 +177,34 @@ impl PtyIoActorHandle {
         }
     }
 
+    pub(crate) fn input_consumer_epoch_matches(&self, epoch: &str) -> bool {
+        self.consumer_epoch
+            .lock()
+            .ok()
+            .is_some_and(|e| e.as_deref() == Some(epoch))
+    }
+    #[cfg(test)]
+    pub(crate) fn try_write_user_input(
+        &self,
+        bytes: Bytes,
+    ) -> Result<(), mpsc::error::TrySendError<Bytes>> {
+        self.try_write_user_input_with_source(bytes, InputSource::Api)
+    }
+    #[cfg(test)]
     pub(crate) fn queue_user_input_submission(
         &self,
         text: Bytes,
         enter: Bytes,
         delay: Duration,
+    ) -> std::io::Result<std_mpsc::Receiver<std::io::Result<()>>> {
+        self.queue_user_input_submission_with_source(text, enter, delay, InputSource::Api)
+    }
+    pub(crate) fn queue_user_input_submission_with_source(
+        &self,
+        text: Bytes,
+        enter: Bytes,
+        delay: Duration,
+        source: InputSource,
     ) -> std::io::Result<std_mpsc::Receiver<std::io::Result<()>>> {
         let user_writes = self
             .user_writes
@@ -160,6 +219,7 @@ impl PtyIoActorHandle {
         let (reply_tx, reply_rx) = std_mpsc::channel();
         self.data_tx
             .try_send(PtyIoDataCommand::SubmitUserInput {
+                source: source.user(),
                 text,
                 enter,
                 delay,
@@ -409,10 +469,17 @@ impl PtyIoActor {
             controls: Arc::clone(&controls),
             response_order: Arc::clone(&response_order),
             foreground_fd: PtyForegroundObserver(Arc::downgrade(&file.foreground)),
+            consumer_epoch: Arc::new(Mutex::new(None)),
         };
 
         let mut runner = PtyIoActorRunner {
             pane_id: config.pane_id,
+            consumer_epoch: Arc::clone(&handle.consumer_epoch),
+            consumer: None,
+            enrolled_groups: Vec::new(),
+            pending_consumer: None,
+            marker_reply: None,
+            sanitizer: Sanitizer::default(),
             file,
             data_rx,
             control_rx,
@@ -527,6 +594,21 @@ impl Write for ActorPtyFile {
 
 struct PtyIoActorRunner {
     pane_id: u32,
+    consumer_epoch: Arc<Mutex<Option<String>>>,
+    consumer: Option<(crate::platform::InputConsumerSnapshot, Ledger)>,
+    /// (group leader, original consumer) per foreground-group incarnation.
+    /// Only the original consumer may re-enroll, after its epoch ends.
+    enrolled_groups: Vec<(
+        crate::platform::ProcessIdentity,
+        crate::platform::ProcessIdentity,
+    )>,
+    pending_consumer: Option<(
+        ConsumerOperation,
+        Option<AuditSink>,
+        std_mpsc::Sender<ConsumerResponse>,
+    )>,
+    marker_reply: Option<(std_mpsc::Sender<ConsumerResponse>, ConsumerResponse)>,
+    sanitizer: Sanitizer,
     file: ActorPtyFile,
     data_rx: mpsc::Receiver<PtyIoDataCommand>,
     control_rx: std_mpsc::Receiver<PtyIoControlCommand>,
@@ -544,6 +626,7 @@ struct PtyIoActorRunner {
 }
 
 struct ActiveSubmission {
+    source: InputSource,
     enter: Bytes,
     delay: Duration,
     phase: SubmissionPhase,
@@ -552,6 +635,7 @@ struct ActiveSubmission {
 
 #[derive(Debug, PartialEq, Eq)]
 struct PendingWrite {
+    source: Option<InputSource>,
     bytes: Bytes,
     boundary: Option<SubmissionBoundary>,
 }
@@ -560,6 +644,7 @@ struct PendingWrite {
 enum SubmissionBoundary {
     Text,
     Enter,
+    Marker,
 }
 
 enum SubmissionPhase {
@@ -569,27 +654,202 @@ enum SubmissionPhase {
 }
 
 impl PtyIoActorRunner {
-    fn enqueue_write(&mut self, bytes: Bytes) {
-        if !bytes.is_empty() {
-            self.pending_writes.push_back(PendingWrite {
-                bytes,
-                boundary: None,
+    fn end_consumer(&mut self) {
+        self.consumer = None;
+        *self
+            .consumer_epoch
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = None;
+        if let Some((reply, _)) = self.marker_reply.take() {
+            let _ = reply.send(ConsumerResponse::Refused {
+                reason: "consumer_ended".into(),
             });
         }
     }
-
-    fn enqueue_submission_write(&mut self, bytes: Bytes, boundary: SubmissionBoundary) {
+    /// First enroller owns its foreground-group incarnation for life. Only
+    /// that same (pid, start time) may enroll again, and only once its epoch
+    /// ended (release, foreground change, Ctrl+Z) or was poisoned.
+    fn enroll_admission(
+        &self,
+        leader: crate::platform::ProcessIdentity,
+        peer: crate::platform::ProcessIdentity,
+    ) -> std::io::Result<()> {
+        let refused = || {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "already_enrolled",
+            ))
+        };
+        match self.enrolled_groups.iter().find(|(l, _)| *l == leader) {
+            None => Ok(()),
+            Some((_, original)) if *original != peer => refused(),
+            Some(_) => match &self.consumer {
+                Some((s, ledger)) if s.leader == leader && !ledger.poisoned() => refused(),
+                _ => Ok(()),
+            },
+        }
+    }
+    fn check_consumer(&mut self) {
+        if self.consumer.as_ref().is_some_and(|(snapshot, _)| {
+            !crate::platform::input_consumer_alive(self.file.as_raw_fd(), snapshot)
+        }) {
+            self.end_consumer();
+        }
+        if let Some((_, ledger)) = &mut self.consumer {
+            ledger.expire(Instant::now());
+        }
+    }
+    fn execute_pending_consumer(&mut self) {
+        let Some((operation, audit, reply)) = self.pending_consumer.take() else {
+            return;
+        };
+        self.check_consumer();
+        let response = match operation {
+            ConsumerOperation::Enroll { peer } => {
+                let admission =
+                    crate::platform::input_consumer_incarnation(self.file.as_raw_fd(), peer)
+                        .and_then(|leader| {
+                            self.enroll_admission(leader, peer)?;
+                            crate::platform::input_consumer_snapshot(self.file.as_raw_fd(), peer)
+                        });
+                match admission {
+                    Err(err) => ConsumerResponse::Refused {
+                        reason: err.to_string(),
+                    },
+                    Ok(snapshot) => {
+                        let known = self
+                            .enrolled_groups
+                            .iter()
+                            .any(|(leader, _)| *leader == snapshot.leader);
+                        if let Err(err) = self.enroll_admission(snapshot.leader, peer) {
+                            ConsumerResponse::Refused {
+                                reason: err.to_string(),
+                            }
+                        } else if !known && self.enrolled_groups.len() >= 1024 {
+                            ConsumerResponse::Refused {
+                                reason: "incarnation_overflow".into(),
+                            }
+                        } else {
+                            let mut entropy = [0u8; 80];
+                            let tty = crate::platform::pane_tty_identity(self.file.as_raw_fd());
+                            match (crate::platform::input_consumer_random(&mut entropy), tty) {
+                                (Err(_), _) => ConsumerResponse::Refused {
+                                    reason: "entropy_unavailable".into(),
+                                },
+                                (_, Err(_)) => ConsumerResponse::Refused {
+                                    reason: "tty_unavailable".into(),
+                                },
+                                (Ok(()), Ok(tty)) => {
+                                    fn hex(bytes: &[u8]) -> String {
+                                        bytes.iter().map(|b| format!("{b:02x}")).collect()
+                                    }
+                                    let epoch = hex(&entropy[..16]);
+                                    let epoch_key = hex(&entropy[16..48]);
+                                    let nonce = hex(&entropy[48..]);
+                                    if known {
+                                        // Original consumer after its epoch
+                                        // ended or was poisoned: fresh epoch.
+                                        self.end_consumer();
+                                    } else {
+                                        self.enrolled_groups.push((snapshot.leader, peer));
+                                    }
+                                    self.consumer = Some((
+                                        snapshot,
+                                        Ledger::new(epoch.clone(), epoch_key.clone()),
+                                    ));
+                                    self.sanitizer.reset();
+                                    self.pending_writes.push_back(PendingWrite {
+                                        bytes: Bytes::from(format!(
+                                            "\x1b_herdr-epoch;{nonce}\x1b\\"
+                                        )),
+                                        source: None,
+                                        boundary: Some(SubmissionBoundary::Marker),
+                                    });
+                                    self.marker_reply = Some((
+                                        reply,
+                                        ConsumerResponse::Enrolled {
+                                            epoch,
+                                            epoch_key,
+                                            nonce,
+                                            tty,
+                                        },
+                                    ));
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            ConsumerOperation::Cut(request) => match &mut self.consumer {
+                Some((snapshot, ledger)) => {
+                    if !ledger.authentic(&request.epoch, &request.epoch_key) {
+                        ConsumerResponse::Refused {
+                            reason: "invalid_epoch".into(),
+                        }
+                    } else {
+                        if !crate::platform::input_consumer_unchanged(
+                            self.file.as_raw_fd(),
+                            snapshot,
+                        ) {
+                            ledger.poison("termios_changed");
+                        }
+                        ledger.cut(request, audit.as_ref(), Instant::now())
+                    }
+                }
+                None => ConsumerResponse::Refused {
+                    reason: "invalid_epoch".into(),
+                },
+            },
+            ConsumerOperation::Release { epoch, epoch_key } => {
+                if self
+                    .consumer
+                    .as_ref()
+                    .is_some_and(|(_, l)| l.authentic(&epoch, &epoch_key))
+                {
+                    self.end_consumer();
+                    ConsumerResponse::Released
+                } else {
+                    ConsumerResponse::Refused {
+                        reason: "invalid_epoch".into(),
+                    }
+                }
+            }
+        };
+        let _ = reply.send(response);
+    }
+    #[cfg(test)]
+    fn enqueue_write(&mut self, bytes: Bytes) {
+        self.enqueue_sourced_write(bytes, InputSource::Api, None);
+    }
+    fn enqueue_sourced_write(
+        &mut self,
+        bytes: Bytes,
+        source: InputSource,
+        boundary: Option<SubmissionBoundary>,
+    ) {
         if !bytes.is_empty() {
+            let bytes = self.sanitizer.sanitize(bytes);
             self.pending_writes.push_back(PendingWrite {
                 bytes,
-                boundary: Some(boundary),
+                source: Some(source),
+                boundary,
             });
         }
+    }
+    fn enqueue_submission_write(&mut self, bytes: Bytes, boundary: SubmissionBoundary) {
+        let source = self
+            .active_submission
+            .as_ref()
+            .map(|s| s.source.clone())
+            .unwrap_or(InputSource::Api);
+        self.enqueue_sourced_write(bytes, source, Some(boundary));
     }
 
     fn run(&mut self) {
         let mut should_exit = false;
         while !should_exit {
+            self.check_consumer();
             should_exit = self.drain_commands();
             if should_exit || self.state == ActorState::Released {
                 break;
@@ -608,6 +868,13 @@ impl PtyIoActorRunner {
                 }
             }
             self.schedule_submission_enter();
+            if self.pending_writes.is_empty()
+                && self.active_submission.is_none()
+                && self.pending_consumer.is_some()
+            {
+                self.execute_pending_consumer();
+                continue;
+            }
             if self.active_submission.is_none() && self.pending_handoff.is_some() {
                 continue;
             }
@@ -655,6 +922,7 @@ impl PtyIoActorRunner {
             }
         }
 
+        self.end_consumer();
         self.file.close();
         self.close_input_queue();
         if let Some(on_reader_exit) = self.on_reader_exit.take() {
@@ -667,7 +935,10 @@ impl PtyIoActorRunner {
         if self.drain_control_commands() {
             return true;
         }
-        if self.active_submission.is_some() {
+        if self.active_submission.is_some()
+            || self.pending_consumer.is_some()
+            || self.marker_reply.is_some()
+        {
             return false;
         }
         if let Some(reply) = self.pending_handoff.take() {
@@ -706,7 +977,10 @@ impl PtyIoActorRunner {
                         should_exit = true;
                         break;
                     }
-                    if self.active_submission.is_some() {
+                    if self.active_submission.is_some()
+                        || self.pending_consumer.is_some()
+                        || self.marker_reply.is_some()
+                    {
                         break;
                     }
                 }
@@ -722,12 +996,26 @@ impl PtyIoActorRunner {
 
     fn handle_data_command(&mut self, command: PtyIoDataCommand) -> bool {
         match command {
-            PtyIoDataCommand::WriteUserInput(bytes) => {
+            PtyIoDataCommand::Consumer {
+                operation,
+                audit,
+                reply,
+            } => {
                 if self.state == ActorState::Running {
-                    self.enqueue_write(bytes);
+                    self.pending_consumer = Some((operation, audit, reply));
+                } else {
+                    let _ = reply.send(ConsumerResponse::Refused {
+                        reason: "runtime_unavailable".into(),
+                    });
+                }
+            }
+            PtyIoDataCommand::WriteUserInput(bytes, source) => {
+                if self.state == ActorState::Running {
+                    self.enqueue_sourced_write(bytes, source, None);
                 }
             }
             PtyIoDataCommand::SubmitUserInput {
+                source,
                 text,
                 enter,
                 delay,
@@ -737,10 +1025,15 @@ impl PtyIoActorRunner {
                     let phase = if text.is_empty() {
                         SubmissionPhase::WaitingUntil(Instant::now() + delay)
                     } else {
-                        self.enqueue_submission_write(text, SubmissionBoundary::Text);
+                        self.enqueue_sourced_write(
+                            text,
+                            source.clone(),
+                            Some(SubmissionBoundary::Text),
+                        );
                         SubmissionPhase::WritingText
                     };
                     self.active_submission = Some(ActiveSubmission {
+                        source,
                         enter,
                         delay,
                         phase,
@@ -791,6 +1084,7 @@ impl PtyIoActorRunner {
                 let _ = reply.send(result);
             }
             PtyIoControlCommand::ReleaseAfterCommit(reply) => {
+                self.end_consumer();
                 self.state = ActorState::Released;
                 self.pending_writes.clear();
                 self.file.close();
@@ -860,12 +1154,34 @@ impl PtyIoActorRunner {
                 let _ = self.flush_pending_writes_once()?;
             }
         }
+        self.end_consumer();
+        if let Some((_, _, reply)) = self.pending_consumer.take() {
+            let _ = reply.send(ConsumerResponse::Refused {
+                reason: "runtime_unavailable".into(),
+            });
+        }
         self.state = ActorState::Quiesced;
         Ok(())
     }
 
     fn drain_pre_quiesce_commands(&mut self) {
+        // Lifecycle controls retain priority, but must still drain all accepted
+        // ordinary input behind a refused consumer operation before handoff.
+        if let Some((_, _, reply)) = self.pending_consumer.take() {
+            let _ = reply.send(ConsumerResponse::Refused {
+                reason: "runtime_unavailable".into(),
+            });
+        }
+        if self.marker_reply.is_some() {
+            self.end_consumer();
+        }
         while let Ok(command) = self.data_rx.try_recv() {
+            if let PtyIoDataCommand::Consumer { reply, .. } = command {
+                let _ = reply.send(ConsumerResponse::Refused {
+                    reason: "runtime_unavailable".into(),
+                });
+                continue;
+            }
             if self.handle_data_command(command) {
                 break;
             }
@@ -940,12 +1256,25 @@ impl PtyIoActorRunner {
             return;
         }
         for bytes in terminal_responses {
-            self.enqueue_write(bytes);
+            for (frame, source) in classify_replies(bytes) {
+                self.enqueue_sourced_write(frame, source, None);
+            }
         }
     }
 
     fn complete_submission_boundary(&mut self, boundary: SubmissionBoundary) {
         match boundary {
+            SubmissionBoundary::Marker => {
+                if let Some((reply, response)) = self.marker_reply.take() {
+                    if let Some((_, ledger)) = &self.consumer {
+                        *self
+                            .consumer_epoch
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner()) = Some(ledger.epoch.clone());
+                    }
+                    let _ = reply.send(response);
+                }
+            }
             SubmissionBoundary::Text => {
                 let Some(submission) = self.active_submission.as_mut() else {
                     return;
@@ -1008,14 +1337,28 @@ impl PtyIoActorRunner {
     fn close_input_queue(&mut self) {
         self.data_rx.close();
         self.fail_active_submission(input_submission_closed_error());
+        if let Some((_, _, reply)) = self.pending_consumer.take() {
+            let _ = reply.send(ConsumerResponse::Refused {
+                reason: "runtime_unavailable".into(),
+            });
+        }
         while let Some(command) = self.data_rx.blocking_recv() {
-            if let PtyIoDataCommand::SubmitUserInput { reply, .. } = command {
-                let _ = reply.send(Err(input_submission_closed_error()));
+            match command {
+                PtyIoDataCommand::SubmitUserInput { reply, .. } => {
+                    let _ = reply.send(Err(input_submission_closed_error()));
+                }
+                PtyIoDataCommand::Consumer { reply, .. } => {
+                    let _ = reply.send(ConsumerResponse::Refused {
+                        reason: "runtime_unavailable".into(),
+                    });
+                }
+                _ => {}
             }
         }
     }
 
     fn flush_pending_writes_once(&mut self) -> std::io::Result<Option<SubmissionBoundary>> {
+        self.check_consumer();
         while let Some(write) = self.pending_writes.front() {
             let chunk = &write.bytes[self.current_write_offset..];
             match self.file.write(chunk) {
@@ -1026,6 +1369,9 @@ impl PtyIoActorRunner {
                     ));
                 }
                 Ok(written) => {
+                    if let (Some(source), Some((_, ledger))) = (&write.source, &mut self.consumer) {
+                        ledger.record(&chunk[..written], source, Instant::now());
+                    }
                     self.current_write_offset += written;
                     if self.current_write_offset >= write.bytes.len() {
                         let completed = self.pending_writes.pop_front().unwrap();
@@ -1185,6 +1531,12 @@ mod tests {
         let wake_pipe = fd::create_wake_pipe().expect("wake pipe");
         let runner = PtyIoActorRunner {
             pane_id: 1,
+            consumer_epoch: Arc::new(Mutex::new(None)),
+            consumer: None,
+            enrolled_groups: Vec::new(),
+            pending_consumer: None,
+            marker_reply: None,
+            sanitizer: Sanitizer::default(),
             file: ActorPtyFile::new(std::fs::File::from(owned)),
             data_rx,
             control_rx,
@@ -1207,7 +1559,12 @@ mod tests {
     fn actor_ignores_empty_user_input_write() {
         let (mut runner, _peer) = actor_runner_for_unit_test();
 
-        assert!(!runner.handle_data_command(PtyIoDataCommand::WriteUserInput(Bytes::new())));
+        assert!(
+            !runner.handle_data_command(PtyIoDataCommand::WriteUserInput(
+                Bytes::new(),
+                InputSource::Api
+            ))
+        );
 
         assert!(runner.pending_writes.is_empty());
     }
@@ -1721,9 +2078,10 @@ mod tests {
         let (data_tx, _data_rx) = mpsc::channel(1);
         let (control_tx, _control_rx) = std_mpsc::channel();
         data_tx
-            .try_send(PtyIoDataCommand::WriteUserInput(Bytes::from_static(
-                b"fill",
-            )))
+            .try_send(PtyIoDataCommand::WriteUserInput(
+                Bytes::from_static(b"fill"),
+                InputSource::Api,
+            ))
             .expect("fill command queue");
         let controls = Arc::new(Mutex::new(SharedPtyControls::default()));
         let (wake, _wake_read_fd) = test_wake_pair();
@@ -1735,6 +2093,7 @@ mod tests {
             controls: Arc::clone(&controls),
             response_order: Arc::new(Mutex::new(())),
             foreground_fd: PtyForegroundObserver::default(),
+            consumer_epoch: Arc::new(Mutex::new(None)),
         };
 
         handle.resize(20, 80, 8, 16, vec![Bytes::from_static(b"old")]);
@@ -1786,6 +2145,12 @@ mod tests {
         let query_light = Arc::clone(&light);
         let runner = PtyIoActorRunner {
             pane_id: 1,
+            consumer_epoch: Arc::new(Mutex::new(None)),
+            consumer: None,
+            enrolled_groups: Vec::new(),
+            pending_consumer: None,
+            marker_reply: None,
+            sanitizer: Sanitizer::default(),
             file: ActorPtyFile::new(std::fs::File::from(owned)),
             data_rx,
             control_rx,
@@ -1815,6 +2180,7 @@ mod tests {
             controls,
             response_order,
             foreground_fd: PtyForegroundObserver(Arc::downgrade(&runner.file.foreground)),
+            consumer_epoch: Arc::clone(&runner.consumer_epoch),
         };
         let (changed_tx, changed_rx) = std_mpsc::channel();
         let (continue_tx, continue_rx) = std_mpsc::channel();
@@ -1842,10 +2208,12 @@ mod tests {
             runner.pending_writes,
             VecDeque::from([
                 PendingWrite {
+                    source: Some(InputSource::Unknown),
                     bytes: Bytes::from_static(b"live-light"),
                     boundary: None,
                 },
                 PendingWrite {
+                    source: Some(InputSource::Unknown),
                     bytes: Bytes::from_static(b"query-light"),
                     boundary: None,
                 },
@@ -1872,9 +2240,10 @@ mod tests {
         let (data_tx, _data_rx) = mpsc::channel(1);
         let (control_tx, control_rx) = std_mpsc::channel();
         data_tx
-            .try_send(PtyIoDataCommand::WriteUserInput(Bytes::from_static(
-                b"fill",
-            )))
+            .try_send(PtyIoDataCommand::WriteUserInput(
+                Bytes::from_static(b"fill"),
+                InputSource::Api,
+            ))
             .expect("fill data queue");
         let (wake, _wake_read_fd) = test_wake_pair();
         let handle = PtyIoActorHandle {
@@ -1885,6 +2254,7 @@ mod tests {
             controls: Arc::new(Mutex::new(SharedPtyControls::default())),
             response_order: Arc::new(Mutex::new(())),
             foreground_fd: PtyForegroundObserver::default(),
+            consumer_epoch: Arc::new(Mutex::new(None)),
         };
 
         let handoff = std::thread::spawn(move || handle.begin_handoff(Duration::from_secs(1)));
@@ -1915,12 +2285,19 @@ mod tests {
         let (data_tx, data_rx) = mpsc::channel(ACTOR_COMMAND_BUFFER);
         let (_control_tx, control_rx) = std_mpsc::channel();
         data_tx
-            .try_send(PtyIoDataCommand::WriteUserInput(Bytes::from_static(
-                b"queued-before-ack",
-            )))
+            .try_send(PtyIoDataCommand::WriteUserInput(
+                Bytes::from_static(b"queued-before-ack"),
+                InputSource::Api,
+            ))
             .expect("queued write");
         let mut runner = PtyIoActorRunner {
             pane_id: 1,
+            consumer_epoch: Arc::new(Mutex::new(None)),
+            consumer: None,
+            enrolled_groups: Vec::new(),
+            pending_consumer: None,
+            marker_reply: None,
+            sanitizer: Sanitizer::default(),
             file: ActorPtyFile::new(std::fs::File::from(unsafe {
                 OwnedFd::from_raw_fd(actor_socket.into_raw_fd())
             })),
@@ -1946,6 +2323,47 @@ mod tests {
             .expect("queued write reaches peer before quiesce ack");
         assert_eq!(&buf, b"queued-before-ack");
         assert_eq!(runner.state, ActorState::Quiesced);
+    }
+
+    #[test]
+    fn input_consumer_handoff_refuses_operation_without_losing_accepted_later_input() {
+        let (mut runner, mut peer) = actor_runner_for_unit_test();
+        let (data_tx, data_rx) = mpsc::channel(ACTOR_COMMAND_BUFFER);
+        runner.data_rx = data_rx;
+        let (reply, receipt) = std_mpsc::channel();
+        data_tx
+            .try_send(PtyIoDataCommand::WriteUserInput(
+                Bytes::from_static(b"before"),
+                InputSource::Api,
+            ))
+            .expect("before");
+        data_tx
+            .try_send(PtyIoDataCommand::Consumer {
+                operation: ConsumerOperation::Enroll {
+                    peer: crate::platform::ProcessIdentity {
+                        pid: 1,
+                        start_time: 0,
+                    },
+                },
+                audit: None,
+                reply,
+            })
+            .expect("consumer");
+        data_tx
+            .try_send(PtyIoDataCommand::WriteUserInput(
+                Bytes::from_static(b"after"),
+                InputSource::Api,
+            ))
+            .expect("after");
+        runner
+            .begin_handoff()
+            .expect("handoff drains accepted ordinary writes");
+        let mut bytes = [0; 11];
+        peer.read_exact(&mut bytes).expect("all input drained");
+        assert_eq!(&bytes, b"beforeafter");
+        assert!(
+            matches!(receipt.recv_timeout(Duration::from_secs(1)),Ok(ConsumerResponse::Refused { reason }) if reason=="runtime_unavailable")
+        );
     }
 
     #[test]

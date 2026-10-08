@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 mod agent_view;
 mod agents;
 mod env;
+mod input_consumer;
 mod input_guard;
 pub(super) mod input_log;
 mod integrations;
@@ -902,7 +903,8 @@ impl App {
         }) else {
             return;
         };
-        runtime.try_send_focus_event(event);
+        runtime
+            .try_send_focus_event_with_source(event, crate::pty::input_consumer::InputSource::Api);
     }
 
     #[cfg(test)]
@@ -1145,6 +1147,15 @@ impl App {
             }
             Method::AgentStart(params) | Method::AgentStartGuarded(params) => {
                 return self.handle_agent_start(request.id, params);
+            }
+            Method::PaneInputConsumerEnroll(_)
+            | Method::PaneInputConsumerCut(_)
+            | Method::PaneInputConsumerRelease(_) => {
+                return responses::encode_error(
+                    request.id,
+                    "invalid_request",
+                    "input consumer operations require the asynchronous local API route",
+                );
             }
             Method::AgentPrompt(_) => {
                 return responses::encode_error(
