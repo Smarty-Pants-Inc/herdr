@@ -12,10 +12,14 @@
 //! same account checks as `key_group_is_private` before it writes the key. This runtime check
 //! is defense in depth: it refuses a key whose group has since gained a member.
 //!
-//! Every mode, setgid or not, also refuses to run while the real gid or a supplementary group
-//! is the key group (the setgid egid, or any gid named `herdr` in `/etc/group`; herdr#188):
-//! those survive the drop and would reach every pane child, which could then read the key
-//! file.
+//! Every mode, setgid or not, also refuses to run when, after the verified drop, the real gid
+//! or a supplementary group is a key gid (herdr#188, same rule): any gid named `herdr` in
+//! `/etc/group`, the group owner of `/etc/herdr/server.key` or `server.pub` if present (by
+//! `lstat`; a symlink refuses, EACCES counts as no reachable key), or the starting effective
+//! or saved gid when it differs from the real gid. Those survive the drop and would reach
+//! every pane child, which could then read the key file. A missing or unreadable
+//! `/etc/group` refuses too. The key itself is read before the drop (only the setgid group
+//! can open it); a refusal exits before any child exists, so the key never reaches one.
 //!
 //! Load rules, in order (the root block, smarty-dev#2636, runs rules 2 to 6 too):
 //! 1. the process is a setgid `herdr server` invocation and `fs.suid_dumpable` is 0 or 2;
@@ -54,11 +58,12 @@ use std::time::{Duration, Instant};
 use ring::signature::Ed25519KeyPair;
 
 const KEY_PATH: &str = "/etc/herdr/server.key";
+const PUB_PATH: &str = "/etc/herdr/server.pub";
 const KEY_LIMIT: u64 = 4096;
 
 pub(crate) const SETGID_REFUSAL: &str = "herdr: refusing to run with a set-group-id it cannot drop";
 pub(crate) const HERDR_GROUP_REFUSAL: &str =
-    "herdr: refusing to run with the herdr group; pane children would inherit it";
+    "herdr: refusing to run with a group that may read the herdr server key";
 
 const GROUP_FILE: &str = "/etc/group";
 const HERDR_GROUP: &str = "herdr";
@@ -78,8 +83,10 @@ pub(crate) trait GidOps {
     /// attached. False means the key must be discarded.
     fn make_non_dumpable(&mut self) -> bool;
     fn supplementary_groups(&mut self) -> std::io::Result<Vec<u32>>;
-    /// Contents of `/etc/group`; `Ok(None)` when the file does not exist.
-    fn group_file(&mut self) -> std::io::Result<Option<String>>;
+    /// Contents of `/etc/group`; a missing file is an error.
+    fn group_file(&mut self) -> std::io::Result<String>;
+    /// Group owners of the key files that exist (see `key_file_gids`).
+    fn key_file_groups(&mut self) -> std::io::Result<Vec<u32>>;
 }
 
 struct Kernel;
@@ -120,13 +127,38 @@ impl GidOps for Kernel {
     fn supplementary_groups(&mut self) -> std::io::Result<Vec<u32>> {
         process_groups()
     }
-    fn group_file(&mut self) -> std::io::Result<Option<String>> {
-        match std::fs::read_to_string(GROUP_FILE) {
-            Ok(contents) => Ok(Some(contents)),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(err) => Err(err),
+    fn group_file(&mut self) -> std::io::Result<String> {
+        std::fs::read_to_string(GROUP_FILE)
+    }
+    fn key_file_groups(&mut self) -> std::io::Result<Vec<u32>> {
+        key_file_gids(&[Path::new(KEY_PATH), Path::new(PUB_PATH)])
+    }
+}
+
+/// The group owner of each path that exists, by `lstat` (never followed). A missing path adds
+/// nothing; a symlink or any other error fails.
+// ponytail: EACCES also adds nothing, as in herdr#188: the check runs after the gid drop, so
+// neither this process nor its children (same credentials) can reach that key.
+fn key_file_gids(paths: &[&Path]) -> std::io::Result<Vec<u32>> {
+    let mut gids = Vec::new();
+    for path in paths {
+        match std::fs::symlink_metadata(path) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(std::io::Error::other(format!(
+                    "{} is a symlink",
+                    path.display()
+                )));
+            }
+            Ok(meta) => gids.push(meta.gid()),
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+                ) => {}
+            Err(err) => return Err(err),
         }
     }
+    Ok(gids)
 }
 
 /// The process's supplementary group list. On Linux it never includes the egid gained from
@@ -187,25 +219,6 @@ fn acquire_with<K>(
 ) -> Result<Option<K>, &'static str> {
     let (real, effective, saved) = ops.getresgid();
     let setgid = effective != real || saved != real;
-    // herdr#188: a real or supplementary key group survives the drop and reaches every pane
-    // child. The key group is the setgid gid, or any gid named `herdr` in /etc/group (an
-    // unreadable file refuses; a missing one names none). Checked before the key is touched.
-    let mut key_groups = match ops.group_file().map_err(|_| HERDR_GROUP_REFUSAL)? {
-        Some(contents) => herdr_group_ids(&contents),
-        None => Vec::new(),
-    };
-    // The setgid-gained gid: whichever of effective and saved differs from the real gid.
-    key_groups.extend([effective, saved].into_iter().filter(|&gid| gid != real));
-    let groups = ops
-        .supplementary_groups()
-        .map_err(|_| HERDR_GROUP_REFUSAL)?;
-    if groups
-        .iter()
-        .chain(std::iter::once(&real))
-        .any(|gid| key_groups.contains(gid))
-    {
-        return Err(HERDR_GROUP_REFUSAL);
-    }
     // The key is read before the drop: afterwards the process can no longer open it. A
     // setgid exec starts non-dumpable; refuse the key if the drop could make it ptraceable.
     let key = if is_server_invocation(args) && (!setgid || ops.suid_dumpable_safe()) {
@@ -216,6 +229,30 @@ fn acquire_with<K>(
     if setgid && (!ops.setresgid(real) || ops.getresgid() != (real, real, real)) {
         // Never continue with a group the drop could not shed.
         return Err(SETGID_REFUSAL);
+    }
+    // herdr#188, after the verified drop: a real or supplementary key gid survives the drop
+    // and would reach every pane child. Key gids: the starting effective and saved gid when
+    // they differ from the real gid, every gid named `herdr` in /etc/group, and the group
+    // owner of each /etc/herdr key file that exists (so a supplementary gid /etc/group does
+    // not map still refuses when a key file carries it). getgroups failure, a missing or
+    // unreadable /etc/group, or a key-file symlink or lstat error refuses. A key read above
+    // never outlives a refusal: the process exits before any child exists.
+    let groups = ops
+        .supplementary_groups()
+        .map_err(|_| HERDR_GROUP_REFUSAL)?;
+    let group_file = ops.group_file().map_err(|_| HERDR_GROUP_REFUSAL)?;
+    let mut key_gids: Vec<u32> = [effective, saved]
+        .into_iter()
+        .filter(|&gid| gid != real)
+        .collect();
+    key_gids.extend(herdr_group_ids(&group_file));
+    key_gids.extend(ops.key_file_groups().map_err(|_| HERDR_GROUP_REFUSAL)?);
+    if groups
+        .iter()
+        .chain(std::iter::once(&real))
+        .any(|gid| key_gids.contains(gid))
+    {
+        return Err(HERDR_GROUP_REFUSAL);
     }
     // Re-assert after the credential change and verify it; otherwise discard the key
     // (fail closed: capability false, no enrollment).
@@ -935,8 +972,10 @@ mod tests {
         drop_ignored: bool,
         /// `None`: getgroups fails.
         groups: Option<Vec<u32>>,
-        /// `None`: /etc/group is unreadable; `Some(None)`: it does not exist.
-        group_file: Option<Option<String>>,
+        /// `None`: /etc/group is missing or unreadable.
+        group_file: Option<String>,
+        /// Key file group owners; `None`: a key file is a symlink or cannot be lstat'ed.
+        key_files: Option<Vec<u32>>,
         calls: Vec<String>,
     }
     impl Default for Fake {
@@ -948,7 +987,8 @@ mod tests {
                 nodump_ok: true,
                 drop_ignored: false,
                 groups: Some(vec![1000]),
-                group_file: Some(Some("root:x:0:\nherdr:x:990:\npaul:x:1000:\n".into())),
+                group_file: Some("root:x:0:\nherdr:x:990:\npaul:x:1000:\n".into()),
+                key_files: Some(Vec::new()),
                 calls: Vec::new(),
             }
         }
@@ -979,11 +1019,17 @@ mod tests {
                 .clone()
                 .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EINVAL))
         }
-        fn group_file(&mut self) -> std::io::Result<Option<String>> {
+        fn group_file(&mut self) -> std::io::Result<String> {
             self.calls.push("file".into());
             self.group_file
                 .clone()
-                .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EACCES))
+                .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))
+        }
+        fn key_file_groups(&mut self) -> std::io::Result<Vec<u32>> {
+            self.calls.push("keys".into());
+            self.key_files
+                .clone()
+                .ok_or_else(|| std::io::Error::other("symlink"))
         }
     }
     struct TempDir(std::path::PathBuf);
@@ -1012,7 +1058,7 @@ mod tests {
         assert_eq!(seen, Some((true, 990)));
         assert_eq!(
             fake.calls,
-            ["get", "file", "groups", "suid", "set 1000", "get", "nodump"]
+            ["get", "suid", "set 1000", "get", "groups", "file", "keys", "nodump"]
         );
         assert_eq!(fake.ids, (1000, 1000, 1000));
     }
@@ -1738,7 +1784,7 @@ mod tests {
             (setgid).then_some(())
         });
         assert_eq!(key, Ok(None));
-        assert_eq!(fake.calls, ["get", "file", "groups"]);
+        assert_eq!(fake.calls, ["get", "groups", "file", "keys"]);
     }
 
     // Ported from herdr#188 group_privilege: every mode drops an inherited setgid, verifies
@@ -1779,7 +1825,8 @@ mod tests {
     #[test]
     fn server_key_group_herdr_membership_refuses_every_mode() {
         // Supplementary herdr (by /etc/group name or as the setgid egid) and a real herdr
-        // gid reach every pane child, so no mode runs; the key is never touched.
+        // gid reach every pane child, so no mode runs. The check follows the verified drop;
+        // a key read before it is discarded with the refusal (the process exits).
         for (ids, groups) in [
             ((1000, 1000, 1000), vec![1000, 990]),
             ((1000, 990, 990), vec![1000, 990]),
@@ -1791,10 +1838,9 @@ mod tests {
                     groups: Some(groups.clone()),
                     ..Fake::default()
                 };
-                let refused = acquire_with(&args(argv), &mut fake, |_, _| -> Option<()> {
-                    panic!("must not read the key")
-                });
+                let refused = acquire_with(&args(argv), &mut fake, |_, _| Some(()));
                 assert_eq!(refused, Err(HERDR_GROUP_REFUSAL), "{ids:?} {groups:?}");
+                assert!(!fake.calls.contains(&"nodump".to_string()));
             }
         }
         // The setgid egid is the key group even when /etc/group does not name it herdr.
@@ -1804,17 +1850,93 @@ mod tests {
             ..Fake::default()
         };
         assert_eq!(run(&mut fake), Err(HERDR_GROUP_REFUSAL));
-        // getgroups failure or an unreadable /etc/group refuses.
+        // getgroups failure refuses.
         let mut fake = Fake {
             groups: None,
             ..Fake::default()
         };
         assert_eq!(run(&mut fake), Err(HERDR_GROUP_REFUSAL));
+    }
+
+    #[test]
+    fn server_key_group_key_file_group_and_unknown_key_groups_refuse() {
+        // #188 security: a supplementary gid kept from an earlier login or NSS, which
+        // /etc/group does not map, still refuses when a key file carries it.
+        for argv in [&["herdr", "client"][..], &["herdr", "server"]] {
+            let mut fake = Fake {
+                ids: (1000, 1000, 1000),
+                groups: Some(vec![1000, 4242]),
+                key_files: Some(vec![4242, 4242]),
+                ..Fake::default()
+            };
+            let refused = acquire_with(&args(argv), &mut fake, |_, _| Some(()));
+            assert_eq!(refused, Err(HERDR_GROUP_REFUSAL), "{argv:?}");
+        }
+        // As the real gid too.
+        let mut fake = Fake {
+            ids: (4242, 4242, 4242),
+            groups: Some(vec![4242]),
+            key_files: Some(vec![4242]),
+            ..Fake::default()
+        };
+        assert_eq!(run(&mut fake), Err(HERDR_GROUP_REFUSAL));
+        // Missing or unreadable /etc/group, or a key file symlink, refuses.
         let mut fake = Fake {
             group_file: None,
             ..Fake::default()
         };
         assert_eq!(run(&mut fake), Err(HERDR_GROUP_REFUSAL));
+        let mut fake = Fake {
+            key_files: None,
+            ..Fake::default()
+        };
+        assert_eq!(run(&mut fake), Err(HERDR_GROUP_REFUSAL));
+        // Counterpart: a key file whose group the process does not hold runs.
+        let mut fake = Fake {
+            ids: (1000, 1000, 1000),
+            groups: Some(vec![1000, 100]),
+            key_files: Some(vec![4242]),
+            ..Fake::default()
+        };
+        assert_eq!(run(&mut fake), Ok(None));
+    }
+
+    #[test]
+    fn server_key_group_key_file_gids_lstat_and_refuse_symlinks() {
+        let dir = std::env::temp_dir().join(format!("herdr-keygid-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("tempdir");
+        let dir = TempDir(dir);
+        let key = dir.0.join("server.key");
+        std::fs::write(&key, "k").expect("write");
+        let gid = std::fs::metadata(&key).expect("meta").gid();
+        let missing = dir.0.join("server.pub");
+        assert_eq!(key_file_gids(&[&key, &missing]).expect("lstat"), vec![gid]);
+        assert_eq!(
+            key_file_gids(&[&missing]).expect("lstat"),
+            Vec::<u32>::new()
+        );
+        // A symlink refuses, even one to a valid file, and is never followed.
+        let link = dir.0.join("link.pub");
+        std::os::unix::fs::symlink(&key, &link).expect("symlink");
+        assert!(key_file_gids(&[&key, &link]).is_err());
+        let dangling = dir.0.join("dangling.key");
+        std::os::unix::fs::symlink(dir.0.join("gone"), &dangling).expect("symlink");
+        assert!(key_file_gids(&[&dangling]).is_err());
+        // EACCES adds nothing: these credentials cannot reach that key (#188 semantics).
+        // A non-root test only; root bypasses the directory mode.
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } != 0 {
+            use std::os::unix::fs::PermissionsExt;
+            let closed = dir.0.join("closed");
+            std::fs::create_dir(&closed).expect("dir");
+            std::fs::write(closed.join("server.key"), "k").expect("write");
+            std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o000))
+                .expect("mode");
+            let hidden = key_file_gids(&[&closed.join("server.key")]);
+            std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o700))
+                .expect("mode");
+            assert_eq!(hidden.expect("EACCES is no key"), Vec::<u32>::new());
+        }
     }
 
     #[test]
@@ -1826,14 +1948,6 @@ mod tests {
         };
         assert_eq!(run(&mut fake), Ok(None));
         assert!(!fake.calls.iter().any(|c| c.starts_with("set")));
-        // No /etc/group names no herdr group.
-        let mut fake = Fake {
-            ids: (1000, 1000, 1000),
-            groups: Some(vec![1000, 990]),
-            group_file: Some(None),
-            ..Fake::default()
-        };
-        assert_eq!(run(&mut fake), Ok(None));
     }
 
     #[test]
