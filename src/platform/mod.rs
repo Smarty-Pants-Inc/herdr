@@ -159,7 +159,10 @@ pub(crate) use unix_common::{
 };
 
 #[cfg(all(unix, test))]
-pub(crate) use unix_common::process_in_pane_session;
+pub(crate) use unix_common::{
+    blocked_client_stream_pair_for_test, client_stream_buffer_full_for_test,
+    process_in_pane_session,
+};
 
 /// Capture process metadata across two checks of the transport's liveness
 /// primitive (native pidfd/audit token, or connected socket for the older Linux

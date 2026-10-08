@@ -104,6 +104,86 @@ pub(crate) fn shutdown_client_stream(stream: &crate::ipc::LocalStream) -> std::i
     result
 }
 
+/// Fresh real byte-mode pipe streams; no fixture bytes are sent. Buffer hints
+/// are rounded by Windows, so return the accepted instance's actual output size.
+#[cfg(test)]
+pub(crate) fn blocked_client_stream_pair_for_test(
+) -> std::io::Result<(crate::ipc::LocalStream, crate::ipc::LocalStream, usize)> {
+    use interprocess::os::windows::named_pipe::{
+        local_socket, pipe_mode, DuplexPipeStream, PipeListenerOptions,
+    };
+    use windows_sys::Win32::System::Pipes::GetNamedPipeInfo;
+
+    static NEXT_PIPE: AtomicU64 = AtomicU64::new(1);
+    let path = format!(
+        r"\\.\pipe\herdr-blocked-client-{}-{}",
+        std::process::id(),
+        NEXT_PIPE.fetch_add(1, AtomicOrdering::Relaxed),
+    );
+    let listener = PipeListenerOptions::new()
+        .path(path.as_str())
+        .input_buffer_size_hint(4096)
+        .output_buffer_size_hint(4096)
+        .create_duplex::<pipe_mode::Bytes>()?;
+    let client = DuplexPipeStream::<pipe_mode::Bytes>::connect_by_path(path.as_str())?;
+    let server = listener.accept()?;
+    let mut capacity = 0_u32;
+    // SAFETY: the server handle is live, no I/O is pending, and capacity is a u32.
+    if unsafe {
+        GetNamedPipeInfo(
+            server.as_raw_handle(),
+            null_mut(),
+            &mut capacity,
+            null_mut(),
+            null_mut(),
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    if capacity == 0 {
+        return Err(std::io::Error::other("test pipe has no output buffer"));
+    }
+    let to_local = |stream: DuplexPipeStream<pipe_mode::Bytes>| {
+        let handle = OwnedHandle::try_from(stream)
+            .map_err(|_| std::io::Error::other("test pipe unexpectedly split"))?;
+        local_socket::Stream::try_from(handle)
+            .map(crate::ipc::LocalStream::from)
+            .map_err(std::io::Error::from)
+    };
+    Ok((to_local(client)?, to_local(server)?, capacity as usize))
+}
+
+/// Inspect only the client read handle: peeking a synchronous server handle
+/// while its write is blocked could itself block. Peek does not consume bytes.
+#[cfg(test)]
+pub(crate) fn client_stream_buffer_full_for_test(
+    client: &crate::ipc::LocalStream,
+    _server: &crate::ipc::LocalStream,
+    capacity: usize,
+) -> std::io::Result<bool> {
+    use std::os::windows::io::AsHandle as _;
+    use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+
+    let crate::ipc::LocalStream::NamedPipe(client) = client;
+    let mut available = 0_u32;
+    // SAFETY: this live peer handle has no pending read; only available is written.
+    if unsafe {
+        PeekNamedPipe(
+            client.as_handle().as_raw_handle(),
+            null_mut(),
+            0,
+            null_mut(),
+            &mut available,
+            null_mut(),
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(capacity > 0 && available as usize >= capacity)
+}
+
 pub(crate) fn wait_client_stream_readable(
     _stream: &crate::ipc::LocalStream,
 ) -> std::io::Result<()> {

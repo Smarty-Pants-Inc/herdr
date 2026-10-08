@@ -1067,11 +1067,32 @@ fn client_writer_loop(
     debug!("client writer thread exiting");
 }
 
+#[cfg(test)]
+thread_local! {
+    // Optional, writer-thread-local observer: no other connection/test can
+    // advance this counter. Odd means the transport write has not returned.
+    static TEST_CLIENT_WRITE_PROGRESS: std::cell::RefCell<Option<Arc<std::sync::atomic::AtomicUsize>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn record_client_write_progress_for_test() {
+    TEST_CLIENT_WRITE_PROGRESS.with(|progress| {
+        if let Some(progress) = &*progress.borrow() {
+            progress.fetch_add(1, Ordering::Release);
+        }
+    });
+}
+
 fn write_framed_bytes(stream: &mut LocalStream, data: &[u8]) -> bool {
+    #[cfg(test)]
+    record_client_write_progress_for_test();
     #[cfg(unix)]
     let result = crate::platform::write_client_stream(stream, data);
     #[cfg(windows)]
     let result = stream.write_all(data);
+    #[cfg(test)]
+    record_client_write_progress_for_test();
     if let Err(err) = result {
         debug!(err = %err, "client write failed, closing writer");
         return false;
@@ -2301,7 +2322,15 @@ mod tests {
     #[cfg(any(unix, windows))]
     #[test]
     fn control_overflow_unblocks_a_writer_stuck_on_a_non_reading_client() {
-        let (mut client_stream, server_stream, _path) = local_stream_pair("client-overflow-stuck");
+        let (mut client_stream, server_stream, capacity) =
+            crate::platform::blocked_client_stream_pair_for_test().unwrap();
+        let probe_stream = server_stream.try_clone().unwrap();
+        assert!(!crate::platform::client_stream_buffer_full_for_test(
+            &client_stream,
+            &probe_stream,
+            capacity,
+        )
+        .unwrap());
         let queue = ClientWriterQueue::with_control_limit(1 << 20);
         queue.set_overflow_stream(server_stream.try_clone().unwrap());
         let control = ClientControlWriter::queue(queue.clone());
@@ -2317,41 +2346,51 @@ mod tests {
         });
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let writer_queue = queue.clone();
+        let write_progress = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let writer_progress = write_progress.clone();
         std::thread::spawn(move || {
+            TEST_CLIENT_WRITE_PROGRESS.with(|progress| {
+                *progress.borrow_mut() = Some(writer_progress);
+            });
             client_writer_loop(server_stream, 9, writer_queue, server_event_tx);
             let _ = done_tx.send(());
         });
 
-        // The client never reads, so the writer blocks once the transport buffer
-        // fills: a queued frame then stays unclaimed behind an unfinished write.
-        let frame = vec![0; 64 * 1024];
-        let mut writer_blocked = false;
-        for _ in 0..1024 {
-            control.send(frame.clone()).expect("below the bound");
-            let deadline = std::time::Instant::now() + Duration::from_millis(200);
-            while !queue.lock_state().control.is_empty() && std::time::Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            if !queue.lock_state().control.is_empty() {
-                writer_blocked = true;
+        // Only ONE frame is sent to this fresh stream. A full kernel buffer
+        // therefore proves this write entered the transport, not merely that
+        // the writer popped a frame. It cannot return: the frame exceeds the
+        // configured capacity and the client never consumes any bytes.
+        let frame_len = 512 * 1024;
+        assert!(capacity < frame_len, "frame must exceed transport capacity");
+        control.send(vec![0; frame_len]).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let full = crate::platform::client_stream_buffer_full_for_test(
+                &client_stream,
+                &probe_stream,
+                capacity,
+            )
+            .unwrap();
+            if full && write_progress.load(Ordering::Acquire) == 1 {
                 break;
             }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the first write must enter the transport and fill its buffer before overflow"
+            );
+            std::thread::sleep(Duration::from_millis(5));
         }
-        assert!(writer_blocked, "a queued frame must stay unclaimed");
+        assert!(done_rx.try_recv().is_err(), "the write has not returned");
         assert!(
-            done_rx.try_recv().is_err(),
-            "the blocked writer is still running"
-        );
-        assert!(
-            control.send(vec![0; 1 << 20]).is_err(),
+            control.send(vec![0; (1 << 20) + 1]).is_err(),
             "unread control bytes must overflow"
         );
         done_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("overflow unblocks the writer thread");
-        // Only a write that failed reports this; a writer that was merely idle
-        // or finished its write exits without it. So a write was pending and
-        // the overflow cancelled it.
+        assert_eq!(write_progress.load(Ordering::Acquire), 2, "write returned");
+        // Keep the write-failure assertion as well as the kernel-full and
+        // in-flight preconditions; the reader's distinct ID cannot satisfy it.
         let mut write_failed = false;
         while let Ok(event) = server_event_rx.try_recv() {
             write_failed |= matches!(event, ServerEvent::ClientDisconnected { client_id: 9 });
