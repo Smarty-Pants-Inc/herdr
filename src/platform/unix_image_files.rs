@@ -514,6 +514,47 @@ mod tests {
         assert!(ledger.probe().is_none());
     }
 
+    /// libtest runs tests as threads of one process, so another test's fork can
+    /// hold a copy of an O_CLOEXEC flock descriptor until its child execs.
+    /// Re-exec a lock-lifecycle test alone so only its own forks can exist.
+    fn run_lock_test_in_child(name: &str) -> bool {
+        const CHILD_ENV: &str = "HERDR_TEST_IMAGE_LOCK_CHILD";
+        if std::env::var(CHILD_ENV).as_deref() == Ok(name) {
+            return false;
+        }
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--test-threads=1", "--nocapture"])
+            .env(CHILD_ENV, name)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let timed_out = loop {
+            if child.try_wait().unwrap().is_some() {
+                break false;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                break true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let output = child.wait_with_output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !timed_out
+                && output.status.success()
+                && stdout.contains("test result: ok. 1 passed; 0 failed;")
+                && stdout.contains(&format!("test {name} ... ok")),
+            "isolated {name}: timed_out={timed_out}, status={}\n{stdout}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr),
+        );
+        true
+    }
+
     fn recover_for_test(parent: &Path, now: SystemTime) -> usize {
         let lock = open_private_directory(parent).unwrap();
         lock_directory(&lock).unwrap();
@@ -522,6 +563,11 @@ mod tests {
 
     #[test]
     fn recovery_preserves_live_and_recent_but_removes_abandoned_generations() {
+        if run_lock_test_in_child(
+            "platform::unix_image_files::tests::recovery_preserves_live_and_recent_but_removes_abandoned_generations",
+        ) {
+            return;
+        }
         let mut ledger = test_ledger();
         let image = ledger.prepare(b"live").unwrap();
         let generation_path = image.parent().unwrap().to_owned();
@@ -540,6 +586,11 @@ mod tests {
 
     #[test]
     fn generation_cap_bounds_crash_leftovers_and_parent_lock_is_nonblocking() {
+        if run_lock_test_in_child(
+            "platform::unix_image_files::tests::generation_cap_bounds_crash_leftovers_and_parent_lock_is_nonblocking",
+        ) {
+            return;
+        }
         let fixture = test_ledger();
         let root = &fixture.scratch;
         let now = SystemTime::now();
@@ -552,17 +603,76 @@ mod tests {
         let lock = open_private_directory(&parent).unwrap();
         lock_directory(&lock).unwrap();
         assert!(create_generation(root, now).is_err());
+        // Keep an exec'd child alive while releasing the original lock owners.
+        // Its readiness pipe makes this deterministic without timing sleeps.
+        struct ExecChild(std::process::Child);
+        impl Drop for ExecChild {
+            fn drop(&mut self) {
+                // Only this test's child; reap it even when an assertion fails.
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut child = ExecChild(
+            std::process::Command::new("/bin/sh")
+                .args(["-c", "printf 'ready\\n'; IFS= read -r release"])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let mut ready = String::new();
+        std::io::BufRead::read_line(
+            &mut std::io::BufReader::new(child.0.stdout.take().unwrap()),
+            &mut ready,
+        )
+        .unwrap();
+        assert_eq!(ready, "ready\n");
+        assert!(child.0.try_wait().unwrap().is_none());
+
         drop(lock);
+        let parent_probe = open_private_directory(&parent).unwrap();
+        assert!(
+            lock_directory(&parent_probe).is_ok(),
+            "exec'd child retained the parent directory flock"
+        );
+        drop(parent_probe);
+        let generation_paths: Vec<_> = generations.iter().map(|g| g.path.clone()).collect();
         drop(generations); // Empty abandoned generations, as after an early crash.
+        for path in generation_paths {
+            let generation_probe = open_private_directory(&path).unwrap();
+            assert!(
+                lock_directory(&generation_probe).is_ok(),
+                "exec'd child retained a generation directory flock"
+            );
+        }
+        assert!(child.0.try_wait().unwrap().is_none());
         assert!(create_generation(root, now).is_err());
-        let recovered =
-            create_generation(root, now + STALE_GRACE + Duration::from_secs(1)).unwrap();
+        // Each generation's mtime is its creation time, which can trail `now` by
+        // more than a second under load, so measure staleness from the current time.
+        let later = SystemTime::now() + STALE_GRACE + Duration::from_secs(1);
+        let recovered = create_generation(root, later).unwrap();
         assert_eq!(fs::read_dir(parent).unwrap().count(), 1);
+        assert!(child.0.try_wait().unwrap().is_none());
         drop(recovered);
+        child
+            .0
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"release\n")
+            .unwrap();
+        assert!(child.0.wait().unwrap().success());
     }
 
     #[test]
     fn recovery_rejects_symlinks_and_unknown_content() {
+        if run_lock_test_in_child(
+            "platform::unix_image_files::tests::recovery_rejects_symlinks_and_unknown_content",
+        ) {
+            return;
+        }
         use std::os::unix::fs::symlink;
         let mut ledger = test_ledger();
         let image = ledger.prepare(b"keep").unwrap();
