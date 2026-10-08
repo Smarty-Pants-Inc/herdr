@@ -7,19 +7,23 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path};
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use crate::platform::ProcessIdentity;
 use crate::pty::input_consumer::Principal;
 use crate::server::client_identity::{
-    self, AcceptedPeer, ExecutableIdentity, JournalQuery, JournalRow, MapCache, MapImage, Process,
-    Sources,
+    self, AcceptedPeer, ExecutableIdentity, MapCache, MapImage, Process, Sources, SshdLogin,
 };
 
 const MAP_PATH: &str = "/etc/herdr/principals.json";
 const MAP_LIMIT: usize = 65_536;
 const OUTPUT_LIMIT: usize = 262_144;
 const COMMAND_TIMEOUT: Duration = Duration::from_millis(800);
+/// Installed `root:systemd-journal` mode 2755 (docs/next/sshd-lookup.md). The
+/// server itself is not in the journal group.
+const SSHD_LOOKUP: &str = "/usr/local/libexec/herdr-sshd-lookup";
+/// Above the helper's own 1.2 s journal deadline.
+const SSHD_LOOKUP_TIMEOUT: Duration = Duration::from_millis(2_000);
 static MAP: OnceLock<Mutex<MapCache>> = OnceLock::new();
 
 fn cache() -> &'static Mutex<MapCache> {
@@ -181,50 +185,27 @@ fn bounded_read(path: impl AsRef<Path>, limit: usize) -> Option<Vec<u8>> {
     (bytes.len() <= limit).then_some(bytes)
 }
 
-fn micros_now() -> Option<u64> {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()?
-        .as_micros()
-        .try_into()
-        .ok()
-}
-
 struct LinuxSources {
-    boot_id: String,
-    boot_micros: u64,
-    ticks: u64,
     server_exe: Metadata,
 }
 
 impl LinuxSources {
     fn new() -> Option<Self> {
-        let boot_id = String::from_utf8(bounded_read("/proc/sys/kernel/random/boot_id", 128)?)
-            .ok()?
-            .trim()
-            .replace('-', "");
-        let stat = String::from_utf8(bounded_read("/proc/stat", 262_144)?).ok()?;
-        let boot_seconds: u64 = stat
-            .lines()
-            .find_map(|line| line.strip_prefix("btime "))?
-            .parse()
-            .ok()?;
-        // SAFETY: sysconf has no pointer arguments.
-        let ticks = u64::try_from(unsafe { libc::sysconf(libc::_SC_CLK_TCK) }).ok()?;
-        if ticks == 0 {
-            return None;
-        }
         Some(Self {
-            boot_id,
-            boot_micros: boot_seconds.checked_mul(1_000_000)?,
-            ticks,
             server_exe: std::fs::metadata("/proc/self/exe").ok()?,
         })
     }
+}
 
-    fn monotonic_start(&self, start: u64) -> Option<u64> {
-        start.checked_mul(1_000_000)?.checked_div(self.ticks)
-    }
+/// Ask the setgid helper about one sshd priv pid. A missing, failing, hung or
+/// malformed helper leaves the connection unmapped.
+fn sshd_login_via(helper: &Path, pid: u32) -> Option<SshdLogin> {
+    sshd_login_from(helper, &[pid.to_string()], pid)
+}
+
+fn sshd_login_from(helper: &Path, args: &[String], pid: u32) -> Option<SshdLogin> {
+    let output = trusted_command(helper, args, SSHD_LOOKUP_TIMEOUT)?;
+    client_identity::parse_sshd_login(&output).filter(|login| login.pid == pid)
 }
 
 impl Sources for LinuxSources {
@@ -252,8 +233,8 @@ impl Sources for LinuxSources {
         let uid = uids[1];
         let all_root = uids.iter().all(|uid| *uid == 0);
         // An unprivileged server cannot read a root process's exe link
-        // (EACCES). Such a root process is only `RootUnreadable`; the resolver
-        // then requires journald's trusted `_EXE` for it (ruling r3 A).
+        // (EACCES). Such a root process is only `RootUnreadable`; the sshd
+        // lookup helper then requires journald's trusted `_EXE` (ruling r3 A).
         let exe_metadata = std::fs::read_link(format!("/proc/{pid}/exe")).and_then(|path| {
             let metadata = File::open(format!("/proc/{pid}/exe"))?.metadata()?;
             Ok((path, metadata))
@@ -292,9 +273,6 @@ impl Sources for LinuxSources {
             parent,
             uid,
             start: identity.start_time,
-            started_at: self
-                .boot_micros
-                .checked_add(self.monotonic_start(identity.start_time)?)?,
             exe,
             argv,
             title,
@@ -310,63 +288,8 @@ impl Sources for LinuxSources {
         })
     }
 
-    fn journal(&mut self, query: JournalQuery) -> Option<Vec<JournalRow>> {
-        let process = self.proc(query.pid)?;
-        if process.uid != 0
-            || !matches!(
-                process.executable,
-                ExecutableIdentity::Sshd | ExecutableIdentity::RootUnreadable
-            )
-            || query.uid != 0
-            || query.comm != "sshd"
-            || query.format != "json"
-            || query.since != process.started_at
-        {
-            return None;
-        }
-        let args = vec![
-            format!("_PID={}", query.pid),
-            "_UID=0".into(),
-            "_COMM=sshd".into(),
-            "--since".into(),
-            format!(
-                "@{}.{:06}",
-                query.since / 1_000_000,
-                query.since % 1_000_000
-            ),
-            "-o".into(),
-            "json".into(),
-            "--no-pager".into(),
-        ];
-        let bytes = trusted_command(Path::new("/usr/bin/journalctl"), &args)?;
-        let text = String::from_utf8(bytes).ok()?;
-        let now = micros_now()?;
-        let mut time = std::mem::MaybeUninit::<libc::timespec>::uninit();
-        // SAFETY: clock_gettime initializes the valid output pointer on success.
-        if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, time.as_mut_ptr()) } != 0 {
-            return None;
-        }
-        // SAFETY: successful clock_gettime initialized the structure.
-        let time = unsafe { time.assume_init() };
-        let monotonic_now = u64::try_from(time.tv_sec)
-            .ok()?
-            .checked_mul(1_000_000)?
-            .checked_add(u64::try_from(time.tv_nsec).ok()? / 1_000)?;
-        let mut rows = Vec::new();
-        for line in text.lines().filter(|s| !s.is_empty()) {
-            rows.push(parse_journal_row(
-                line,
-                &query,
-                &self.boot_id,
-                self.monotonic_start(process.start)?,
-                now,
-                monotonic_now,
-            )?);
-        }
-        if self.proc(query.pid)? != process {
-            return None;
-        }
-        Some(rows)
+    fn sshd_login(&mut self, pid: u32) -> Option<SshdLogin> {
+        sshd_login_via(Path::new(SSHD_LOOKUP), pid)
     }
 
     fn whois(&mut self, ip: &str) -> Option<String> {
@@ -376,51 +299,15 @@ impl Sources for LinuxSources {
         String::from_utf8(trusted_command(
             Path::new("/usr/bin/tailscale"),
             &["whois".into(), "--json".into(), ip.into()],
+            COMMAND_TIMEOUT,
         )?)
         .ok()
     }
 }
 
-fn parse_journal_row(
-    line: &str,
-    query: &JournalQuery,
-    boot: &str,
-    monotonic_start: u64,
-    now: u64,
-    monotonic_now: u64,
-) -> Option<JournalRow> {
-    let value: serde_json::Value = serde_json::from_str(line).ok()?;
-    let string = |key| value.get(key)?.as_str();
-    let pid = string("_PID")?.parse().ok()?;
-    let uid = string("_UID")?.parse().ok()?;
-    let comm = string("_COMM")?;
-    let timestamp = string("__REALTIME_TIMESTAMP")?.parse().ok()?;
-    let monotonic: u64 = string("__MONOTONIC_TIMESTAMP")?.parse().ok()?;
-    if pid != query.pid
-        || uid != 0
-        || comm != "sshd"
-        || string("_BOOT_ID")? != boot
-        || string("_EXE")? != "/usr/sbin/sshd"
-        || string("_TRANSPORT")? != "syslog"
-        || timestamp < query.since
-        || timestamp > now
-        || monotonic < monotonic_start
-        || monotonic > monotonic_now
-    {
-        return None;
-    }
-    Some(JournalRow {
-        pid,
-        uid,
-        comm: comm.into(),
-        timestamp,
-        message: string("MESSAGE")?.into(),
-    })
-}
-
 /// Execute an already-open root-protected binary, with a clean environment, no
 /// shell, bounded output and wall deadline. A hung/unavailable helper gives None.
-fn trusted_command(path: &Path, args: &[String]) -> Option<Vec<u8>> {
+fn trusted_command(path: &Path, args: &[String], timeout: Duration) -> Option<Vec<u8>> {
     let executable = protected_open(path)?;
     let mut child = Command::new(format!("/proc/self/fd/{}", executable.as_raw_fd()))
         .args(args)
@@ -442,7 +329,7 @@ fn trusted_command(path: &Path, args: &[String]) -> Option<Vec<u8>> {
         {
             return None;
         }
-        let deadline = Instant::now() + COMMAND_TIMEOUT;
+        let deadline = Instant::now() + timeout;
         let mut output = Vec::new();
         let mut eof = false;
         loop {
@@ -490,41 +377,46 @@ mod tests {
     use super::*;
 
     #[test]
-    fn journal_trusted_metadata_not_environment_fields() {
-        let query = JournalQuery {
-            pid: 20,
-            uid: 0,
-            comm: "sshd".into(),
-            since: 100,
-            format: "json".into(),
-        };
-        let row = serde_json::json!({"_PID":"20", "_UID":"0", "_COMM":"sshd", "_EXE":"/usr/sbin/sshd",
-            "_TRANSPORT":"syslog", "_BOOT_ID":"boot", "__REALTIME_TIMESTAMP":"101", "__MONOTONIC_TIMESTAMP":"80",
-            "MESSAGE":"Accepted publickey for paul from 100.64.0.7 port 1234 ssh2: ED25519 SHA256:paul"});
-        assert!(parse_journal_row(&row.to_string(), &query, "boot", 80, 102, 81).is_some());
-        for (key, bad) in [
-            ("_PID", "21"),
-            ("_UID", "1000"),
-            ("_COMM", "bash"),
-            ("_EXE", "/tmp/sshd"),
-            ("_TRANSPORT", "stdout"),
-            ("_BOOT_ID", "other"),
-            ("__REALTIME_TIMESTAMP", "99"),
-            ("__REALTIME_TIMESTAMP", "103"),
-            ("__MONOTONIC_TIMESTAMP", "79"),
-            ("__MONOTONIC_TIMESTAMP", "82"),
-        ] {
-            let mut candidate = row.clone();
-            candidate[key] = bad.into();
-            assert!(
-                parse_journal_row(&candidate.to_string(), &query, "boot", 80, 102, 81).is_none(),
-                "{key}"
-            );
+    fn server_path_refuses_when_the_sshd_lookup_helper_is_missing_or_fails() {
+        let line =
+            r#"{"pid":20,"user":"paul","fingerprint":"SHA256:paul","source_ip":"100.64.0.7"}"#;
+        let printf = |text: &str| sshd_login_via_printf(text, 20);
+        // The installed path is absent on test hosts: the production source refuses.
+        if !Path::new(SSHD_LOOKUP).exists() {
+            assert_eq!(LinuxSources::new().unwrap().sshd_login(20), None);
         }
-        let mut candidate = row.clone();
-        candidate.as_object_mut().unwrap().remove("_UID");
-        candidate["UID"] = "0".into();
-        assert!(parse_journal_row(&candidate.to_string(), &query, "boot", 80, 102, 81).is_none());
+        assert_eq!(
+            sshd_login_via(
+                Path::new("/usr/local/libexec/herdr-sshd-lookup-missing"),
+                20
+            ),
+            None
+        );
+        // Untrusted location, failure exit, hang, and the empty fail-closed answer.
+        assert_eq!(
+            sshd_login_via(Path::new("/tmp/herdr-sshd-lookup"), 20),
+            None
+        );
+        assert_eq!(sshd_login_via(Path::new("/usr/bin/false"), 20), None);
+        assert_eq!(sshd_login_via(Path::new("/usr/bin/true"), 20), None);
+        // A well-formed answer is used only for the pid that was asked about.
+        assert_eq!(
+            printf(&format!("{line}\n")).map(|login| login.fingerprint),
+            Some("SHA256:paul".into())
+        );
+        assert_eq!(sshd_login_via_printf(&format!("{line}\n"), 21), None);
+        assert_eq!(printf(&format!("{line}\n{line}\n")), None);
+        assert_eq!(printf(line), None);
+        assert_eq!(printf("garbage\n"), None);
+    }
+
+    /// `/usr/bin/printf` stands in for a helper that printed `text`.
+    fn sshd_login_via_printf(text: &str, pid: u32) -> Option<SshdLogin> {
+        sshd_login_from(
+            Path::new("/usr/bin/printf"),
+            &["%s".into(), text.into()],
+            pid,
+        )
     }
 
     #[test]
@@ -548,7 +440,6 @@ mod tests {
                 .unwrap()
                 .start_time
         );
-        assert!(process.started_at <= micros_now().unwrap());
         assert!(sources.proc(u32::MAX).is_none());
     }
 
@@ -583,14 +474,17 @@ mod tests {
         assert_eq!(
             trusted_command(
                 Path::new("/usr/bin/printf"),
-                &["%s".into(), "literal;$(touch nope)".into()]
+                &["%s".into(), "literal;$(touch nope)".into()],
+                COMMAND_TIMEOUT
             ),
             Some(b"literal;$(touch nope)".to_vec())
         );
-        assert!(trusted_command(Path::new("/usr/bin/sleep"), &["2".into()]).is_none());
-        assert!(trusted_command(Path::new("/tmp/journalctl"), &[]).is_none());
+        assert!(
+            trusted_command(Path::new("/usr/bin/sleep"), &["2".into()], COMMAND_TIMEOUT).is_none()
+        );
+        assert!(trusted_command(Path::new("/tmp/journalctl"), &[], COMMAND_TIMEOUT).is_none());
         assert_eq!(
-            trusted_command(Path::new("/usr/bin/env"), &[]),
+            trusted_command(Path::new("/usr/bin/env"), &[], COMMAND_TIMEOUT),
             Some(b"LANG=C\nLC_ALL=C\n".to_vec())
         );
         assert!(trusted_command(
@@ -599,9 +493,10 @@ mod tests {
                 "-c".into(),
                 (OUTPUT_LIMIT + 1).to_string(),
                 "/dev/zero".into()
-            ]
+            ],
+            COMMAND_TIMEOUT
         )
         .is_none());
-        assert!(trusted_command(Path::new("/usr/bin/false"), &[]).is_none());
+        assert!(trusted_command(Path::new("/usr/bin/false"), &[], COMMAND_TIMEOUT).is_none());
     }
 }
