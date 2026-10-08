@@ -2746,7 +2746,7 @@
           "additionalProperties": false,
           "properties": {
             "challenge": {
-              "description": "Fresh 256-bit consumer challenge as 64 lowercase hex characters; the\nanswer's Ed25519 `sig` covers it.",
+              "description": "Fresh 256-bit consumer challenge as 64 lowercase hex characters.",
               "type": "string"
             },
             "pane_id": {

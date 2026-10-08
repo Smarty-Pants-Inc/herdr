@@ -486,49 +486,30 @@ fn input_cut_host_appearance_reply_contains_no_reserved_introducer() {
 }
 
 #[test]
-fn input_cut_server_without_key_fails_closed_and_advertises_false() {
-    let mut f = Fixture::new_without_key();
-    let ping = request(&f.api, "ping", json!({}));
-    assert_eq!(
-        ping["result"]["capabilities"]["input_consumer"], false,
-        "{ping}"
-    );
-    let r = f.command(json!({"op":"enroll"}));
-    assert_eq!(r["error"]["code"], "server_key_unavailable", "{r}");
-    assert!(r.get("result").is_none(), "no unsigned fallback: {r}");
-}
-#[test]
-fn input_cut_keyed_server_advertises_and_rejects_malformed_challenge() {
+fn input_cut_linux_enroll_without_server_auth_works_unsigned() {
+    // smarty-dev#6690 option 1: no server authentication in this build. Linux still
+    // advertises and enrolls; the answer has no `sig`, so Pi labels turns `terminal`.
     let mut f = Fixture::new();
     let ping = request(&f.api, "ping", json!({}));
     assert_eq!(
         ping["result"]["capabilities"]["input_consumer"], true,
         "{ping}"
     );
+    let epoch = f.enroll();
+    assert!(epoch.get("sig").is_none(), "{epoch}");
+    // The unsigned epoch still cuts with a MAC that verifies under its key.
+    f.api_input("pane.send_text", json!({"text":"x\r"}));
+    f.wait_len(2);
+    let r = f.cut(json!({}));
+    assert_eq!(classification(&r), "api", "{r}");
+}
+#[test]
+fn input_cut_enroll_rejects_malformed_challenge() {
+    let mut f = Fixture::new();
     for challenge in ["", "AB", &"AB".repeat(32), &"0".repeat(63)] {
         let r = f.command(json!({"op":"enroll","challenge":challenge}));
         assert_eq!(r["error"]["code"], "invalid_params", "{challenge:?}: {r}");
     }
-    // The counterpart: a well-formed challenge still enrolls and verifies.
+    // The counterpart: a well-formed challenge still enrolls.
     f.enroll();
-}
-#[test]
-fn input_cut_pane_children_and_server_never_hold_another_group() {
-    // A child of the server must carry only the real gid (r4 condition 1). Without root the
-    // test binary cannot be setgid; this pins the observable outcome on every run.
-    let f = Fixture::new();
-    let gids = |pid: &str| -> Vec<String> {
-        std::fs::read_to_string(format!("/proc/{pid}/status"))
-            .unwrap()
-            .lines()
-            .find_map(|l| l.strip_prefix("Gid:"))
-            .unwrap()
-            .split_whitespace()
-            .map(str::to_owned)
-            .collect()
-    };
-    let consumer = f.file("ready")["pid"].to_string();
-    let own = gids("self");
-    assert_eq!(gids(&consumer), own);
-    assert!(own.iter().all(|g| g == &own[0]), "{own:?}");
 }

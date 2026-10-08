@@ -9,8 +9,7 @@ use serde::{Deserialize, Serialize};
 #[serde(deny_unknown_fields)]
 pub struct PaneInputConsumerEnrollParams {
     pub pane_id: String,
-    /// Fresh 256-bit consumer challenge as 64 lowercase hex characters; the
-    /// answer's Ed25519 `sig` covers it.
+    /// Fresh 256-bit consumer challenge as 64 lowercase hex characters.
     pub challenge: String,
 }
 

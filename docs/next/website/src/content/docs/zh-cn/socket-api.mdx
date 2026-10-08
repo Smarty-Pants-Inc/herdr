@@ -186,7 +186,7 @@ command in a loop.
 
 | 方法 | 必填 params | 用途 |
 | --- | --- | --- |
-| `pane.input_consumer.enroll` | `pane_id`、`challenge` | 验证本地 socket 对端，发放 `epoch`、秘密 `epoch_key`、`nonce`、窗格 `tty` 和服务器签名 `sig`。 |
+| `pane.input_consumer.enroll` | `pane_id`、`challenge` | 验证本地 socket 对端，发放 `epoch`、秘密 `epoch_key`、`nonce`和窗格 `tty`。 |
 | `pane.input_consumer.cut` | `epoch`、`epoch_key`、`seq`、`token`、`cut`、`digest`、`kind` | 关闭区间；`kind` 为 `submit` 或 `discard`。 |
 | `pane.input_consumer.release` | `epoch`、`epoch_key` | 在退出、挂起或交接 TTY 前结束 epoch。 |
 
@@ -194,7 +194,7 @@ command in a loop.
 
 ```json
 {"id":"enroll","method":"pane.input_consumer.enroll","params":{"pane_id":"w1:p1","challenge":"<64 lowercase hex>"}}
-{"id":"enroll","result":{"epoch":"<epoch>","epoch_key":"<epoch_key>","nonce":"<nonce>","tty":{"dev":"<st_dev>","ino":"<st_ino>"},"sig":"<base64 Ed25519>"}}
+{"id":"enroll","result":{"epoch":"<epoch>","epoch_key":"<epoch_key>","nonce":"<nonce>","tty":{"dev":"<st_dev>","ino":"<st_ino>"}}}
 ```
 
 若第一个区间仅包含确切的 `a\r`（十六进制字节 `61 0d`），则 `cut = 2`，`digest` 为这两个字节的 SHA-256，而不是反斜杠表示法本身的哈希。
@@ -223,7 +223,7 @@ release 成功时返回空对象。拒绝使用含 `code` 和 `message` 的标�
 
 所有 params 均必填；`cut` 和 `release` **不接受 `pane_id`**。注册时检查 socket 对端的控制 TTY 是否为窗格 PTY、是否属于前台进程组（`getpgid(peer) == tcgetpgrp(master)`），以及是否属于窗格会话（`getsid(peer)`）。同一进程组实例（pgid 加组长启动时间）仅首次注册成功，在该实例存续期间，其他进程的注册得到 `already_enrolled`。首个消费者（相同 pid 和启动时间）在其 epoch 结束后（release、失效，或 Ctrl+Z 与恢复等前台变化）可以重新注册，并获得重放缓存为空的新 epoch。没有额外的祖先检查：消费者必须先于扩展和子进程注册，并将工具子进程隔离到其他进程组。`ICANON`、`ECHO`、`ICRNL`、`ISTRIP`、`IXON`、`IEXTEN` 必须全部关闭。每次切分重新检查 raw 模式及 termios 是否与注册时一致；失败返回 `unknown` 并使 epoch 失效。请先检查 `ping.result.capabilities.input_consumer == true`：非 Linux 服务器通告 `false`，并以 `unsupported_platform` 拒绝全部三个方法。
 
-**服务器认证。** 消费者不得信任任何作出应答的 socket。已安装的服务器为 `root:herdr`、模式 `2755`，启动时只读取一次 Ed25519 密钥 `/etc/herdr/server.key`（`0640 root:herdr`），随后放弃该组，因此窗格子进程不会带有该组，同一用户的进程既无法从文件、也无法从服务器内存读取密钥。`herdr` 组不得有任何成员，也不得是任何用户的主组，否则服务器不会加载密钥。`sig` 是对以下字段的 Ed25519 签名：`herdr-enroll-v1`、`challenge`、`epoch`、解码后 `epoch_key` 的 SHA-256（十六进制）、`nonce`、`pane_id`，以及窗格 slave 的 `tty.dev` 和 `tty.ino`（十进制），每个字段编码为 u32 大端字节长度加 UTF-8 字节。请用 `/etc/herdr/server.pub` 验证，并检查 `tty` 与自身 stdin 的 `fstat` 一致。每个切分应答的 `mac` 是以解码后 `epoch_key` 为密钥的 HMAC-SHA256，覆盖 `herdr-cut-v1`、`epoch`、`seq`、`token`、`cut`、`digest`、`kind`、`result`、`reason` 以及 principal 的 `smarty_id` 和 `display_name`（缺失时为空字符串）。没有可用密钥时，服务器通告 `false`，并以 `server_key_unavailable` 拒绝注册；不存在无签名模式。
+**服务器认证。** 此版本不提供服务器认证：注册应答不含 `sig`，因此消费者无法证明是哪台服务器作出应答，必须将其应答视为未经认证的终端输入。请检查 `tty` 与自身 stdin 的 `fstat` 一致。每个切分应答的 `mac` 是以解码后 `epoch_key` 为密钥的 HMAC-SHA256，覆盖 `herdr-cut-v1`、`epoch`、`seq`、`token`、`cut`、`digest`、`kind`、`result`、`reason` 以及 principal 的 `smarty_id` 和 `display_name`（缺失时为空字符串），每个字段编码为 u32 大端字节长度加 UTF-8 字节。`challenge` 会被校验，但尚未绑定到签名。
 
 注册和写入标记是同一个有序窗格 actor 操作。标记为 `ESC _ herdr-epoch;<nonce> ESC \\`；丢弃更早的输入，移除预期标记后再计数。偏移 0 是标记后的第一个字节。`cut` 是**不含终点的字节计数**，不是字符索引：字节 `a\r` 对应 `cut = 2`。区间为 `[prev_cut, cut)`，初始 `prev_cut = 0`；`digest` 是这些确切字节的 SHA-256 小写十六进制值。切分之后的字节保留给下一区间。Herdr 在所有其他输入路径中中和保留标记的引导序列，包括客户端输入、API 输入和终端回复。
 

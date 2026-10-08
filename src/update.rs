@@ -2117,7 +2117,7 @@ fn homebrew_cellar_keg_root(path: &Path) -> Option<PathBuf> {
 pub(crate) const SMARTY_INSTALL_REFUSAL: &str = "this herdr is installed by smarty-install (setgid herdr for the server key); update it with smarty-install herdr <sha>";
 
 /// A setgid or root-owned binary belongs to smarty-install: replacing it here would drop
-/// `root:herdr 2755`, and the next server could not read its attestation key.
+/// the `root:herdr 2755` mode that smarty-install sets (smarty-dev#2636).
 #[cfg(unix)]
 fn is_smarty_install_managed_exe(exe: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;

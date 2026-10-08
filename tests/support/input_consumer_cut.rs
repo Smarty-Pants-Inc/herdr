@@ -89,8 +89,6 @@ pub struct Fixture {
     pub base: PathBuf,
     pub api: PathBuf,
     pub pane: String,
-    /// Ed25519 public key of this server's test attestation key, if it has one.
-    pub server_pub: Option<Vec<u8>>,
     master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send + Sync>,
     index: usize,
@@ -115,32 +113,6 @@ pub fn request(api: &Path, method: &str, params: Value) -> Value {
     serde_json::from_str(&line).unwrap()
 }
 
-/// Writes an owner-only PKCS#8 PEM Ed25519 key, as `openssl genpkey` would.
-fn write_test_key(path: &Path) -> Vec<u8> {
-    use base64::Engine as _;
-    use ring::signature::KeyPair as _;
-    use std::os::unix::fs::OpenOptionsExt;
-    let rng = ring::rand::SystemRandom::new();
-    let pkcs8 = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
-    let pem = format!(
-        "-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n",
-        base64::engine::general_purpose::STANDARD.encode(pkcs8.as_ref())
-    );
-    fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)
-        .unwrap()
-        .write_all(pem.as_bytes())
-        .unwrap();
-    ring::signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref())
-        .unwrap()
-        .public_key()
-        .as_ref()
-        .to_vec()
-}
-
 fn fields(list: &[&str]) -> Vec<u8> {
     let mut out = Vec::new();
     for f in list {
@@ -157,19 +129,8 @@ fn unhex(s: &str) -> Vec<u8> {
         .collect()
 }
 
-fn hexs(b: &[u8]) -> String {
-    b.iter().map(|b| format!("{b:02x}")).collect()
-}
-
 impl Fixture {
     pub fn new() -> Self {
-        Self::with_key(true)
-    }
-    /// A real server with no attestation key: it must fail closed.
-    pub fn new_without_key() -> Self {
-        Self::with_key(false)
-    }
-    fn with_key(keyed: bool) -> Self {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -203,13 +164,6 @@ impl Fixture {
         cmd.env("XDG_RUNTIME_DIR", &runtime);
         cmd.env("HERDR_SOCKET_PATH", &api);
         cmd.env("SHELL", "/bin/sh");
-        let server_pub = keyed.then(|| {
-            let key = base.join("server.key");
-            let public = write_test_key(&key);
-            // Debug-build-only seam; release builds read only /etc/herdr/server.key.
-            cmd.env("HERDR_TEST_SERVER_KEY_PATH", &key);
-            public
-        });
         let child = pair.slave.spawn_command(cmd).unwrap();
         support::register_spawned_herdr_pid(child.process_id());
         drop(pair.slave);
@@ -227,7 +181,6 @@ impl Fixture {
             base,
             api,
             pane: String::new(),
-            server_pub,
             master: pair.master,
             child,
             index: 0,
@@ -316,9 +269,11 @@ impl Fixture {
             r.get("error").is_none(),
             "pane.input_consumer.enroll is required on real PTY: {r}"
         );
-        for key in ["epoch", "epoch_key", "nonce", "sig"] {
+        for key in ["epoch", "epoch_key", "nonce"] {
             assert!(r["result"][key].is_string(), "enroll contract {key}: {r}");
         }
+        // No server authentication in this build (smarty-dev#6690): never a signature.
+        assert!(r["result"].get("sig").is_none(), "unsigned enroll: {r}");
         self.verify_enroll(&r);
         let deadline = Instant::now() + Duration::from_secs(3);
         while Instant::now() < deadline {
@@ -329,39 +284,18 @@ impl Fixture {
         }
         panic!("enroll did not write matching one-operation nonce marker");
     }
-    /// Checks the answer exactly as Pi does: Ed25519 over Pi's field encoding, for this
-    /// consumer's own stdin tty.
+    /// The answer names this consumer's own stdin tty.
     pub fn verify_enroll(&self, r: &Value) {
-        use base64::Engine as _;
-        use sha2::Digest as _;
         let res = &r["result"];
         let ready = self.file("ready");
         assert_eq!(
             res["tty"]["dev"], ready["tty_dev"],
-            "signed tty is the consumer's: {r}"
+            "tty is the consumer's: {r}"
         );
         assert_eq!(
             res["tty"]["ino"], ready["tty_ino"],
-            "signed tty is the consumer's: {r}"
+            "tty is the consumer's: {r}"
         );
-        let key = unhex(res["epoch_key"].as_str().unwrap());
-        let message = fields(&[
-            "herdr-enroll-v1",
-            r["_challenge"].as_str().unwrap(),
-            res["epoch"].as_str().unwrap(),
-            &hexs(&sha2::Sha256::digest(&key)),
-            res["nonce"].as_str().unwrap(),
-            &self.pane,
-            res["tty"]["dev"].as_str().unwrap(),
-            res["tty"]["ino"].as_str().unwrap(),
-        ]);
-        let sig = base64::engine::general_purpose::STANDARD
-            .decode(res["sig"].as_str().unwrap())
-            .unwrap();
-        let public = self.server_pub.as_ref().expect("keyed fixture");
-        ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, public)
-            .verify(&message, &sig)
-            .expect("enroll signature verifies with the server key");
     }
     pub fn api_input(&self, method: &str, mut params: Value) -> Value {
         params["pane_id"] = json!(self.pane);

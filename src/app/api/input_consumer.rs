@@ -70,14 +70,6 @@ impl App {
                 "input consumer cuts require a Linux server",
             ));
         }
-        // Fail closed: no attestation key means no epoch, never an unsigned one.
-        if !crate::platform::server_key_available() {
-            return Err(encode_error(
-                id.to_owned(),
-                "server_key_unavailable",
-                "this server has no attestation key",
-            ));
-        }
         let (runtime, operation, audit, answer) = match method {
             Method::PaneInputConsumerEnroll(params) => {
                 if !is_lower_hex(&params.challenge, 64) {
@@ -108,11 +100,12 @@ impl App {
                         "pane runtime not found",
                     ));
                 };
-                let answer = AnswerContext::Enroll {
-                    pane_id: params.pane_id,
-                    challenge: params.challenge,
-                };
-                (runtime, ConsumerOperation::Enroll { peer }, None, answer)
+                (
+                    runtime,
+                    ConsumerOperation::Enroll { peer },
+                    None,
+                    AnswerContext::Enroll,
+                )
             }
             Method::PaneInputConsumerCut(params) => {
                 let runtime = self.input_consumer_runtime(id, &params.epoch)?;
@@ -187,7 +180,7 @@ impl App {
 
 /// What the answer must bind to, taken from the request that produced it.
 enum AnswerContext {
-    Enroll { pane_id: String, challenge: String },
+    Enroll,
     Cut(CutRequest),
     Release,
 }
@@ -243,27 +236,6 @@ fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
         .into()
 }
 
-fn enroll_message(
-    challenge: &str,
-    pane_id: &str,
-    epoch: &str,
-    epoch_key: &[u8],
-    nonce: &str,
-    tty: (u64, u64),
-) -> Vec<u8> {
-    use sha2::{Digest, Sha256};
-    encode_fields(&[
-        "herdr-enroll-v1",
-        challenge,
-        epoch,
-        &hex(&Sha256::digest(epoch_key)),
-        nonce,
-        pane_id,
-        &tty.0.to_string(),
-        &tty.1.to_string(),
-    ])
-}
-
 /// The cut answer as Pi reads it, with its HMAC under the epoch key.
 fn cut_answer(request: &CutRequest, result: &CutResult) -> Option<serde_json::Value> {
     let (kind, reason, principal) = match result {
@@ -313,26 +285,15 @@ fn encode_consumer_response(
                 nonce,
                 tty,
             },
-            AnswerContext::Enroll { pane_id, challenge },
+            AnswerContext::Enroll,
         ) => {
-            let Some(key_bytes) = decode_hex(&epoch_key) else {
-                return encode_error(id, "server_key_unavailable", "epoch key encoding");
-            };
-            let message = enroll_message(challenge, pane_id, &epoch, &key_bytes, &nonce, tty);
-            let Some(sig) = crate::platform::server_key_sign(&message) else {
-                return encode_error(
-                    id,
-                    "server_key_unavailable",
-                    "this server has no attestation key",
-                );
-            };
-            use base64::Engine as _;
+            // Server authentication is unavailable in this build (smarty-dev#6690): the
+            // answer carries no `sig`, so a consumer labels its turns `terminal`.
             serde_json::json!({
                 "epoch": epoch,
                 "epoch_key": epoch_key,
                 "nonce": nonce,
                 "tty": {"dev": tty.0.to_string(), "ino": tty.1.to_string()},
-                "sig": base64::engine::general_purpose::STANDARD.encode(sig),
             })
         }
         (ConsumerResponse::Cut(result), AnswerContext::Cut(request)) => {
@@ -416,23 +377,6 @@ mod tests {
     }
 
     #[test]
-    fn input_consumer_enroll_message_matches_pi_encoding() {
-        use sha2::{Digest, Sha256};
-        let message = enroll_message(
-            &"07".repeat(32),
-            "w1:p1",
-            "e1",
-            &decode_hex(EPOCH_KEY).unwrap(),
-            "nonce0123456789abcdef",
-            (26, 3),
-        );
-        assert_eq!(
-            hex(&Sha256::digest(&message)),
-            "d7cd2ee9789574c6627275312ef2569ee57d8e92b3dd746eda23f210c3248a73"
-        );
-    }
-
-    #[test]
     fn input_consumer_hmac_matches_rfc4231_case_2() {
         assert_eq!(
             hex(&hmac_sha256(b"Jefe", b"what do ya want for nothing?")),
@@ -441,10 +385,7 @@ mod tests {
     }
 
     #[test]
-    fn input_consumer_enroll_without_key_is_refused_never_unsigned() {
-        if crate::platform::server_key_available() {
-            return;
-        }
+    fn input_consumer_enroll_answer_has_no_signature() {
         let response = encode_consumer_response(
             "enroll".into(),
             ConsumerResponse::Enrolled {
@@ -453,14 +394,14 @@ mod tests {
                 nonce: "n".repeat(16),
                 tty: (1, 2),
             },
-            &AnswerContext::Enroll {
-                pane_id: "w1:p1".into(),
-                challenge: "07".repeat(32),
-            },
+            &AnswerContext::Enroll,
         );
         let value: serde_json::Value = serde_json::from_str(&response).unwrap();
-        assert_eq!(value["error"]["code"], "server_key_unavailable");
-        assert!(value.get("result").is_none());
+        assert_eq!(
+            value,
+            serde_json::json!({"id":"enroll","result":{"epoch":"e1","epoch_key":EPOCH_KEY,
+                "nonce":"n".repeat(16),"tty":{"dev":"1","ino":"2"}}})
+        );
     }
 
     #[test]
