@@ -40,7 +40,8 @@ pub(crate) enum Exe {
     Sshd,
     /// EACCES: a root process, unreadable without root. Other evidence decides.
     Unreadable,
-    Other,
+    /// Any other executable, by device and inode.
+    Other(u64, u64),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -291,7 +292,7 @@ fn is_priv(process: &Snapshot) -> bool {
     priv_user(&process.cmdline).is_some()
         && process.comm == "sshd"
         && process.uids == [0; 4]
-        && process.exe != Exe::Other
+        && !matches!(process.exe, Exe::Other(..))
 }
 
 /// `peer` is the kernel-attested pid at the other end of the caller's
@@ -304,6 +305,13 @@ pub(crate) fn lookup(host: &mut impl Host, peer: u32) -> Option<Login> {
     }
     let caller = snapshot(host, caller_pid)?;
     let mut chain = vec![(peer, snapshot(host, peer)?)];
+    // The peer runs the caller's executable (both the installed herdr): a
+    // bridge never listens, so a process holds a socket whose peer is a
+    // bridge only when that bridge connected to it. The end re-read repeats
+    // this check, since the snapshots hold the inode.
+    if !matches!(caller.exe, Exe::Other(..)) || chain[0].1.exe != caller.exe {
+        return None;
+    }
     // Like the server's walk: the caller is never traversed, no cycles, and
     // no parent is younger than its child.
     for _ in 0..MAX_PARENTS {
@@ -338,7 +346,7 @@ pub(crate) fn lookup(host: &mut impl Host, peer: u32) -> Option<Login> {
     if listener.parent != 1
         || listener.comm != "sshd"
         || listener.uids != [0; 4]
-        || listener.exe == Exe::Other
+        || matches!(listener.exe, Exe::Other(..))
         || !LISTENER_CGROUPS.contains(&listener.cgroup.trim_end())
         || listener.start > login.start
     {
@@ -408,7 +416,7 @@ impl Host for System {
                 Some(if (exe.dev(), exe.ino()) == (sshd.dev(), sshd.ino()) {
                     Exe::Sshd
                 } else {
-                    Exe::Other
+                    Exe::Other(exe.dev(), exe.ino())
                 })
             }
             Err(e) if e.kind() == ErrorKind::PermissionDenied => Some(Exe::Unreadable),
@@ -579,6 +587,9 @@ mod tests {
     const BOOT_MICROS: u64 = 1_000_000_000;
     const START_MONO: u64 = 500_000_000;
     const START_REAL: u64 = BOOT_MICROS + START_MONO;
+    /// The installed herdr binary: the server (caller) and the bridge.
+    const HERDR: Exe = Exe::Other(1, 100);
+    const SHELL: Exe = Exe::Other(1, 200);
     /// A real row from this kind of query on systemd 255 (ryzen2, user
     /// journal: the priv's root rows need the journal group), with its
     /// identity fields rewritten to the fixture's login.
@@ -593,6 +604,7 @@ mod tests {
         journal_calls: Vec<Vec<String>>,
         /// Applied when the journal is read: models pid reuse mid-lookup.
         after_journal: Vec<((u32, &'static str), Vec<u8>)>,
+        after_journal_exes: Vec<(u32, Exe)>,
     }
 
     impl Host for Fixture {
@@ -622,6 +634,8 @@ mod tests {
             for (key, value) in std::mem::take(&mut self.after_journal) {
                 self.files.insert(key, value);
             }
+            self.exes
+                .extend(std::mem::take(&mut self.after_journal_exes));
             self.journal.clone()
         }
     }
@@ -703,8 +717,8 @@ mod tests {
         Fixture {
             files,
             exes: [
-                (CALLER, Exe::Other),
-                (BRIDGE, Exe::Other),
+                (CALLER, HERDR),
+                (BRIDGE, HERDR),
                 (NOTTY, Exe::Sshd),
                 (PRIV, Exe::Unreadable),
                 (LISTENER, Exe::Unreadable),
@@ -720,6 +734,7 @@ mod tests {
             ]),
             journal_calls: Vec::new(),
             after_journal: Vec::new(),
+            after_journal_exes: Vec::new(),
         }
     }
 
@@ -962,7 +977,7 @@ mod tests {
             f.files.insert((PRIV, "status"), status(1000));
         });
         refused(|f| {
-            f.exes.insert(PRIV, Exe::Other);
+            f.exes.insert(PRIV, SHELL);
         });
         refused(|f| {
             f.files
@@ -973,7 +988,7 @@ mod tests {
             f.files.insert((LISTENER, "status"), status(1000));
         });
         refused(|f| {
-            f.exes.insert(LISTENER, Exe::Other);
+            f.exes.insert(LISTENER, SHELL);
         });
         refused(|f| {
             f.files.insert(
@@ -1030,8 +1045,7 @@ mod tests {
                 b"systemd\0",
                 SESSION,
             );
-            f.exes
-                .extend([(50, Exe::Other), (51, Exe::Other), (52, Exe::Other)]);
+            f.exes.extend([(50, SHELL), (51, SHELL), (52, SHELL)]);
         });
         // The walk reaches init before a priv.
         refused(|f| {
@@ -1062,7 +1076,7 @@ mod tests {
                 b"sh\0",
                 SESSION,
             );
-            f.exes.extend([(41, Exe::Other), (42, Exe::Other)]);
+            f.exes.extend([(41, SHELL), (42, SHELL)]);
         });
         // The walk ends on its third parent: a non-root process titled like
         // the priv there is not one.
@@ -1079,7 +1093,7 @@ mod tests {
                 b"sh\0",
                 SESSION,
             );
-            f.exes.insert(41, Exe::Other);
+            f.exes.insert(41, SHELL);
             f.files.insert((PRIV, "status"), status(1000));
         });
         // A user process titled like a priv is not one; nor is the peer itself.
@@ -1111,6 +1125,45 @@ mod tests {
         refused(|f| f.files.retain(|(pid, _), _| *pid != BRIDGE));
     }
 
+    /// The peer must run the caller's executable inode (the installed herdr),
+    /// read before the walk and again at the end.
+    #[test]
+    fn peer_must_run_the_callers_executable() {
+        // Same inode: the good chain passes (also with a readable sshd exe).
+        let mut f = fixture();
+        assert_eq!(f.exes[&BRIDGE], f.exes[&CALLER]);
+        assert_eq!(lookup(&mut f, BRIDGE), Some(paul()));
+        // Another executable: same inode on another device, another inode.
+        refused(|f| {
+            f.exes.insert(BRIDGE, Exe::Other(2, 100));
+        });
+        refused(|f| {
+            f.exes.insert(BRIDGE, SHELL);
+        });
+        // Unreadable (another user's process) or sshd: refused, also for the caller.
+        refused(|f| {
+            f.exes.insert(BRIDGE, Exe::Unreadable);
+        });
+        refused(|f| {
+            f.exes.insert(BRIDGE, Exe::Sshd);
+        });
+        refused(|f| {
+            f.exes.insert(CALLER, Exe::Unreadable);
+            f.exes.insert(BRIDGE, Exe::Unreadable);
+        });
+        refused(|f| {
+            f.exes.insert(CALLER, Exe::Sshd);
+            f.exes.insert(BRIDGE, Exe::Sshd);
+        });
+        refused(|f| {
+            f.exes.remove(&BRIDGE);
+        });
+        // Changed between the reads, for the peer or the caller.
+        refused(|f| f.after_journal_exes = vec![(BRIDGE, SHELL)]);
+        refused(|f| f.after_journal_exes = vec![(CALLER, SHELL)]);
+        refused(|f| f.after_journal_exes = vec![(BRIDGE, SHELL), (CALLER, SHELL)]);
+    }
+
     #[test]
     fn third_parent_allowed() {
         let mut f = fixture();
@@ -1126,7 +1179,7 @@ mod tests {
             b"sh\0",
             SESSION,
         );
-        f.exes.insert(41, Exe::Other);
+        f.exes.insert(41, SHELL);
         assert_eq!(lookup(&mut f, BRIDGE), Some(paul()));
     }
 
@@ -1217,6 +1270,12 @@ mod tests {
         assert_eq!(lookup(&mut host, std::process::id()), None);
         assert_eq!(lookup(&mut host, u32::MAX >> 1), None);
         assert!(snapshot(&mut host, std::process::id()).is_some());
+        // A same-user process's executable reads as its device and inode.
+        let own = std::fs::metadata("/proc/self/exe").unwrap();
+        assert_eq!(
+            host.exe(std::process::id()),
+            Some(Exe::Other(own.dev(), own.ino()))
+        );
         // An unprivileged test cannot read pid 1's executable.
         // SAFETY: getuid cannot fail.
         if unsafe { libc::getuid() } != 0 {
