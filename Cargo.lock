@@ -1382,6 +1382,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "herdr-sshd-lookup"
+version = "0.0.0"
+dependencies = [
+ "libc",
+ "serde_json",
+]
+
+[[package]]
 name = "hex"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
