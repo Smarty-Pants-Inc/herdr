@@ -16,11 +16,38 @@
 //! is the key group (the setgid egid, or any gid named `herdr` in `/etc/group`; herdr#188):
 //! those survive the drop and would reach every pane child, which could then read the key
 //! file.
+//!
+//! Load rules, in order (the root block, smarty-dev#2636, runs rules 2 to 6 too):
+//! 1. the process is a setgid `herdr server` invocation and `fs.suid_dumpable` is 0 or 2;
+//! 2. the key gid is not one of the process's supplementary groups (`getgroups`): an
+//!    inherited supplementary `herdr` survives `setresgid` and proves a member exists;
+//! 3. `nsswitch.conf` maps `passwd`, `group` (and `initgroups`, if listed) to exactly
+//!    `files` or `files systemd`;
+//! 4. `/etc/group` gives the key gid a name and no members; `/etc/passwd` gives nobody it as
+//!    primary group;
+//! 5. no userdb drop-in (`/etc/userdb`, `/run/userdb`, `/run/host/userdb`, `/usr/lib/userdb`)
+//!    names the group as a membership or primary group;
+//! 6. when NSS lists `systemd`, every Varlink userdb service in `/run/systemd/userdb` (homed,
+//!    machined, DynamicUser, third-party) answers `GetMemberships(groupName)` with
+//!    `NoRecordFound`, and enumerates its users (`GetUserRecord`, no name) with no record
+//!    whose `gid` is the key gid or whose `memberOf` names the group (an empty enumeration is
+//!    fine). Only `io.systemd.Machine` may refuse enumeration (`EnumerationNotSupported`), and
+//!    then `GetGroupRecord(gid)` must answer `NoRecordFound`. All within 2 s total; any
+//!    membership, other error, timeout or bad reply refuses. `io.systemd.Multiplexer` (an
+//!    aggregate of the others) and `io.systemd.NameServiceSwitch` (a re-export of NSS) are
+//!    skipped;
+//! 7. the key file is a regular file (no symlink), `root:<key gid>`, no group-write or other
+//!    bits, at most 4096 bytes, in a root-owned directory without group or other write;
+//! 8. after the gid drop the process is verified non-dumpable and untraced.
+//!
+//! Any failure, unreadable file or unparseable record refuses.
 use std::ffi::OsString;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use ring::signature::Ed25519KeyPair;
 
@@ -220,7 +247,23 @@ fn load(setgid: bool, effective_gid: u32) -> Option<LockedKey> {
         // Test-only trust root; release builds read only KEY_PATH.
         return read_key(Path::new(&path), None);
     }
-    load_with(setgid, effective_gid, &SYSTEM_ACCOUNTS, read_key)
+    load_with(
+        setgid,
+        effective_gid,
+        process_groups().map_err(|e| format!("getgroups failed: {e}")),
+        &SYSTEM_ACCOUNTS,
+        read_key,
+    )
+}
+
+fn not_supplementary(groups: Result<Vec<u32>, String>, gid: u32) -> Result<(), String> {
+    if groups?.contains(&gid) {
+        return Err(format!(
+            "gid {gid} is a supplementary group of this process, so the group has a member; \
+             remove that account from the group"
+        ));
+    }
+    Ok(())
 }
 
 /// The account database files; injectable so tests never touch the real `/etc`.
@@ -230,6 +273,10 @@ struct AccountFiles<'a> {
     passwd: &'a str,
     /// systemd userdb drop-in directories that `nss-systemd` reads.
     userdb: &'a [&'a str],
+    /// The Varlink userdb service sockets that `nss-systemd` queries.
+    userdb_services: &'a str,
+    /// Total deadline for all service queries.
+    userdb_deadline: Duration,
 }
 
 const SYSTEM_ACCOUNTS: AccountFiles<'static> = AccountFiles {
@@ -242,24 +289,30 @@ const SYSTEM_ACCOUNTS: AccountFiles<'static> = AccountFiles {
         "/run/host/userdb",
         "/usr/lib/userdb",
     ],
+    userdb_services: "/run/systemd/userdb",
+    userdb_deadline: Duration::from_secs(2),
 };
 
 /// The key file is `0640 root:herdr`, so every member of `herdr` could read it and forge
 /// signatures. Load only when the group is provably the setgid binary's alone (NSS policy B,
 /// smarty-dev#6690): NSS resolves `passwd`, `group` and `initgroups` from `files`, optionally
 /// followed by `systemd`, so no other source (sss, ldap, nis) can grant membership; the local
-/// files give the group no members and nobody as primary group; and no systemd userdb
-/// drop-in record names the group as a membership. Anything else refuses.
+/// files give the group no members and nobody as primary group; no systemd userdb drop-in
+/// record or Varlink service names the group as a membership; and the process does not
+/// carry the group as a supplementary group. Anything else refuses.
 fn load_with<K>(
     setgid: bool,
     effective_gid: u32,
+    groups: Result<Vec<u32>, String>,
     accounts: &AccountFiles,
     read: impl FnOnce(&Path, Option<u32>) -> Option<K>,
 ) -> Option<K> {
     if !setgid {
         return None;
     }
-    if let Err(why) = key_group_is_private(accounts, effective_gid) {
+    let checks = not_supplementary(groups, effective_gid)
+        .and_then(|()| key_group_is_private(accounts, effective_gid));
+    if let Err(why) = checks {
         eprintln!("herdr: server key refused: {why}");
         return None;
     }
@@ -269,20 +322,29 @@ fn load_with<K>(
 fn key_group_is_private(accounts: &AccountFiles, gid: u32) -> Result<(), String> {
     let read =
         |path: &str| std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"));
-    nss_is_files_or_systemd(&read(accounts.nsswitch)?)?;
+    let systemd = nss_is_files_or_systemd(&read(accounts.nsswitch)?)?;
     let name = group_has_no_members(&read(accounts.group)?, gid)?;
     no_primary_holder(&read(accounts.passwd)?, gid)?;
     for dir in accounts.userdb {
         userdb_grants_no_membership(Path::new(dir), &name, gid)?;
+    }
+    if systemd {
+        userdb_services_report_no_membership(
+            Path::new(accounts.userdb_services),
+            &name,
+            gid,
+            accounts.userdb_deadline,
+        )?;
     }
     Ok(())
 }
 
 /// `passwd` and `group` must be listed exactly as `files` or `files systemd`; `initgroups`
 /// (supplementary groups at login) too when listed. Any other source, action term or
-/// duplicate refuses. `systemd` is safe only with the userdb scan below.
-fn nss_is_files_or_systemd(conf: &str) -> Result<(), String> {
-    let (mut passwd, mut group) = (false, false);
+/// duplicate refuses. Returns whether any of them lists `systemd`, which is safe only with
+/// the userdb drop-in scan and the Varlink service query below.
+fn nss_is_files_or_systemd(conf: &str) -> Result<bool, String> {
+    let (mut passwd, mut group, mut systemd) = (false, false, false);
     let mut seen = Vec::new();
     for raw in conf.lines() {
         let line = raw.split('#').next().unwrap_or_default().trim();
@@ -308,12 +370,231 @@ fn nss_is_files_or_systemd(conf: &str) -> Result<(), String> {
         }
         passwd |= db == "passwd";
         group |= db == "group";
+        systemd |= sources.len() == 2;
         seen.push(db);
     }
     if !(passwd && group) {
         return Err("nsswitch.conf must map both `passwd` and `group`".into());
     }
-    Ok(())
+    Ok(systemd)
+}
+
+const VARLINK_REPLY_LIMIT: usize = 256 * 1024;
+
+const NO_RECORD: &str = "io.systemd.UserDatabase.NoRecordFound";
+const NO_ENUMERATION: &str = "io.systemd.UserDatabase.EnumerationNotSupported";
+
+/// The only service allowed to refuse user enumeration (`EnumerationNotSupported`, observed
+/// on systemd 255). machined synthesizes a user and a same-id group for each container
+/// user mapped into the host's transient range, so a `NoRecordFound` for
+/// `GetGroupRecord(gid)` shows that no machined user has the key gid as primary group.
+const ENUMERATION_EXEMPT: &str = "io.systemd.Machine";
+
+/// `nss-systemd` asks every Varlink service socket in `/run/systemd/userdb` for records:
+/// homed, machined, DynamicUser and any third-party service (through `io.systemd.Multiplexer`
+/// when userdbd runs, otherwise socket by socket). This asks each socket directly, as
+/// `nss-systemd` does without the multiplexer, so it needs neither userdbd nor `userdbctl`.
+/// The multiplexer only aggregates the other sockets and `io.systemd.NameServiceSwitch`
+/// re-exports NSS (files, checked above), so both are skipped. Every other entry must answer
+/// `GetMemberships(groupName)` with `NoRecordFound`, and enumerate its users
+/// (`GetUserRecord` without a name) with no record whose `gid` is the key gid or whose
+/// `memberOf` names the group; an empty enumeration (`NoRecordFound`) is fine. Only
+/// `ENUMERATION_EXEMPT` may answer `EnumerationNotSupported`, and then only with
+/// `NoRecordFound` for `GetGroupRecord(gid)`. A membership, any other error, a non-socket
+/// entry, a connect or read error, a reply over 256 KiB, malformed JSON or the 2 s total
+/// deadline refuses. A missing directory means no services exist.
+fn userdb_services_report_no_membership(
+    dir: &Path,
+    group: &str,
+    gid: u32,
+    deadline: Duration,
+) -> Result<(), String> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("cannot read {}: {e}", dir.display())),
+    };
+    let mut services = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("cannot read {}: {e}", dir.display()))?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| format!("{}: non-UTF-8 service name", dir.display()))?;
+        if !matches!(
+            name.as_str(),
+            "io.systemd.Multiplexer" | "io.systemd.NameServiceSwitch"
+        ) {
+            services.push((name, entry.path()));
+        }
+    }
+    // ponytail: one thread bounds every blocking step (connect included) by the deadline;
+    // on timeout it is abandoned with its sockets, which have their own timeouts.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let group = group.to_owned();
+    let end = Instant::now() + deadline;
+    std::thread::Builder::new()
+        .name("herdr-userdb".into())
+        .spawn(move || {
+            let result = services
+                .iter()
+                .try_for_each(|(name, path)| query_service(name, path, &group, gid, end));
+            let _ = tx.send(result);
+        })
+        .map_err(|e| format!("cannot query userdb services: {e}"))?;
+    rx.recv_timeout(deadline)
+        .unwrap_or_else(|_| Err("userdb services did not answer within the deadline".into()))
+}
+
+fn query_service(
+    service: &str,
+    path: &Path,
+    group: &str,
+    gid: u32,
+    end: Instant,
+) -> Result<(), String> {
+    let fail = |what: String| format!("userdb service {service}: {what}");
+    let memberships = varlink_more(
+        service,
+        path,
+        "GetMemberships",
+        serde_json::json!({ "groupName": group }),
+        end,
+        |reply| {
+            let user = reply
+                .get("userName")
+                .map_or_else(|| "an account".to_owned(), ToString::to_string);
+            Err(format!("reports {user} as a member of group {group}"))
+        },
+    )
+    .map_err(fail)?;
+    if memberships.as_deref() != Some(NO_RECORD) {
+        return Err(fail(format!("GetMemberships: error {memberships:?}")));
+    }
+    let users = varlink_more(
+        service,
+        path,
+        "GetUserRecord",
+        serde_json::json!({}),
+        end,
+        |reply| match reply.get("record") {
+            Some(record) if user_record_names_group(record, group, gid) => Err(format!(
+                "user record {} has group {group} (gid {gid}) as primary group or membership",
+                record
+                    .get("userName")
+                    .map_or_else(|| "?".to_owned(), ToString::to_string)
+            )),
+            Some(serde_json::Value::Object(_)) => Ok(()),
+            _ => Err("malformed user record".into()),
+        },
+    )
+    .map_err(fail)?;
+    match users.as_deref() {
+        None | Some(NO_RECORD) => Ok(()),
+        Some(NO_ENUMERATION) if service == ENUMERATION_EXEMPT => {
+            let groups = varlink_more(
+                service,
+                path,
+                "GetGroupRecord",
+                serde_json::json!({ "gid": gid }),
+                end,
+                |_| Err(format!("has a group record with gid {gid}")),
+            )
+            .map_err(fail)?;
+            match groups.as_deref() {
+                Some(NO_RECORD) => Ok(()),
+                other => Err(fail(format!("GetGroupRecord: error {other:?}"))),
+            }
+        }
+        Some(other) => Err(fail(format!("user enumeration refused: {other}"))),
+    }
+}
+
+/// Calls `io.systemd.UserDatabase.<method>` with `more` and passes each reply's parameters
+/// to `each`. Returns `None` when the replies ended normally (the last one without
+/// `continues`), or the error name when the service answered with an error.
+fn varlink_more(
+    service: &str,
+    path: &Path,
+    method: &str,
+    mut parameters: serde_json::Value,
+    end: Instant,
+    mut each: impl FnMut(&serde_json::Value) -> Result<(), String>,
+) -> Result<Option<String>, String> {
+    let remaining = || {
+        end.checked_duration_since(Instant::now())
+            .filter(|d| !d.is_zero())
+            .ok_or_else(|| "timed out".to_owned())
+    };
+    let mut stream = UnixStream::connect(path).map_err(|e| format!("connect: {e}"))?;
+    parameters["service"] = service.into();
+    let request = serde_json::json!({
+        "method": format!("io.systemd.UserDatabase.{method}"),
+        "parameters": parameters,
+        "more": true,
+    });
+    let mut bytes = request.to_string().into_bytes();
+    bytes.push(0);
+    stream
+        .set_write_timeout(Some(remaining()?))
+        .and_then(|()| stream.write_all(&bytes))
+        .map_err(|e| format!("write: {e}"))?;
+    let (mut reply, mut total) = (Vec::new(), 0usize);
+    let mut chunk = [0u8; 8192];
+    loop {
+        while let Some(end_of_message) = reply.iter().position(|&b| b == 0) {
+            let message: Vec<u8> = reply.drain(..=end_of_message).collect();
+            let message: serde_json::Value = serde_json::from_slice(&message[..end_of_message])
+                .map_err(|_| format!("{method}: malformed reply"))?;
+            if let Some(error) = message.get("error") {
+                return Ok(Some(
+                    error.as_str().unwrap_or("<non-string error>").to_owned(),
+                ));
+            }
+            each(
+                message
+                    .get("parameters")
+                    .unwrap_or(&serde_json::Value::Null),
+            )
+            .map_err(|e| format!("{method}: {e}"))?;
+            if message.get("continues") != Some(&serde_json::Value::Bool(true)) {
+                return Ok(None);
+            }
+        }
+        stream
+            .set_read_timeout(Some(remaining()?))
+            .map_err(|e| format!("{method}: read: {e}"))?;
+        let n = match stream.read(&mut chunk) {
+            Ok(0) => return Err(format!("{method}: closed without a reply")),
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(format!("{method}: read: {e}")),
+        };
+        reply.extend_from_slice(&chunk[..n]);
+        total += n;
+        if total > VARLINK_REPLY_LIMIT {
+            return Err(format!("{method}: reply too large"));
+        }
+    }
+}
+
+/// A user record (drop-in or service) whose `gid` is the key gid or whose `memberOf` names
+/// the group, anywhere in the document (`perMachine` and other sections included). A
+/// non-array `memberOf` counts as naming it (fail closed).
+fn user_record_names_group(record: &serde_json::Value, name: &str, gid: u32) -> bool {
+    let is_key_group = key_group_matcher(name, gid);
+    json_values(record, "memberOf")
+        .any(|v| v.as_array().is_none_or(|a| a.iter().any(&is_key_group)))
+        || json_values(record, "gid").any(&is_key_group)
+}
+
+fn key_group_matcher(name: &str, gid: u32) -> impl Fn(&serde_json::Value) -> bool + '_ {
+    let gid_text = gid.to_string();
+    move |value| match value {
+        serde_json::Value::String(s) => s == name || *s == gid_text,
+        serde_json::Value::Number(n) => n.as_u64() == Some(u64::from(gid)),
+        _ => false,
+    }
 }
 
 /// The records of an `/etc/group` or `/etc/passwd` file, split into exactly `fields` fields.
@@ -376,11 +657,7 @@ fn userdb_grants_no_membership(dir: &Path, name: &str, gid: u32) -> Result<(), S
         Err(e) => return Err(format!("cannot read {}: {e}", dir.display())),
     };
     let gid_text = gid.to_string();
-    let is_key_group = |value: &serde_json::Value| match value {
-        serde_json::Value::String(s) => s == name || s == &gid_text,
-        serde_json::Value::Number(n) => n.as_u64() == Some(u64::from(gid)),
-        _ => false,
-    };
+    let is_key_group = key_group_matcher(name, gid);
     for entry in entries {
         let entry = entry.map_err(|e| format!("cannot read {}: {e}", dir.display()))?;
         let path = entry.path();
@@ -407,14 +684,10 @@ fn userdb_grants_no_membership(dir: &Path, name: &str, gid: u32) -> Result<(), S
         };
         let record = read_userdb_record(&path)?;
         let names_key_group = match kind {
-            "user" => {
-                json_values(&record, "memberOf")
-                    .any(|v| v.as_array().is_none_or(|a| a.iter().any(is_key_group)))
-                    || json_values(&record, "gid").any(is_key_group)
-            }
+            "user" => user_record_names_group(&record, name, gid),
             _ => {
-                let is_key = json_values(&record, "groupName").any(is_key_group)
-                    || json_values(&record, "gid").any(is_key_group);
+                let is_key = json_values(&record, "groupName").any(&is_key_group)
+                    || json_values(&record, "gid").any(&is_key_group);
                 is_key
                     && json_values(&record, "members")
                         .any(|v| v.as_array().is_none_or(|a| !a.is_empty()))
@@ -793,6 +1066,32 @@ mod tests {
         passwd: &str,
         userdb: &[(&str, &str)],
     ) -> Option<Option<u32>> {
+        load_case(nss, group, passwd, userdb, &[], Ok(Vec::new())).0
+    }
+
+    /// A fake Varlink userdb service socket.
+    enum Service {
+        /// Records each request and writes these bytes, whatever the method.
+        Answer(&'static str),
+        /// `NoRecordFound` for memberships; these replies for `GetUserRecord` and
+        /// `GetGroupRecord`.
+        Methods(&'static str, &'static str),
+        /// Never accepts: connect succeeds into the backlog, the reply never comes.
+        Hang,
+        /// A regular file where a socket should be.
+        NotSocket,
+    }
+
+    /// As `load_from_userdb`, plus fake services in the Varlink socket directory and an
+    /// injected supplementary group list. Returns the load result and the requests received.
+    fn load_case(
+        nss: &str,
+        group: &str,
+        passwd: &str,
+        userdb: &[(&str, &str)],
+        services: &[(&str, Service)],
+        groups: Result<Vec<u32>, String>,
+    ) -> (Option<Option<u32>>, Vec<String>) {
         let dir = std::env::temp_dir().join(format!(
             "herdr-accounts-{}-{:?}",
             std::process::id(),
@@ -818,16 +1117,320 @@ mod tests {
         let missing = dir.0.join("no-such-userdb");
         let userdb_dirs = [&dropins, &missing].map(|d| d.to_str().expect("utf-8").to_owned());
         let userdb_dirs = [userdb_dirs[0].as_str(), userdb_dirs[1].as_str()];
+        let sockets = dir.0.join("svc");
+        std::fs::create_dir_all(&sockets).expect("services dir");
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut idle = Vec::new();
+        for (name, service) in services {
+            let path = sockets.join(name);
+            match service {
+                Service::NotSocket => std::fs::write(&path, "").expect("write"),
+                Service::Hang => {
+                    idle.push(std::os::unix::net::UnixListener::bind(&path).expect("bind"))
+                }
+                Service::Answer(_) | Service::Methods(..) => {
+                    let (memberships, users, groups): (&'static str, &'static str, &'static str) =
+                        match service {
+                            Service::Answer(reply) => (reply, reply, reply),
+                            Service::Methods(users, groups) => (NO_RECORD_Z, users, groups),
+                            _ => unreachable!(),
+                        };
+                    let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
+                    let requests = requests.clone();
+                    // Serves until the test process exits (nextest runs one test per process).
+                    std::thread::spawn(move || {
+                        while let Ok((mut conn, _)) = listener.accept() {
+                            let mut request = Vec::new();
+                            let mut byte = [0u8; 1];
+                            while conn.read_exact(&mut byte).is_ok() && byte[0] != 0 {
+                                request.push(byte[0]);
+                            }
+                            let text = String::from_utf8(request).expect("utf-8 request");
+                            let reply = if text.contains("GetMemberships") {
+                                memberships
+                            } else if text.contains("GetUserRecord") {
+                                users
+                            } else {
+                                groups
+                            };
+                            requests.lock().expect("lock").push(text);
+                            let _ = conn.write_all(reply.as_bytes());
+                        }
+                    });
+                }
+            }
+        }
         let accounts = AccountFiles {
             nsswitch: &paths[0],
             group: &paths[1],
             passwd: &paths[2],
             userdb: &userdb_dirs,
+            userdb_services: sockets.to_str().expect("utf-8"),
+            userdb_deadline: Duration::from_millis(300),
         };
-        load_with(true, 990, &accounts, |path, gid| {
+        let loaded = load_with(true, 990, groups, &accounts, |path, gid| {
             assert_eq!(path, Path::new(KEY_PATH));
             Some(gid)
-        })
+        });
+        drop(idle);
+        let requests = requests.lock().expect("lock").clone();
+        (loaded, requests)
+    }
+
+    #[test]
+    fn server_key_userdb_service_membership_is_refused() {
+        // Review r2 P1-a: homed, DynamicUser or a third-party Varlink service can grant
+        // membership that no drop-in shows. Any reported membership refuses.
+        let member = concat!(
+            r#"{"parameters":{"userName":"mallory","groupName":"herdr"},"continues":true}"#,
+            "\0",
+            r#"{"parameters":{"userName":"eve","groupName":"herdr"}}"#,
+            "\0"
+        );
+        let services = [
+            ("io.systemd.Machine", Service::Answer(NO_RECORD_Z)),
+            ("com.example.Users", Service::Answer(member)),
+        ];
+        let (loaded, requests) = load_case(
+            SYSTEMD_NSS,
+            CLEAN_GROUP,
+            CLEAN_PASSWD,
+            &[],
+            &services,
+            Ok(Vec::new()),
+        );
+        assert_eq!(loaded, None);
+        let request = requests
+            .iter()
+            .find(|r| r.contains("com.example.Users"))
+            .expect("the member service was asked");
+        let request: serde_json::Value = serde_json::from_str(request).expect("json");
+        assert_eq!(
+            request,
+            serde_json::json!({
+                "method": "io.systemd.UserDatabase.GetMemberships",
+                "parameters": {"groupName": "herdr", "service": "com.example.Users"},
+                "more": true,
+            })
+        );
+    }
+
+    #[test]
+    fn server_key_userdb_service_failure_or_timeout_refuses() {
+        for service in [
+            Service::Hang,
+            Service::NotSocket,
+            Service::Answer(""),
+            Service::Answer("not json\0"),
+            Service::Answer(r#"{"error":"io.systemd.UserDatabase.NoRecordFound"}"#),
+            Service::Answer("{\"error\":\"org.varlink.service.MethodNotFound\"}\0"),
+            Service::Answer("{\"error\":\"io.systemd.UserDatabase.ServiceNotAvailable\"}\0"),
+        ] {
+            let services = [
+                ("io.systemd.DynamicUser", Service::Answer(NO_RECORD_Z)),
+                ("com.example.Bad", service),
+            ];
+            let started = Instant::now();
+            let (loaded, _) = load_case(
+                SYSTEMD_NSS,
+                CLEAN_GROUP,
+                CLEAN_PASSWD,
+                &[],
+                &services,
+                Ok(Vec::new()),
+            );
+            assert_eq!(loaded, None);
+            assert!(started.elapsed() < Duration::from_secs(2), "deadline holds");
+        }
+        // An oversized reply refuses without reading it all.
+        let big: &'static str = Box::leak("x".repeat(VARLINK_REPLY_LIMIT + 1).into_boxed_str());
+        let services = [("com.example.Big", Service::Answer(big))];
+        let (loaded, _) = load_case(
+            SYSTEMD_NSS,
+            CLEAN_GROUP,
+            CLEAN_PASSWD,
+            &[],
+            &services,
+            Ok(Vec::new()),
+        );
+        assert_eq!(loaded, None);
+    }
+
+    const NO_RECORD_Z: &str =
+        "{\"error\":\"io.systemd.UserDatabase.NoRecordFound\",\"parameters\":{}}\0";
+    const NO_ENUM_Z: &str =
+        "{\"error\":\"io.systemd.UserDatabase.EnumerationNotSupported\",\"parameters\":{}}\0";
+    /// DynamicUser-style enumeration of two unrelated users, as observed on ryzen2.
+    const OTHER_USERS: &str = concat!(
+        r#"{"parameters":{"record":{"userName":"svc-a","uid":65498,"gid":65498,"service":"x"}},"continues":true}"#,
+        "\0",
+        r#"{"parameters":{"record":{"userName":"svc-b","uid":65499,"gid":65499,"memberOf":["users"]}}}"#,
+        "\0"
+    );
+
+    fn systemd_case(services: &[(&str, Service)]) -> (Option<Option<u32>>, Vec<String>) {
+        load_case(
+            SYSTEMD_NSS,
+            CLEAN_GROUP,
+            CLEAN_PASSWD,
+            &[],
+            services,
+            Ok(Vec::new()),
+        )
+    }
+
+    #[test]
+    fn server_key_userdb_service_primary_holder_or_member_of_is_refused() {
+        // Security verdict 6053925456: a Varlink provider can report a user whose primary gid
+        // is herdr, or whose memberOf names it, without any GetMemberships answer.
+        for users in [
+            concat!(
+                r#"{"parameters":{"record":{"userName":"svc-a","uid":65498,"gid":65498}},"continues":true}"#,
+                "\0",
+                r#"{"parameters":{"record":{"userName":"mallory","uid":1001,"gid":990}}}"#,
+                "\0"
+            ),
+            "{\"parameters\":{\"record\":{\"userName\":\"mallory\",\"memberOf\":[\"herdr\"]}}}\0",
+            "{\"parameters\":{\"record\":{\"userName\":\"m\",\"perMachine\":[{\"gid\":990}]}}}\0",
+            "{\"parameters\":{\"record\":{\"userName\":\"mallory\",\"memberOf\":\"herdr\"}}}\0",
+            // A reply without a record object is malformed.
+            "{\"parameters\":{}}\0",
+            // A stream that says it continues but ends is cut short.
+            "{\"parameters\":{\"record\":{\"userName\":\"a\"}},\"continues\":true}\0",
+        ] {
+            let services = [("com.example.Users", Service::Methods(users, NO_RECORD_Z))];
+            assert_eq!(systemd_case(&services).0, None, "{users}");
+        }
+        // Counterpart: unrelated users enumerate and load.
+        let services = [(
+            "com.example.Users",
+            Service::Methods(OTHER_USERS, NO_RECORD_Z),
+        )];
+        let (loaded, requests) = systemd_case(&services);
+        assert_eq!(loaded, Some(Some(990)));
+        let request: serde_json::Value = serde_json::from_str(&requests[1]).expect("json");
+        assert_eq!(
+            request,
+            serde_json::json!({
+                "method": "io.systemd.UserDatabase.GetUserRecord",
+                "parameters": {"service": "com.example.Users"},
+                "more": true,
+            })
+        );
+    }
+
+    #[test]
+    fn server_key_userdb_enumeration_refusal_is_exempt_only_for_machined() {
+        let method_not_found = "{\"error\":\"org.varlink.service.MethodNotFound\"}\0";
+        let group_990 = "{\"parameters\":{\"record\":{\"groupName\":\"vg\",\"gid\":990}}}\0";
+        // Any other service refusing enumeration refuses, whatever the refusal.
+        for (name, users) in [
+            ("io.systemd.DynamicUser", NO_ENUM_Z),
+            ("io.systemd.Home", NO_ENUM_Z),
+            ("com.example.Users", NO_ENUM_Z),
+            ("com.example.Users", method_not_found),
+            ("io.systemd.Machine", method_not_found),
+        ] {
+            let services = [(name, Service::Methods(users, NO_RECORD_Z))];
+            assert_eq!(systemd_case(&services).0, None, "{name} {users}");
+        }
+        // machined refusing enumeration still needs NoRecordFound for the key gid's group.
+        for groups in [group_990, method_not_found, NO_ENUM_Z] {
+            let services = [("io.systemd.Machine", Service::Methods(NO_ENUM_Z, groups))];
+            assert_eq!(systemd_case(&services).0, None, "{groups}");
+        }
+        let services = [(
+            "io.systemd.Machine",
+            Service::Methods(NO_ENUM_Z, NO_RECORD_Z),
+        )];
+        let (loaded, requests) = systemd_case(&services);
+        assert_eq!(loaded, Some(Some(990)));
+        let request: serde_json::Value = serde_json::from_str(&requests[2]).expect("json");
+        assert_eq!(
+            request["parameters"],
+            serde_json::json!({"gid": 990, "service": "io.systemd.Machine"})
+        );
+    }
+
+    #[test]
+    fn server_key_userdb_services_without_memberships_load() {
+        // The services observed on ryzen2: DynamicUser enumerates unrelated users, machined
+        // refuses enumeration and knows no gid 990. The multiplexer and the NSS re-export are
+        // skipped (they would hang here if queried). An empty enumeration also loads.
+        let services = [
+            (
+                "io.systemd.DynamicUser",
+                Service::Methods(OTHER_USERS, NO_RECORD_Z),
+            ),
+            (
+                "io.systemd.Machine",
+                Service::Methods(NO_ENUM_Z, NO_RECORD_Z),
+            ),
+            ("com.example.Empty", Service::Answer(NO_RECORD_Z)),
+            ("io.systemd.Multiplexer", Service::Hang),
+            ("io.systemd.NameServiceSwitch", Service::Hang),
+        ];
+        let (loaded, requests) = load_case(
+            SYSTEMD_NSS,
+            CLEAN_GROUP,
+            CLEAN_PASSWD,
+            &[],
+            &services,
+            Ok(Vec::new()),
+        );
+        assert_eq!(loaded, Some(Some(990)));
+        assert_eq!(requests.len(), 7);
+        // No services at all, or no socket directory, also load.
+        assert_eq!(
+            load_from(SYSTEMD_NSS, CLEAN_GROUP, CLEAN_PASSWD),
+            Some(Some(990))
+        );
+        assert_eq!(
+            userdb_services_report_no_membership(
+                Path::new("/nonexistent/herdr-userdb"),
+                "herdr",
+                990,
+                Duration::from_millis(300)
+            ),
+            Ok(())
+        );
+        // Files-only NSS never asks the services: a hanging one does not matter.
+        let services = [("com.example.Hang", Service::Hang)];
+        let (loaded, _) = load_case(
+            CLEAN_NSS,
+            CLEAN_GROUP,
+            CLEAN_PASSWD,
+            &[],
+            &services,
+            Ok(Vec::new()),
+        );
+        assert_eq!(loaded, Some(Some(990)));
+    }
+
+    #[test]
+    fn server_key_supplementary_key_gid_refuses() {
+        // Review r2 P1-b: a supplementary herdr survives setresgid; it also proves a member.
+        for groups in [
+            Ok(vec![990]),
+            Ok(vec![4, 24, 990, 1000]),
+            Err("getgroups failed".into()),
+        ] {
+            let (loaded, _) = load_case(
+                CLEAN_NSS,
+                CLEAN_GROUP,
+                CLEAN_PASSWD,
+                &[],
+                &[],
+                groups.clone(),
+            );
+            assert_eq!(loaded, None, "{groups:?}");
+        }
+        for groups in [vec![], vec![4, 24, 100, 1000]] {
+            let (loaded, _) = load_case(CLEAN_NSS, CLEAN_GROUP, CLEAN_PASSWD, &[], &[], Ok(groups));
+            assert_eq!(loaded, Some(Some(990)));
+        }
+        // The real list for this test process is readable.
+        assert!(process_groups().is_ok());
     }
 
     #[test]
@@ -996,9 +1599,13 @@ mod tests {
         assert_eq!(load_from(nss, CLEAN_GROUP, CLEAN_PASSWD), Some(Some(990)));
         // Not setgid: never reads.
         assert_eq!(
-            load_with(false, 990, &SYSTEM_ACCOUNTS, |_, _| -> Option<()> {
-                panic!("must not read the key")
-            }),
+            load_with(
+                false,
+                990,
+                Ok(Vec::new()),
+                &SYSTEM_ACCOUNTS,
+                |_, _| -> Option<()> { panic!("must not read the key") }
+            ),
             None
         );
         // Unreadable files refuse.
@@ -1008,8 +1615,13 @@ mod tests {
             group: missing,
             passwd: missing,
             userdb: &[],
+            userdb_services: missing,
+            userdb_deadline: Duration::from_millis(300),
         };
-        assert_eq!(load_with(true, 990, &accounts, |_, _| Some(())), None);
+        assert_eq!(
+            load_with(true, 990, Ok(Vec::new()), &accounts, |_, _| Some(())),
+            None
+        );
     }
 
     #[test]
