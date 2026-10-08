@@ -1517,6 +1517,10 @@ pub(crate) fn begin_cli_output() {}
 #[cfg(not(unix))]
 pub(crate) fn end_cli_output() {}
 
+/// Linux drops an inherited set-group-id at startup (herdr#188); elsewhere there is no guard.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn drop_inherited_group_privilege() {}
+
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
