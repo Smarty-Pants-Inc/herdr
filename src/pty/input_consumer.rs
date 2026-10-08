@@ -41,7 +41,13 @@ pub(crate) enum CutResult {
     Mixed,
     Unknown { reason: String },
 }
+// The cross-platform API builds operations, but only the Unix pane actor reads them;
+// non-Linux servers refuse with `unsupported_platform` before queueing one.
 #[derive(Debug, Clone)]
+#[cfg_attr(
+    not(unix),
+    expect(dead_code, reason = "read only by the Unix pane actor")
+)]
 pub(crate) enum ConsumerOperation {
     Enroll {
         peer: crate::platform::ProcessIdentity,
@@ -53,6 +59,14 @@ pub(crate) enum ConsumerOperation {
     },
 }
 // No Debug: enrollment response contains a bearer capability.
+// Only the Unix ledger (and API tests) build the success variants; other targets only refuse.
+#[cfg_attr(
+    not(any(unix, test)),
+    expect(
+        dead_code,
+        reason = "success variants are built only by the Unix ledger"
+    )
+)]
 pub(crate) enum ConsumerResponse {
     Enrolled {
         epoch: String,

@@ -1,4 +1,6 @@
 //! Connection-local principal resolution; observations are acquired by the platform.
+//! Only the Linux platform resolves client principals; other targets report none.
+#![cfg(target_os = "linux")]
 
 use crate::pty::input_consumer::Principal;
 use std::collections::BTreeMap;
