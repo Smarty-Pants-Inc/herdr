@@ -68,7 +68,10 @@ pub(crate) struct SshdLogin {
 /// metadata itself; this server holds no journal access.
 pub(crate) trait Sources {
     fn proc(&mut self, pid: u32) -> Option<Process>;
-    fn sshd_login(&mut self, pid: u32) -> Option<SshdLogin>;
+    /// Ask the helper about the login behind this connection. The helper gets
+    /// the connection itself (fd 3), never a pid, and finds the priv process
+    /// from the kernel-attested peer.
+    fn sshd_login(&mut self) -> Option<SshdLogin>;
     fn whois(&mut self, ip: &str) -> Option<String>;
 }
 
@@ -250,7 +253,9 @@ pub(crate) fn resolve(
     }
     let user = priv_user?;
     let (priv_pid, _) = chain.last()?;
-    let login = sources.sshd_login(*priv_pid)?;
+    // The helper walked from the connection's peer on its own; it must name
+    // the same priv process as this server's walk.
+    let login = sources.sshd_login()?;
     if login.pid != *priv_pid || login.user != user {
         return None;
     }
@@ -383,7 +388,7 @@ mod tests {
         login: Option<SshdLogin>,
         whois_json: Option<String>,
         proc_calls: Vec<u32>,
-        login_calls: Vec<u32>,
+        login_calls: usize,
         whois_calls: Vec<String>,
     }
 
@@ -399,8 +404,8 @@ mod tests {
             }
             self.processes.get(&pid).cloned()
         }
-        fn sshd_login(&mut self, pid: u32) -> Option<SshdLogin> {
-            self.login_calls.push(pid);
+        fn sshd_login(&mut self) -> Option<SshdLogin> {
+            self.login_calls += 1;
             self.login.clone()
         }
         fn whois(&mut self, ip: &str) -> Option<String> {
@@ -453,7 +458,7 @@ mod tests {
             login: parse_sshd_login(HELPER_LINE.as_bytes()),
             whois_json: Some(WHOIS.into()),
             proc_calls: Vec::new(),
-            login_calls: Vec::new(),
+            login_calls: 0,
             whois_calls: Vec::new(),
         }
     }
@@ -625,10 +630,10 @@ mod tests {
     }
 
     #[test]
-    fn trusted_sources_resolve_and_ask_the_helper_about_the_priv_pid_only() {
+    fn trusted_sources_resolve_and_ask_the_helper_once() {
         let mut f = sources();
         assert_eq!(resolve(peer(), &trusted_map(), &mut f), Some(paul()));
-        assert_eq!(f.login_calls, vec![20]);
+        assert_eq!(f.login_calls, 1);
         assert_eq!(f.whois_calls, vec!["100.64.0.7"]);
         assert!(f.proc_calls.contains(&40));
     }
@@ -738,7 +743,7 @@ mod tests {
         f.processes.get_mut(&20).unwrap().executable = ExecutableIdentity::RootUnreadable;
         f.processes.get_mut(&20).unwrap().exe = String::new();
         assert_eq!(resolve(peer(), &trusted_map(), &mut f), Some(paul()));
-        assert_eq!(f.login_calls, vec![20]);
+        assert_eq!(f.login_calls, 1);
     }
 
     rejected_source!(
@@ -748,9 +753,15 @@ mod tests {
         }
     );
     rejected_source!(
-        helper_answer_for_another_pid_is_unmapped,
+        helper_answer_for_another_priv_pid_is_unmapped,
         |f: &mut FakeSources, _: &mut AcceptedPeer| {
-            f.login.as_mut().unwrap().pid = 19;
+            // Another live login of the same user: the helper walked from the
+            // connection's peer to a priv this server's walk did not find.
+            f.processes.insert(
+                21,
+                process(1, 0, "/usr/sbin/sshd", &["sshd"], "sshd: paul [priv]"),
+            );
+            f.login.as_mut().unwrap().pid = 21;
         }
     );
     rejected_source!(
@@ -898,7 +909,7 @@ mod tests {
         p.server_pid = 30;
         assert_eq!(resolve(p, &trusted_map(), &mut f), None);
         assert!(!f.proc_calls.contains(&20));
-        assert!(f.login_calls.is_empty());
+        assert_eq!(f.login_calls, 0);
         assert!(f.whois_calls.is_empty());
     }
 

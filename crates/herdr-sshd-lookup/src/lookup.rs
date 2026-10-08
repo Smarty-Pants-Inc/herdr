@@ -1,11 +1,10 @@
 //! Checks and journal parsing. Every fact comes from /proc and from journald's
 //! trusted fields, read by this process. No environment or configuration input.
 
-use std::ffi::OsString;
 use std::fs::File;
 use std::io::{ErrorKind, Read};
 use std::net::IpAddr;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::MetadataExt;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -20,6 +19,15 @@ const READ_LIMIT: usize = 16_384;
 const OUTPUT_LIMIT: usize = 262_144;
 /// Below the server's helper deadline, so the server never waits on a stuck journal.
 const JOURNAL_TIMEOUT: Duration = Duration::from_millis(1_200);
+/// The caller passes its accepted connection from the bridge here.
+const CONNECTION_FD: RawFd = 3;
+/// The server's chain walk allows at most three parents from the bridge to the priv.
+const MAX_PARENTS: usize = 3;
+/// Every journal field `accepted_record` reads. journald always adds the
+/// last three to JSON output (journalctl(1), systemd 236+); naming them keeps
+/// the query independent of that default.
+const JOURNAL_FIELDS: &str = "MESSAGE,_PID,_UID,_COMM,_EXE,_TRANSPORT,\
+_BOOT_ID,__REALTIME_TIMESTAMP,__MONOTONIC_TIMESTAMP";
 /// Only root (systemd) places a process in these cgroups.
 const LISTENER_CGROUPS: [&str; 2] = [
     "0::/system.slice/ssh.service",
@@ -42,8 +50,6 @@ struct Snapshot {
     comm: String,
     uids: [u32; 4],
     cmdline: Vec<u8>,
-    /// Audit login uid, set once by pam_loginuid; None when unset.
-    loginuid: Option<u32>,
     cgroup: String,
     exe: Exe,
 }
@@ -64,8 +70,6 @@ pub(crate) trait Host {
     fn exe(&mut self, pid: u32) -> Option<Exe>;
     /// The process that started this helper (`getppid`).
     fn caller(&mut self) -> u32;
-    /// This helper's real uid, inherited from the caller.
-    fn uid(&mut self) -> u32;
     fn clock(&mut self) -> Option<Clock>;
     /// Fixed `journalctl` arguments; None on failure, timeout or excess output.
     fn journal(&mut self, args: &[String]) -> Option<Vec<u8>>;
@@ -89,21 +93,55 @@ impl Login {
     }
 }
 
-/// Exactly one canonical decimal pid above 1.
-pub(crate) fn parse_pid(args: &[OsString]) -> Option<u32> {
-    let [arg] = args else {
-        return None;
+fn socket_option(fd: RawFd, option: libc::c_int) -> Option<libc::c_int> {
+    let mut value: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: getsockopt writes at most `len` bytes into the integer.
+    let status = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            option,
+            (&mut value as *mut libc::c_int).cast(),
+            &mut len,
+        )
     };
-    let arg = arg.to_str()?;
-    if arg.is_empty()
-        || arg.len() > 10
-        || arg.starts_with('0')
-        || !arg.bytes().all(|b| b.is_ascii_digit())
+    (status == 0 && len as usize == std::mem::size_of::<libc::c_int>()).then_some(value)
+}
+
+/// The kernel-attested pid at the other end of `fd`, only when `fd` is a
+/// connected AF_UNIX stream socket. `getpeername` refuses a listening socket,
+/// whose SO_PEERCRED would name its own creator, and an unconnected one.
+pub(crate) fn peer_pid(fd: RawFd) -> Option<u32> {
+    if socket_option(fd, libc::SO_DOMAIN)? != libc::AF_UNIX
+        || socket_option(fd, libc::SO_TYPE)? != libc::SOCK_STREAM
     {
         return None;
     }
-    let pid: u32 = arg.parse().ok()?;
-    (pid > 1 && pid <= i32::MAX as u32).then_some(pid)
+    let mut address = std::mem::MaybeUninit::<libc::sockaddr_un>::zeroed();
+    let mut len = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+    // SAFETY: getpeername writes at most `len` bytes into the zeroed address.
+    if unsafe { libc::getpeername(fd, address.as_mut_ptr().cast(), &mut len) } != 0 {
+        return None;
+    }
+    let mut credentials = std::mem::MaybeUninit::<libc::ucred>::zeroed();
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: getsockopt writes at most `len` bytes into the zeroed ucred.
+    let status = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            credentials.as_mut_ptr().cast(),
+            &mut len,
+        )
+    };
+    if status != 0 || len as usize != std::mem::size_of::<libc::ucred>() {
+        return None;
+    }
+    // SAFETY: SO_PEERCRED filled the zero-initialized structure.
+    let pid = unsafe { credentials.assume_init() }.pid;
+    u32::try_from(pid).ok().filter(|pid| *pid > 1)
 }
 
 fn snapshot(host: &mut impl Host, pid: u32) -> Option<Snapshot> {
@@ -125,17 +163,12 @@ fn snapshot(host: &mut impl Host, pid: u32) -> Option<Snapshot> {
         .map(str::parse)
         .collect::<Result<_, _>>()
         .ok()?;
-    let loginuid = host
-        .read(pid, "loginuid")
-        .and_then(|bytes| String::from_utf8(bytes).ok()?.trim().parse::<u32>().ok())
-        .filter(|uid| *uid != u32::MAX);
     Some(Snapshot {
         parent,
         start,
         comm,
         uids: uids.try_into().ok()?,
         cmdline: host.read(pid, "cmdline")?,
-        loginuid,
         cgroup: String::from_utf8(host.read(pid, "cgroup")?).ok()?,
         exe: host.exe(pid)?,
     })
@@ -165,7 +198,7 @@ fn journal_args(pid: u32, since: u64) -> Vec<String> {
         "--quiet".into(),
         "--boot".into(),
         "--output=json".into(),
-        "--output-fields=MESSAGE,_PID,_UID,_COMM,_EXE,_TRANSPORT".into(),
+        format!("--output-fields={JOURNAL_FIELDS}"),
         format!("--lines={ROW_LIMIT}"),
         format!("--since=@{since}"),
         format!("--until=@{}", since + LOGIN_WINDOW_SECONDS),
@@ -254,26 +287,51 @@ fn accepted_record(
     found
 }
 
-pub(crate) fn lookup(host: &mut impl Host, pid: u32) -> Option<Login> {
-    let uid = host.uid();
+fn is_priv(process: &Snapshot) -> bool {
+    priv_user(&process.cmdline).is_some()
+        && process.comm == "sshd"
+        && process.uids == [0; 4]
+        && process.exe != Exe::Other
+}
+
+/// `peer` is the kernel-attested pid at the other end of the caller's
+/// connection (`peer_pid`). The answer names the sshd login that the peer
+/// descends from, within the server's three-parent rule.
+pub(crate) fn lookup(host: &mut impl Host, peer: u32) -> Option<Login> {
     let caller_pid = host.caller();
-    if caller_pid <= 1 || caller_pid == pid {
+    if caller_pid <= 1 || peer <= 1 || peer == caller_pid {
         return None;
     }
     let caller = snapshot(host, caller_pid)?;
-    let login = snapshot(host, pid)?;
+    let mut chain = vec![(peer, snapshot(host, peer)?)];
+    // Like the server's walk: the caller is never traversed, no cycles, and
+    // no parent is younger than its child.
+    for _ in 0..MAX_PARENTS {
+        let (_, child) = chain.last()?;
+        let parent_pid = child.parent;
+        if parent_pid <= 1
+            || parent_pid == caller_pid
+            || chain.iter().any(|(pid, _)| *pid == parent_pid)
+        {
+            return None;
+        }
+        let parent = snapshot(host, parent_pid)?;
+        if parent.start > child.start {
+            return None;
+        }
+        let found = is_priv(&parent);
+        chain.push((parent_pid, parent));
+        if found {
+            break;
+        }
+    }
+    let (pid, login) = chain.last().cloned()?;
+    if !is_priv(&login) {
+        return None;
+    }
     let user = priv_user(&login.cmdline)?.to_owned();
     let listener_pid = login.parent;
-    // The caller must run as the user this login authenticated: another
-    // user's process cannot learn about it.
-    if caller.uids != [uid; 4]
-        || login.loginuid != Some(uid)
-        || login.comm != "sshd"
-        || login.uids != [0; 4]
-        || login.exe == Exe::Other
-        || listener_pid <= 1
-        || listener_pid == caller_pid
-    {
+    if listener_pid <= 1 || listener_pid == caller_pid {
         return None;
     }
     let listener = snapshot(host, listener_pid)?;
@@ -295,13 +353,18 @@ pub(crate) fn lookup(host: &mut impl Host, pid: u32) -> Option<Login> {
     let output = host.journal(&journal_args(pid, start_realtime / 1_000_000))?;
     let (fingerprint, source_ip) =
         accepted_record(&output, pid, &user, &clock, start_monotonic, start_realtime)?;
-    // Every fact was read by number. A changed process refuses the answer.
+    // Every fact was read by number. A changed process (a reused peer pid
+    // included: its start time differs) refuses the answer.
     if host.caller() != caller_pid
         || snapshot(host, caller_pid)? != caller
-        || snapshot(host, pid)? != login
         || snapshot(host, listener_pid)? != listener
     {
         return None;
+    }
+    for (pid, process) in &chain {
+        if snapshot(host, *pid)? != *process {
+            return None;
+        }
     }
     Some(Login {
         pid,
@@ -356,11 +419,6 @@ impl Host for System {
     fn caller(&mut self) -> u32 {
         // SAFETY: getppid cannot fail.
         unsafe { libc::getppid() as u32 }
-    }
-
-    fn uid(&mut self) -> u32 {
-        // SAFETY: getuid cannot fail.
-        unsafe { libc::getuid() }
     }
 
     fn clock(&mut self) -> Option<Clock> {
@@ -462,9 +520,15 @@ fn bounded_output(child: &mut std::process::Child) -> Option<Vec<u8>> {
 
 /// Entry point for the installed binary.
 pub(crate) fn run() -> Option<String> {
-    // Inherited descriptors must not reach journalctl.
+    // Inherited descriptors must not reach journalctl. Fd 3 is the caller's
+    // connection: read its peer, then close it too.
     // SAFETY: close_range has no pointer arguments.
-    if unsafe { libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 0u32) } != 0 {
+    if unsafe { libc::syscall(libc::SYS_close_range, 4u32, u32::MAX, 0u32) } != 0 {
+        return None;
+    }
+    let peer = peer_pid(CONNECTION_FD);
+    // SAFETY: fd 3 is not used again.
+    if unsafe { libc::close(CONNECTION_FD) } != 0 {
         return None;
     }
     // SAFETY: integer-only prctl.
@@ -480,12 +544,14 @@ pub(crate) fn run() -> Option<String> {
     if !set_gids(libc::gid_t::MAX, real, libc::gid_t::MAX) {
         return None;
     }
-    let args: Vec<OsString> = std::env::args_os().skip(1).collect();
     let mut host = System {
         caller_gid: real,
         journal_gid: effective,
     };
-    let login = parse_pid(&args).and_then(|pid| lookup(&mut host, pid));
+    // The contract takes no arguments: the peer is the only input.
+    let login = peer
+        .filter(|_| std::env::args_os().len() == 1)
+        .and_then(|peer| lookup(&mut host, peer));
     if !set_gids(real, real, real) {
         return None;
     }
@@ -496,11 +562,16 @@ pub(crate) fn run() -> Option<String> {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+    use std::os::fd::AsRawFd;
 
     const ACCEPTED: &str =
         "Accepted publickey for paul from 100.64.0.7 port 1234 ssh2: ED25519 SHA256:paulKey+/=";
     const BOOT: &str = "0123456789abcdef0123456789abcdef";
+    /// The Herdr server that runs the helper.
     const CALLER: u32 = 900;
+    /// `herdr remote-client-bridge`, at the other end of fd 3.
+    const BRIDGE: u32 = 40;
+    const NOTTY: u32 = 30;
     const PRIV: u32 = 20;
     const LISTENER: u32 = 10;
     /// 500 s after boot at 100 ticks per second.
@@ -508,13 +579,16 @@ mod tests {
     const BOOT_MICROS: u64 = 1_000_000_000;
     const START_MONO: u64 = 500_000_000;
     const START_REAL: u64 = BOOT_MICROS + START_MONO;
+    /// A real row from this kind of query on systemd 255 (ryzen2, user
+    /// journal: the priv's root rows need the journal group), with its
+    /// identity fields rewritten to the fixture's login.
+    const REAL_ROW: &str = r#"{"MESSAGE":"Disconnected from user paul 100.78.221.70 port 45732","__CURSOR":"s=ddf8c2b7f40c4315bf30bf6fd8ce41c0;i=83e198;b=8d13f1eae46342f58531ea73c9813542;m=aff907dcfb;t=65d4e8f4059eb;x=1e5edca72a63987d","__SEQNUM":"8642968","_PID":"3212144","__MONOTONIC_TIMESTAMP":"755797318907","__REALTIME_TIMESTAMP":"1791441852455403","_BOOT_ID":"8d13f1eae46342f58531ea73c9813542","_EXE":"/usr/sbin/sshd","_COMM":"sshd","__SEQNUM_ID":"ddf8c2b7f40c4315bf30bf6fd8ce41c0","_TRANSPORT":"syslog","_UID":"1000"}"#;
 
     #[derive(Clone)]
     struct Fixture {
         files: BTreeMap<(u32, &'static str), Vec<u8>>,
         exes: BTreeMap<u32, Exe>,
         caller: u32,
-        uid: u32,
         journal: Option<Vec<u8>>,
         journal_calls: Vec<Vec<String>>,
         /// Applied when the journal is read: models pid reuse mid-lookup.
@@ -533,9 +607,6 @@ mod tests {
         }
         fn caller(&mut self) -> u32 {
             self.caller
-        }
-        fn uid(&mut self) -> u32 {
-            self.uid
         }
         fn clock(&mut self) -> Option<Clock> {
             Some(Clock {
@@ -583,56 +654,63 @@ mod tests {
         )
     }
 
+    fn add(
+        files: &mut BTreeMap<(u32, &'static str), Vec<u8>>,
+        (pid, comm, parent, start, uid): (u32, &str, u32, u64, u32),
+        cmdline: &[u8],
+        cgroup: &str,
+    ) {
+        files.insert((pid, "stat"), stat(pid, comm, parent, start));
+        files.insert((pid, "status"), status(uid));
+        files.insert((pid, "cmdline"), cmdline.to_vec());
+        files.insert((pid, "cgroup"), cgroup.as_bytes().to_vec());
+    }
+
+    const SESSION: &str = "0::/user.slice/user-1000.slice/session-7.scope\n";
+
     fn fixture() -> Fixture {
         let mut files = BTreeMap::new();
-        let mut add =
-            |pid, comm: &str, parent, start, uid, cmdline: &[u8], login: &str, cg: &str| {
-                files.insert((pid, "stat"), stat(pid, comm, parent, start));
-                files.insert((pid, "status"), status(uid));
-                files.insert((pid, "cmdline"), cmdline.to_vec());
-                files.insert((pid, "loginuid"), login.as_bytes().to_vec());
-                files.insert((pid, "cgroup"), cg.as_bytes().to_vec());
-            };
         add(
-            CALLER,
-            "herdr",
-            700,
-            60_000,
-            1000,
+            &mut files,
+            (CALLER, "herdr", 700, 60_000, 1000),
             b"herdr\0server\0",
-            "1000",
             "0::/user.slice/user-1000.slice/session-4.scope\n",
         );
         add(
-            PRIV,
-            "sshd",
-            LISTENER,
-            PRIV_START,
-            0,
-            b"sshd: paul [priv]\0\0\0\0",
-            "1000",
-            "0::/user.slice/user-1000.slice/session-7.scope\n",
+            &mut files,
+            (BRIDGE, "herdr", NOTTY, PRIV_START + 20, 1000),
+            b"herdr\0remote-client-bridge\0",
+            SESSION,
         );
         add(
-            LISTENER,
-            "sshd",
-            1,
-            100,
-            0,
+            &mut files,
+            (NOTTY, "sshd", PRIV, PRIV_START + 10, 1000),
+            b"sshd: paul@notty\0",
+            SESSION,
+        );
+        add(
+            &mut files,
+            (PRIV, "sshd", LISTENER, PRIV_START, 0),
+            b"sshd: paul [priv]\0\0\0\0",
+            SESSION,
+        );
+        add(
+            &mut files,
+            (LISTENER, "sshd", 1, 100, 0),
             b"sshd: /usr/sbin/sshd -D [listener] 0 of 10-100 startups\0",
-            "4294967295",
             "0::/system.slice/ssh.service\n",
         );
         Fixture {
             files,
             exes: [
                 (CALLER, Exe::Other),
+                (BRIDGE, Exe::Other),
+                (NOTTY, Exe::Sshd),
                 (PRIV, Exe::Unreadable),
                 (LISTENER, Exe::Unreadable),
             ]
             .into(),
             caller: CALLER,
-            uid: 1000,
             journal: journal(&[
                 row("Connection from 100.64.0.7 port 1234 on 100.64.0.1 port 22"),
                 row(ACCEPTED),
@@ -655,9 +733,9 @@ mod tests {
     }
 
     #[test]
-    fn good_login_prints_one_line_from_one_bounded_query() {
+    fn good_chain_prints_one_line_from_one_bounded_query() {
         let mut f = fixture();
-        let login = lookup(&mut f, PRIV).expect("login");
+        let login = lookup(&mut f, BRIDGE).expect("login");
         assert_eq!(login, paul());
         assert_eq!(
             login.line(),
@@ -681,18 +759,106 @@ mod tests {
         }
     }
 
+    /// P1-a: the query must name every field the parser reads. A row that
+    /// holds only the requested fields (plus the cursor) still proves the login.
+    #[test]
+    fn journal_query_requests_every_field_the_record_parser_reads() {
+        let args = journal_args(PRIV, 1);
+        let requested: Vec<&str> = args
+            .iter()
+            .find_map(|a| a.strip_prefix("--output-fields="))
+            .expect("output fields")
+            .split(',')
+            .collect();
+        let read = [
+            "MESSAGE",
+            "_PID",
+            "_UID",
+            "_COMM",
+            "_EXE",
+            "_TRANSPORT",
+            "_BOOT_ID",
+            "__REALTIME_TIMESTAMP",
+            "__MONOTONIC_TIMESTAMP",
+        ];
+        for field in read {
+            assert!(requested.contains(&field), "{field} is not requested");
+        }
+        let clock = fixture().clock().unwrap();
+        let project = |message: &str| {
+            let full = row(message);
+            let mut kept = serde_json::Map::new();
+            for (key, value) in full.as_object().unwrap() {
+                if requested.contains(&key.as_str()) || key == "__CURSOR" {
+                    kept.insert(key.clone(), value.clone());
+                }
+            }
+            serde_json::Value::Object(kept)
+        };
+        let output = journal(&[project("Connection from x"), project(ACCEPTED)]).unwrap();
+        assert_eq!(
+            accepted_record(&output, PRIV, "paul", &clock, START_MONO, START_REAL),
+            Some(("SHA256:paulKey+/=".into(), "100.64.0.7".parse().unwrap()))
+        );
+        // Each read field is load-bearing: without it the row refuses.
+        for field in read {
+            let mut row = project(ACCEPTED);
+            row.as_object_mut().unwrap().remove(field);
+            let output = journal(&[row]).unwrap();
+            assert_eq!(
+                accepted_record(&output, PRIV, "paul", &clock, START_MONO, START_REAL),
+                None,
+                "{field}"
+            );
+        }
+    }
+
+    /// The real JSON shape (string timestamps, undashed boot id, extra
+    /// fields) parses; only the identity values are the fixture's.
+    #[test]
+    fn real_journal_row_shape_is_accepted() {
+        let mut real: serde_json::Value = serde_json::from_str(REAL_ROW).unwrap();
+        let boot = real["_BOOT_ID"].as_str().unwrap().to_owned();
+        let realtime: u64 = real["__REALTIME_TIMESTAMP"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let monotonic: u64 = real["__MONOTONIC_TIMESTAMP"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        real["_PID"] = "20".into();
+        real["_UID"] = "0".into();
+        real["MESSAGE"] = ACCEPTED.into();
+        let clock = Clock {
+            boot_id: boot,
+            boot_micros: realtime - monotonic,
+            ticks: 100,
+            now: realtime + 1,
+            monotonic_now: monotonic + 1,
+        };
+        let output = journal(&[real]).unwrap();
+        assert_eq!(
+            accepted_record(&output, PRIV, "paul", &clock, monotonic - 1, realtime - 1)
+                .map(|(fp, _)| fp),
+            Some("SHA256:paulKey+/=".into())
+        );
+    }
+
     #[test]
     fn readable_sshd_exe_is_accepted_like_the_journal_proof() {
         let mut f = fixture();
         f.exes.insert(PRIV, Exe::Sshd);
         f.exes.insert(LISTENER, Exe::Sshd);
-        assert_eq!(lookup(&mut f, PRIV), Some(paul()));
+        assert_eq!(lookup(&mut f, BRIDGE), Some(paul()));
     }
 
     fn refused(change: impl FnOnce(&mut Fixture)) {
         let mut f = fixture();
         change(&mut f);
-        assert_eq!(lookup(&mut f, PRIV), None);
+        assert_eq!(lookup(&mut f, BRIDGE), None);
     }
 
     #[test]
@@ -770,7 +936,7 @@ mod tests {
     }
 
     #[test]
-    fn pid_checks_refuse_dead_spoofed_or_foreign_logins() {
+    fn priv_checks_refuse_dead_spoofed_or_orphaned_logins() {
         // Not alive.
         refused(|f| f.files.retain(|(pid, _), _| *pid != PRIV));
         refused(|f| {
@@ -831,28 +997,151 @@ mod tests {
             f.files
                 .insert((PRIV, "stat"), stat(PRIV, "sshd", 1, PRIV_START));
         });
-        // Another user's login, an unset login uid, or a caller not running
-        // wholly as this helper's real uid.
-        refused(|f| {
-            f.files.insert((PRIV, "loginuid"), b"1001".to_vec());
-        });
-        refused(|f| {
-            f.files.insert((PRIV, "loginuid"), b"4294967295".to_vec());
-        });
-        refused(|f| f.uid = 1001);
-        refused(|f| {
-            f.files
-                .insert((CALLER, "status"), b"Uid:\t1000\t0\t1000\t1000\n".to_vec());
-        });
+        // The caller is not alive, is init, or is part of the login chain.
         refused(|f| f.caller = 1);
-        refused(|f| f.caller = PRIV);
         refused(|f| f.files.retain(|(pid, _), _| *pid != CALLER));
+        refused(|f| f.caller = LISTENER);
         // The journal is unavailable.
         refused(|f| f.journal = None);
     }
 
+    /// A peer that is not within three parents of a root sshd priv learns
+    /// nothing: the agent's own socket, a local process, or a title spoof.
+    #[test]
+    fn peer_that_does_not_descend_from_a_priv_refuses() {
+        // A local process: bridge -> shell -> herdr server -> systemd user.
+        refused(|f| {
+            add(
+                &mut f.files,
+                (BRIDGE, "herdr", 50, PRIV_START + 20, 1000),
+                b"herdr\0remote-client-bridge\0",
+                SESSION,
+            );
+            add(&mut f.files, (50, "bash", 51, 10, 1000), b"bash\0", SESSION);
+            add(
+                &mut f.files,
+                (51, "herdr", 52, 5, 1000),
+                b"herdr\0",
+                SESSION,
+            );
+            add(
+                &mut f.files,
+                (52, "systemd", 1, 1, 1000),
+                b"systemd\0",
+                SESSION,
+            );
+            f.exes
+                .extend([(50, Exe::Other), (51, Exe::Other), (52, Exe::Other)]);
+        });
+        // The walk reaches init before a priv.
+        refused(|f| {
+            add(
+                &mut f.files,
+                (NOTTY, "sshd", 1, PRIV_START + 10, 1000),
+                b"sshd: paul@notty\0",
+                SESSION,
+            );
+        });
+        // A fourth parent is out of reach (the server's rule).
+        refused(|f| {
+            add(
+                &mut f.files,
+                (BRIDGE, "herdr", 41, PRIV_START + 20, 1000),
+                b"herdr\0remote-client-bridge\0",
+                SESSION,
+            );
+            add(
+                &mut f.files,
+                (41, "sh", 42, PRIV_START + 15, 1000),
+                b"sh\0",
+                SESSION,
+            );
+            add(
+                &mut f.files,
+                (42, "sh", NOTTY, PRIV_START + 12, 1000),
+                b"sh\0",
+                SESSION,
+            );
+            f.exes.extend([(41, Exe::Other), (42, Exe::Other)]);
+        });
+        // The walk ends on its third parent: a non-root process titled like
+        // the priv there is not one.
+        refused(|f| {
+            add(
+                &mut f.files,
+                (BRIDGE, "herdr", 41, PRIV_START + 20, 1000),
+                b"herdr\0remote-client-bridge\0",
+                SESSION,
+            );
+            add(
+                &mut f.files,
+                (41, "sh", NOTTY, PRIV_START + 15, 1000),
+                b"sh\0",
+                SESSION,
+            );
+            f.exes.insert(41, Exe::Other);
+            f.files.insert((PRIV, "status"), status(1000));
+        });
+        // A user process titled like a priv is not one; nor is the peer itself.
+        refused(|f| {
+            add(
+                &mut f.files,
+                (NOTTY, "sshd", 1, PRIV_START + 10, 1000),
+                b"sshd: paul [priv]\0",
+                SESSION,
+            );
+        });
+        let mut f = fixture();
+        assert_eq!(lookup(&mut f, PRIV), None);
+        // The caller is the peer (its own socketpair) or sits in the chain.
+        refused(|f| f.caller = BRIDGE);
+        refused(|f| f.caller = NOTTY);
+        // A parent younger than its child, and a cycle.
+        refused(|f| {
+            f.files
+                .insert((NOTTY, "stat"), stat(NOTTY, "sshd", PRIV, PRIV_START + 30));
+        });
+        refused(|f| {
+            f.files.insert(
+                (NOTTY, "stat"),
+                stat(NOTTY, "sshd", BRIDGE, PRIV_START + 10),
+            );
+        });
+        // The peer is gone.
+        refused(|f| f.files.retain(|(pid, _), _| *pid != BRIDGE));
+    }
+
+    #[test]
+    fn third_parent_allowed() {
+        let mut f = fixture();
+        add(
+            &mut f.files,
+            (BRIDGE, "herdr", 41, PRIV_START + 20, 1000),
+            b"herdr\0remote-client-bridge\0",
+            SESSION,
+        );
+        add(
+            &mut f.files,
+            (41, "sh", NOTTY, PRIV_START + 15, 1000),
+            b"sh\0",
+            SESSION,
+        );
+        f.exes.insert(41, Exe::Other);
+        assert_eq!(lookup(&mut f, BRIDGE), Some(paul()));
+    }
+
     #[test]
     fn process_change_during_lookup_refuses_the_answer() {
+        // Peer pid reuse: the bridge pid now names a new process.
+        refused(|f| {
+            f.after_journal = vec![(
+                (BRIDGE, "stat"),
+                stat(BRIDGE, "herdr", NOTTY, PRIV_START + 21),
+            )]
+        });
+        refused(|f| {
+            f.after_journal = vec![((NOTTY, "stat"), stat(NOTTY, "sshd", PRIV, PRIV_START + 11))]
+        });
         refused(|f| {
             f.after_journal = vec![((PRIV, "stat"), stat(PRIV, "sshd", LISTENER, PRIV_START + 1))]
         });
@@ -865,37 +1154,61 @@ mod tests {
                 (PRIV, "stat"),
                 stat(PRIV, "sshd", LISTENER, PRIV_START + 100),
             );
+            f.files
+                .insert((NOTTY, "stat"), stat(NOTTY, "sshd", PRIV, PRIV_START + 110));
+            f.files.insert(
+                (BRIDGE, "stat"),
+                stat(BRIDGE, "herdr", NOTTY, PRIV_START + 120),
+            );
         });
     }
 
     #[test]
-    fn exactly_one_canonical_decimal_pid() {
-        let parse = |args: &[&str]| parse_pid(&args.iter().map(OsString::from).collect::<Vec<_>>());
-        assert_eq!(parse(&["20"]), Some(20));
-        assert_eq!(parse(&["2147483647"]), Some(i32::MAX as u32));
-        for bad in [
-            &[][..],
-            &["20", "21"],
-            &[""],
-            &["0"],
-            &["1"],
-            &["020"],
-            &["+20"],
-            &["-20"],
-            &["20 "],
-            &[" 20"],
-            &["2147483648"],
-            &["99999999999"],
-            &["0x14"],
-        ] {
-            assert_eq!(parse(bad), None, "{bad:?}");
+    fn only_a_connected_unix_stream_socket_names_a_peer() {
+        use std::os::unix::net::{UnixDatagram, UnixListener, UnixStream};
+        // Connected stream pair: the kernel names this process.
+        let (a, _b) = UnixStream::pair().unwrap();
+        assert_eq!(peer_pid(a.as_raw_fd()), Some(std::process::id()));
+        // A connected stream accepted from a listener, like the server's.
+        let dir = std::env::temp_dir().join(format!("herdr-peer-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s");
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let _client = UnixStream::connect(&path).unwrap();
+        let (accepted, _) = listener.accept().unwrap();
+        assert_eq!(peer_pid(accepted.as_raw_fd()), Some(std::process::id()));
+        // A listening socket reports its own creator: refused.
+        assert_eq!(peer_pid(listener.as_raw_fd()), None);
+        // Not a socket, a closed fd, a datagram pair, an unconnected socket.
+        let file = File::open("/proc/self/stat").unwrap();
+        assert_eq!(peer_pid(file.as_raw_fd()), None);
+        let mut pipe = [0; 2];
+        // SAFETY: valid two-element output array.
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+        assert_eq!(peer_pid(pipe[0]), None);
+        // SAFETY: closing the two descriptors created above.
+        unsafe {
+            libc::close(pipe[0]);
+            libc::close(pipe[1]);
         }
-        use std::os::unix::ffi::OsStringExt;
-        assert_eq!(parse_pid(&[OsString::from_vec(vec![b'2', 0xff])]), None);
+        assert_eq!(peer_pid(-1), None);
+        let (d, _e) = UnixDatagram::pair().unwrap();
+        assert_eq!(peer_pid(d.as_raw_fd()), None);
+        // SAFETY: socket has no pointer arguments.
+        let unconnected = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+        assert!(unconnected >= 0);
+        assert_eq!(peer_pid(unconnected), None);
+        // SAFETY: closing the descriptor created above.
+        unsafe { libc::close(unconnected) };
+        let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let tcp_client = std::net::TcpStream::connect(tcp.local_addr().unwrap()).unwrap();
+        assert_eq!(peer_pid(tcp_client.as_raw_fd()), None);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
-    fn real_host_refuses_a_process_that_is_not_an_sshd_login() {
+    fn real_host_refuses_a_peer_that_is_not_an_sshd_login() {
         let mut host = System {
             caller_gid: 0,
             journal_gid: 0,

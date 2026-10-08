@@ -184,14 +184,21 @@ pub(crate) fn input_consumer_random(bytes: &mut [u8]) -> std::io::Result<()> {
         ))
     }
 }
+/// `connection` is the accepted stream from `peer`. On Linux the sshd lookup
+/// helper receives it to read the peer from the kernel.
 pub(crate) fn resolve_client_principal(
     peer: Option<ProcessIdentity>,
+    connection: &crate::ipc::LocalStream,
 ) -> Option<crate::pty::input_consumer::Principal> {
     #[cfg(target_os = "linux")]
-    return linux::client_identity::resolve_client_principal(peer);
+    {
+        use std::os::fd::AsFd as _;
+        let crate::ipc::LocalStream::UdSocket(stream) = connection;
+        linux::client_identity::resolve_client_principal(peer, stream.as_fd())
+    }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = peer;
+        let _ = (peer, connection);
         None
     }
 }

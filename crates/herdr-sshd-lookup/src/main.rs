@@ -1,4 +1,5 @@
-//! `herdr-sshd-lookup <pid>`: print the accepted public key of one sshd login.
+//! `herdr-sshd-lookup 3<&CONNECTION`: print the accepted public key of the sshd
+//! login that the connection's peer descends from.
 //!
 //! Installed `root:systemd-journal` mode 2755 (docs/next/sshd-lookup.md). It
 //! prints one JSON line only after every check passes; otherwise it prints

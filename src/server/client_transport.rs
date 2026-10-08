@@ -694,7 +694,7 @@ pub(crate) fn handle_client_handshake(
 
     // This identity was pinned at accept, not repinned from a delayed hello.
     // Resolve before reading any client-controlled field or forwarding input.
-    let principal = crate::platform::resolve_client_principal(peer);
+    let principal = crate::platform::resolve_client_principal(peer, &stream);
 
     // Reset to blocking mode — the accept loop sets nonblocking but
     // the handshake thread needs blocking I/O for read_message/write_message.
