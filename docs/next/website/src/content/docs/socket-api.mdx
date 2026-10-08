@@ -269,17 +269,18 @@ group, so no pane child runs with it and same-user processes cannot read the
 key from the file or from server memory. The `herdr` group must have no
 members and be nobody's primary group, or the server does not load the key:
 `nsswitch.conf` must map `passwd` and `group` (and `initgroups`, if listed) to
-`files` or `files systemd`, `/etc/group` and `/etc/passwd` must give the group
-no member or primary holder, and no systemd userdb drop-in (`*.membership`,
-`*.user` `memberOf`, `*.group` `members` in `/etc/userdb`, `/run/userdb`,
-`/run/host/userdb`, or `/usr/lib/userdb`) may name it. When NSS lists
-`systemd`, every Varlink userdb service in `/run/systemd/userdb` (homed,
-machined, `DynamicUser=`, third-party services; the multiplexer and the NSS
-re-export are skipped) must answer `GetMemberships` for the group with
-`NoRecordFound`, and its user enumeration (`GetUserRecord` without a name) must
-hold no user whose primary gid is the group or whose `memberOf` names it. Only
-`io.systemd.Machine` may refuse enumeration, and then it must answer
-`GetGroupRecord` for the gid with `NoRecordFound`. All queries share a
+`files` or `files systemd`, `/etc/group` must hold exactly one entry with the
+group's gid (no second name) and no other entry with its name, `/etc/group` and
+`/etc/passwd` must give the group no member or primary holder, and no systemd
+userdb drop-in (`*.membership`, `*.user` `memberOf`, `*.group` `members` in
+`/etc/userdb`, `/run/userdb`, `/run/host/userdb`, or `/usr/lib/userdb`) may
+name it or define its gid under another name. When NSS lists `systemd`, every
+Varlink userdb service in `/run/systemd/userdb` (homed, machined,
+`DynamicUser=`, third-party services; the multiplexer and the NSS re-export are
+skipped) must answer `GetMemberships` for the group and `GetGroupRecord` for its
+gid with `NoRecordFound`, and its user enumeration (`GetUserRecord` without a
+name) must hold no user whose primary gid is the group or whose `memberOf`
+names it. Only `io.systemd.Machine` may refuse enumeration. All queries share a
 2-second deadline; a membership, an error, a timeout, or a bad reply refuses. The server also refuses when it runs with `herdr` as a
 supplementary group, which a setgid drop cannot shed and which proves a member
 exists. An unreadable or unparseable record also refuses. The key is provisioned only by a reviewed root

@@ -23,16 +23,18 @@
 //!    inherited supplementary `herdr` survives `setresgid` and proves a member exists;
 //! 3. `nsswitch.conf` maps `passwd`, `group` (and `initgroups`, if listed) to exactly
 //!    `files` or `files systemd`;
-//! 4. `/etc/group` gives the key gid a name and no members; `/etc/passwd` gives nobody it as
-//!    primary group;
+//! 4. `/etc/group` has exactly one record with the key gid (no alias name), no other record
+//!    with its name, and no members; `/etc/passwd` gives nobody it as primary group. With
+//!    one name, every name-based check below covers every name of the gid;
 //! 5. no userdb drop-in (`/etc/userdb`, `/run/userdb`, `/run/host/userdb`, `/usr/lib/userdb`)
-//!    names the group as a membership or primary group;
+//!    names the group as a membership or primary group, or defines the gid under another
+//!    name;
 //! 6. when NSS lists `systemd`, every Varlink userdb service in `/run/systemd/userdb` (homed,
-//!    machined, DynamicUser, third-party) answers `GetMemberships(groupName)` with
-//!    `NoRecordFound`, and enumerates its users (`GetUserRecord`, no name) with no record
-//!    whose `gid` is the key gid or whose `memberOf` names the group (an empty enumeration is
-//!    fine). Only `io.systemd.Machine` may refuse enumeration (`EnumerationNotSupported`), and
-//!    then `GetGroupRecord(gid)` must answer `NoRecordFound`. All within 2 s total; any
+//!    machined, DynamicUser, third-party) answers `GetMemberships(groupName)` and
+//!    `GetGroupRecord(gid)` with `NoRecordFound` (no alias or second member list), and
+//!    enumerates its users (`GetUserRecord`, no name) with no record whose `gid` is the key
+//!    gid or whose `memberOf` names the group (an empty enumeration is fine). Only
+//!    `io.systemd.Machine` may refuse enumeration (`EnumerationNotSupported`). All within 2 s total; any
 //!    membership, other error, timeout or bad reply refuses. `io.systemd.Multiplexer` (an
 //!    aggregate of the others) and `io.systemd.NameServiceSwitch` (a re-export of NSS) are
 //!    skipped;
@@ -386,8 +388,9 @@ const NO_ENUMERATION: &str = "io.systemd.UserDatabase.EnumerationNotSupported";
 
 /// The only service allowed to refuse user enumeration (`EnumerationNotSupported`, observed
 /// on systemd 255). machined synthesizes a user and a same-id group for each container
-/// user mapped into the host's transient range, so a `NoRecordFound` for
-/// `GetGroupRecord(gid)` shows that no machined user has the key gid as primary group.
+/// user mapped into the host's transient range, so the `NoRecordFound` for
+/// `GetGroupRecord(gid)` that every service must give shows that no machined user has the
+/// key gid as primary group.
 const ENUMERATION_EXEMPT: &str = "io.systemd.Machine";
 
 /// `nss-systemd` asks every Varlink service socket in `/run/systemd/userdb` for records:
@@ -396,11 +399,10 @@ const ENUMERATION_EXEMPT: &str = "io.systemd.Machine";
 /// `nss-systemd` does without the multiplexer, so it needs neither userdbd nor `userdbctl`.
 /// The multiplexer only aggregates the other sockets and `io.systemd.NameServiceSwitch`
 /// re-exports NSS (files, checked above), so both are skipped. Every other entry must answer
-/// `GetMemberships(groupName)` with `NoRecordFound`, and enumerate its users
-/// (`GetUserRecord` without a name) with no record whose `gid` is the key gid or whose
-/// `memberOf` names the group; an empty enumeration (`NoRecordFound`) is fine. Only
-/// `ENUMERATION_EXEMPT` may answer `EnumerationNotSupported`, and then only with
-/// `NoRecordFound` for `GetGroupRecord(gid)`. A membership, any other error, a non-socket
+/// `GetMemberships(groupName)` and `GetGroupRecord(gid)` with `NoRecordFound`, and enumerate
+/// its users (`GetUserRecord` without a name) with no record whose `gid` is the key gid or
+/// whose `memberOf` names the group; an empty enumeration (`NoRecordFound`) is fine. Only
+/// `ENUMERATION_EXEMPT` may answer `EnumerationNotSupported`. A membership, a group record, any other error, a non-socket
 /// entry, a connect or read error, a reply over 256 KiB, malformed JSON or the 2 s total
 /// deadline refuses. A missing directory means no services exist.
 fn userdb_services_report_no_membership(
@@ -471,6 +473,25 @@ fn query_service(
     if memberships.as_deref() != Some(NO_RECORD) {
         return Err(fail(format!("GetMemberships: error {memberships:?}")));
     }
+    // Any service group record with the key gid is a second name (or a second member list)
+    // for it, which the name-based checks would miss: refuse it.
+    let groups = varlink_more(
+        service,
+        path,
+        "GetGroupRecord",
+        serde_json::json!({ "gid": gid }),
+        end,
+        |reply| {
+            let name = reply
+                .pointer("/record/groupName")
+                .map_or_else(|| "?".to_owned(), ToString::to_string);
+            Err(format!("has a group record {name} with gid {gid}"))
+        },
+    )
+    .map_err(fail)?;
+    if groups.as_deref() != Some(NO_RECORD) {
+        return Err(fail(format!("GetGroupRecord: error {groups:?}")));
+    }
     let users = varlink_more(
         service,
         path,
@@ -491,21 +512,8 @@ fn query_service(
     .map_err(fail)?;
     match users.as_deref() {
         None | Some(NO_RECORD) => Ok(()),
-        Some(NO_ENUMERATION) if service == ENUMERATION_EXEMPT => {
-            let groups = varlink_more(
-                service,
-                path,
-                "GetGroupRecord",
-                serde_json::json!({ "gid": gid }),
-                end,
-                |_| Err(format!("has a group record with gid {gid}")),
-            )
-            .map_err(fail)?;
-            match groups.as_deref() {
-                Some(NO_RECORD) => Ok(()),
-                other => Err(fail(format!("GetGroupRecord: error {other:?}"))),
-            }
-        }
+        // The gid query above already answered NoRecordFound.
+        Some(NO_ENUMERATION) if service == ENUMERATION_EXEMPT => Ok(()),
         Some(other) => Err(fail(format!("user enumeration refused: {other}"))),
     }
 }
@@ -624,15 +632,25 @@ fn field_id(value: &str, name: &str) -> Result<u32, String> {
         .map_err(|_| format!("{name}: bad id `{value}`"))
 }
 
-/// Returns the key group's name. Every `/etc/group` record with this gid must be memberless.
+/// Returns the key group's name. Exactly one `/etc/group` record has this gid, no other record
+/// has its name, and it is memberless. A second name (alias) for the gid would let a
+/// membership by that name grant the gid past the name-based checks.
 fn group_has_no_members(text: &str, gid: u32) -> Result<String, String> {
-    let mut found = None;
+    let mut found: Option<String> = None;
+    let mut names = Vec::new();
     for record in records(text, "/etc/group", 4) {
         let fields = record?;
+        names.push(fields[0]);
         if field_id(fields[2], "/etc/group")? != gid {
             continue;
         }
-        found.get_or_insert_with(|| fields[0].to_owned());
+        if let Some(first) = &found {
+            return Err(format!(
+                "gid {gid} has more than one name in /etc/group (`{first}`, `{}`); it must have one",
+                fields[0]
+            ));
+        }
+        found = Some(fields[0].to_owned());
         if !fields[3].trim().is_empty() {
             return Err(format!(
                 "group {} (gid {gid}) has members `{}`; it must have none",
@@ -640,7 +658,13 @@ fn group_has_no_members(text: &str, gid: u32) -> Result<String, String> {
             ));
         }
     }
-    found.ok_or_else(|| format!("gid {gid} is not a local group in /etc/group"))
+    let name = found.ok_or_else(|| format!("gid {gid} is not a local group in /etc/group"))?;
+    if names.iter().filter(|n| **n == name).count() > 1 {
+        return Err(format!(
+            "group name {name} appears more than once in /etc/group"
+        ));
+    }
+    Ok(name)
 }
 
 const USERDB_RECORD_LIMIT: u64 = 1 << 20;
@@ -686,11 +710,15 @@ fn userdb_grants_no_membership(dir: &Path, name: &str, gid: u32) -> Result<(), S
         let names_key_group = match kind {
             "user" => user_record_names_group(&record, name, gid),
             _ => {
-                let is_key = json_values(&record, "groupName").any(&is_key_group)
-                    || json_values(&record, "gid").any(&is_key_group);
-                is_key
-                    && json_values(&record, "members")
-                        .any(|v| v.as_array().is_none_or(|a| !a.is_empty()))
+                let has_key_gid = json_values(&record, "gid").any(&is_key_group);
+                // A record with the key gid under another name is an alias for it.
+                let alias = has_key_gid
+                    && json_values(&record, "groupName").any(|v| v.as_str() != Some(name));
+                let is_key = has_key_gid || json_values(&record, "groupName").any(&is_key_group);
+                alias
+                    || is_key
+                        && json_values(&record, "members")
+                            .any(|v| v.as_array().is_none_or(|a| !a.is_empty()))
             }
         };
         if names_key_group {
@@ -1308,7 +1336,7 @@ mod tests {
         )];
         let (loaded, requests) = systemd_case(&services);
         assert_eq!(loaded, Some(Some(990)));
-        let request: serde_json::Value = serde_json::from_str(&requests[1]).expect("json");
+        let request: serde_json::Value = serde_json::from_str(&requests[2]).expect("json");
         assert_eq!(
             request,
             serde_json::json!({
@@ -1345,11 +1373,67 @@ mod tests {
         )];
         let (loaded, requests) = systemd_case(&services);
         assert_eq!(loaded, Some(Some(990)));
-        let request: serde_json::Value = serde_json::from_str(&requests[2]).expect("json");
+        let request: serde_json::Value = serde_json::from_str(&requests[1]).expect("json");
         assert_eq!(
             request["parameters"],
             serde_json::json!({"gid": 990, "service": "io.systemd.Machine"})
         );
+    }
+
+    #[test]
+    fn server_key_key_gid_alias_names_are_refused() {
+        // Security round 3: a second name for the key gid would let a membership by that name
+        // grant the gid past every name-based check. Every alias source refuses.
+        for group in [
+            "herdr:x:990:\nhgrp:x:990:\n",
+            "hgrp:x:990:\nherdr:x:990:\n",
+            "herdr:x:990:\nherdr:x:991:\n",
+        ] {
+            assert_eq!(load_from(CLEAN_NSS, group, CLEAN_PASSWD), None, "{group:?}");
+        }
+        // A userdb drop-in group record with the key gid under another name, alone or with a
+        // membership or memberOf by that alias name.
+        let alias = r#"{"groupName":"hgrp","gid":990}"#;
+        for files in [
+            &[("hgrp.group", alias)][..],
+            &[("hgrp.group", alias), ("mallory:hgrp.membership", "")],
+            &[
+                ("hgrp.group", alias),
+                (
+                    "mallory.user",
+                    r#"{"userName":"mallory","memberOf":["hgrp"]}"#,
+                ),
+            ],
+            &[(
+                "hgrp.group",
+                r#"{"groupName":"hgrp","perMachine":[{"gid":990}]}"#,
+            )],
+        ] {
+            for nss in [CLEAN_NSS, SYSTEMD_NSS] {
+                let refused = load_from_userdb(nss, CLEAN_GROUP, CLEAN_PASSWD, files);
+                assert_eq!(refused, None, "{files:?}");
+            }
+        }
+        // A Varlink service group record for the key gid under another name (or any name).
+        for record in [
+            "{\"parameters\":{\"record\":{\"groupName\":\"hgrp\",\"gid\":990}}}\0",
+            "{\"parameters\":{\"record\":{\"groupName\":\"herdr\",\"gid\":990,\"members\":[\"m\"]}}}\0",
+        ] {
+            for name in ["com.example.Users", "io.systemd.DynamicUser"] {
+                let services = [(name, Service::Methods(OTHER_USERS, record))];
+                assert_eq!(systemd_case(&services).0, None, "{name} {record}");
+            }
+        }
+        // Counterparts: one name, other groups' records and a memberless same-name drop-in load.
+        let files = [
+            (
+                "herdr.group",
+                r#"{"groupName":"herdr","gid":990,"members":[]}"#,
+            ),
+            ("users.group", r#"{"groupName":"users","gid":100}"#),
+        ];
+        let loaded = load_from_userdb(SYSTEMD_NSS, CLEAN_GROUP, CLEAN_PASSWD, &files);
+        assert_eq!(loaded, Some(Some(990)));
     }
 
     #[test]
@@ -1379,7 +1463,7 @@ mod tests {
             Ok(Vec::new()),
         );
         assert_eq!(loaded, Some(Some(990)));
-        assert_eq!(requests.len(), 7);
+        assert_eq!(requests.len(), 9);
         // No services at all, or no socket directory, also load.
         assert_eq!(
             load_from(SYSTEMD_NSS, CLEAN_GROUP, CLEAN_PASSWD),
