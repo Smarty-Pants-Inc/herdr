@@ -2116,12 +2116,13 @@ fn homebrew_cellar_keg_root(path: &Path) -> Option<PathBuf> {
 /// Exact refusal for a smarty-install install (herdr-lead ruling, smarty-dev#2636).
 pub(crate) const SMARTY_INSTALL_REFUSAL: &str = "this herdr is installed by smarty-install (setgid herdr for the server key); update it with smarty-install herdr <sha>";
 
-/// A setgid or root-owned binary belongs to smarty-install: replacing it here would drop
-/// the `root:herdr 2755` mode that smarty-install sets (smarty-dev#2636).
+/// A setgid binary (any group) belongs to smarty-install: replacing it here would drop
+/// the `root:herdr 2755` mode that smarty-install sets (smarty-dev#2636). A plain
+/// root-owned binary is an ordinary system install and takes the normal update path.
 #[cfg(unix)]
 fn is_smarty_install_managed_exe(exe: &Path) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    fs::metadata(exe).is_ok_and(|m| m.mode() & 0o2000 != 0 || m.uid() == 0)
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(exe).is_ok_and(|m| m.permissions().mode() & 0o2000 != 0)
 }
 
 #[cfg(not(unix))]
@@ -3025,7 +3026,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn smarty_install_managed_exe_is_setgid_or_root_owned() {
+    fn smarty_install_managed_exe_is_setgid_only() {
         use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("herdr-upd-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -3041,9 +3042,13 @@ mod tests {
             is_smarty_install_managed_exe(&exe),
             "setgid binary is refused"
         );
+        use std::os::unix::fs::MetadataExt;
+        let sh = std::fs::metadata("/bin/sh").unwrap();
+        assert_eq!(sh.uid(), 0, "fixture: /bin/sh is root-owned");
+        assert_eq!(sh.mode() & 0o2000, 0, "fixture: /bin/sh is not setgid");
         assert!(
-            is_smarty_install_managed_exe(Path::new("/bin/sh")),
-            "root-owned is refused"
+            !is_smarty_install_managed_exe(Path::new("/bin/sh")),
+            "a plain root-owned binary takes the normal update path"
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }
