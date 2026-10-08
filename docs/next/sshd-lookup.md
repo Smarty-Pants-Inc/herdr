@@ -32,6 +32,15 @@ The server must run without `NoNewPrivileges` (or another no-new-privileges
 sandbox). Otherwise the kernel ignores the setgid bit, the helper cannot read
 the system journal, and connections stay unmapped.
 
+The host must run Yama with `kernel.yama.ptrace_scope` 1 or higher (the
+Ubuntu default). With scope 0, or without Yama, any process of a user could
+ptrace that user's bridge from another session, so the helper refuses every
+lookup. Check it:
+
+```bash
+cat /proc/sys/kernel/yama/ptrace_scope   # 1, 2 or 3
+```
+
 To remove it: `sudo rm /usr/local/libexec/herdr-sshd-lookup`.
 
 ## Contract
@@ -69,6 +78,14 @@ these are true:
   of `/proc/<pid>/exe`, normally the installed `herdr` binary that runs both
   the server and the bridge. An unreadable executable (another user's process)
   refuses. The helper reads both again at the end; a change refuses.
+- The peer is a bridge: its `argv[1]` is `remote-client-bridge` (the server's
+  own rule), read again at the end, and none of its descriptors is a listening
+  socket in its `/proc/<pid>/net/unix`. A Herdr server listens; it refuses.
+- The caller accepted this connection: the caller holds fd 3's socket inode
+  (`/proc/<caller>/fd`), that socket is not listening and carries a bound path
+  (an accepted socket inherits its listener's path; the connecting side is
+  unnamed), and the caller also holds a listening socket with that path.
+- `kernel.yama.ptrace_scope` is 1 or higher.
 - From the peer, the helper walks at most three parents, like the server, to a
   process whose command line is exactly `sshd: <user> [priv]`, with `comm`
   `sshd` and all uids 0. The walk refuses at pid 1, at the helper's caller, on
@@ -106,38 +123,42 @@ bridges more than three parents below the priv, and OpenSSH 9.8 and later
 ## Threat notes
 
 - The answer is bound to a connection, not to a uid. A process learns about a
-  login only when it holds a connected stream socket whose peer descends from
-  that login's priv within three parents. Nothing else is an input.
-- The peer must run the caller's executable (the installed `herdr`). A bridge
-  never listens, so a process holds a socket whose peer is a bridge only when
-  that bridge connected to it, and the bridge connects only to a Herdr server
-  socket. The server does not pass its connections on. Herdr's own listening
-  sockets (server, API, local attach) are filesystem sockets with mode 0600,
-  so another user cannot connect to a herdr process either.
-- A connection to a listening socket of some other process started from
-  another user's SSH login (an abstract Unix socket has no file permissions)
-  refuses: that peer does not run the herdr executable.
-- The caller check compares an executable inode; it is not a code-integrity
-  check. A user can run the helper from a herdr process they control (for
-  example with `LD_PRELOAD`). The peer check is what binds the answer.
-- A socket a process connects to itself (`socketpair`, or a connection to its
-  own listener) has that process as peer. It refuses unless the process runs
-  the herdr executable and descends from an sshd priv within three parents. If
-  the caller is the peer or sits in the walk, it refuses too.
-- Residual: a process that can connect to a herdr process within three parents
-  of a priv learns that login. For example, a pane of a Herdr server started
-  directly by `ssh host herdr ...` can connect to that server's socket (peer:
-  server → `sshd: <user>@notty` → priv), run the helper from a herdr process,
-  and learn the user, key fingerprint and source address of the login that
-  started the server. The fingerprint is of a public key; it grants no access.
-  This needs no other user's resources. The server never trusts
-  the answer alone: it maps a principal only for its own verified bridge,
-  through its own walk, with the same priv pid, and with a matching Tailscale
-  node.
+  login only when it holds a socket that it accepted on its own listener, and
+  whose peer is a herdr bridge (same executable, bridge `argv`, no listening
+  socket) within three parents of that login's priv. Nothing else is an input.
+- A bridge never listens and connects only to a Herdr server socket, so a
+  process holds an accepted socket whose peer is a bridge only when that bridge
+  connected to its listener. The server does not pass its connections on.
+  Herdr's own listening sockets (server, API, local attach) are filesystem
+  sockets with mode 0600, so another user cannot reach them.
+- A connection to another session's Herdr server (round 3): the peer is a
+  server, which listens and does not run the bridge subcommand, and the
+  connecting process holds the unnamed side, not an accepted socket. Refused.
+  This also covers a pane of a Herdr server started directly by
+  `ssh host herdr ...` that connects to its own server.
+- A connection to a listening socket of some other process (an abstract Unix
+  socket has no file permissions) refuses: that peer does not run herdr as a
+  bridge.
+- The caller checks compare an executable inode and `/proc` state; they are
+  not a code-integrity check. A user can run the helper from a herdr process
+  they control (for example with `LD_PRELOAD`). The peer checks bind the
+  answer.
+- `ptrace_scope` 1 or higher stops a process of the same user in another
+  session from attaching to a bridge (or writing its memory) to make it
+  connect elsewhere. Scope 1 still lets a process trace its own descendants;
+  a bridge descends from sshd, not from another session.
+- Residual: a process of the same user can replace that user's server socket
+  file (the user owns the directory). The user's next bridge then connects to
+  the impostor's listener, and the impostor learns that login's user, public
+  key fingerprint and source address. Such a process can already take over
+  the user's Herdr session this way; the fingerprint is of a public key and
+  grants no access. The server never trusts the answer alone: it maps a
+  principal only for its own verified bridge, through its own walk, with the
+  same priv pid, and with a matching Tailscale node.
 - A herdr update that replaces the binary gives new bridges a new inode. Until
   the server restarts, their connections stay unmapped; the server's own
   bridge check already compares the same inode.
 - `SO_PEERCRED` names the process that connected. If that process exits and
   its pid is reused before the helper reads `/proc`, the helper sees the new
-  process; it answers only if that process also runs herdr and descends from a
-  priv within three parents, and the server's own pid pin and walk refuse a mismatch.
+  process; it answers only if that process is also a herdr bridge within three
+  parents of a priv, and the server's own pid pin and walk refuse a mismatch.

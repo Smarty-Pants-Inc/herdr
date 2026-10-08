@@ -28,6 +28,15 @@ const MAX_PARENTS: usize = 3;
 /// the query independent of that default.
 const JOURNAL_FIELDS: &str = "MESSAGE,_PID,_UID,_COMM,_EXE,_TRANSPORT,\
 _BOOT_ID,__REALTIME_TIMESTAMP,__MONOTONIC_TIMESTAMP";
+/// `/proc/<pid>/net/unix` on a busy host; a longer table refuses.
+const UNIX_TABLE_LIMIT: usize = 16 << 20;
+/// A bridge holds a handful of descriptors; a longer table refuses.
+const FD_LIMIT: usize = 4_096;
+/// `__SO_ACCEPTCON` in the `Flags` column of `/proc/net/unix`: listening.
+const SO_ACCEPTCON: u32 = 0x0001_0000;
+/// The subcommand the bridge runs as (`herdr remote-client-bridge`), as the
+/// server's own check reads it.
+const BRIDGE_SUBCOMMAND: &str = "remote-client-bridge";
 /// Only root (systemd) places a process in these cgroups.
 const LISTENER_CGROUPS: [&str; 2] = [
     "0::/system.slice/ssh.service",
@@ -74,6 +83,95 @@ pub(crate) trait Host {
     fn clock(&mut self) -> Option<Clock>;
     /// Fixed `journalctl` arguments; None on failure, timeout or excess output.
     fn journal(&mut self, args: &[String]) -> Option<Vec<u8>>;
+    /// Socket inodes among `/proc/<pid>/fd`; None when unreadable or too many.
+    fn sockets(&mut self, pid: u32) -> Option<Vec<u64>>;
+    /// Bounded `/proc/<pid>/net/unix`: the Unix sockets of its network namespace.
+    fn unix_table(&mut self, pid: u32) -> Option<Vec<u8>>;
+    /// `kernel.yama.ptrace_scope`; None without Yama.
+    fn ptrace_scope(&mut self) -> Option<u32>;
+}
+
+/// The caller's connection (fd 3): its socket inode and its peer pid.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Connection {
+    pub peer: u32,
+    pub inode: u64,
+}
+
+#[derive(Debug, PartialEq)]
+struct UnixRow {
+    inode: u64,
+    listening: bool,
+    /// Bound path; abstract names start with `@`. None when unnamed.
+    path: Option<String>,
+}
+
+/// Rows of `/proc/<pid>/net/unix`. A bound path may hold a newline, which
+/// splits its row; the row's own fields stay on the first line, so a line
+/// that does not parse is skipped, never trusted.
+fn unix_rows(table: &[u8]) -> Vec<UnixRow> {
+    String::from_utf8_lossy(table)
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let fields: Vec<_> = line.splitn(8, ' ').collect();
+            if fields.len() < 7 || !fields[0].ends_with(':') {
+                return None;
+            }
+            let flags = u32::from_str_radix(fields[3], 16).ok()?;
+            u32::from_str_radix(fields[4], 16).ok()?;
+            u32::from_str_radix(fields[5], 16).ok()?;
+            Some(UnixRow {
+                inode: fields[6].parse().ok()?,
+                listening: flags & SO_ACCEPTCON != 0,
+                path: fields
+                    .get(7)
+                    .filter(|p| !p.is_empty())
+                    .map(|p| (*p).to_owned()),
+            })
+        })
+        .collect()
+}
+
+/// The fd-3 peer is a bridge that this caller accepted: the peer runs the
+/// bridge subcommand and holds no listening socket, and the caller holds
+/// both this accepted socket and the listener it was accepted from.
+fn accepted_bridge(
+    host: &mut impl Host,
+    caller: u32,
+    peer: &Snapshot,
+    connection: Connection,
+) -> Option<()> {
+    let argv: Vec<_> = peer.cmdline.split(|b| *b == 0).collect();
+    if argv.get(1).copied() != Some(BRIDGE_SUBCOMMAND.as_bytes()) {
+        return None;
+    }
+    let peer_sockets = host.sockets(connection.peer)?;
+    let peer_rows = unix_rows(&host.unix_table(connection.peer)?);
+    if peer_rows
+        .iter()
+        .any(|row| row.listening && peer_sockets.contains(&row.inode))
+    {
+        return None;
+    }
+    let caller_sockets = host.sockets(caller)?;
+    if !caller_sockets.contains(&connection.inode) {
+        return None;
+    }
+    let caller_rows = unix_rows(&host.unix_table(caller)?);
+    // An accepted socket carries its listener's address; the connecting
+    // side is unnamed.
+    let path = caller_rows
+        .iter()
+        .find(|row| row.inode == connection.inode && !row.listening)?
+        .path
+        .as_ref()?;
+    caller_rows
+        .iter()
+        .any(|row| {
+            row.listening && row.path.as_ref() == Some(path) && caller_sockets.contains(&row.inode)
+        })
+        .then_some(())
 }
 
 #[derive(Debug, PartialEq)]
@@ -143,6 +241,18 @@ pub(crate) fn peer_pid(fd: RawFd) -> Option<u32> {
     // SAFETY: SO_PEERCRED filled the zero-initialized structure.
     let pid = unsafe { credentials.assume_init() }.pid;
     u32::try_from(pid).ok().filter(|pid| *pid > 1)
+}
+
+/// The inode of the socket at `fd`, as `/proc/<pid>/fd` and `/proc/net/unix` name it.
+fn socket_inode(fd: RawFd) -> Option<u64> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    // SAFETY: fstat fills the zeroed structure on success.
+    if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    // SAFETY: fstat succeeded.
+    let stat = unsafe { stat.assume_init() };
+    (stat.st_mode & libc::S_IFMT == libc::S_IFSOCK).then_some(stat.st_ino)
 }
 
 fn snapshot(host: &mut impl Host, pid: u32) -> Option<Snapshot> {
@@ -295,23 +405,31 @@ fn is_priv(process: &Snapshot) -> bool {
         && !matches!(process.exe, Exe::Other(..))
 }
 
-/// `peer` is the kernel-attested pid at the other end of the caller's
-/// connection (`peer_pid`). The answer names the sshd login that the peer
-/// descends from, within the server's three-parent rule.
-pub(crate) fn lookup(host: &mut impl Host, peer: u32) -> Option<Login> {
+/// `connection.peer` is the kernel-attested pid at the other end of the
+/// caller's connection (`peer_pid`). The answer names the sshd login that the
+/// peer descends from, within the server's three-parent rule.
+pub(crate) fn lookup(host: &mut impl Host, connection: Connection) -> Option<Login> {
+    let peer = connection.peer;
     let caller_pid = host.caller();
     if caller_pid <= 1 || peer <= 1 || peer == caller_pid {
         return None;
     }
+    // Without Yama (or with scope 0) another process of the same user could
+    // ptrace a bridge and make it connect anywhere.
+    if host.ptrace_scope()? < 1 {
+        return None;
+    }
     let caller = snapshot(host, caller_pid)?;
     let mut chain = vec![(peer, snapshot(host, peer)?)];
-    // The peer runs the caller's executable (both the installed herdr): a
-    // bridge never listens, so a process holds a socket whose peer is a
-    // bridge only when that bridge connected to it. The end re-read repeats
-    // this check, since the snapshots hold the inode.
+    // The peer runs the caller's executable (both the installed herdr) as a
+    // bridge, and the caller accepted it on its own listener. A bridge never
+    // listens, so a process holds a socket whose peer is a bridge only when
+    // that bridge connected to it. The end re-read repeats the executable and
+    // argv checks, since the snapshots hold them.
     if !matches!(caller.exe, Exe::Other(..)) || chain[0].1.exe != caller.exe {
         return None;
     }
+    accepted_bridge(host, caller_pid, &chain[0].1, connection)?;
     // Like the server's walk: the caller is never traversed, no cycles, and
     // no parent is younger than its child.
     for _ in 0..MAX_PARENTS {
@@ -471,6 +589,41 @@ impl Host for System {
         })
     }
 
+    fn sockets(&mut self, pid: u32) -> Option<Vec<u64>> {
+        let mut inodes = Vec::new();
+        let entries = std::fs::read_dir(format!("/proc/{pid}/fd")).ok()?;
+        for (index, entry) in entries.enumerate() {
+            if index >= FD_LIMIT {
+                return None;
+            }
+            match std::fs::read_link(entry.ok()?.path()) {
+                Ok(target) => inodes.extend(target.to_str().and_then(|target| {
+                    target
+                        .strip_prefix("socket:[")?
+                        .strip_suffix(']')?
+                        .parse::<u64>()
+                        .ok()
+                })),
+                // Closed while listing.
+                Err(e) if e.kind() == ErrorKind::NotFound => {}
+                Err(_) => return None,
+            }
+        }
+        Some(inodes)
+    }
+
+    fn unix_table(&mut self, pid: u32) -> Option<Vec<u8>> {
+        bounded_read(&format!("/proc/{pid}/net/unix"), UNIX_TABLE_LIMIT)
+    }
+
+    fn ptrace_scope(&mut self) -> Option<u32> {
+        String::from_utf8(bounded_read("/proc/sys/kernel/yama/ptrace_scope", 16)?)
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
+    }
+
     fn journal(&mut self, args: &[String]) -> Option<Vec<u8>> {
         // The journal group is effective only while journalctl is spawned.
         if !set_gids(libc::gid_t::MAX, self.journal_gid, libc::gid_t::MAX) {
@@ -534,7 +687,12 @@ pub(crate) fn run() -> Option<String> {
     if unsafe { libc::syscall(libc::SYS_close_range, 4u32, u32::MAX, 0u32) } != 0 {
         return None;
     }
-    let peer = peer_pid(CONNECTION_FD);
+    let peer = peer_pid(CONNECTION_FD).and_then(|peer| {
+        Some(Connection {
+            peer,
+            inode: socket_inode(CONNECTION_FD)?,
+        })
+    });
     // SAFETY: fd 3 is not used again.
     if unsafe { libc::close(CONNECTION_FD) } != 0 {
         return None;
@@ -605,6 +763,39 @@ mod tests {
         /// Applied when the journal is read: models pid reuse mid-lookup.
         after_journal: Vec<((u32, &'static str), Vec<u8>)>,
         after_journal_exes: Vec<(u32, Exe)>,
+        sockets: BTreeMap<u32, Vec<u64>>,
+        tables: BTreeMap<u32, String>,
+        ptrace_scope: Option<u32>,
+    }
+
+    /// The server's listener, its accepted socket (fd 3) and the bridge's end.
+    const LISTEN_INO: u64 = 500;
+    const ACCEPTED_INO: u64 = 501;
+    const CLIENT_INO: u64 = 502;
+    const SERVER_SOCKET: &str = "/run/user/1000/herdr/herdr.sock";
+
+    fn unix_row(inode: u64, listening: bool, path: &str) -> String {
+        let (flags, state) = if listening {
+            ("00010000", "01")
+        } else {
+            ("00000000", "03")
+        };
+        format!("0000000000000000: 00000002 00000000 {flags} 0001 {state} {inode} {path}\n")
+            .replace(" \n", "\n")
+    }
+
+    fn unix_table(rows: &[String]) -> String {
+        format!(
+            "Num       RefCount Protocol Flags    Type St Inode Path\n{}",
+            rows.concat()
+        )
+    }
+
+    fn connection() -> Connection {
+        Connection {
+            peer: BRIDGE,
+            inode: ACCEPTED_INO,
+        }
     }
 
     impl Host for Fixture {
@@ -628,6 +819,15 @@ mod tests {
                 now: START_REAL + 3_600_000_000,
                 monotonic_now: START_MONO + 3_600_000_000,
             })
+        }
+        fn sockets(&mut self, pid: u32) -> Option<Vec<u64>> {
+            self.sockets.get(&pid).cloned()
+        }
+        fn unix_table(&mut self, pid: u32) -> Option<Vec<u8>> {
+            self.tables.get(&pid).map(|t| t.clone().into_bytes())
+        }
+        fn ptrace_scope(&mut self) -> Option<u32> {
+            self.ptrace_scope
         }
         fn journal(&mut self, args: &[String]) -> Option<Vec<u8>> {
             self.journal_calls.push(args.to_vec());
@@ -735,6 +935,20 @@ mod tests {
             journal_calls: Vec::new(),
             after_journal: Vec::new(),
             after_journal_exes: Vec::new(),
+            sockets: [
+                (CALLER, vec![LISTEN_INO, ACCEPTED_INO]),
+                (BRIDGE, vec![CLIENT_INO]),
+            ]
+            .into(),
+            tables: {
+                let table = unix_table(&[
+                    unix_row(LISTEN_INO, true, SERVER_SOCKET),
+                    unix_row(ACCEPTED_INO, false, SERVER_SOCKET),
+                    unix_row(CLIENT_INO, false, ""),
+                ]);
+                [(CALLER, table.clone()), (BRIDGE, table)].into()
+            },
+            ptrace_scope: Some(1),
         }
     }
 
@@ -750,7 +964,7 @@ mod tests {
     #[test]
     fn good_chain_prints_one_line_from_one_bounded_query() {
         let mut f = fixture();
-        let login = lookup(&mut f, BRIDGE).expect("login");
+        let login = lookup(&mut f, connection()).expect("login");
         assert_eq!(login, paul());
         assert_eq!(
             login.line(),
@@ -867,13 +1081,13 @@ mod tests {
         let mut f = fixture();
         f.exes.insert(PRIV, Exe::Sshd);
         f.exes.insert(LISTENER, Exe::Sshd);
-        assert_eq!(lookup(&mut f, BRIDGE), Some(paul()));
+        assert_eq!(lookup(&mut f, connection()), Some(paul()));
     }
 
     fn refused(change: impl FnOnce(&mut Fixture)) {
         let mut f = fixture();
         change(&mut f);
-        assert_eq!(lookup(&mut f, BRIDGE), None);
+        assert_eq!(lookup(&mut f, connection()), None);
     }
 
     #[test]
@@ -1106,7 +1320,16 @@ mod tests {
             );
         });
         let mut f = fixture();
-        assert_eq!(lookup(&mut f, PRIV), None);
+        assert_eq!(
+            lookup(
+                &mut f,
+                Connection {
+                    peer: PRIV,
+                    ..connection()
+                }
+            ),
+            None
+        );
         // The caller is the peer (its own socketpair) or sits in the chain.
         refused(|f| f.caller = BRIDGE);
         refused(|f| f.caller = NOTTY);
@@ -1132,7 +1355,7 @@ mod tests {
         // Same inode: the good chain passes (also with a readable sshd exe).
         let mut f = fixture();
         assert_eq!(f.exes[&BRIDGE], f.exes[&CALLER]);
-        assert_eq!(lookup(&mut f, BRIDGE), Some(paul()));
+        assert_eq!(lookup(&mut f, connection()), Some(paul()));
         // Another executable: same inode on another device, another inode.
         refused(|f| {
             f.exes.insert(BRIDGE, Exe::Other(2, 100));
@@ -1164,6 +1387,132 @@ mod tests {
         refused(|f| f.after_journal_exes = vec![(BRIDGE, SHELL), (CALLER, SHELL)]);
     }
 
+    /// Round 3: the peer is a bridge this caller accepted, on a host where
+    /// another process of the same user cannot ptrace it.
+    #[test]
+    fn peer_must_be_a_bridge_accepted_by_the_caller() {
+        // The bridge accepted by the caller passes.
+        assert_eq!(lookup(&mut fixture(), connection()), Some(paul()));
+        // The peer is a server: it listens, or runs another subcommand.
+        refused(|f| {
+            f.sockets.get_mut(&BRIDGE).unwrap().push(LISTEN_INO);
+        });
+        refused(|f| {
+            let table = unix_table(&[
+                unix_row(LISTEN_INO, true, SERVER_SOCKET),
+                unix_row(ACCEPTED_INO, false, SERVER_SOCKET),
+                unix_row(CLIENT_INO, false, ""),
+                unix_row(600, true, "@herdr-b"),
+            ]);
+            f.tables.insert(BRIDGE, table);
+            f.sockets.get_mut(&BRIDGE).unwrap().push(600);
+        });
+        for argv in [
+            &b"herdr\0server\0"[..],
+            b"herdr\0",
+            b"herdr\0--session\0b\0remote-client-bridge\0",
+            b"herdr\0remote-client-bridge-x\0",
+        ] {
+            refused(|f| {
+                f.files.insert((BRIDGE, "cmdline"), argv.to_vec());
+            });
+        }
+        // Changed argv between the reads.
+        refused(|f| f.after_journal = vec![((BRIDGE, "cmdline"), b"herdr\0server\0".to_vec())]);
+        // The peer's descriptors or table are unreadable.
+        refused(|f| {
+            f.sockets.remove(&BRIDGE);
+        });
+        refused(|f| {
+            f.tables.remove(&BRIDGE);
+        });
+        // The caller did not accept this connection: it does not hold it, it
+        // holds the connecting (unnamed) side, or it holds no listener with
+        // the accepted socket's path.
+        refused(|f| {
+            f.sockets.insert(CALLER, vec![LISTEN_INO]);
+        });
+        let mut f = fixture();
+        f.sockets.insert(CALLER, vec![LISTEN_INO, CLIENT_INO]);
+        let client_side = Connection {
+            peer: BRIDGE,
+            inode: CLIENT_INO,
+        };
+        assert_eq!(lookup(&mut f, client_side), None);
+        // The listener itself is not an accepted connection.
+        let listener = Connection {
+            peer: BRIDGE,
+            inode: LISTEN_INO,
+        };
+        assert_eq!(lookup(&mut fixture(), listener), None);
+        refused(|f| {
+            f.sockets.insert(CALLER, vec![ACCEPTED_INO]);
+        });
+        refused(|f| {
+            let table = unix_table(&[
+                unix_row(LISTEN_INO, true, "/run/user/1000/other.sock"),
+                unix_row(ACCEPTED_INO, false, SERVER_SOCKET),
+            ]);
+            f.tables.insert(CALLER, table);
+        });
+        refused(|f| {
+            let table = unix_table(&[
+                unix_row(LISTEN_INO, true, SERVER_SOCKET),
+                unix_row(ACCEPTED_INO, false, ""),
+            ]);
+            f.tables.insert(CALLER, table);
+        });
+        refused(|f| {
+            f.tables.remove(&CALLER);
+        });
+        // Same-user ptrace is open, or Yama is absent.
+        refused(|f| f.ptrace_scope = Some(0));
+        refused(|f| f.ptrace_scope = None);
+        for scope in [2, 3] {
+            let mut f = fixture();
+            f.ptrace_scope = Some(scope);
+            assert_eq!(lookup(&mut f, connection()), Some(paul()));
+        }
+    }
+
+    #[test]
+    fn unix_table_rows_parse_and_split_paths_are_skipped() {
+        let table = unix_table(&[
+            unix_row(500, true, "/run/a b.sock"),
+            unix_row(501, false, "@abstract"),
+            unix_row(502, false, ""),
+            // A path with a newline: its tail is not a row.
+            "0000000000000000: 00000002 00000000 00010000 0001 01 503 /tmp/x\nfake 00010000\n"
+                .into(),
+        ]);
+        let rows = unix_rows(table.as_bytes());
+        assert_eq!(
+            rows,
+            vec![
+                UnixRow {
+                    inode: 500,
+                    listening: true,
+                    path: Some("/run/a b.sock".into())
+                },
+                UnixRow {
+                    inode: 501,
+                    listening: false,
+                    path: Some("@abstract".into())
+                },
+                UnixRow {
+                    inode: 502,
+                    listening: false,
+                    path: None
+                },
+                UnixRow {
+                    inode: 503,
+                    listening: true,
+                    path: Some("/tmp/x".into())
+                },
+            ]
+        );
+    }
+
     #[test]
     fn third_parent_allowed() {
         let mut f = fixture();
@@ -1180,7 +1529,7 @@ mod tests {
             SESSION,
         );
         f.exes.insert(41, SHELL);
-        assert_eq!(lookup(&mut f, BRIDGE), Some(paul()));
+        assert_eq!(lookup(&mut f, connection()), Some(paul()));
     }
 
     #[test]
@@ -1267,8 +1616,44 @@ mod tests {
             journal_gid: 0,
         };
         assert!(host.clock().is_some());
-        assert_eq!(lookup(&mut host, std::process::id()), None);
-        assert_eq!(lookup(&mut host, u32::MAX >> 1), None);
+        let own = |peer| Connection {
+            peer,
+            inode: ACCEPTED_INO,
+        };
+        assert_eq!(lookup(&mut host, own(std::process::id())), None);
+        assert_eq!(lookup(&mut host, own(u32::MAX >> 1)), None);
+        // The real tables name a listener, its accepted socket (with the
+        // listener's path) and the unnamed connecting side.
+        use std::os::unix::net::{UnixListener, UnixStream};
+        let dir = std::env::temp_dir().join(format!("herdr-table-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s");
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let client = UnixStream::connect(&path).unwrap();
+        let (accepted, _) = listener.accept().unwrap();
+        let inode = |fd: RawFd| socket_inode(fd).unwrap();
+        let (l, c, a) = (
+            inode(listener.as_raw_fd()),
+            inode(client.as_raw_fd()),
+            inode(accepted.as_raw_fd()),
+        );
+        let sockets = host.sockets(std::process::id()).unwrap();
+        assert!([l, c, a].iter().all(|i| sockets.contains(i)));
+        let rows = unix_rows(&host.unix_table(std::process::id()).unwrap());
+        let row = |i| rows.iter().find(|r| r.inode == i).unwrap();
+        let named = Some(path.to_str().unwrap().to_owned());
+        assert_eq!((row(l).listening, &row(l).path), (true, &named));
+        assert_eq!((row(a).listening, &row(a).path), (false, &named));
+        assert_eq!((row(c).listening, &row(c).path), (false, &None));
+        assert_eq!(
+            socket_inode(File::open("/proc/self/stat").unwrap().as_raw_fd()),
+            None
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+        if std::path::Path::new("/proc/sys/kernel/yama/ptrace_scope").exists() {
+            assert!(host.ptrace_scope().is_some());
+        }
         assert!(snapshot(&mut host, std::process::id()).is_some());
         // A same-user process's executable reads as its device and inode.
         let own = std::fs::metadata("/proc/self/exe").unwrap();
@@ -1276,9 +1661,11 @@ mod tests {
             host.exe(std::process::id()),
             Some(Exe::Other(own.dev(), own.ino()))
         );
-        // An unprivileged test cannot read pid 1's executable.
+        // An unprivileged test cannot read a root pid 1's executable (a CI
+        // container's pid 1 may run as the test's own user).
         // SAFETY: getuid cannot fail.
-        if unsafe { libc::getuid() } != 0 {
+        let uid = unsafe { libc::getuid() };
+        if uid != 0 && snapshot(&mut host, 1).is_some_and(|init| init.uids == [0; 4]) {
             assert_eq!(host.exe(1), Some(Exe::Unreadable));
         }
     }
