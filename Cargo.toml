@@ -70,9 +70,7 @@ portable-pty = { path = "vendor/portable-pty" }
 # logind's delay inhibitor lets the server save before host shutdown kills panes.
 zbus = { version = "5.19", default-features = false, features = ["tokio"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
-
-[target.'cfg(target_os = "linux")'.dev-dependencies]
-# Independent HMAC check of input-consumer cut answers in tests (smarty-dev#2636).
+# Ed25519 server attestation and HMAC cut answers (input consumer, smarty-dev#2636).
 # Already in Cargo.lock through other dependencies.
 ring = "0.17"
 

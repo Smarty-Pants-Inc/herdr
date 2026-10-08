@@ -32,9 +32,8 @@ pub(crate) use super::unix_common::remote_bridge_endpoint_path_in;
 mod config_file_tests;
 
 pub(super) mod client_identity;
-mod group_privilege;
-pub(crate) use group_privilege::drop_inherited_group_privilege;
 pub(super) mod input_consumer;
+pub(super) mod server_key;
 
 mod shutdown;
 pub(crate) use shutdown::monitor_host_shutdown;

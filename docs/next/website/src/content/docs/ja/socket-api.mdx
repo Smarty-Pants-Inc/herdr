@@ -185,7 +185,7 @@ command in a loop.
 
 | メソッド | 必須 params | 用途 |
 | --- | --- | --- |
-| `pane.input_consumer.enroll` | `pane_id`、`challenge` | ローカルソケットのピアを検証し、`epoch`、秘密の `epoch_key`、`nonce`、ペインの `tty` を発行します。 |
+| `pane.input_consumer.enroll` | `pane_id`、`challenge` | ローカルソケットのピアを検証し、`epoch`、秘密の `epoch_key`、`nonce`、ペインの `tty`、サーバー署名 `sig` を発行します。 |
 | `pane.input_consumer.cut` | `epoch`、`epoch_key`、`seq`、`token`、`cut`、`digest`、`kind` | 区間を閉じます。`kind` は `submit` または `discard` です。 |
 | `pane.input_consumer.release` | `epoch`、`epoch_key` | 終了、一時停止、TTY 引き渡しの前に epoch を終了します。 |
 
@@ -193,7 +193,7 @@ command in a loop.
 
 ```json
 {"id":"enroll","method":"pane.input_consumer.enroll","params":{"pane_id":"w1:p1","challenge":"<64 lowercase hex>"}}
-{"id":"enroll","result":{"epoch":"<epoch>","epoch_key":"<epoch_key>","nonce":"<nonce>","tty":{"dev":"<st_dev>","ino":"<st_ino>"}}}
+{"id":"enroll","result":{"epoch":"<epoch>","epoch_key":"<epoch_key>","nonce":"<nonce>","tty":{"dev":"<st_dev>","ino":"<st_ino>"},"sig":"<base64 Ed25519>"}}
 ```
 
 最初の区間が正確に `a\r`（16 進バイト `61 0d`）だけを含む場合、`cut = 2` です。`digest` はこの 2 バイトの SHA-256 であり、バックスラッシュ表記そのもののハッシュではありません。
@@ -222,7 +222,7 @@ release の成功は空のオブジェクトを返します。拒否時は送信
 
 すべての params が必須で、`cut` と `release` に **`pane_id` はありません**。登録時には、ソケットピアの制御 TTY がペイン PTY と一致すること、フォアグラウンドグループのメンバーであること（`getpgid(peer) == tcgetpgrp(master)`）、ペインのセッションに属すること（`getsid(peer)`）を確認します。プロセスグループのインカーネーション（pgid とリーダーの開始時刻）ごとに最初の登録だけが成功し、そのインカーネーションが続く間、他のプロセスの登録は `already_enrolled` になります。最初のコンシューマー（同じ pid と開始時刻）は、epoch の終了後（release、無効化、Ctrl+Z と再開などのフォアグラウンド変更）に再登録でき、リプレイキャッシュが空の新しい epoch を受け取ります。追加の祖先チェックはありません。コンシューマーは拡張機能や子プロセスより先に登録し、ツールの子プロセスを別グループに分離する必要があります。`ICANON`、`ECHO`、`ICRNL`、`ISTRIP`、`IXON`、`IEXTEN` はすべてオフでなければなりません。各カットで raw モードと termios が登録時から変わっていないことを再確認し、失敗時は `unknown` を返して epoch を無効化します。先に `ping.result.capabilities.input_consumer == true` を確認してください。Linux 以外のサーバーは `false` を通知し、3 つのメソッドすべてを `unsupported_platform` で拒否します。
 
-**サーバー認証。** このビルドにはサーバー認証がありません。登録の応答には `sig` が含まれないため、コンシューマーはどのサーバーが応答したかを証明できず、その応答を認証されていない端末入力として扱う必要があります。`tty` が自分の stdin の `fstat` と一致することを確認してください。各カット応答の `mac` は、デコードした `epoch_key` による HMAC-SHA256 で、対象は `herdr-cut-v1`、`epoch`、`seq`、`token`、`cut`、`digest`、`kind`、`result`、`reason`、principal の `smarty_id` と `display_name`（ない場合は空文字列）です。各フィールドは u32 ビッグエンディアンのバイト長と UTF-8 バイトで符号化します。`challenge` は検証されますが、まだ署名には結び付けられていません。
+**サーバー認証。** コンシューマーは応答したソケットをそのまま信用してはいけません。インストール済みのサーバーは `root:herdr` のモード `2755` で、起動時に一度だけ Ed25519 鍵 `/etc/herdr/server.key`（`0640 root:herdr`）を読み、その後グループを手放します。そのためペインの子プロセスはこのグループを持たず、同じユーザーのプロセスはファイルからもサーバーのメモリからも鍵を読めません。`herdr` グループにメンバーがいる場合や、誰かのプライマリグループである場合、サーバーは鍵を読み込みません。`nsswitch.conf` は `passwd` と `group`（記載があれば `initgroups` も）を `files` または `files systemd` に対応付ける必要があり、`/etc/group` と `/etc/passwd` にこのグループのメンバーやプライマリ保持者がいてはならず、systemd userdb のドロップイン（`/etc/userdb`、`/run/userdb`、`/run/host/userdb`、`/usr/lib/userdb` の `*.membership`、`*.user` の `memberOf`、`*.group` の `members`）がこのグループを指定してはなりません。読めない、または解析できないレコードがある場合も拒否します。鍵は、書き込む前に同じ検査を行うレビュー済みの root セットアップ手順だけが配置します。サーバー側の検査は多層防御です。`sig` は `herdr-enroll-v1`、`challenge`、`epoch`、デコードした `epoch_key` の SHA-256（16 進）、`nonce`、`pane_id`、ペインのスレーブの `tty.dev` と `tty.ino`（10 進）に対する Ed25519 署名で、各フィールドは u32 ビッグエンディアンのバイト長と UTF-8 バイトで符号化します。`/etc/herdr/server.pub` で検証し、`tty` が自分の stdin の `fstat` と一致することを確認してください。各カット応答の `mac` は、デコードした `epoch_key` による HMAC-SHA256 で、対象は `herdr-cut-v1`、`epoch`、`seq`、`token`、`cut`、`digest`、`kind`、`result`、`reason`、principal の `smarty_id` と `display_name`（ない場合は空文字列）です。使える鍵がない場合、サーバーは `false` を通知し、登録を `server_key_unavailable` で拒否します。署名なしのモードはありません。
 
 登録とマーカーの書き込みは、順序保証された単一のペインアクター操作です。マーカーは `ESC _ herdr-epoch;<nonce> ESC \\` です。それ以前の入力を捨て、期待するマーカーを取り除いてから数えます。オフセット 0 はマーカー直後の最初のバイトです。`cut` は文字インデックスではなく、**終端を含まないバイト数**です。バイト列 `a\r` なら `cut = 2` になります。区間は `[prev_cut, cut)` で、初期値は `prev_cut = 0` です。`digest` はその正確なバイト列の SHA-256 を小文字の 16 進数で表した値です。カット以降のバイトは次の区間に残ります。Herdr は、クライアント入力、API 入力、ターミナル応答など、他のすべての入力経路で予約済みマーカーの導入部を無害化します。
 
