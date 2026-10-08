@@ -97,7 +97,7 @@ herdr pane read w1:p2 --source recent --lines 50
 | 客户端 | `client.window_title.set`、`client.window_title.clear` |
 | 会话 | `session.snapshot` |
 | 工作区 | `workspace.create`、`workspace.list`、`workspace.get`、`workspace.focus`、`workspace.rename`、`workspace.move`、`workspace.move_block`、`workspace.report_metadata`、`workspace.close` |
-| Worktree | `worktree.list`、`worktree.create`、`worktree.open`、`worktree.remove` |
+| Worktree | `worktree.list`、`worktree.create`、`worktree.create_project_checked`、`worktree.open`、`worktree.open_project_checked`、`worktree.remove` |
 | 标签页 | `tab.create`、`tab.list`、`tab.get`、`tab.focus`、`tab.rename`、`tab.move`、`tab.close` |
 | 窗格 | `pane.split`、`pane.swap`、`pane.move`、`pane.zoom`、`pane.layout`、`pane.process_info`、`pane.neighbor`、`pane.edges`、`pane.focus_direction`、`pane.resize`、`pane.list`、`pane.current`、`pane.get`、`pane.last_input`、`pane.rename`、`pane.send_text`、`pane.send_keys`、`pane.send_input`、`pane.send_input_guarded`、`pane.read`、`pane.report_agent`、`pane.report_agent_session`、`pane.report_metadata`、`pane.clear_agent_authority`、`pane.release_agent`、`pane.close`、`pane.wait_for_output` |
 | 输入消费者（仅本地 JSON） | `pane.input_consumer.enroll`、`pane.input_consumer.cut`、`pane.input_consumer.release` |
@@ -427,6 +427,17 @@ herdr notification show "build failed" --body "api workspace" --position top-lef
 `client.window_title.clear` 把标题交还给 `ui.window_title`。响应是 `type: "client_window_title"`,带 `changed` 和 `set`、`cleared` 或 `no_foreground_client` 之一的 reason。
 
 Worktree 方法把 Git 检出作为 Herdr 工作区管理。`worktree.create` 创建检出,并返回新的 `workspace`、`tab`、`root_pane` 和 `worktree` 记录。请求的分支已在本地存在时检出它;否则从请求的 base 或 `HEAD` 创建分支。`worktree.open` 打开已有检出,或返回已打开的工作区。`worktree.remove` 对关联的子工作区运行 `git worktree remove`,从不删除分支。
+
+`worktree.create_project_checked` 和 `worktree.open_project_checked` 是经过安全检查的别名。它们使用与旧方法相同的扁平参数和响应，并添加可选的 `allow_project_change`（默认 `false`）。它们保留仍存续的智能体会话的项目归属；当变更需要明确许可时，返回 `project_change_refused`。只有有意改变归属时才设置 `allow_project_change: true`；它不授予仓库信任。旧的 `worktree.create` 和 `worktree.open` 保持原参数形状不变，且不授予此许可。
+
+CLI 即使不带 `--allow-project-change` 也始终使用经过检查的方法名。端点客户端必须在 welcome 的 `methods` 列表中检查相应方法名。旧服务器会拒绝这些方法；切勿回退到旧名称，也不要向旧方法发送许可字段。
+
+```json
+{"id":"checked_create","method":"worktree.create_project_checked","params":{"workspace_id":"w1","branch":"worktree/api","allow_project_change":true}}
+{"id":"checked_open","method":"worktree.open_project_checked","params":{"workspace_id":"w1","branch":"worktree/api","allow_project_change":false}}
+```
+
+下文的来源选择、路径规则、响应记录和生命周期事件也适用于经过检查的别名。
 
 从来源工作区创建 worktree:
 

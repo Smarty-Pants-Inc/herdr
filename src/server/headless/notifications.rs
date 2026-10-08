@@ -309,8 +309,11 @@ impl HeadlessServer {
                 .filter(|request| request.focus)
                 .map(|request| &mut request.respond_to),
             AppEvent::WorktreeReadFinished(result)
-                if matches!(&result.request.method,
-                api::schema::Method::WorktreeOpen(params) if params.focus) =>
+                if match &result.request.method {
+                    api::schema::Method::WorktreeOpen(params) => params.focus,
+                    api::schema::Method::WorktreeOpenProjectChecked(params) => params.params.focus,
+                    _ => false,
+                } =>
             {
                 Some(&mut result.respond_to)
             }
