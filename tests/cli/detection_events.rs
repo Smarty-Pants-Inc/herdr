@@ -415,3 +415,85 @@ fn detection_events_silent_exec_replacement_rescans_unchanged_idle_buffer() {
     assert_eq!(event["data"]["agent"], "codex", "{event}");
     fixture.wait_for_agent("codex", "idle", OUTPUT_DEADLINE);
 }
+
+#[test]
+fn detection_events_agent_exec_after_acquisition_window_is_identified() {
+    // #3261: a launcher keeps writing output past the acquisition window, then
+    // execs the agent in place (same PID and PGID, like a wrapper that becomes
+    // Pi). The agent draws one frame and goes silent.
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket = runtime_dir.join("herdr.sock");
+    let manifests = config_home.join(app_dir_name()).join("agent-detection");
+    fs::create_dir_all(&manifests).unwrap();
+    fs::write(manifests.join("pi.toml"), synthetic_manifest("pi")).unwrap();
+    let launcher = base.join("launcher.sh");
+    fs::write(
+        &launcher,
+        r#"#!/bin/sh
+i=0
+while [ ! -e "$1/go" ]; do
+    printf 'launcher tick %s\n' "$i"
+    i=$((i + 1))
+    /bin/sleep 0.2
+done
+HERDR_AGENT=pi exec /bin/sh -c 'printf "\033[2J\033[HE2E:READY"; IFS= read -r _'
+"#,
+    )
+    .unwrap();
+
+    let server = spawn_herdr(&config_home, &runtime_dir, &socket);
+    struct Cleanup(Option<SpawnedHerdr>, PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            drop(self.0.take());
+            cleanup_test_base(&self.1);
+        }
+    }
+    let _cleanup = Cleanup(Some(server), base.clone());
+    wait_for_socket(&socket, SETUP_DEADLINE);
+    let created = run_cli_json(
+        &socket,
+        &["workspace", "create", "--cwd", base.to_str().unwrap()],
+    );
+    let pane = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let launch = format!(
+        "stty -echo; PS1=; PS2=; /bin/sh '{}' '{}'",
+        launcher.display(),
+        base.display()
+    );
+    let launched = run_cli(&socket, &["pane", "run", &pane, &launch]);
+    assert!(launched.status.success(), "{launched:?}");
+    let pane_info = || run_cli_json(&socket, &["pane", "get", &pane])["result"]["pane"].clone();
+
+    // Outlast the 8s acquisition window with output that never pauses for 2s.
+    let launched_at = Instant::now();
+    while launched_at.elapsed() < Duration::from_secs(11) {
+        let info = pane_info();
+        assert!(info["agent"].is_null(), "launcher misidentified: {info}");
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    fs::write(base.join("go"), "").unwrap();
+
+    // The unidentified-output recheck runs every 5s; allow 3s CI slack.
+    let mut last = serde_json::Value::Null;
+    assert!(
+        wait_until(Duration::from_secs(8), Duration::from_millis(50), || {
+            last = pane_info();
+            last["agent"] == "pi"
+        }),
+        "agent exec'd after the acquisition window was never identified: {last}"
+    );
+    // Identification starts the 3s startup grace before the screen is read.
+    assert!(
+        wait_until(Duration::from_secs(5), Duration::from_millis(50), || {
+            last = pane_info();
+            last["agent"] == "pi" && status_matches(&last["agent_status"], "idle")
+        }),
+        "identified agent never reached idle: {last}"
+    );
+}

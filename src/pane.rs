@@ -533,6 +533,16 @@ struct ProcessProbeInput {
     pending_foreground_shell_clear: bool,
     pending_restore_probe: bool,
     elapsed_since_process_check: std::time::Duration,
+    /// An unidentified pane's screen changed after the last process probe.
+    unidentified_output_since_process_check: bool,
+}
+
+fn unidentified_output_since(
+    last_content_change_at: Option<std::time::Instant>,
+    last_process_check: std::time::Instant,
+) -> bool {
+    // Equal: this pass probed before it read the frame, so the probe may predate it.
+    last_content_change_at.is_some_and(|changed| changed >= last_process_check)
 }
 
 fn foreground_group_changed(
@@ -608,8 +618,14 @@ fn should_probe_foreground_job(input: ProcessProbeInput) -> bool {
     }
 
     if input.current_agent.is_none() {
+        // An exec in place (a launcher that becomes the agent) keeps the PGID,
+        // and output that never pauses keeps one acquisition window from
+        // re-arming. Changed output re-probes at the identified-agent safety
+        // cadence; a quiet pane schedules nothing (#3261).
         return !input.has_process_probe
             || foreground_group_changed
+            || (input.unidentified_output_since_process_check
+                && input.elapsed_since_process_check >= PROCESS_RECHECK_IDENTIFIED)
             || (input.foreground_pgid.is_none()
                 && input.elapsed_since_process_check >= PROCESS_RECHECK_MISSING_FOREGROUND_GROUP);
     }
@@ -806,6 +822,7 @@ fn detection_deadline(
     pending_release: &Mutex<Option<PendingAgentRelease>>,
     transient_theme: bool,
     acquisition_started_at: Option<std::time::Instant>,
+    last_content_change_at: Option<std::time::Instant>,
     last_process_check: std::time::Instant,
     self_reported_active: bool,
     last_self_reported_check: Option<std::time::Instant>,
@@ -840,6 +857,10 @@ fn detection_deadline(
             };
             include((last_process_check + interval > now).then_some(last_process_check + interval));
         }
+    }
+    if unidentified_output_since(last_content_change_at, last_process_check) {
+        let next = last_process_check + PROCESS_RECHECK_IDENTIFIED;
+        include((next > now).then_some(next));
     }
     if self_reported_active {
         include(Some(
@@ -901,6 +922,7 @@ fn spawn_basic_detection_task(
                 &pending_release_for_task,
                 false,
                 acquisition_started_at,
+                last_content_change_at,
                 last_process_check,
                 child_pid.load(Ordering::Acquire) > 0
                     && self_reported_agent_active.load(Ordering::Acquire),
@@ -978,6 +1000,10 @@ fn spawn_basic_detection_task(
                     pending_foreground_shell_clear,
                     pending_restore_probe: false,
                     elapsed_since_process_check: now.duration_since(last_process_check),
+                    unidentified_output_since_process_check: unidentified_output_since(
+                        last_content_change_at,
+                        last_process_check,
+                    ),
                 };
                 !should_skip_process_probe_for_lifecycle_authority(
                     lifecycle_authority_active,
@@ -2905,6 +2931,7 @@ impl PaneRuntime {
                         &pending_release_for_task,
                         terminal.has_transient_default_color_override(),
                         acquisition_started_at,
+                        last_content_change_at,
                         last_process_check,
                         child_pid.load(Ordering::Acquire) > 0
                             && self_reported_agent_active_for_task.load(Ordering::Acquire),
@@ -2977,6 +3004,10 @@ impl PaneRuntime {
                         pending_foreground_shell_clear,
                         pending_restore_probe,
                         elapsed_since_process_check: now.duration_since(last_process_check),
+                        unidentified_output_since_process_check: unidentified_output_since(
+                            last_content_change_at,
+                            last_process_check,
+                        ),
                     };
                     #[cfg(windows)]
                     let content_seq = detection_content_seq.load(Ordering::Relaxed);
@@ -5692,6 +5723,7 @@ mod tests {
             pending_foreground_shell_clear: false,
             pending_restore_probe: false,
             elapsed_since_process_check: std::time::Duration::from_secs(1),
+            unidentified_output_since_process_check: false,
         }
     }
 
@@ -6106,6 +6138,51 @@ mod tests {
 
         assert_eq!(acquisition_started_at, Some(now));
         assert_eq!(last_content_change_at, Some(now));
+    }
+
+    #[test]
+    fn unidentified_output_rechecks_process_after_acquisition_window() {
+        let changed = ProcessProbeInput {
+            unidentified_output_since_process_check: true,
+            elapsed_since_process_check: PROCESS_RECHECK_IDENTIFIED,
+            ..process_probe_input()
+        };
+        assert!(should_probe_foreground_job(changed));
+        assert!(!should_probe_foreground_job(ProcessProbeInput {
+            elapsed_since_process_check: PROCESS_RECHECK_IDENTIFIED
+                - std::time::Duration::from_millis(1),
+            ..changed
+        }));
+        assert!(!should_probe_foreground_job(ProcessProbeInput {
+            unidentified_output_since_process_check: false,
+            ..changed
+        }));
+
+        // A silent agent after exec still gets one scheduled probe; a pane
+        // without output since the last probe schedules none.
+        let checked = std::time::Instant::now();
+        let deadline = |changed_at| {
+            detection_deadline(
+                &PendingIdleConfirmation::default(),
+                None,
+                &Mutex::new(None),
+                false,
+                None,
+                changed_at,
+                checked,
+                false,
+                None,
+            )
+        };
+        assert_eq!(
+            deadline(Some(checked)),
+            Some(checked + PROCESS_RECHECK_IDENTIFIED)
+        );
+        assert_eq!(
+            deadline(Some(checked - std::time::Duration::from_millis(1))),
+            None
+        );
+        assert_eq!(deadline(None), None);
     }
 
     #[test]
