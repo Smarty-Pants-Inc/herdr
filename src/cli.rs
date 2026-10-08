@@ -162,6 +162,12 @@ fn channel_set(args: &[String]) -> std::io::Result<i32> {
         return Ok(2);
     };
 
+    // A smarty-install binary is updated only by smarty-install; refuse before touching config.
+    if let Some(refusal) = crate::update::smarty_install_refusal() {
+        eprintln!("{refusal}");
+        return Ok(1);
+    }
+
     if let Some(reason) = channel_set_rejection(
         channel,
         crate::update::preview_channel_rejection_for_current_install(),

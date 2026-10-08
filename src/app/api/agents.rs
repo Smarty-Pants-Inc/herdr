@@ -205,7 +205,10 @@ impl App {
                     return Err(encode_error(id, "agent_prompt_failed", err.to_string()));
                 }
             };
-            if let Err(err) = runtime.try_send_bytes(Bytes::from(focus)) {
+            if let Err(err) = runtime.try_send_bytes_with_source(
+                Bytes::from(focus),
+                crate::pty::input_consumer::InputSource::Api,
+            ) {
                 return Err(encode_error(id, "agent_prompt_failed", err.to_string()));
             }
         }
@@ -223,11 +226,12 @@ impl App {
             return Err(agent_not_found(id, &params.target));
         };
         let completion = runtime
-            .queue_user_input_submission(
+            .queue_user_input_submission_with_source(
                 Bytes::from(text),
                 Bytes::from(enter),
                 AGENT_PROMPT_SUBMIT_DELAY,
                 submit_deadline,
+                crate::pty::input_consumer::InputSource::Api,
             )
             .map_err(|err| encode_error(id.clone(), "agent_prompt_failed", err.to_string()))?;
         // Receipt is issued on enqueue, before the asynchronous submission completes.
@@ -397,7 +401,10 @@ impl App {
             return response;
         }
         let has_input = !bytes.is_empty();
-        if let Err(err) = runtime.try_send_bytes(Bytes::from(bytes)) {
+        if let Err(err) = runtime.try_send_bytes_with_source(
+            Bytes::from(bytes),
+            crate::pty::input_consumer::InputSource::Api,
+        ) {
             return encode_error(id, "agent_send_keys_failed", err.to_string());
         }
         if has_input {

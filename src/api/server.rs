@@ -151,6 +151,7 @@ fn default_capabilities() -> Option<ServerCapabilities> {
         ssh_agent_registration: false,
         guarded_live_handoff: crate::platform::capabilities().live_handoff,
         expected_terminal_guard: true,
+        input_consumer: crate::platform::input_consumer_supported(),
     })
 }
 
@@ -841,6 +842,9 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::PaneCurrent(_) => "pane.current",
         Method::PaneGet(_) => "pane.get",
         Method::PaneLastInput(_) => "pane.last_input",
+        Method::PaneInputConsumerEnroll(_) => "pane.input_consumer.enroll",
+        Method::PaneInputConsumerCut(_) => "pane.input_consumer.cut",
+        Method::PaneInputConsumerRelease(_) => "pane.input_consumer.release",
         Method::PaneFocus(_) => "pane.focus",
         Method::PaneInputSet(_) => "pane.input.set",
         Method::PaneLinkActivate(_) => "pane.link.activate",
@@ -1385,6 +1389,12 @@ fn error_response_json(id: String, code: &str, message: String) -> String {
 mod tests {
     use super::*;
     use interprocess::local_socket::traits::Listener as _;
+
+    #[test]
+    fn input_consumer_capability_is_advertised_only_on_linux() {
+        let caps = default_capabilities().expect("capabilities");
+        assert_eq!(caps.input_consumer, cfg!(target_os = "linux"));
+    }
     use std::collections::HashMap;
     use std::io::{BufRead, BufReader, Read};
     use std::os::unix::fs::PermissionsExt;
@@ -2012,6 +2022,7 @@ mod tests {
                 ssh_agent_registration: false,
                 guarded_live_handoff: true,
                 expected_terminal_guard: true,
+                input_consumer: false,
             }),
             None,
             None,
