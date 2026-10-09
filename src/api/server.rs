@@ -154,6 +154,7 @@ fn default_capabilities() -> Option<ServerCapabilities> {
         // Native live-generation and PTY foreground proof is required. Other
         // platforms deliberately refuse guarded session delivery.
         expected_agent_session_guard: cfg!(any(target_os = "linux", target_os = "macos")),
+        expected_agent_status_guard: true,
         input_consumer: crate::platform::input_consumer_supported(),
     })
 }
@@ -588,11 +589,17 @@ fn handle_connection_with_stop(
             )?;
             finish_wait_response(&mut stream, response, &request_id, method, changes_ui)
         }
-        Method::AgentPrompt(params) | Method::AgentPromptSessionChecked(params) => {
+        Method::AgentPrompt(params)
+        | Method::AgentPromptSessionChecked(params)
+        | Method::AgentPromptStatusChecked(params) => {
             let response = prompt_agent(
                 request_id.clone(),
                 params,
-                method == "agent.prompt_session_checked",
+                match method {
+                    "agent.prompt_status_checked" => super::wait::AgentPromptKind::StatusChecked,
+                    "agent.prompt_session_checked" => super::wait::AgentPromptKind::SessionChecked,
+                    _ => super::wait::AgentPromptKind::Legacy,
+                },
                 context,
                 &mut stream,
                 api_tx,
@@ -821,6 +828,7 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::AgentStartGuarded(_) => "agent.start_guarded",
         Method::AgentPrompt(_) => "agent.prompt",
         Method::AgentPromptSessionChecked(_) => "agent.prompt_session_checked",
+        Method::AgentPromptStatusChecked(_) => "agent.prompt_status_checked",
         Method::AgentWait(_) => "agent.wait",
         Method::PaneSplit(_) => "pane.split",
         Method::PaneSwap(_) => "pane.swap",
@@ -1368,6 +1376,7 @@ fn caller_timeout_dispatch_uses_timeout_error() {
             method: Method::AgentPrompt(crate::api::schema::AgentPromptParams {
                 expected_agent_session_id: None,
                 expected_pane_id: None,
+                expected_agent_status: None,
                 target: "reviewer".into(),
                 text: "review this".into(),
                 wait: None,
@@ -2048,6 +2057,7 @@ mod tests {
                 guarded_live_handoff: true,
                 expected_terminal_guard: true,
                 expected_agent_session_guard: true,
+                expected_agent_status_guard: true,
                 input_consumer: false,
             }),
             None,
@@ -2057,6 +2067,26 @@ mod tests {
         let parsed: SuccessResponse = serde_json::from_str(&response).unwrap();
         assert_eq!(parsed.id, "req_1");
         assert!(matches!(parsed.result, ResponseResult::Pong { .. }));
+    }
+
+    #[test]
+    fn expected_status_guard_is_advertised_by_default_ping() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let response = handle_request(
+            Request {
+                id: "capability-ping".into(),
+                method: Method::Ping(crate::api::schema::PingParams::default()),
+            },
+            &tx,
+            default_capabilities(),
+            None,
+            None,
+        );
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            response["result"]["capabilities"]["expected_agent_status_guard"],
+            true
+        );
     }
 
     #[test]
@@ -2404,6 +2434,70 @@ mod tests {
     }
 
     #[test]
+    fn expected_status_guard_requires_session_before_lookup_or_dispatch() {
+        for method in [
+            "agent.prompt",
+            "agent.prompt_session_checked",
+            "agent.prompt_status_checked",
+        ] {
+            for wait in [false, true] {
+                let (api_tx, mut api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+                let (mut client, server, path) = local_stream_pair("status-only-invalid");
+                let mut params = serde_json::json!({"target": "reviewer", "text": "hello", "expected_agent_status": "idle", "expected_pane_id": "w1:p1"});
+                if wait {
+                    params["wait"] = serde_json::json!({"timeout_ms": 100});
+                }
+                writeln!(
+                    client,
+                    "{}",
+                    serde_json::json!({"id": "status-only", "method": method, "params": params})
+                )
+                .unwrap();
+                let running = Arc::new(AtomicBool::new(true));
+                handle_connection(server, &api_tx, &EventHub::default(), &running, None).unwrap();
+                let response: ErrorResponse =
+                    serde_json::from_str(&read_line(&mut client)).unwrap();
+                assert_eq!(response.error.code, "invalid_request");
+                assert!(
+                    api_rx.try_recv().is_err(),
+                    "invalid status guard must not resolve or dispatch"
+                );
+                fs::remove_file(path).unwrap();
+            }
+        }
+        // The new alias requires both guards; the old alias still requires identity.
+        for (method, params) in [
+            (
+                "agent.prompt_status_checked",
+                serde_json::json!({"target": "reviewer", "text": "hello", "expected_agent_session_id": "session=a"}),
+            ),
+            (
+                "agent.prompt_status_checked",
+                serde_json::json!({"target": "reviewer", "text": "hello"}),
+            ),
+            (
+                "agent.prompt_session_checked",
+                serde_json::json!({"target": "reviewer", "text": "hello"}),
+            ),
+        ] {
+            let (api_tx, mut api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+            let (mut client, server, path) = local_stream_pair("missing-checked-guards");
+            writeln!(
+                client,
+                "{}",
+                serde_json::json!({"id": "missing-guard", "method": method, "params": params})
+            )
+            .unwrap();
+            let running = Arc::new(AtomicBool::new(true));
+            handle_connection(server, &api_tx, &EventHub::default(), &running, None).unwrap();
+            let response: ErrorResponse = serde_json::from_str(&read_line(&mut client)).unwrap();
+            assert_eq!(response.error.code, "invalid_request");
+            assert!(api_rx.try_recv().is_err());
+            fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
     fn subscription_setup_errors_preserve_request_id_and_reject_entire_stream() {
         let (api_tx, mut api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
         let event_hub = EventHub::default();
@@ -2519,88 +2613,105 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn agent_prompt_wait_preserves_local_peer_context() {
-        let (api_tx, mut api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
-        let (mut client, server, path) = local_stream_pair("agent-prompt-context");
-        client
-            .write_all(
-                br#"{"id":"prompt_wait","method":"agent.prompt","params":{"target":"target","text":"hello","wait":{"timeout_ms":100}}}"#,
-            )
-            .unwrap();
-        client.write_all(b"\n").unwrap();
-        client.flush().unwrap();
+        for method in [
+            "agent.prompt",
+            "agent.prompt_session_checked",
+            "agent.prompt_status_checked",
+        ] {
+            let (api_tx, mut api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+            let (mut client, server, path) = local_stream_pair("agent-prompt-context");
+            client
+                .write_all(
+                    serde_json::json!({"id": "prompt_wait", "method": method,
+                    "params": {"target": "target", "text": "hello", "wait": {"timeout_ms": 100},
+                        "expected_agent_session_id": "session=a", "expected_agent_status": "idle"}})
+                    .to_string()
+                    .as_bytes(),
+                )
+                .unwrap();
+            client.write_all(b"\n").unwrap();
+            client.flush().unwrap();
 
-        let running = Arc::new(AtomicBool::new(true));
-        let server_running = Arc::clone(&running);
-        let event_hub = EventHub::default();
-        let server_thread = std::thread::spawn(move || {
-            handle_connection(server, &api_tx, &event_hub, &server_running, None)
-        });
+            let running = Arc::new(AtomicBool::new(true));
+            let server_running = Arc::clone(&running);
+            let event_hub = EventHub::default();
+            let server_thread = std::thread::spawn(move || {
+                handle_connection(server, &api_tx, &event_hub, &server_running, None)
+            });
 
-        let agent_get = api_rx.blocking_recv().expect("agent.get dispatch");
-        assert!(matches!(agent_get.request.method, Method::AgentGet(_)));
-        agent_get
-            .respond_to
-            .send(
-                serde_json::to_string(&SuccessResponse {
-                    id: agent_get.request.id,
-                    result: ResponseResult::AgentInfo {
-                        agent: crate::api::schema::AgentInfo {
-                            terminal_id: "term_1".into(),
-                            name: Some("target".into()),
-                            agent: Some("pi".into()),
-                            title: None,
-                            terminal_title: None,
-                            terminal_title_stripped: None,
-                            display_agent: None,
-                            agent_status: crate::api::schema::AgentStatus::Idle,
-                            screen_detection_skipped: false,
-                            state_labels: HashMap::new(),
-                            tokens: HashMap::new(),
-                            agent_session: None,
-                            agent_session_id: None,
-                            workspace_id: "ws_1".into(),
-                            tab_id: "tab_1".into(),
-                            pane_id: "pane_1".into(),
-                            focused: true,
-                            launch_pending: false,
-                            interactive_ready: true,
-                            state_change_seq: 1,
-                            completion_seq: None,
-                            cwd: None,
-                            foreground_cwd: None,
-                            revision: 0,
+            let agent_get = api_rx.blocking_recv().expect("agent.get dispatch");
+            assert!(matches!(agent_get.request.method, Method::AgentGet(_)));
+            agent_get
+                .respond_to
+                .send(
+                    serde_json::to_string(&SuccessResponse {
+                        id: agent_get.request.id,
+                        result: ResponseResult::AgentInfo {
+                            agent: crate::api::schema::AgentInfo {
+                                terminal_id: "term_1".into(),
+                                name: Some("target".into()),
+                                agent: Some("pi".into()),
+                                title: None,
+                                terminal_title: None,
+                                terminal_title_stripped: None,
+                                display_agent: None,
+                                agent_status: crate::api::schema::AgentStatus::Idle,
+                                screen_detection_skipped: false,
+                                state_labels: HashMap::new(),
+                                tokens: HashMap::new(),
+                                agent_session: None,
+                                agent_session_id: None,
+                                workspace_id: "ws_1".into(),
+                                tab_id: "tab_1".into(),
+                                pane_id: "pane_1".into(),
+                                focused: true,
+                                launch_pending: false,
+                                interactive_ready: true,
+                                state_change_seq: 1,
+                                completion_seq: None,
+                                cwd: None,
+                                foreground_cwd: None,
+                                revision: 0,
+                            },
                         },
-                    },
-                })
-                .unwrap(),
-            )
-            .unwrap();
+                    })
+                    .unwrap(),
+                )
+                .unwrap();
 
-        let prompt = api_rx.blocking_recv().expect("agent.prompt dispatch");
-        assert_eq!(
-            prompt.context.local_peer_pid(),
-            Some(std::process::id()),
-            "wait-mode prompt must retain the socket origin"
-        );
-        assert_eq!(
-            prompt.context.local_peer_identity,
-            crate::platform::process_identity(std::process::id()),
-            "wait-mode prompt must retain the captured socket process instance"
-        );
-        assert!(matches!(prompt.request.method, Method::AgentPrompt(_)));
-        let prompt_id = prompt.request.id.clone();
-        prompt
-            .respond_to
-            .send(error_response_json(
-                prompt_id,
-                "cross_pane_input_denied",
-                "agent-originated input cannot target a different pane".into(),
-            ))
-            .unwrap();
+            let prompt = api_rx.blocking_recv().expect("agent.prompt dispatch");
+            assert_eq!(
+                prompt.context.local_peer_pid(),
+                Some(std::process::id()),
+                "wait-mode prompt must retain the socket origin"
+            );
+            assert_eq!(
+                prompt.context.local_peer_identity,
+                crate::platform::process_identity(std::process::id()),
+                "wait-mode prompt must retain the captured socket process instance"
+            );
+            assert_eq!(api_method_name(&prompt.request.method), method);
+            let forwarded = serde_json::to_value(&prompt.request).unwrap();
+            assert_eq!(forwarded["params"]["expected_agent_status"], "idle");
+            assert_eq!(
+                forwarded["params"]["expected_agent_session_id"],
+                "session=a"
+            );
+            let prompt_id = prompt.request.id.clone();
+            prompt
+                .respond_to
+                .send(error_response_json(
+                    prompt_id,
+                    "cross_pane_input_denied",
+                    "agent-originated input cannot target a different pane".into(),
+                ))
+                .unwrap();
 
-        let response: serde_json::Value = serde_json::from_str(&read_line(&mut client)).unwrap();
-        assert_eq!(response["error"]["code"], "cross_pane_input_denied");
-        server_thread.join().unwrap().unwrap();
-        let _ = std::fs::remove_file(path);
+            let response: serde_json::Value =
+                serde_json::from_str(&read_line(&mut client)).unwrap();
+            assert_eq!(response["error"]["code"], "cross_pane_input_denied");
+            server_thread.join().unwrap().unwrap();
+            let _ = std::fs::remove_file(path);
+        }
     }
 }

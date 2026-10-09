@@ -6,7 +6,25 @@ use crate::app::terminal_targets::{InputOrigin, TerminalTarget};
 
 impl App {
     pub(super) fn session_checked_guard_denial(&self, request: &Request) -> Option<String> {
+        let prompt_params = match &request.method {
+            Method::AgentPrompt(params)
+            | Method::AgentPromptSessionChecked(params)
+            | Method::AgentPromptStatusChecked(params) => Some(params),
+            _ => None,
+        };
+        if prompt_params.is_some_and(|params| {
+            params.expected_agent_status.is_some() && params.expected_agent_session_id.is_none()
+        }) {
+            return Some(encode_error(
+                request.id.clone(),
+                "invalid_request",
+                "expected_agent_status requires expected_agent_session_id",
+            ));
+        }
         let missing = match &request.method {
+            Method::AgentPromptStatusChecked(params) => {
+                params.expected_agent_session_id.is_none() || params.expected_agent_status.is_none()
+            }
             Method::AgentPromptSessionChecked(params) => {
                 params.expected_agent_session_id.is_none() && params.expected_pane_id.is_none()
             }
@@ -22,7 +40,7 @@ impl App {
             encode_error(
                 request.id.clone(),
                 "invalid_request",
-                "session-checked method requires an identity expectation",
+                "checked method requires its input guard expectations",
             )
         })
     }
@@ -61,9 +79,9 @@ impl App {
             Method::AgentStart(params) | Method::AgentStartGuarded(params) => {
                 params.allow_cross_pane
             }
-            Method::AgentPrompt(params) | Method::AgentPromptSessionChecked(params) => {
-                params.allow_cross_pane
-            }
+            Method::AgentPrompt(params)
+            | Method::AgentPromptSessionChecked(params)
+            | Method::AgentPromptStatusChecked(params) => params.allow_cross_pane,
             Method::AgentSendKeys(params) => params.allow_cross_pane,
             Method::PaneReportAgent(params) => params.allow_cross_pane,
             Method::PaneReportAgentSession(params) => params.allow_cross_pane,
@@ -85,7 +103,9 @@ impl App {
             Method::AgentStart(params) | Method::AgentStartGuarded(params) => {
                 self.pane_target(&params.pane_id)
             }
-            Method::AgentPrompt(params) | Method::AgentPromptSessionChecked(params) => {
+            Method::AgentPrompt(params)
+            | Method::AgentPromptSessionChecked(params)
+            | Method::AgentPromptStatusChecked(params) => {
                 self.resolve_agent_target(&params.target).ok()
             }
             Method::AgentSendKeys(params) => self.resolve_agent_target(&params.target).ok(),
@@ -212,6 +232,84 @@ mod tests {
     fn assert_ok(response: &str) {
         let response: SuccessResponse = serde_json::from_str(response).expect("success response");
         assert!(matches!(response.result, ResponseResult::Ok {}));
+    }
+
+    #[tokio::test]
+    async fn expected_agent_status_admission_requires_session_and_checked_alias_requires_status() {
+        let mut fixture = attributed_agent_fixture();
+        for method in [
+            "agent.prompt",
+            "agent.prompt_session_checked",
+            "agent.prompt_status_checked",
+        ] {
+            for (session, status, pane) in [
+                (false, false, false),
+                (false, false, true),
+                (false, true, false),
+                (false, true, true),
+                (true, false, false),
+                (true, true, false),
+            ] {
+                let mut params = serde_json::json!({
+                    "target": fixture.target_pane_id, "text": "bad", "allow_cross_pane": true,
+                });
+                if session {
+                    params["expected_agent_session_id"] = "opaque-session".into();
+                }
+                if status {
+                    params["expected_agent_status"] = "idle".into();
+                }
+                if pane {
+                    params["expected_pane_id"] = fixture.target_pane_id.clone().into();
+                }
+                let request: Request = serde_json::from_value(serde_json::json!({
+                    "id": "admission", "method": method, "params": params,
+                }))
+                .expect("prompt request");
+                assert!(
+                    App::api_request_requires_deferred_input(&request),
+                    "{method}"
+                );
+                let denied = match method {
+                    "agent.prompt_status_checked" => !status || !session,
+                    "agent.prompt_session_checked" => !session && (status || !pane),
+                    _ => status && !session,
+                };
+                let denial = fixture.app.session_checked_guard_denial(&request);
+                assert_eq!(
+                    denial.is_some(),
+                    denied,
+                    "{method}: session={session}, status={status}, pane={pane}"
+                );
+                if denied {
+                    let assert_invalid = |response: &str| {
+                        let error: ErrorResponse =
+                            serde_json::from_str(response).expect("invalid response");
+                        assert_eq!(error.error.code, "invalid_request");
+                    };
+                    assert_invalid(&denial.expect("denial"));
+                    // Both direct and deferred app admission reject before lookup or input attribution.
+                    assert_invalid(
+                        &fixture
+                            .app
+                            .handle_api_request_with_context(request.clone(), Default::default()),
+                    );
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    assert!(fixture.app.handle_deferred_agent_api_request(
+                        request,
+                        Default::default(),
+                        tx
+                    ));
+                    assert_invalid(
+                        &rx.recv_timeout(std::time::Duration::from_secs(1))
+                            .expect("invalid deferred response"),
+                    );
+                    assert!(fixture.app.accepted_api_inputs.is_empty());
+                    assert!(fixture.source_rx.try_recv().is_err());
+                    assert!(fixture.target_rx.try_recv().is_err());
+                }
+            }
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -423,6 +521,7 @@ mod tests {
             request.method = Method::AgentPrompt(AgentPromptParams {
                 expected_agent_session_id: None,
                 expected_pane_id: None,
+                expected_agent_status: None,
                 target: "target-agent".into(),
                 text: "explicit".into(),
                 wait: None,
@@ -551,6 +650,7 @@ mod tests {
             method: Method::AgentPrompt(AgentPromptParams {
                 expected_agent_session_id: None,
                 expected_pane_id: None,
+                expected_agent_status: None,
                 target: "target-agent".into(),
                 text: "explicitly allowed".into(),
                 wait: None,
@@ -637,8 +737,18 @@ mod tests {
             Method::AgentPrompt(AgentPromptParams {
                 expected_agent_session_id: None,
                 expected_pane_id: None,
+                expected_agent_status: None,
                 target: "target-agent".into(),
                 text: "prompt".into(),
+                wait: None,
+                allow_cross_pane: false,
+            }),
+            Method::AgentPromptStatusChecked(AgentPromptParams {
+                expected_agent_session_id: Some("opaque-session".into()),
+                expected_pane_id: None,
+                expected_agent_status: Some(crate::api::schema::AgentStatus::Idle),
+                target: "target-agent".into(),
+                text: "guarded prompt".into(),
                 wait: None,
                 allow_cross_pane: false,
             }),
@@ -1097,6 +1207,7 @@ mod tests {
                         method: Method::AgentPrompt(AgentPromptParams {
                             expected_agent_session_id: None,
                             expected_pane_id: None,
+                            expected_agent_status: None,
                             target: "target-agent".into(),
                             text: "blocked".into(),
                             wait: None,
@@ -1239,6 +1350,7 @@ mod tests {
                     method: Method::AgentPrompt(AgentPromptParams {
                         expected_agent_session_id: None,
                         expected_pane_id: None,
+                        expected_agent_status: None,
                         target: fixture.target_pane_id.clone(),
                         text: "deferred".into(),
                         wait: None,
@@ -2028,6 +2140,7 @@ mod tests {
                 method: Method::AgentPrompt(AgentPromptParams {
                     expected_agent_session_id: None,
                     expected_pane_id: None,
+                    expected_agent_status: None,
                     target: "target-agent".into(),
                     text: "blocked".into(),
                     wait: None,
@@ -2423,6 +2536,7 @@ finally:
                     method: Method::AgentPrompt(AgentPromptParams {
                         expected_agent_session_id: None,
                         expected_pane_id: None,
+                        expected_agent_status: None,
                         target: "target-agent".into(),
                         text: "orphan".into(),
                         wait: None,

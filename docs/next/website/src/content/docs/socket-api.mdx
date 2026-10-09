@@ -387,6 +387,20 @@ Check `ping.result.capabilities.expected_agent_session_guard == true` (Linux and
 {"id":"checked_keys","method":"pane.send_keys_session_checked","params":{"pane_id":"w1:p1","keys":["Enter"],"expected_agent_session_id":"reported_id_from_pane_get"}}
 ```
 
+### Expected detected agent status guard
+
+Agent prompt params accept the optional `expected_agent_status` field, which **requires `expected_agent_session_id`**. Status-only guards are not supported: a status expectation without a session expectation returns `invalid_request`. Set the status to `"idle"` to require Herdr's **detected** agent state to be idle at admission. An initial mismatch returns `expected_status_mismatch` before any input bytes are written. Omit the field to retain existing prompting behavior; a present `null`, non-string, or unrecognized status is an `invalid_request`, not an unguarded prompt.
+
+Check `ping.result.capabilities.expected_agent_status_guard == true` and use `agent.prompt_status_checked` for status-guarded prompts. This method requires both `expected_agent_status` and `expected_agent_session_id`. Older servers, including those supporting only the session guard, reject the unknown method rather than silently ignoring the status field. The CLI uses this method whenever `--expected-status` is given and refuses unsupported servers with `expected_agent_status_unsupported`. There is no legacy retry; do not silently drop the expectation or fall back to another prompt method after rejection. Supporting servers also enforce the field when supplied on `agent.prompt` or `agent.prompt_session_checked`, but those names alone do not guarantee enforcement by older servers.
+
+```json
+{"id":"status_checked_prompt","method":"agent.prompt_status_checked","params":{"target":"worker","text":"review this change","expected_agent_session_id":"reported_id_from_agent_get","expected_agent_status":"idle"}}
+```
+
+The comparison uses the effective detected state from hooks and screen detection, not the pane's seen state or its `done` presentation. An idle agent displayed as `done` satisfies `"idle"`. In addition to the required session expectation, `expected_pane_id` and the optional `wait` object can be supplied. The detected-status predicate rides the existing session/reporter guard at admission and before PTY writes. A later detected-status mismatch also returns `expected_status_mismatch`, stops further request bytes, and sends no further Enter. Partial input may already have been written; this later error does not promise zero total bytes. Session ownership loss remains a separate `agent_session_lost` error.
+
+Detected idle is the **last observed state**, not transactional proof that the actual agent is not busy. Hook and screen observations can lag, and the agent can become busy after a check. Destructive commands still need an agent-side busy check. This is not a wait-until-idle operation, and `wait` still observes activity and settled status after submission.
+
 `pane.send_keys` and `pane.send_input.keys` accept Herdr key-combo strings:
 plain printable keys, special keys like `enter` and `esc`, modifier chords
 like `ctrl+h`, `control+j`, `alt+x`, and `shift+tab`, function keys like

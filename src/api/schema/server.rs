@@ -57,6 +57,9 @@ pub struct ServerCapabilities {
     /// Supports the local JSON session-checked prompt, text and key methods.
     #[serde(default)]
     pub expected_agent_session_guard: bool,
+    /// Supports the detected-agent-status guard on local JSON prompts.
+    #[serde(default)]
+    pub expected_agent_status_guard: bool,
     /// Supports the local `pane.input_consumer.*` methods (Linux servers only).
     #[serde(default)]
     pub input_consumer: bool,

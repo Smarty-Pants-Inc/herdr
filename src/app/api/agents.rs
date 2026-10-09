@@ -88,6 +88,7 @@ impl App {
         match &request.method {
             Method::AgentPrompt(_)
             | Method::AgentPromptSessionChecked(_)
+            | Method::AgentPromptStatusChecked(_)
             | Method::PaneSendTextSessionChecked(_)
             | Method::PaneSendKeysSessionChecked(_) => true,
             Method::PaneSendText(params) => params.expected_agent_session_id.is_some(),
@@ -115,7 +116,8 @@ impl App {
         }
         let params = match request.method {
             crate::api::schema::Method::AgentPrompt(params)
-            | crate::api::schema::Method::AgentPromptSessionChecked(params) => params,
+            | crate::api::schema::Method::AgentPromptSessionChecked(params)
+            | crate::api::schema::Method::AgentPromptStatusChecked(params) => params,
             crate::api::schema::Method::PaneSendText(params)
             | crate::api::schema::Method::PaneSendTextSessionChecked(params) => {
                 self.defer_session_checked_pane_input(
@@ -143,6 +145,9 @@ impl App {
                 std::thread::spawn(move || {
                     let response = match completion.recv() {
                         Ok(Ok(())) => encode_success(id, ResponseResult::AgentPrompted { agent }),
+                        Ok(Err(err)) if crate::pty::actor::is_expected_status_mismatch(&err) => {
+                            encode_error(id, "expected_status_mismatch", err.to_string())
+                        }
                         Ok(Err(err)) if crate::pty::actor::is_agent_session_lost(&err) => {
                             encode_error(id, "agent_session_lost", err.to_string())
                         }
@@ -215,7 +220,8 @@ impl App {
         self.check_expected_pane(params.expected_pane_id.as_deref(), &resolved)
             .map_err(|error| encode_error_body(id.clone(), error))?;
         let guard = self
-            .capture_expected_agent_session(
+            .capture_expected_agent_input_guard(
+                params.expected_agent_status,
                 params.expected_agent_session_id.as_deref(),
                 resolved.ws_idx,
                 resolved.pane_id,
@@ -330,7 +336,9 @@ impl App {
             )
         }
         .map_err(|err| {
-            let code = if crate::pty::actor::is_agent_session_lost(&err) {
+            let code = if crate::pty::actor::is_expected_status_mismatch(&err) {
+                "expected_status_mismatch"
+            } else if crate::pty::actor::is_agent_session_lost(&err) {
                 "agent_session_lost"
             } else {
                 "agent_prompt_failed"
@@ -697,6 +705,7 @@ mod tests {
             AgentPromptParams {
                 expected_agent_session_id: None,
                 expected_pane_id: None,
+                expected_agent_status: None,
                 target: "reviewer".into(),
                 text: "A != B".into(),
                 wait: None,
@@ -800,6 +809,7 @@ mod tests {
             AgentPromptParams {
                 expected_agent_session_id: None,
                 expected_pane_id: None,
+                expected_agent_status: None,
                 target: public_pane_id,
                 text: "A != B".into(),
                 wait: None,
@@ -833,6 +843,7 @@ mod tests {
             AgentPromptParams {
                 expected_agent_session_id: None,
                 expected_pane_id: None,
+                expected_agent_status: None,
                 target: "reviewer".into(),
                 text: "A != B".into(),
                 wait: None,
@@ -851,6 +862,7 @@ mod tests {
             AgentPromptParams {
                 expected_agent_session_id: None,
                 expected_pane_id: None,
+                expected_agent_status: None,
                 target: "opencode".into(),
                 text: "wrong target".into(),
                 wait: None,
@@ -881,6 +893,7 @@ mod tests {
             AgentPromptParams {
                 expected_agent_session_id: None,
                 expected_pane_id: None,
+                expected_agent_status: None,
                 target: "reviewer".into(),
                 text: "unrelated prompt".into(),
                 wait: None,
@@ -925,6 +938,7 @@ mod tests {
             AgentPromptParams {
                 expected_agent_session_id: None,
                 expected_pane_id: None,
+                expected_agent_status: None,
                 target: "reviewer".into(),
                 text: "A != B".into(),
                 wait: None,
@@ -1012,6 +1026,7 @@ mod tests {
             AgentPromptParams {
                 expected_agent_session_id: None,
                 expected_pane_id: None,
+                expected_agent_status: None,
                 target: "reviewer".into(),
                 text: "A != B".into(),
                 wait: None,

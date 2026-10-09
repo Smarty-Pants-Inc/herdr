@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
@@ -15,6 +15,16 @@ use crate::terminal::TerminalId;
 #[path = "metadata.rs"]
 mod metadata;
 pub use metadata::{AgentMetadata, AgentMetadataReport, EffectivePresentation};
+
+/// Private scalar encoding for native input guards; unrelated to published wire enums.
+pub(crate) fn agent_state_guard_code(state: AgentState) -> u8 {
+    match state {
+        AgentState::Idle => 0,
+        AgentState::Working => 1,
+        AgentState::Blocked => 2,
+        AgentState::Unknown => 3,
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct HookAuthority {
@@ -198,6 +208,8 @@ pub struct TerminalState {
     metadata_report_agents: HashMap<String, Agent>,
     metadata_token_sequence_sources: std::collections::HashSet<String>,
     pub state: AgentState,
+    // Actor guards read this scalar without an App round-trip at the native write.
+    agent_status_cell: Arc<AtomicU8>,
     pub last_agent_state_change_seq: Option<u64>,
     pub last_agent_completion_seq: Option<u64>,
     pub revision: u64,
@@ -245,6 +257,7 @@ impl TerminalState {
             metadata_report_agents: HashMap::new(),
             metadata_token_sequence_sources: std::collections::HashSet::new(),
             state: AgentState::Unknown,
+            agent_status_cell: Arc::new(AtomicU8::new(agent_state_guard_code(AgentState::Unknown))),
             last_agent_state_change_seq: None,
             last_agent_completion_seq: None,
             revision: 0,
@@ -256,6 +269,24 @@ impl TerminalState {
             pending_agent_resume_plan: None,
             restore_error: None,
         }
+    }
+
+    pub(crate) fn detected_agent_status(&self) -> crate::api::schema::AgentStatus {
+        match self.state {
+            AgentState::Idle => crate::api::schema::AgentStatus::Idle,
+            AgentState::Working => crate::api::schema::AgentStatus::Working,
+            AgentState::Blocked => crate::api::schema::AgentStatus::Blocked,
+            AgentState::Unknown => crate::api::schema::AgentStatus::Unknown,
+        }
+    }
+
+    pub(crate) fn agent_status_cell(&self) -> Weak<AtomicU8> {
+        Arc::downgrade(&self.agent_status_cell)
+    }
+
+    fn update_agent_status_cell(&self) {
+        self.agent_status_cell
+            .store(agent_state_guard_code(self.state), Ordering::Release);
     }
 
     pub fn set_detected_agent_process_at(
@@ -303,6 +334,7 @@ impl TerminalState {
         }
         self.detected_agent = crate::detect::parse_agent_label(&snapshot.authority.agent_label);
         self.state = snapshot.authority.state;
+        self.update_agent_status_cell();
         self.hook_authority = Some(snapshot.authority);
         self.replace_reported_agent_session_id(None);
         self.buffered_session_reports.clear();
@@ -2873,6 +2905,7 @@ impl TerminalState {
         self.suppressed_full_lifecycle_hook_reports.clear();
         self.stale_full_lifecycle_hook_sessions.clear();
         self.state = AgentState::Unknown;
+        self.update_agent_status_cell();
         self.last_agent_state_change_seq = None;
         self.last_agent_completion_seq = None;
         self.launch_argv = None;
@@ -2970,6 +3003,7 @@ impl TerminalState {
         }
 
         self.state = state;
+        self.update_agent_status_cell();
         Some(EffectiveStateChange {
             previous_agent_label,
             previous_known_agent,
@@ -2994,6 +3028,65 @@ mod tests {
 
     fn test_terminal() -> TerminalState {
         TerminalState::new(TerminalId::alloc(), "/tmp".into())
+    }
+
+    #[test]
+    fn agent_status_cell_tracks_effective_state_and_respawn_reset() {
+        let mut terminal = test_terminal();
+        let cell = terminal.agent_status_cell();
+        let read = || {
+            cell.upgrade()
+                .expect("terminal owns cell")
+                .load(Ordering::Acquire)
+        };
+        assert_eq!(read(), agent_state_guard_code(AgentState::Unknown));
+        for state in [
+            AgentState::Idle,
+            AgentState::Working,
+            AgentState::Blocked,
+            AgentState::Unknown,
+        ] {
+            terminal.set_detected_state(Some(Agent::Pi), state);
+            assert_eq!(read(), agent_state_guard_code(terminal.state));
+            assert_eq!(terminal.state, state);
+        }
+        terminal.set_hook_authority(
+            "custom".into(),
+            "pi".into(),
+            AgentState::Working,
+            None,
+            None,
+        );
+        assert_eq!(terminal.state, AgentState::Working);
+        assert_eq!(read(), agent_state_guard_code(AgentState::Working));
+        terminal.clear_agent_runtime_identity_after_respawn();
+        assert_eq!(read(), agent_state_guard_code(AgentState::Unknown));
+        drop(terminal);
+        assert!(cell.upgrade().is_none(), "guards do not retain terminals");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_status_cell_tracks_handoff_restore() {
+        let mut terminal = test_terminal();
+        let cell = terminal.agent_status_cell();
+        terminal.restore_handoff_agent_state(HandoffAgentState {
+            authority: HookAuthority {
+                source: "custom".into(),
+                agent_label: "pi".into(),
+                state: AgentState::Blocked,
+                message: None,
+                reported_at: Instant::now(),
+                session_ref: None,
+            },
+            sequence: None,
+            acquisition_pending: false,
+        });
+        assert_eq!(terminal.state, AgentState::Blocked);
+        assert_eq!(
+            cell.upgrade().expect("cell").load(Ordering::Acquire),
+            agent_state_guard_code(AgentState::Blocked)
+        );
     }
 
     fn test_session_path(name: &str) -> String {

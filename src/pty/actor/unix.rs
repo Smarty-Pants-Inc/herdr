@@ -1475,6 +1475,7 @@ impl PtyIoActorRunner {
                     // Each upgrade temporary is dropped within the helper: no
                     // strong Arc survives across native evidence or write(2).
                     if !guard.binding_is_current()
+                        || !guard.status_is_current()
                         || !crate::platform::session_reporter_is_foreground(guard.reporter, || {
                             #[cfg(test)]
                             if let Some(during_proof) = self.file.during_guard_proof.as_mut() {
@@ -1485,6 +1486,7 @@ impl PtyIoActorRunner {
                             )
                         })
                         || !guard.binding_is_current()
+                        || !guard.status_is_current()
                     {
                         let error = super::agent_session_lost(guard);
                         // Single active submission means no request IDs are

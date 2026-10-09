@@ -56,6 +56,15 @@ struct PendingInputSocket {
 #[cfg(target_os = "linux")]
 impl PendingInputSocket {
     async fn enqueue(f: &mut Fixture, method: &str) -> Self {
+        Self::enqueue_with_params(
+            f,
+            method,
+            serde_json::json!({"expected_agent_session_id": "private-queued-old"}),
+        )
+        .await
+    }
+
+    async fn enqueue_with_params(f: &mut Fixture, method: &str, extra: serde_json::Value) -> Self {
         use interprocess::local_socket::traits::Listener as _;
         use std::io::Write;
         use std::sync::{atomic::AtomicBool, Arc};
@@ -76,14 +85,19 @@ impl PendingInputSocket {
             );
             let _ = done_tx.send(result);
         });
+        let mut params = serde_json::json!({
+            "pane_id": f.pane, "target": f.pane, "text": "prompt", "keys": ["p", "enter"],
+            "allow_cross_pane": true,
+        });
+        params
+            .as_object_mut()
+            .expect("input params")
+            .extend(extra.as_object().expect("extra input params").clone());
         writeln!(
             client,
             "{}",
             serde_json::json!({
-                "id": "queued-native-input", "method": method, "params": {
-                    "pane_id": f.pane, "target": f.pane, "text": "prompt", "keys": ["p", "enter"],
-                    "expected_agent_session_id": "private-queued-old", "allow_cross_pane": true,
-                },
+                "id": "queued-native-input", "method": method, "params": params,
             })
         )
         .expect("send actual input RPC");
@@ -284,6 +298,9 @@ def sink(program, establish_group=True):
     return pid
 reporter = sink(executable)
 os.tcsetpgrp(0, reporter)
+# Exec may reach cat's read while its group is still backgrounded and stop on
+# SIGTTIN. Resume AFTER foreground transfer, just like every fallback sink.
+os.kill(reporter, signal.SIGCONT)
 with open(directory + '/reporter.pid', 'w') as file:
     file.write(str(reporter))
 os.mkfifo(control, 0o600)
@@ -557,6 +574,23 @@ with open(capture, 'wb', buffering=0) as output:
             }
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    fn set_detected_status(&mut self, state: AgentState) {
+        let (ws_idx, pane_id) = self.app.parse_pane_id(&self.pane).expect("pane");
+        let terminal_id = self
+            .app
+            .state
+            .terminal_id_for_pane(ws_idx, pane_id)
+            .expect("terminal");
+        let terminal = self
+            .app
+            .state
+            .terminals
+            .get_mut(&terminal_id)
+            .expect("state");
+        terminal.set_detected_state(Some(self.agent), state);
+        assert_eq!(terminal.state, state);
     }
 
     fn assert_cached_session(&mut self, expected: &str) {
@@ -2102,6 +2136,303 @@ async fn expected_agent_session_real_pty_queued_same_id_periodic_native_report_p
         drop(f);
         assert!(!std::path::Path::new(&format!("/proc/{reporter}")).exists());
         assert!(!dir.exists());
+    }
+}
+
+#[tokio::test]
+async fn expected_agent_status_real_pty_busy_mismatch_writes_no_bytes() {
+    for method in [
+        "agent.prompt",
+        "agent.prompt_session_checked",
+        "agent.prompt_status_checked",
+    ] {
+        let mut f = Fixture::new(Agent::Pi);
+        f.report(Some("private-status-session"), None, 1);
+        f.set_detected_status(AgentState::Working);
+        let response = f.request(
+            method,
+            serde_json::json!({
+                "target": f.pane, "text": "bad", "expected_agent_status": "idle",
+                "expected_agent_session_id": "private-status-session",
+            }),
+        );
+        assert_error(&response, "expected_status_mismatch");
+        assert!(f.app.accepted_api_inputs.is_empty());
+        f.bytes(b"");
+    }
+}
+
+#[tokio::test]
+async fn expected_agent_status_real_pty_idle_delivers_once_regardless_of_seen() {
+    for method in [
+        "agent.prompt",
+        "agent.prompt_session_checked",
+        "agent.prompt_status_checked",
+    ] {
+        for seen in [false, true] {
+            let mut f = Fixture::new(Agent::Pi);
+            f.report(Some("private-status-session"), None, 1);
+            let (_, pane_id) = f.app.parse_pane_id(&f.pane).expect("pane");
+            f.app.state.workspaces[0].tabs[0]
+                .panes
+                .get_mut(&pane_id)
+                .expect("pane state")
+                .seen = seen;
+            let discovery = f.request("agent.get", serde_json::json!({"target": f.pane}));
+            let json: serde_json::Value = serde_json::from_str(&discovery).expect("agent info");
+            assert_eq!(
+                json["result"]["agent"]["agent_status"],
+                if seen { "idle" } else { "done" }
+            );
+            // Done is presentation-only even when discovery reports an unseen idle agent as done.
+            assert_error(
+                &f.request(
+                    method,
+                    serde_json::json!({
+                        "target": f.pane, "text": "bad", "expected_agent_status": "done",
+                        "expected_agent_session_id": "private-status-session",
+                    }),
+                ),
+                "expected_status_mismatch",
+            );
+            assert_ok(&f.request(
+                method,
+                serde_json::json!({
+                    "target": f.pane, "text": "once", "expected_agent_status": "idle",
+                    "expected_agent_session_id": "private-status-session",
+                }),
+            ));
+            assert_eq!(f.app.accepted_api_inputs, vec![pane_id]);
+            f.bytes(b"once\r");
+        }
+    }
+}
+
+#[tokio::test]
+async fn expected_agent_status_real_pty_status_only_rejected_without_bytes() {
+    for method in [
+        "agent.prompt",
+        "agent.prompt_session_checked",
+        "agent.prompt_status_checked",
+    ] {
+        let mut f = Fixture::new(Agent::Pi);
+        for with_pane in [false, true] {
+            let mut params = serde_json::json!({
+                "target": f.pane, "text": "bad", "expected_agent_status": "idle",
+            });
+            if with_pane {
+                params["expected_pane_id"] = f.pane.clone().into();
+            }
+            assert_error(&f.request(method, params), "invalid_request");
+        }
+        assert!(f.app.accepted_api_inputs.is_empty());
+        f.bytes(b"");
+    }
+}
+
+#[tokio::test]
+async fn expected_agent_status_real_pty_omission_preserves_working_prompt() {
+    for method in ["agent.prompt", "agent.prompt_session_checked"] {
+        let mut f = Fixture::new(Agent::Pi);
+        f.set_detected_status(AgentState::Working);
+        let mut params = serde_json::json!({"target": f.pane, "text": "legacy"});
+        if method.ends_with("_session_checked") {
+            // The checked alias still needs an independent expectation when status is omitted.
+            params["expected_pane_id"] = f.pane.clone().into();
+        }
+        assert_ok(&f.request(method, params));
+        f.bytes(b"legacy\r");
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expected_agent_status_real_pty_queued_working_before_first_write_is_status_mismatch() {
+    for method in [
+        "agent.prompt",
+        "agent.prompt_session_checked",
+        "agent.prompt_status_checked",
+    ] {
+        let mut f = Fixture::with_modes(Agent::Pi, false, true, true);
+        f.report_from_native_socket("private-queued-old", 1).await;
+        let (ws_idx, pane_id) = f.app.parse_pane_id(&f.pane).expect("pane");
+        let terminal_id = f
+            .app
+            .state
+            .terminal_id_for_pane(ws_idx, pane_id)
+            .expect("terminal");
+        let binding = f.app.state.terminals[&terminal_id]
+            .reported_agent_session_validity()
+            .expect("original session binding");
+        let barrier = ActorWriteBarrier::install(&f, 1);
+        let pending = PendingInputSocket::enqueue_with_params(
+            &mut f,
+            method,
+            serde_json::json!({
+                "expected_agent_session_id": "private-queued-old", "expected_agent_status": "idle",
+            }),
+        )
+        .await;
+        barrier.entered();
+        assert!(
+            pending.done.try_recv().is_err(),
+            "enqueue is not completion"
+        );
+        f.completed_bytes(b"");
+        f.set_detected_status(AgentState::Working);
+        f.assert_cached_session("private-queued-old");
+        let terminal = &f.app.state.terminals[&terminal_id];
+        assert_eq!(terminal.reported_agent_session_reporter(), Some(f.reporter));
+        assert!(binding.ptr_eq(
+            &terminal
+                .reported_agent_session_validity()
+                .expect("same binding")
+        ));
+        assert!(binding
+            .upgrade()
+            .expect("live binding")
+            .load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(
+            crate::platform::process_identity(f.reporter.pid),
+            Some(f.reporter)
+        );
+        barrier.release();
+        assert_error(&pending.response(), "expected_status_mismatch");
+        f.bytes(b"");
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expected_agent_status_real_pty_working_before_delayed_enter_sends_no_enter() {
+    for method in [
+        "agent.prompt",
+        "agent.prompt_session_checked",
+        "agent.prompt_status_checked",
+    ] {
+        let mut f = Fixture::new(Agent::Pi);
+        f.report(Some("private-queued-old"), None, 1);
+        let barrier = ActorWriteBarrier::install(&f, 2);
+        let pending = PendingInputSocket::enqueue_with_params(
+            &mut f,
+            method,
+            serde_json::json!({
+                "expected_agent_session_id": "private-queued-old", "expected_agent_status": "idle",
+            }),
+        )
+        .await;
+        barrier.entered();
+        f.completed_bytes(b"prompt");
+        f.set_detected_status(AgentState::Working);
+        barrier.release();
+        assert_error(&pending.response(), "expected_status_mismatch");
+        f.assert_cached_session("private-queued-old");
+        f.bytes(b"prompt");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expected_agent_status_real_pty_wait_preflight_preserves_guard_and_rechecks_admission() {
+    use interprocess::local_socket::traits::Listener as _;
+    use std::io::{BufRead, Write};
+    use std::sync::{atomic::AtomicBool, Arc};
+    for method in [
+        "agent.prompt",
+        "agent.prompt_session_checked",
+        "agent.prompt_status_checked",
+    ] {
+        for with_session in [false, true] {
+            let mut f = Fixture::new(Agent::Pi);
+            f.report(Some("private-status-session"), None, 1);
+            let path = f.dir.join("wait-status.sock");
+            let listener = crate::ipc::bind_local_listener(&path).expect("wait socket");
+            let mut client = crate::ipc::connect_local_stream(&path).expect("wait client");
+            let server = listener.accept().expect("connected wait client");
+            let (api_tx, mut api_rx) =
+                tokio::sync::mpsc::unbounded_channel::<crate::api::ApiRequestMessage>();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let handle = std::thread::spawn(move || {
+                let result = crate::api::test_handle_connection(
+                    server,
+                    &api_tx,
+                    &crate::api::EventHub::default(),
+                    &Arc::new(AtomicBool::new(true)),
+                    None,
+                );
+                let _ = done_tx.send(result);
+            });
+            let mut params = serde_json::json!({
+                "target": f.pane, "text": "bad", "allow_cross_pane": true,
+                "expected_agent_status": "idle", "wait": {"until": ["working"], "timeout_ms": 500},
+            });
+            if with_session {
+                params["expected_agent_session_id"] = "private-status-session".into();
+            }
+            writeln!(
+                client,
+                "{}",
+                serde_json::json!({
+                    "id": "wait-status", "method": method, "params": params,
+                })
+            )
+            .expect("send wait prompt");
+            client.flush().expect("flush wait prompt");
+            if with_session {
+                let get = tokio::time::timeout(Duration::from_secs(2), api_rx.recv())
+                    .await
+                    .expect("preflight deadline")
+                    .expect("preflight dispatch");
+                assert!(matches!(
+                    get.request.method,
+                    crate::api::schema::Method::AgentGet(_)
+                ));
+                let response = f.app.handle_api_request(get.request);
+                assert_ok(&response);
+                get.respond_to.send(response).expect("preflight response");
+                // Successful idle preflight does not authorize a later working-state write.
+                f.set_detected_status(AgentState::Working);
+                f.assert_cached_session("private-status-session");
+                let prompt = tokio::time::timeout(Duration::from_secs(2), api_rx.recv())
+                    .await
+                    .expect("prompt deadline")
+                    .expect("prompt dispatch");
+                assert_eq!(crate::api::api_method_name(&prompt.request.method), method);
+                let encoded = serde_json::to_value(&prompt.request).expect("forwarded request");
+                assert_eq!(encoded["params"]["expected_agent_status"], "idle");
+                assert_eq!(
+                    encoded["params"]["expected_agent_session_id"],
+                    "private-status-session"
+                );
+                assert!(f.app.handle_deferred_agent_api_request(
+                    prompt.request,
+                    prompt.context,
+                    prompt.respond_to
+                ));
+            }
+            done_rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("wait completion deadline")
+                .expect("wait socket completion");
+            handle.join().expect("wait socket worker");
+            let mut response = String::new();
+            std::io::BufReader::new(client)
+                .read_line(&mut response)
+                .expect("wait response");
+            assert_error(
+                &response,
+                if with_session {
+                    "expected_status_mismatch"
+                } else {
+                    "invalid_request"
+                },
+            );
+            assert!(
+                api_rx.try_recv().is_err(),
+                "invalid guards never preflight; refused writes never wait"
+            );
+            assert!(f.app.accepted_api_inputs.is_empty());
+            f.bytes(b"");
+        }
     }
 }
 

@@ -2733,6 +2733,9 @@ mod tests {
                 start_time: 1,
             },
             expected_agent_session_id: "opaque-session".into(),
+            expected_agent_status: None,
+            agent_status: std::sync::Weak::new(),
+            status_mismatch: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             // Error classification and synthetic-channel rejection fixtures must
             // fail closed; they never authorize a native PTY write.
             binding_validity: std::sync::Weak::new(),

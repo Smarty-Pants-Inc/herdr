@@ -331,7 +331,7 @@ herdr agent list
 herdr agent get <target>
 herdr agent read <target> [--source visible|recent|recent-unwrapped|detection] [--lines N] [--format text|ansi] [--ansi]
 herdr agent send-keys <target> <key> [key ...]
-herdr agent prompt <target> <text> [--expected-session ID] [--expected-pane ID] [--wait] [--until STATUS]... [--timeout MS]
+herdr agent prompt <target> <text> [--expected-session ID] [--expected-pane ID] [--expected-status STATUS] [--wait] [--until STATUS]... [--timeout MS]
 herdr agent rename <target> <name>|--clear
 herdr agent focus <target>
 herdr agent wait <target> [--until STATUS]... [--timeout MS]
@@ -348,6 +348,18 @@ herdr agent explain --file PATH --agent LABEL [--json|--verbose]
 成功的 start 只有在预期智能体占用同一终端并可接受交互输入后才返回。如果启动期间检测到 `blocked`,命令会立即返回 `agent_not_ready`。该名称仍可用于 `agent read` 和 `agent send-keys`,检测变为 `idle` 后即可用于发送提示。默认启动超时是 30000 毫秒;显式值必须大于 3000 且不超过 300000。
 
 `agent prompt` 遵循当前的 bracketed paste 模式，即使智能体处于 working，也会将文本和延迟的 Enter 作为一次有序提交写入。不带 `--wait` 时，成功只确认写入完成，不代表轮次已经开始。在 Windows 上，Codex 在 Enter 前会收到粘贴边界，因此提交不依赖提示大小；调用方的超时包含提交时间。如果智能体已经是 `blocked`,它不会发送输入,而是返回 `agent_blocked`。使用 `--wait` 时,从其他非 working 状态接受的提示必须在提交后的最多五秒内产生可观察的 `working` 或 `blocked` 状态，否则 Herdr 返回 `agent_prompt_stalled`；如果调用方的超时先到期，则返回普通的 `timeout` 错误。这可防止无关的 `idle`、`done` 或会话变化错误地完成等待。观察到活动后，它会等待请求的第一个稳定状态。它不会跟踪单独的轮次。如果智能体已经处于 working，当前轮次的完成可能满足等待。`--until` 用于缩小匹配状态，不带 `--wait` 时会被拒绝。独立的 `agent wait` 在当前状态匹配时立即返回。两者默认匹配 `idle`、`done` 或 `blocked`；需要 `unknown` 时请明确使用 `--until unknown`。
+
+为 `agent prompt` 添加 `--expected-status idle`，可要求 Herdr 在接受请求时**检测到的**智能体状态为 idle，否则拒绝提交。初始不匹配返回 `expected_status_mismatch`，不会写入任何输入字节。该检查比较钩子和屏幕检测得出的有效状态，与窗格是否标记为已查看无关：显示为 `done` 的 idle 智能体仍满足 idle 预期。省略该标志会保留现有行为，包括向 working 状态的智能体发送提示。
+
+```bash
+herdr agent prompt reviewer "Review the current diff" --expected-session "$session_id" --expected-status idle
+```
+
+`--expected-status` **必须与 `--expected-session` 一起使用**；请将 `agent get` 上报的 `agent_session_id` 复制到上例的 `session_id`。不支持仅指定状态的守卫。该标志对应 API 的可选 `expected_agent_status` 字段，需要 `expected_agent_status_guard` 支持。缺少支持时，CLI 返回 `expected_agent_status_unsupported`，不会发送提示。只要指定 `--expected-status`，CLI 就使用 `agent.prompt_status_checked`：旧服务器会拒绝此方法，而不是静默忽略状态字段。不会用旧方法重试；不要移除预期条件后自动重试。还可以组合使用 `--expected-pane` 和 `--wait`。
+
+检测状态条件与现有会话／上报者守卫一起，在接受请求时和 PTY 写入前检查。后续检测状态不匹配也会返回 `expected_status_mismatch`，停止请求的剩余字节，不再发送 Enter。可能已经写入部分输入，因此此后续错误不保证总写入字节数为零。这不是等待 idle 的操作。
+
+检测到的 idle 是**最后观察到的状态**，并非实际智能体不忙的事务性证明。钩子和屏幕检测可能滞后，智能体也可能在检查后变忙。破坏性命令仍需要智能体侧的忙碌检查；该标志不提供此检查。`--wait` 观察提交后的活动和稳定状态，并不会加强接受请求时的检查。
 
 `idle` 和 `done` 都表示可以接受输入。CLI/API 使用服务器的已查看状态：`done` 表示尚未标记为已查看的 idle；显式 `pane focus` / `agent focus` 会标记目标，读取不会。每个 TUI 客户端独立记录它已显示的完成状态，因此其 Done 标记可能与 CLI 或其他客户端不同。`blocked` 表示 Herdr 识别到审批或提问界面。`unknown` 表示智能体存在但无法可靠分类,不代表工作成功。
 

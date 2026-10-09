@@ -356,7 +356,7 @@ herdr agent list
 herdr agent get <target>
 herdr agent read <target> [--source visible|recent|recent-unwrapped|detection] [--lines N] [--format text|ansi] [--ansi]
 herdr agent send-keys <target> <key> [key ...]
-herdr agent prompt <target> <text> [--expected-session ID] [--expected-pane ID] [--wait] [--until STATUS]... [--timeout MS]
+herdr agent prompt <target> <text> [--expected-session ID] [--expected-pane ID] [--expected-status STATUS] [--wait] [--until STATUS]... [--timeout MS]
 herdr agent rename <target> <name>|--clear
 herdr agent focus <target>
 herdr agent wait <target> [--until STATUS]... [--timeout MS]
@@ -373,6 +373,18 @@ Agent targets are either a unique live agent name or the pane ID that currently 
 A successful start returns only after the expected agent owns the same terminal and is ready for interactive input. If detection reports `blocked` during startup, the command returns `agent_not_ready` immediately. The name remains available for `agent read` and `agent send-keys`, and becomes ready for prompts after detection reports `idle`. The default startup timeout is 30000 milliseconds; explicit values must be greater than 3000 and no more than 300000.
 
 `agent prompt` honors live bracketed-paste mode and writes text followed by delayed Enter as one ordered submission, including while the agent is working. Success without `--wait` acknowledges the writes, not the start of a turn. On Windows, Codex receives a paste boundary before Enter so submission does not depend on prompt size; the caller timeout includes submission time. If the agent is already `blocked`, it returns `agent_blocked` without sending input. With `--wait`, a prompt sent from another non-working state has up to five seconds after submission to produce an observed `working` or `blocked` state or Herdr returns `agent_prompt_stalled`; if the caller timeout expires first, Herdr returns the normal `timeout` error. This prevents unrelated `idle`, `done`, or session changes from completing the wait. After activity is observed, it waits for the first requested settled status. It does not track individual turns. If the agent is already working, completion of that active turn may satisfy the wait. `--until` narrows the matching states and is rejected unless `--wait` is also present. Standalone `agent wait` returns immediately when the current status matches. Both default to `idle`, `done`, or `blocked`; use `--until unknown` explicitly when needed.
+
+Add `--expected-status idle` to `agent prompt` to refuse submission unless Herdr's **detected** agent state is idle at admission. An initial mismatch returns `expected_status_mismatch` with zero input bytes. This checks the effective state from hooks and screen detection, independently of whether the pane has been marked seen: an idle agent displayed as `done` still satisfies the idle expectation. Omitting the flag preserves existing prompting behavior, including prompting a working agent.
+
+```bash
+herdr agent prompt reviewer "Review the current diff" --expected-session "$session_id" --expected-status idle
+```
+
+`--expected-status` **requires `--expected-session`**; copy the reported `agent_session_id` from `agent get` into `session_id` for the example above. Status-only guards are not supported. The flag maps to the API's optional `expected_agent_status` field and requires `expected_agent_status_guard` support. If support is absent, the CLI returns `expected_agent_status_unsupported` without sending the prompt. Whenever `--expected-status` is supplied, the CLI uses `agent.prompt_status_checked`: older servers reject this method rather than silently ignoring the status field. There is no legacy retry; do not drop the expectation and retry automatically. `--expected-pane` and `--wait` can also be used.
+
+The detected-status predicate is checked alongside the existing session/reporter guard at admission and before PTY writes. A later detected-status mismatch also returns `expected_status_mismatch`, stops further request bytes, and sends no further Enter. Partial input may already have been written, so this later error does not promise zero total bytes. This is not a wait for idle.
+
+Detected idle is the **last observed state**, not transactional proof that the actual agent is not busy. Hooks and screen detection can lag, and the agent can become busy after a check. Destructive commands still require an agent-side busy check; this flag does not provide one. `--wait` observes activity and settled status after submission rather than strengthening this admission check.
 
 `idle` and `done` both mean ready for input. The CLI/API uses the server's seen state: `done` is idle but not yet marked seen, explicit `pane focus` / `agent focus` commands mark the target seen, and reads do not. Each TUI client tracks viewed completions independently, so its Done badge can differ from the CLI or another client. `blocked` means Herdr recognized an approval or question UI. `unknown` means an agent is present but Herdr cannot classify it confidently, not that its work succeeded.
 

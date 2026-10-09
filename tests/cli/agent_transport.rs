@@ -1,5 +1,170 @@
 use super::harness::*;
 
+fn check_expected_status_transport(
+    capabilities: serde_json::Value,
+    guarded: bool,
+    wait: bool,
+    error_code: Option<&'static str>,
+    expected_method: Option<&str>,
+    expected_error: Option<&str>,
+) {
+    let base = unique_test_dir();
+    fs::create_dir_all(&base).unwrap();
+    let socket_path = base.join("herdr.sock");
+    let listener = UnixListener::bind(&socket_path).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let server = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut operations = Vec::new();
+        loop {
+            if done_rx.try_recv().is_ok() || Instant::now() >= deadline {
+                return operations;
+            }
+            let (mut stream, _) = match listener.accept() {
+                Ok(connection) => connection,
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                Err(err) => panic!("fake server accept failed: {err}"),
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+            let response = if request["method"] == "ping" {
+                serde_json::json!({"id": request["id"], "result": {
+                    "type": "pong", "version": "same-protocol", "protocol": CURRENT_PROTOCOL,
+                    "capabilities": capabilities,
+                }})
+            } else {
+                operations.push(request.clone());
+                if let Some(code) = error_code {
+                    serde_json::json!({"id": request["id"], "error": {"code": code, "message": "refused"}})
+                } else {
+                    serde_json::json!({"id": request["id"], "result": {"type": "agent_prompted"}})
+                }
+            };
+            writeln!(stream, "{response}").unwrap();
+            stream.flush().unwrap();
+        }
+    });
+    let mut args = vec!["agent", "prompt", "reviewer", "--expected-status=working"];
+    if guarded {
+        args.extend(["--expected-status=idle", "--expected-session=session=a"]);
+    }
+    if wait {
+        args.extend(["--wait", "--until", "done", "--timeout", "1200"]);
+    }
+    let output = run_cli(&socket_path, &args);
+    let _ = done_tx.send(());
+    let operations = server.join().unwrap();
+    cleanup_test_base(&base);
+    assert_eq!(
+        output.status.code(),
+        Some(if expected_error.is_some() { 1 } else { 0 }),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if let Some(code) = expected_error {
+        assert!(output.stdout.is_empty());
+        let error: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert_eq!(error["error"]["code"], code);
+    }
+    if let Some(method) = expected_method {
+        assert_eq!(
+            operations.len(),
+            1,
+            "no retries or preflight agent lookup: {operations:?}"
+        );
+        assert_eq!(operations[0]["method"], method);
+        assert_eq!(operations[0]["params"]["text"], "--expected-status=working");
+        assert_eq!(operations[0]["params"].get("wait").is_some(), wait);
+        if guarded {
+            assert_eq!(operations[0]["params"]["expected_agent_status"], "idle");
+            assert_eq!(
+                operations[0]["params"]["expected_agent_session_id"],
+                "session=a"
+            );
+        } else {
+            assert!(operations[0]["params"]
+                .get("expected_agent_status")
+                .is_none());
+        }
+    } else {
+        assert!(
+            operations.is_empty(),
+            "unsupported guard must send no effect: {operations:?}"
+        );
+    }
+}
+
+#[test]
+fn expected_status_transport_negotiates_capability_before_any_effect() {
+    for caps in [
+        serde_json::Value::Null,
+        serde_json::json!({"live_handoff": false, "expected_agent_session_guard": true}),
+        serde_json::json!({"live_handoff": false, "expected_agent_session_guard": true,
+            "expected_terminal_guard": true, "expected_agent_status_guard": false}),
+    ] {
+        let expected = if caps.is_null() {
+            "expected_agent_session_unsupported"
+        } else {
+            "expected_agent_status_unsupported"
+        };
+        check_expected_status_transport(caps, true, true, None, None, Some(expected));
+    }
+}
+
+#[test]
+fn expected_status_transport_uses_new_alias_with_and_without_wait() {
+    for wait in [false, true] {
+        check_expected_status_transport(
+            serde_json::json!({"live_handoff": false,
+            "expected_agent_session_guard": true, "expected_agent_status_guard": true}),
+            true,
+            wait,
+            None,
+            Some("agent.prompt_status_checked"),
+            None,
+        );
+    }
+}
+
+#[test]
+fn expected_status_transport_replacement_rejection_never_retries_legacy_prompt() {
+    check_expected_status_transport(
+        serde_json::json!({"live_handoff": false,
+        "expected_agent_session_guard": true, "expected_agent_status_guard": true}),
+        true,
+        true,
+        Some("method_not_found"),
+        Some("agent.prompt_status_checked"),
+        Some("method_not_found"),
+    );
+}
+
+#[test]
+fn expected_status_transport_omission_preserves_legacy_prompt_on_old_server() {
+    check_expected_status_transport(
+        serde_json::Value::Null,
+        false,
+        false,
+        None,
+        Some("agent.prompt"),
+        None,
+    );
+}
+
 #[test]
 fn agent_start_waits_through_unknown_then_rejects_blocked() {
     let base = unique_test_dir();
