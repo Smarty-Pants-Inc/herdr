@@ -1555,6 +1555,28 @@ mod tests {
         (runner, peer)
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn session_reporter_foreground_rejects_non_tty_and_closed_master() {
+        let (mut runner, _peer) = actor_runner_for_unit_test();
+        let reporter =
+            crate::platform::process_identity(std::process::id()).expect("live reporter pin");
+        let observer = PtyForegroundObserver(Arc::downgrade(&runner.file.foreground));
+        // A live non-terminal fd has no kernel foreground group; a cached
+        // process-group answer cannot turn that into ownership evidence.
+        assert_eq!(observer.observe(), Some(None));
+        assert!(!crate::platform::session_reporter_is_foreground(
+            reporter,
+            || { observer.observe().flatten() }
+        ));
+        runner.file.close();
+        assert_eq!(observer.observe(), None);
+        assert!(!crate::platform::session_reporter_is_foreground(
+            reporter,
+            || { observer.observe().flatten() }
+        ));
+    }
+
     #[test]
     fn actor_ignores_empty_user_input_write() {
         let (mut runner, _peer) = actor_runner_for_unit_test();

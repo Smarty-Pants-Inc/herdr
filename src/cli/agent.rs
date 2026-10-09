@@ -767,85 +767,98 @@ fn agent_rename(args: &[String]) -> std::io::Result<i32> {
     })?)
 }
 
-fn agent_prompt(args: &[String]) -> std::io::Result<i32> {
-    let Some(target) = args.first() else {
-        eprintln!(
-            "usage: herdr agent prompt <target> <text> [--wait] [--until STATUS]... [--timeout MS] [--allow-cross-pane]"
-        );
-        return Ok(2);
-    };
-    let Some(text) = args.get(1) else {
-        eprintln!("agent prompt requires text");
-        return Ok(2);
-    };
+fn parse_agent_prompt_args(args: &[String]) -> Result<AgentPromptParams, String> {
+    let target = args.first().ok_or("usage: herdr agent prompt <target> <text> [--expected-session ID] [--expected-pane ID] [--wait] [--until STATUS]... [--timeout MS] [--allow-cross-pane]")?;
+    let text = args.get(1).ok_or("agent prompt requires text")?;
+    // Keep the fixed positional text literal, including flag-shaped prompts.
+    let options = super::expand_equals_args(
+        &args[2..],
+        &[
+            "--until",
+            "--timeout",
+            "--expected-session",
+            "--expected-pane",
+        ],
+    );
     let mut wait = false;
     let mut until = Vec::new();
     let mut timeout_ms = None;
     let mut allow_cross_pane = false;
-    let mut index = 2;
-    while index < args.len() {
-        match args[index].as_str() {
+    let mut expected_agent_session_id = None;
+    let mut expected_pane_id = None;
+    let mut index = 0;
+    while index < options.len() {
+        match options[index].as_str() {
             "--wait" => {
                 wait = true;
                 index += 1;
             }
             "--until" => {
-                let Some(value) = args.get(index + 1) else {
-                    eprintln!("--until requires at least one status");
-                    return Ok(2);
-                };
-                let status = match super::parse_agent_status(value) {
-                    Ok(status) => status,
-                    Err(err) => {
-                        eprintln!("{err}");
-                        return Ok(2);
-                    }
-                };
-                until.push(status);
+                let value = options
+                    .get(index + 1)
+                    .ok_or("--until requires at least one status")?;
+                until.push(super::parse_agent_status(value).map_err(|err| err.to_string())?);
                 index += 2;
             }
             "--timeout" => {
-                let Some(value) = args.get(index + 1) else {
-                    eprintln!("missing value for --timeout");
-                    return Ok(2);
-                };
-                timeout_ms = match parse_timeout(value) {
-                    Ok(timeout_ms) => Some(timeout_ms),
-                    Err(exit_code) => return Ok(exit_code),
-                };
+                let value = options
+                    .get(index + 1)
+                    .ok_or("missing value for --timeout")?;
+                timeout_ms =
+                    Some(super::parse_u64_flag("--timeout", value).map_err(|err| err.to_string())?);
+                index += 2;
+            }
+            "--expected-session" | "--expected-pane" => {
+                let option = options[index].as_str();
+                let value = options
+                    .get(index + 1)
+                    .filter(|value| !value.starts_with("--"))
+                    .ok_or_else(|| format!("missing value for {option}"))?;
+                if option == "--expected-session" {
+                    expected_agent_session_id = Some(value.clone());
+                } else {
+                    expected_pane_id = Some(super::normalize_pane_id(value));
+                }
                 index += 2;
             }
             "--allow-cross-pane" => {
                 allow_cross_pane = true;
                 index += 1;
             }
-
-            option => {
-                eprintln!("unknown option: {option}");
-                return Ok(2);
-            }
+            option => return Err(format!("unknown option: {option}")),
         }
     }
     if !until.is_empty() && !wait {
-        eprintln!("--until requires --wait");
-        return Ok(2);
+        return Err("--until requires --wait".into());
     }
     if timeout_ms.is_some() && !wait {
-        eprintln!("--timeout requires --wait");
-        return Ok(2);
+        return Err("--timeout requires --wait".into());
     }
+    Ok(AgentPromptParams {
+        target: target.clone(),
+        text: text.clone(),
+        expected_agent_session_id,
+        expected_pane_id,
+        wait: wait.then_some(AgentPromptWaitOptions {
+            until,
+            timeout_ms,
+            submission_deadline: None,
+        }),
+        allow_cross_pane,
+    })
+}
+
+fn agent_prompt(args: &[String]) -> std::io::Result<i32> {
+    let params = match parse_agent_prompt_args(args) {
+        Ok(params) => params,
+        Err(message) => {
+            eprintln!("{message}");
+            return Ok(2);
+        }
+    };
     let response = super::send_request(&Request {
         id: "cli:agent:prompt".into(),
-        method: Method::AgentPrompt(AgentPromptParams {
-            target: target.clone(),
-            text: text.clone(),
-            wait: wait.then_some(AgentPromptWaitOptions {
-                until,
-                timeout_ms,
-                submission_deadline: None,
-            }),
-            allow_cross_pane,
-        }),
+        method: Method::AgentPrompt(params),
     })?;
     super::print_response(&response)
 }
@@ -951,7 +964,7 @@ fn print_agent_help() {
     eprintln!("  herdr agent get <target>");
     eprintln!("  herdr agent read <target> [--source visible|recent|recent-unwrapped|detection] [--lines N] [--format text|ansi] [--ansi]");
     eprintln!("  herdr agent send-keys <target> [--allow-cross-pane] <key> [key ...]");
-    eprintln!("  herdr agent prompt <target> <text> [--wait] [--until STATUS]... [--timeout MS] [--allow-cross-pane]");
+    eprintln!("  herdr agent prompt <target> <text> [--expected-session ID] [--expected-pane ID] [--wait] [--until STATUS]... [--timeout MS] [--allow-cross-pane]");
     eprintln!("  herdr agent rename <target> <name>|--clear");
     eprintln!("  herdr agent focus <target>");
     eprintln!("  herdr agent wait <target> [--until STATUS]... [--timeout MS]");
@@ -1001,6 +1014,82 @@ mod tests {
             parse_agent_send_keys_args(&args(&["reviewer", "--", "--allow-cross-pane"])).unwrap();
         assert_eq!(params.keys, ["--allow-cross-pane"]);
         assert!(!params.allow_cross_pane);
+    }
+
+    #[test]
+    fn prompt_expectations_round_trip_with_wait_and_alias_target() {
+        for options in [
+            &[
+                "--expected-session",
+                "session=a",
+                "--expected-pane",
+                "w1:p2",
+            ][..],
+            &["--expected-session=session=a", "--expected-pane=w1:p2"][..],
+        ] {
+            let mut values = args(&[
+                "reviewer",
+                "hello",
+                "--wait",
+                "--until",
+                "idle",
+                "--timeout",
+                "1200",
+                "--allow-cross-pane",
+            ]);
+            values.extend(args(options));
+            let params = parse_agent_prompt_args(&values).unwrap();
+            assert_eq!(params.target, "reviewer");
+            assert_eq!(params.text, "hello");
+            assert_eq!(
+                params.expected_agent_session_id.as_deref(),
+                Some("session=a")
+            );
+            assert_eq!(params.expected_pane_id.as_deref(), Some("w1:p2"));
+            assert!(params.allow_cross_pane);
+            assert_eq!(params.wait.as_ref().unwrap().timeout_ms, Some(1200));
+            let request = Request {
+                id: "test:prompt".into(),
+                method: Method::AgentPrompt(params),
+            };
+            let value = serde_json::to_value(&request).unwrap();
+            assert_eq!(value["params"]["expected_agent_session_id"], "session=a");
+            assert_eq!(value["params"]["expected_pane_id"], "w1:p2");
+            assert_eq!(serde_json::from_value::<Request>(value).unwrap(), request);
+        }
+    }
+
+    #[test]
+    fn prompt_without_expectations_preserves_literal_flag_text_and_wait_validation() {
+        for text in [
+            "--wait",
+            "--expected-session=session=a",
+            "--expected-pane=w1:p2",
+        ] {
+            let params = parse_agent_prompt_args(&args(&["reviewer", text])).unwrap();
+            assert_eq!(params.text, text);
+            assert!(params.expected_agent_session_id.is_none());
+            assert!(params.expected_pane_id.is_none());
+            assert!(params.wait.is_none());
+            let value = serde_json::to_value(params).unwrap();
+            assert!(value.get("expected_agent_session_id").is_none());
+            assert!(value.get("expected_pane_id").is_none());
+        }
+        for options in [
+            &["--expected-session"][..],
+            &["--expected-pane"][..],
+            &["--until", "idle"][..],
+            &["--timeout=1200"][..],
+        ] {
+            let mut values = args(&["reviewer", "hello"]);
+            values.extend(args(options));
+            assert!(parse_agent_prompt_args(&values).is_err());
+        }
+        let pane_only =
+            parse_agent_prompt_args(&args(&["reviewer", "hello", "--expected-pane=w1:p2"]))
+                .unwrap();
+        assert!(pane_only.expected_agent_session_id.is_none());
+        assert_eq!(pane_only.expected_pane_id.as_deref(), Some("w1:p2"));
     }
 
     #[test]

@@ -776,40 +776,86 @@ pub(super) fn send_ok_request(method: Method) -> std::io::Result<i32> {
 pub(super) fn send_request(request: &Request) -> std::io::Result<serde_json::Value> {
     let client = target::api_client()?;
     let status = ensure_server_protocol_compatible(&client, &request.id)?;
-    let guarded_method = match &request.method {
-        Method::AgentStart(params) if params.expected_terminal.is_some() => {
-            Some(Method::AgentStartGuarded(params.clone()))
-        }
-        Method::PaneSendInput(params) if params.expected_terminal.is_some() => {
-            Some(Method::PaneSendInputGuarded(params.clone()))
-        }
-        Method::AgentStartGuarded(_) | Method::PaneSendInputGuarded(_) => {
-            Some(request.method.clone())
-        }
-        _ => None,
+    let guarded = match guarded_request(request, status.capabilities.as_ref()) {
+        Ok(guarded) => guarded,
+        Err(response) => return Ok(response),
     };
-    if guarded_method.is_some()
-        && !status
-            .capabilities
-            .is_some_and(|caps| caps.expected_terminal_guard)
-    {
-        return Ok(serde_json::json!({
+    client
+        .request_value(guarded.as_ref().unwrap_or(request))
+        .map_err(|err| map_server_not_running_or_io(err, &request.id, &client))
+}
+
+fn guarded_request(
+    request: &Request,
+    capabilities: Option<&crate::api::schema::ServerCapabilities>,
+) -> Result<Option<Request>, serde_json::Value> {
+    let (method, capability, supported, error_code) = match &request.method {
+        Method::AgentStart(params) if params.expected_terminal.is_some() => (
+            Method::AgentStartGuarded(params.clone()),
+            "expected_terminal_guard",
+            capabilities.is_some_and(|caps| caps.expected_terminal_guard),
+            "expected_terminal_unsupported",
+        ),
+        Method::PaneSendInput(params) if params.expected_terminal.is_some() => (
+            Method::PaneSendInputGuarded(params.clone()),
+            "expected_terminal_guard",
+            capabilities.is_some_and(|caps| caps.expected_terminal_guard),
+            "expected_terminal_unsupported",
+        ),
+        Method::AgentStartGuarded(_) | Method::PaneSendInputGuarded(_) => (
+            request.method.clone(),
+            "expected_terminal_guard",
+            capabilities.is_some_and(|caps| caps.expected_terminal_guard),
+            "expected_terminal_unsupported",
+        ),
+        Method::AgentPrompt(params)
+            if params.expected_agent_session_id.is_some() || params.expected_pane_id.is_some() =>
+        {
+            (
+                Method::AgentPromptSessionChecked(params.clone()),
+                "expected_agent_session_guard",
+                capabilities.is_some_and(|caps| caps.expected_agent_session_guard),
+                "expected_agent_session_unsupported",
+            )
+        }
+        Method::PaneSendText(params) if params.expected_agent_session_id.is_some() => (
+            Method::PaneSendTextSessionChecked(params.clone()),
+            "expected_agent_session_guard",
+            capabilities.is_some_and(|caps| caps.expected_agent_session_guard),
+            "expected_agent_session_unsupported",
+        ),
+        Method::PaneSendKeys(params) if params.expected_agent_session_id.is_some() => (
+            Method::PaneSendKeysSessionChecked(params.clone()),
+            "expected_agent_session_guard",
+            capabilities.is_some_and(|caps| caps.expected_agent_session_guard),
+            "expected_agent_session_unsupported",
+        ),
+        Method::AgentPromptSessionChecked(_)
+        | Method::PaneSendTextSessionChecked(_)
+        | Method::PaneSendKeysSessionChecked(_) => (
+            request.method.clone(),
+            "expected_agent_session_guard",
+            capabilities.is_some_and(|caps| caps.expected_agent_session_guard),
+            "expected_agent_session_unsupported",
+        ),
+        _ => return Ok(None),
+    };
+    if !supported {
+        return Err(serde_json::json!({
             "id": request.id,
             "error": {
-                "code": "expected_terminal_unsupported",
-                "message": "server does not advertise expected_terminal_guard; guarded input was not sent",
+                "code": error_code,
+                "message": format!("server does not advertise {capability}; guarded input was not sent"),
             },
         }));
     }
     // Ping and effect use separate connections. A server may be replaced between
-    // them, so the effect must use a method old servers cannot silently accept.
-    let guarded_request = guarded_method.map(|method| Request {
+    // them, so the effect (including prompt-with-wait) must use a checked method
+    // old servers cannot silently accept. Never retry with the unguarded method.
+    Ok(Some(Request {
         id: request.id.clone(),
         method,
-    });
-    client
-        .request_value(guarded_request.as_ref().unwrap_or(request))
-        .map_err(|err| map_server_not_running_or_io(err, &request.id, &client))
+    }))
 }
 
 pub(super) fn send_request_unchecked(request: &Request) -> std::io::Result<serde_json::Value> {
@@ -1094,6 +1140,113 @@ fn _print_json<T: Serialize>(value: &T) {
 
 #[cfg(test)]
 mod tests {
+    fn session_guard_requests() -> Vec<super::Request> {
+        [
+            ("agent.prompt", serde_json::json!({"target": "reviewer", "text": "hello", "expected_agent_session_id": "session=a", "wait": {"until": ["idle"], "timeout_ms": 1200}})),
+            ("agent.prompt", serde_json::json!({"target": "reviewer", "text": "hello", "expected_pane_id": "w1:p2"})),
+            ("pane.send_text", serde_json::json!({"pane_id": "w1:p2", "text": "hello", "expected_agent_session_id": "session=a"})),
+            ("pane.send_keys", serde_json::json!({"pane_id": "w1:p2", "keys": ["Enter"], "expected_agent_session_id": "session=a"})),
+        ].into_iter().map(|(method, params)| serde_json::from_value(serde_json::json!({"id": "test:guard", "method": method, "params": params})).unwrap()).collect()
+    }
+
+    #[test]
+    fn session_guard_refuses_missing_or_false_capability_before_effect() {
+        for capability in [
+            None,
+            Some(serde_json::json!({"live_handoff": false})),
+            Some(
+                serde_json::json!({"live_handoff": false, "expected_agent_session_guard": false, "expected_terminal_guard": true}),
+            ),
+        ] {
+            let caps = capability.map(|value| {
+                serde_json::from_value::<crate::api::schema::ServerCapabilities>(value).unwrap()
+            });
+            for request in session_guard_requests() {
+                let error = super::guarded_request(&request, caps.as_ref()).unwrap_err();
+                assert_eq!(error["id"], request.id);
+                assert_eq!(error["error"]["code"], "expected_agent_session_unsupported");
+                assert!(!error.to_string().contains("session=a"));
+            }
+        }
+    }
+
+    #[test]
+    fn session_guard_uses_checked_alias_including_wait_and_pane_only_expectation() {
+        let caps = serde_json::from_value::<crate::api::schema::ServerCapabilities>(
+            serde_json::json!({"live_handoff": false, "expected_agent_session_guard": true}),
+        )
+        .unwrap();
+        for request in session_guard_requests() {
+            let original = serde_json::to_value(&request).unwrap();
+            let guarded = super::guarded_request(&request, Some(&caps))
+                .unwrap()
+                .unwrap();
+            let value = serde_json::to_value(&guarded).unwrap();
+            assert_eq!(
+                value["method"],
+                format!("{}_session_checked", original["method"].as_str().unwrap())
+            );
+            assert_eq!(value["params"], original["params"]);
+            assert_eq!(value["id"], original["id"]);
+            assert_eq!(
+                serde_json::from_value::<super::Request>(value).unwrap(),
+                guarded
+            );
+            // A checked request remains checked on subsequent send paths, never downgraded.
+            assert_eq!(
+                super::guarded_request(&guarded, Some(&caps))
+                    .unwrap()
+                    .unwrap(),
+                guarded
+            );
+            assert_eq!(
+                super::guarded_request(&guarded, None).unwrap_err()["error"]["code"],
+                "expected_agent_session_unsupported"
+            );
+        }
+    }
+
+    #[test]
+    fn absent_session_expectations_keep_legacy_methods() {
+        for request in session_guard_requests() {
+            let mut value = serde_json::to_value(request).unwrap();
+            value["params"]
+                .as_object_mut()
+                .unwrap()
+                .remove("expected_agent_session_id");
+            value["params"]
+                .as_object_mut()
+                .unwrap()
+                .remove("expected_pane_id");
+            let request = serde_json::from_value::<super::Request>(value).unwrap();
+            assert!(super::guarded_request(&request, None).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn terminal_and_session_capability_guards_are_independent() {
+        let request = serde_json::from_value::<super::Request>(serde_json::json!({"id": "test:terminal", "method": "pane.send_input", "params": {"pane_id": "w1:p2", "text": "hello", "expected_terminal": "term_opaque"}})).unwrap();
+        let session_only = serde_json::from_value::<crate::api::schema::ServerCapabilities>(
+            serde_json::json!({"live_handoff": false, "expected_agent_session_guard": true}),
+        )
+        .unwrap();
+        assert_eq!(
+            super::guarded_request(&request, Some(&session_only)).unwrap_err()["error"]["code"],
+            "expected_terminal_unsupported"
+        );
+        let terminal_only = serde_json::from_value::<crate::api::schema::ServerCapabilities>(
+            serde_json::json!({"live_handoff": false, "expected_terminal_guard": true}),
+        )
+        .unwrap();
+        let guarded = super::guarded_request(&request, Some(&terminal_only))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(guarded).unwrap()["method"],
+            "pane.send_input_guarded"
+        );
+    }
+
     #[test]
     fn parses_channel_set_argument() {
         assert_eq!(

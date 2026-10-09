@@ -621,6 +621,13 @@ impl TerminalRuntime {
         self.0.child_process_identity()
     }
 
+    pub(crate) fn session_reporter_is_foreground(
+        &self,
+        reporter: crate::platform::ProcessIdentity,
+    ) -> bool {
+        self.0.session_reporter_is_foreground(reporter)
+    }
+
     pub(crate) fn current_size(&self) -> (u16, u16) {
         self.0.current_size()
     }

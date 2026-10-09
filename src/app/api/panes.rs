@@ -1655,6 +1655,7 @@ impl App {
         &mut self,
         id: String,
         params: PaneReportAgentParams,
+        context: crate::api::ApiRequestContext,
     ) -> String {
         let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
             return pane_not_found(id, &params.pane_id);
@@ -1668,6 +1669,11 @@ impl App {
         let report_is_newer = self
             .pane_terminal(ws_idx, pane_id)
             .is_some_and(|terminal| terminal.hook_report_is_newer(&params.source, params.seq));
+        let previous_report = self
+            .pane_terminal(ws_idx, pane_id)
+            .map(|terminal| (terminal.session_report_marker(), params.seq))
+            .unwrap_or_default();
+        let reported_id = params.agent_session_id.clone();
         let session_ref = crate::agent_resume::session_ref_from_report(
             &params.source,
             &agent_label,
@@ -1683,6 +1689,15 @@ impl App {
             message: params.message,
             seq: params.seq,
         });
+        self.retain_session_report_id(
+            ws_idx,
+            pane_id,
+            previous_report,
+            &params.source,
+            &agent_label,
+            session_ref.as_ref(),
+            (reported_id, context.local_peer_identity),
+        );
         let applied =
             report_is_newer && self.session_report_applied(ws_idx, pane_id, session_ref.as_ref());
         self.report_agent_resume(
@@ -1700,6 +1715,7 @@ impl App {
         &mut self,
         id: String,
         params: PaneReportAgentSessionParams,
+        context: crate::api::ApiRequestContext,
     ) -> String {
         let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
             return pane_not_found(id, &params.pane_id);
@@ -1713,6 +1729,11 @@ impl App {
         let report_is_newer = self
             .pane_terminal(ws_idx, pane_id)
             .is_some_and(|terminal| terminal.hook_report_is_newer(&params.source, params.seq));
+        let previous_report = self
+            .pane_terminal(ws_idx, pane_id)
+            .map(|terminal| (terminal.session_report_marker(), params.seq))
+            .unwrap_or_default();
+        let reported_id = params.agent_session_id.clone();
         let session_ref = crate::agent_resume::session_ref_from_report(
             &params.source,
             &agent_label,
@@ -1729,6 +1750,15 @@ impl App {
                 params.session_start_source,
             ),
         });
+        self.retain_session_report_id(
+            ws_idx,
+            pane_id,
+            previous_report,
+            &params.source,
+            &agent_label,
+            session_ref.as_ref(),
+            (reported_id, context.local_peer_identity),
+        );
         let applied =
             report_is_newer && self.session_report_applied(ws_idx, pane_id, session_ref.as_ref());
         self.report_agent_resume(
@@ -1740,6 +1770,32 @@ impl App {
             params.seq.filter(|_| applied),
             applied.then_some(params.resume_argv).flatten(),
         )
+    }
+
+    fn retain_session_report_id(
+        &mut self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+        previous_report: (crate::terminal::state::SessionReportMarker, Option<u64>),
+        source: &str,
+        agent: &str,
+        session_ref: Option<&crate::agent_resume::AgentSessionRef>,
+        report: (Option<String>, Option<crate::platform::ProcessIdentity>),
+    ) {
+        let (id, reporter) = report;
+        let Some(terminal_id) = self.state.terminal_id_for_pane(ws_idx, pane_id) else {
+            return;
+        };
+        if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
+            terminal.retain_reported_agent_session_id(
+                previous_report,
+                source,
+                agent,
+                session_ref,
+                id,
+                reporter,
+            );
+        }
     }
 
     /// A resume command belongs to the session it was reported with, so it is
@@ -2018,6 +2074,13 @@ impl App {
         let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
+        if let Err(error) = self.check_expected_agent_session(
+            params.expected_agent_session_id.as_deref(),
+            ws_idx,
+            pane_id,
+        ) {
+            return super::responses::encode_error_body(id, error);
+        }
         if self.lookup_runtime_sender(ws_idx, pane_id).is_none() {
             return pane_not_found(id, &params.pane_id);
         }
@@ -2197,6 +2260,13 @@ impl App {
         let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
+        if let Err(error) = self.check_expected_agent_session(
+            params.expected_agent_session_id.as_deref(),
+            ws_idx,
+            pane_id,
+        ) {
+            return super::responses::encode_error_body(id, error);
+        }
         let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
@@ -2649,6 +2719,7 @@ mod tests {
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "req".into(),
             method: crate::api::schema::Method::PaneSendKeys(PaneSendKeysParams {
+                expected_agent_session_id: None,
                 pane_id,
                 keys: vec![
                     "ctrl+h".into(),
@@ -2678,6 +2749,7 @@ mod tests {
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "req".into(),
             method: crate::api::schema::Method::PaneSendKeys(PaneSendKeysParams {
+                expected_agent_session_id: None,
                 pane_id,
                 keys: vec!["shift+tab".into()],
                 // Synthetic payload fixture explicitly opts out of origin policy.
@@ -3043,6 +3115,7 @@ mod tests {
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "req".into(),
             method: crate::api::schema::Method::PaneSendKeys(PaneSendKeysParams {
+                expected_agent_session_id: None,
                 pane_id,
                 keys: vec!["C-c".into(), "c-c".into(), "ctrl+c".into()],
                 // Synthetic payload fixture explicitly opts out of origin policy.
@@ -3073,6 +3146,7 @@ mod tests {
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "req".into(),
             method: crate::api::schema::Method::PaneSendKeys(PaneSendKeysParams {
+                expected_agent_session_id: None,
                 pane_id,
                 keys: vec!["cmd+c".into()],
                 // Synthetic payload fixture explicitly opts out of origin policy.
@@ -3097,6 +3171,7 @@ mod tests {
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "req".into(),
             method: crate::api::schema::Method::PaneSendKeys(PaneSendKeysParams {
+                expected_agent_session_id: None,
                 pane_id,
                 keys: vec!["+".into()],
                 // Synthetic payload fixture explicitly opts out of origin policy.
@@ -3128,6 +3203,7 @@ mod tests {
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "req".into(),
             method: crate::api::schema::Method::PaneSendKeys(PaneSendKeysParams {
+                expected_agent_session_id: None,
                 pane_id,
                 keys: vec!["shift+?".into()],
                 // Synthetic payload fixture explicitly opts out of origin policy.
@@ -3353,6 +3429,7 @@ mod tests {
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "req".into(),
             method: crate::api::schema::Method::PaneSendKeys(PaneSendKeysParams {
+                expected_agent_session_id: None,
                 pane_id,
                 keys: vec!["ctrl+h".into(), "not-a-key".into()],
                 // Synthetic payload fixture explicitly opts out of origin policy.

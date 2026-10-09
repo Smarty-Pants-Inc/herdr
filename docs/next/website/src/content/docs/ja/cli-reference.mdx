@@ -240,8 +240,8 @@ herdr pane read <pane_id> --source recent-unwrapped --lines 120
 入力を送る:
 
 ```bash
-herdr pane send-text <pane_id> <text>
-herdr pane send-keys <pane_id> <key> [key ...]
+herdr pane send-text <pane_id> [--expected-session ID] <text>
+herdr pane send-keys <pane_id> [--expected-session ID] <key> [key ...]
 herdr pane run <pane_id> <command>
 ```
 
@@ -250,6 +250,12 @@ herdr pane run <pane_id> <command>
 標準表記は `esc` ですが、`escape` も使えます。
 
 `pane run` は現在の bracketed paste モードを尊重し、テキストと Enter をアトミックに送信します。コマンドには `send-text` + `send-keys Enter` よりこちらを使ってください。個別の送信操作は低レベルのままで、コマンドを送信しません。
+
+`agent prompt`、`pane send-text`、`pane send-keys` に `--expected-session ID` を指定すると、報告済みのネイティブエージェントセッションが異なる場合に入力を拒否できます。`pane get` または `agent get` から現在の `agent_session_id` をコピーしてください。これは報告された ID であり、`agent_session.value` ではありません。Pi ではその値が再開用のパスになることがありますが、Herdr は報告された ID を別に保持します。ID が未報告ならガード付き入力は `agent_session_unknown`、異なる ID なら `agent_session_mismatch` を返します。どちらの拒否も実際の ID を公開せず、入力を送りません。
+
+`agent prompt` のターゲットにはエイリアスも使えます。`--expected-pane ID` を追加すると、先に確認したペインに引き続き解決されることを要求できます。異なるペインに解決された場合は `expected_pane_mismatch` です。どちらの期待値も単独または組み合わせて使え、`--wait` とも併用できます。`pane send-text` と `pane send-keys` はすでに正規化された正確な `pane_id` を指定するため、`--expected-pane` は受け付けません。
+
+入力をキューに入れる時点で、チェックは Herdr の報告済みペイン状態に対してアトミックです。エージェントがまだ報告していないセッション変更は検出できません。CLI は `expected_agent_session_guard` を必要とし、未対応ならガード付き操作を送らずに `expected_agent_session_unsupported` を返します。また checked メソッド名を使うため、能力チェック後にサーバーが置き換わっても、安全を確認できなければ操作を拒否します。拒否後に期待値を外して再試行しないでください。これらのフラグを省略すると、既存の動作と別途定められたペイン間入力ポリシーは変わりません。
 
 カスタムフックからエージェント状態を報告する:
 
@@ -321,7 +327,7 @@ herdr agent list
 herdr agent get <target>
 herdr agent read <target> [--source visible|recent|recent-unwrapped|detection] [--lines N] [--format text|ansi] [--ansi]
 herdr agent send-keys <target> <key> [key ...]
-herdr agent prompt <target> <text> [--wait] [--until STATUS]... [--timeout MS]
+herdr agent prompt <target> <text> [--expected-session ID] [--expected-pane ID] [--wait] [--until STATUS]... [--timeout MS]
 herdr agent rename <target> <name>|--clear
 herdr agent focus <target>
 herdr agent wait <target> [--until STATUS]... [--timeout MS]

@@ -175,6 +175,9 @@ pub enum Method {
     AgentStartGuarded(AgentStartParams),
     #[serde(rename = "agent.prompt")]
     AgentPrompt(AgentPromptParams),
+    /// Local JSON only; older servers reject instead of ignoring identity guards.
+    #[serde(rename = "agent.prompt_session_checked")]
+    AgentPromptSessionChecked(AgentPromptParams),
     #[serde(rename = "agent.wait")]
     AgentWait(AgentWaitParams),
     #[serde(rename = "pane.split")]
@@ -253,8 +256,12 @@ pub enum Method {
     PaneRename(PaneRenameParams),
     #[serde(rename = "pane.send_text")]
     PaneSendText(PaneSendTextParams),
+    #[serde(rename = "pane.send_text_session_checked")]
+    PaneSendTextSessionChecked(PaneSendTextParams),
     #[serde(rename = "pane.send_keys")]
     PaneSendKeys(PaneSendKeysParams),
+    #[serde(rename = "pane.send_keys_session_checked")]
+    PaneSendKeysSessionChecked(PaneSendKeysParams),
     #[serde(rename = "pane.send_input")]
     PaneSendInput(PaneSendInputParams),
     /// Requires `expected_terminal`; older servers reject instead of ignoring the guard.

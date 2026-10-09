@@ -8518,6 +8518,7 @@ async fn headless_api_dispatch_uses_origin_context_for_cross_pane_guard() {
     let response = fixture.send_attributed(
         "headless-cross-pane",
         api::schema::Method::PaneSendText(api::schema::PaneSendTextParams {
+            expected_agent_session_id: None,
             pane_id: target_pane_id,
             text: "blocked".into(),
             allow_cross_pane: false,
@@ -8534,6 +8535,8 @@ async fn headless_api_dispatch_uses_origin_context_for_cross_pane_guard() {
 async fn headless_deferred_agent_prompt_enforces_cross_pane_guard() {
     let prompt = |target: &str, allow_cross_pane| {
         api::schema::Method::AgentPrompt(api::schema::AgentPromptParams {
+            expected_agent_session_id: None,
+            expected_pane_id: None,
             target: target.into(),
             text: "hello".into(),
             wait: None,

@@ -121,6 +121,38 @@ struct RecentAgentProcessExit {
     observed_at: Instant,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct SessionReportMarker {
+    processed: u64,
+    accepted: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum BufferedSessionReportKind {
+    Session,
+    Hook,
+}
+
+struct BufferedSessionReport {
+    processed: u64,
+    agent_label: String,
+    session_ref: crate::agent_resume::AgentSessionRef,
+    seq: u64,
+    binding: Option<ReportedAgentSessionId>,
+}
+
+struct ReportedAgentSessionId {
+    identity: (
+        String,
+        String,
+        crate::agent_resume::AgentSessionRefKind,
+        String,
+    ),
+    revision: u64,
+    id: String,
+    reporter: crate::platform::ProcessIdentity,
+}
+
 /// Pure state for a server-owned terminal.
 ///
 /// During the migration this is still one-to-one with a pane-backed PTY, but
@@ -139,6 +171,14 @@ pub struct TerminalState {
     pub persisted_agent_session: Option<crate::agent_resume::PersistedAgentSession>,
     reported_resume: Option<crate::agent_resume::ReportedAgentResume>,
     reported_resume_revision: u64,
+    accepted_session_report_revision: u64,
+    session_report_processing_revision: u64,
+    // At most the selected startup and hook report per lifecycle source. These
+    // transport receipts are transient, not restored or inferred from a path.
+    buffered_session_reports: HashMap<(String, BufferedSessionReportKind), BufferedSessionReport>,
+    // The actual ID is distinct from Pi/OMP's path-based resume reference.
+    // Never persist it or let a rejected report replace it.
+    reported_agent_session_id: Option<ReportedAgentSessionId>,
     pub terminal_title: Option<String>,
     pub manual_label: Option<String>,
     pub agent_name: Option<String>,
@@ -182,6 +222,10 @@ impl TerminalState {
             persisted_agent_session: None,
             reported_resume: None,
             reported_resume_revision: 0,
+            accepted_session_report_revision: 0,
+            session_report_processing_revision: 0,
+            buffered_session_reports: HashMap::new(),
+            reported_agent_session_id: None,
             terminal_title: None,
             manual_label: None,
             agent_name: None,
@@ -445,6 +489,31 @@ impl TerminalState {
             };
         }
         self.detected_agent = agent;
+        // Cached exit/agent replacement still retires buffered transport evidence.
+        // A matching initial label may promote it, but never proves a live PID.
+        self.buffered_session_reports.retain(|_, report| {
+            !process_exited
+                && agent.is_none_or(|agent| {
+                    crate::detect::parse_agent_label(&report.agent_label) == Some(agent)
+                })
+        });
+        // An accepted startup report can precede the first process label. That
+        // matching initial observation is not a replacement of its pinned owner.
+        // This is only a data predicate: delivery must still freshly prove the
+        // unchanged reporter's generation and this PTY's foreground group.
+        let initial_detection_matches_report = previous_detected_agent.is_none()
+            && agent.is_some()
+            && self.reported_agent_session_id().is_some()
+            && self
+                .reported_agent_session_id
+                .as_ref()
+                .is_some_and(|reported| {
+                    crate::detect::parse_agent_label(&reported.identity.1) == agent
+                });
+        if process_exited || (previous_detected_agent != agent && !initial_detection_matches_report)
+        {
+            self.reported_agent_session_id = None;
+        }
         if process_exited || agent != Some(Agent::Codex) || fallback_state == AgentState::Blocked {
             self.codex_prompt_ready = false;
         }
@@ -728,6 +797,34 @@ impl TerminalState {
         seq: Option<u64>,
         now: Instant,
     ) -> Option<TerminalStateMutation> {
+        let mutation = self.apply_hook_authority_at(
+            source,
+            agent_label,
+            state,
+            message,
+            session_ref,
+            seq,
+            now,
+        )?;
+        self.accepted_session_report_revision =
+            self.accepted_session_report_revision.wrapping_add(1);
+        self.reported_agent_session_id = None;
+        self.session_report_processing_revision =
+            self.session_report_processing_revision.wrapping_add(1);
+        Some(mutation)
+    }
+
+    // Keep authority and sequence decisions in the existing implementation.
+    fn apply_hook_authority_at(
+        &mut self,
+        source: String,
+        agent_label: String,
+        state: AgentState,
+        message: Option<String>,
+        session_ref: Option<crate::agent_resume::AgentSessionRef>,
+        seq: Option<u64>,
+        now: Instant,
+    ) -> Option<TerminalStateMutation> {
         if crate::detect::session_identity_only_integration(&source, &agent_label) {
             return None;
         }
@@ -939,6 +1036,8 @@ impl TerminalState {
         reason: FullLifecycleHookSuppressionReason,
         observed_at: Instant,
     ) {
+        self.buffered_session_reports
+            .retain(|(report_source, _), _| report_source != &source);
         self.suppressed_full_lifecycle_hook_reports.insert(
             source,
             SuppressedFullLifecycleHookReport {
@@ -1070,6 +1169,7 @@ impl TerminalState {
             .as_ref()
             .is_none_or(|pending| seq > pending.seq);
         if replace_pending {
+            let queued_ref = session_ref.clone();
             suppressed.pending_replacement_report = Some(PendingFullLifecycleHookReport {
                 authority: HookAuthority {
                     source: source.to_string(),
@@ -1081,6 +1181,13 @@ impl TerminalState {
                 },
                 seq,
             });
+            self.record_buffered_session_report(
+                BufferedSessionReportKind::Hook,
+                source,
+                agent_label,
+                queued_ref,
+                seq,
+            );
         }
         FullLifecycleHookReportRoute::Ignore
     }
@@ -1337,6 +1444,33 @@ impl TerminalState {
         });
         let previous_session = self.current_session_identity_for_persistence();
         for (source, agent_label, session_ref, pending) in validated_replacement_sessions {
+            let selected = pending
+                .as_ref()
+                .map(|report| (BufferedSessionReportKind::Hook, report.seq))
+                .or_else(|| {
+                    self.hook_report_sequences
+                        .get(&source)
+                        .copied()
+                        .map(|seq| (BufferedSessionReportKind::Session, seq))
+                });
+            let binding = selected.and_then(|(kind, seq)| {
+                self.buffered_session_reports
+                    .remove(&(source.clone(), kind))
+                    .filter(|report| {
+                        report.seq == seq
+                            && report.agent_label == agent_label
+                            && report.session_ref == session_ref
+                    })
+                    .and_then(|report| report.binding)
+            });
+            self.buffered_session_reports
+                .retain(|(report_source, _), _| report_source != &source);
+            self.accepted_session_report_revision =
+                self.accepted_session_report_revision.wrapping_add(1);
+            self.reported_agent_session_id = binding.map(|mut binding| {
+                binding.revision = self.accepted_session_report_revision;
+                binding
+            });
             self.forget_stale_full_lifecycle_hook_session(&source, &agent_label, &session_ref);
             self.reconcile_agent_name_owner(&agent_label, Some(&session_ref));
             self.persisted_agent_session = Some(crate::agent_resume::PersistedAgentSession {
@@ -1423,6 +1557,147 @@ impl TerminalState {
                     .as_ref()
                     .map(|session| &session.session_ref)
             })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn accepted_session_report_revision(&self) -> u64 {
+        self.accepted_session_report_revision
+    }
+
+    pub(crate) fn session_report_marker(&self) -> SessionReportMarker {
+        SessionReportMarker {
+            processed: self.session_report_processing_revision,
+            accepted: self.accepted_session_report_revision,
+        }
+    }
+
+    fn record_buffered_session_report(
+        &mut self,
+        kind: BufferedSessionReportKind,
+        source: &str,
+        agent: &str,
+        session_ref: crate::agent_resume::AgentSessionRef,
+        seq: u64,
+    ) {
+        self.session_report_processing_revision =
+            self.session_report_processing_revision.wrapping_add(1);
+        self.buffered_session_reports.insert(
+            (source.to_string(), kind),
+            BufferedSessionReport {
+                processed: self.session_report_processing_revision,
+                agent_label: agent.to_string(),
+                session_ref,
+                seq,
+                binding: None,
+            },
+        );
+    }
+
+    pub(crate) fn retain_reported_agent_session_id(
+        &mut self,
+        report: (SessionReportMarker, Option<u64>),
+        source: &str,
+        agent: &str,
+        session_ref: Option<&crate::agent_resume::AgentSessionRef>,
+        id: Option<String>,
+        reporter: Option<crate::platform::ProcessIdentity>,
+    ) {
+        let (previous, seq) = report;
+        // Equality of source/path/seq is NOT an acceptance receipt: ignored
+        // duplicates must not attach an ID or replace an authentic transport peer.
+        if previous.processed == self.session_report_processing_revision {
+            return;
+        }
+        let Some(reference) = session_ref else {
+            return;
+        };
+        let identity = (
+            source.to_string(),
+            agent.to_string(),
+            reference.kind,
+            reference.value.clone(),
+        );
+        let binding = id
+            .and_then(crate::agent_resume::AgentSessionRef::id)
+            .zip(reporter)
+            .map(|(id, reporter)| ReportedAgentSessionId {
+                identity: identity.clone(),
+                revision: self.accepted_session_report_revision,
+                id: id.value,
+                reporter,
+            });
+        if previous.accepted != self.accepted_session_report_revision {
+            if self.current_session_identity_for_persistence().as_ref() == Some(&identity) {
+                self.reported_agent_session_id = binding;
+            }
+            return;
+        }
+        if let Some((_, pending)) =
+            self.buffered_session_reports
+                .iter_mut()
+                .find(|((pending_source, _), pending)| {
+                    pending_source == source
+                        && pending.agent_label == agent
+                        && &pending.session_ref == reference
+                        && Some(pending.seq) == seq
+                        && pending.processed == self.session_report_processing_revision
+                })
+        {
+            pending.binding = binding;
+        }
+    }
+
+    /// Transport-bound owner of the accepted current report. Live foreground
+    /// ownership must still be proved by the runtime at the point of input.
+    pub(crate) fn reported_agent_session_reporter(
+        &self,
+    ) -> Option<crate::platform::ProcessIdentity> {
+        self.reported_agent_session_id()?;
+        self.reported_agent_session_id
+            .as_ref()
+            .map(|reported| reported.reporter)
+    }
+
+    /// Discovery of an ID from an accepted current, transport-bound report.
+    /// A restored resume path (or even a restored ID) is not current evidence.
+    /// This accessor alone does not prove the reporter is still live/foreground.
+    pub(crate) fn reported_agent_session_id(&self) -> Option<&str> {
+        let reported = self.reported_agent_session_id.as_ref()?;
+        if reported.revision != self.accepted_session_report_revision {
+            return None;
+        }
+        // This accessor is used when building pane/agent info. Compare borrowed
+        // state, rather than allocating a full persistence identity per pane.
+        let (source, agent, kind, value) = &reported.identity;
+        let current = self
+            .hook_authority
+            .as_ref()
+            .and_then(|authority| {
+                authority.session_ref.as_ref().map(|reference| {
+                    (
+                        authority.source.as_str(),
+                        authority.agent_label.as_str(),
+                        reference,
+                    )
+                })
+            })
+            .or_else(|| {
+                self.persisted_agent_session.as_ref().map(|session| {
+                    (
+                        session.source.as_str(),
+                        session.agent.as_str(),
+                        &session.session_ref,
+                    )
+                })
+            });
+        current
+            .filter(|(current_source, current_agent, reference)| {
+                *current_source == source
+                    && *current_agent == agent
+                    && reference.kind == *kind
+                    && reference.value == *value
+            })
+            .map(|_| reported.id.as_str())
     }
 
     fn current_session_identity_for_persistence(
@@ -1563,6 +1838,8 @@ impl TerminalState {
         &mut self,
         session: crate::agent_resume::PersistedAgentSession,
     ) {
+        self.reported_agent_session_id = None;
+        self.buffered_session_reports.clear();
         self.persisted_agent_session = Some(session);
     }
 
@@ -1570,6 +1847,8 @@ impl TerminalState {
         &mut self,
         session: crate::agent_resume::PersistedAgentSession,
     ) {
+        self.reported_agent_session_id = None;
+        self.buffered_session_reports.clear();
         self.persisted_agent_session = Some(session.clone());
         self.managed_agent_launch_session = Some(session);
     }
@@ -1585,6 +1864,29 @@ impl TerminalState {
     }
 
     pub fn set_agent_session_ref_for_session_start(
+        &mut self,
+        source: String,
+        agent_label: String,
+        session_ref: Option<crate::agent_resume::AgentSessionRef>,
+        seq: Option<u64>,
+        session_start_source: Option<String>,
+    ) -> Option<TerminalStateMutation> {
+        let mutation = self.apply_agent_session_ref_for_session_start(
+            source,
+            agent_label,
+            session_ref,
+            seq,
+            session_start_source,
+        )?;
+        self.accepted_session_report_revision =
+            self.accepted_session_report_revision.wrapping_add(1);
+        self.reported_agent_session_id = None;
+        self.session_report_processing_revision =
+            self.session_report_processing_revision.wrapping_add(1);
+        Some(mutation)
+    }
+
+    fn apply_agent_session_ref_for_session_start(
         &mut self,
         source: String,
         agent_label: String,
@@ -1646,7 +1948,7 @@ impl TerminalState {
                 });
             let suppressed = self
                 .suppressed_full_lifecycle_hook_reports
-                .entry(source)
+                .entry(source.clone())
                 .or_insert_with(|| SuppressedFullLifecycleHookReport {
                     agent_label,
                     session_ref: previous_session_ref,
@@ -1657,6 +1959,8 @@ impl TerminalState {
                 });
             suppressed.replacement_session_ref = Some(session_ref);
             suppressed.pending_replacement_report = None;
+            self.buffered_session_reports
+                .retain(|(report_source, _), _| report_source != &source);
             return None;
         }
         if full_lifecycle_source
@@ -1705,7 +2009,17 @@ impl TerminalState {
                 }
                 suppressed.replacement_session_ref = Some(session_ref);
             }
+            let queued_ref = suppressed.replacement_session_ref.clone();
             self.hook_report_sequences.insert(source.clone(), seq);
+            if let Some(queued_ref) = queued_ref {
+                self.record_buffered_session_report(
+                    BufferedSessionReportKind::Session,
+                    &source,
+                    &agent_label,
+                    queued_ref,
+                    seq,
+                );
+            }
 
             if process_present {
                 self.clear_full_lifecycle_hook_suppression_for_detected_agent(None, known_agent);
@@ -1951,6 +2265,8 @@ impl TerminalState {
         }
         self.persisted_agent_session = None;
         self.displaced_persisted_session = None;
+        self.reported_agent_session_id = None;
+        self.buffered_session_reports.clear();
         Some(TerminalStateMutation {
             effective_state_change: self.recompute_effective_state(
                 previous_agent_label,
@@ -2013,6 +2329,8 @@ impl TerminalState {
             self.clear_agent_name();
         }
         self.hook_authority = None;
+        self.reported_agent_session_id = None;
+        self.buffered_session_reports.clear();
         self.forget_reported_resume_of(source, agent_label);
         if !preserve_foreign_persisted_session {
             self.persisted_agent_session = None;
@@ -2637,6 +2955,272 @@ mod tests {
             agent: agent_label.into(),
             session_ref,
         });
+    }
+
+    fn accepted_startup_session_id() -> (TerminalState, crate::platform::ProcessIdentity) {
+        let mut terminal = test_terminal();
+        let reporter = crate::platform::ProcessIdentity {
+            pid: 17,
+            start_time: 11,
+        };
+        let session_ref = crate::agent_resume::AgentSessionRef::id("private-startup");
+        let marker = terminal.session_report_marker();
+        terminal
+            .set_agent_session_ref_for_session_start(
+                "herdr:claude".into(),
+                "claude".into(),
+                session_ref.clone(),
+                Some(1),
+                Some("startup".into()),
+            )
+            .expect("native session-only startup report accepted before detection");
+        terminal.retain_reported_agent_session_id(
+            (marker, Some(1)),
+            "herdr:claude",
+            "claude",
+            session_ref.as_ref(),
+            Some("private-startup".into()),
+            Some(reporter),
+        );
+        assert_eq!(terminal.detected_agent, None);
+        assert_eq!(
+            terminal.reported_agent_session_id(),
+            Some("private-startup")
+        );
+        (terminal, reporter)
+    }
+
+    #[test]
+    fn reported_session_id_initial_matching_detection_preserves_binding() {
+        let (mut terminal, reporter) = accepted_startup_session_id();
+        let revision = terminal.accepted_session_report_revision();
+        let identity = terminal.current_session_identity_for_persistence();
+        terminal.set_detected_agent_process_at(Agent::Claude, Instant::now());
+        assert_eq!(
+            terminal.reported_agent_session_id(),
+            Some("private-startup")
+        );
+        assert_eq!(terminal.reported_agent_session_reporter(), Some(reporter));
+        assert_eq!(terminal.accepted_session_report_revision(), revision);
+        assert_eq!(
+            terminal.current_session_identity_for_persistence(),
+            identity
+        );
+    }
+
+    #[test]
+    fn reported_session_id_initial_detection_counterexamples_clear_binding() {
+        for (first_detection, next_detection, process_exited) in [
+            (Agent::Codex, None, false),
+            (Agent::Claude, Some(Agent::Claude), true),
+            (Agent::Claude, Some(Agent::Codex), false),
+            (Agent::Claude, None, false),
+        ] {
+            let (mut terminal, _) = accepted_startup_session_id();
+            terminal.set_detected_agent_process_at(first_detection, Instant::now());
+            if first_detection == Agent::Claude {
+                terminal.set_detected_state_with_screen_signals_at(
+                    next_detection,
+                    AgentState::Unknown,
+                    false,
+                    false,
+                    false,
+                    process_exited,
+                    Instant::now(),
+                );
+            }
+            assert_eq!(terminal.reported_agent_session_id(), None);
+            assert_eq!(terminal.reported_agent_session_reporter(), None);
+        }
+    }
+
+    #[test]
+    fn reported_session_id_initial_matching_detection_cannot_revive_superseded_binding() {
+        let (mut terminal, _) = accepted_startup_session_id();
+        terminal
+            .set_agent_session_ref(
+                "herdr:claude".into(),
+                "claude".into(),
+                crate::agent_resume::AgentSessionRef::id("private-startup"),
+                Some(2),
+            )
+            .expect("new report with identical reference still invalidates old binding");
+        terminal.set_detected_agent_process_at(Agent::Claude, Instant::now());
+        assert_eq!(terminal.reported_agent_session_id(), None);
+        assert_eq!(terminal.reported_agent_session_reporter(), None);
+    }
+
+    fn buffer_pi_report(
+        terminal: &mut TerminalState,
+        hook: bool,
+        seq: u64,
+        id: Option<&str>,
+        reporter: Option<crate::platform::ProcessIdentity>,
+    ) {
+        let reference = crate::agent_resume::AgentSessionRef::path("/tmp/buffered.jsonl");
+        let marker = terminal.session_report_marker();
+        if hook {
+            terminal.set_hook_authority_with_session_ref(
+                "herdr:pi".into(),
+                "pi".into(),
+                AgentState::Idle,
+                None,
+                reference.clone(),
+                Some(seq),
+            );
+        } else {
+            terminal.set_agent_session_ref_for_session_start(
+                "herdr:pi".into(),
+                "pi".into(),
+                reference.clone(),
+                Some(seq),
+                Some("startup".into()),
+            );
+        }
+        terminal.retain_reported_agent_session_id(
+            (marker, Some(seq)),
+            "herdr:pi",
+            "pi",
+            reference.as_ref(),
+            id.map(str::to_string),
+            reporter,
+        );
+    }
+
+    #[test]
+    fn buffered_session_report_promotes_only_the_selected_report_metadata() {
+        let reporter = crate::platform::ProcessIdentity {
+            pid: 17,
+            start_time: 11,
+        };
+        for (last_session_seq, expected) in [(2, Some("selected-hook")), (4, None)] {
+            let mut terminal = test_terminal();
+            buffer_pi_report(&mut terminal, false, 1, Some("startup"), Some(reporter));
+            buffer_pi_report(
+                &mut terminal,
+                true,
+                3,
+                Some("selected-hook"),
+                Some(reporter),
+            );
+            // A later-arriving lower-sequence startup does not own the selected
+            // newer hook; a newer startup must not inherit the discarded hook ID.
+            buffer_pi_report(&mut terminal, false, last_session_seq, None, Some(reporter));
+            terminal.set_detected_agent_process_at(Agent::Pi, Instant::now());
+            assert_eq!(terminal.reported_agent_session_id(), expected);
+            assert_eq!(
+                terminal.reported_agent_session_reporter(),
+                expected.map(|_| reporter)
+            );
+        }
+    }
+
+    #[test]
+    fn buffered_session_report_rejected_same_key_does_not_advance_unique_marker() {
+        let reporter = crate::platform::ProcessIdentity {
+            pid: 17,
+            start_time: 11,
+        };
+        for hook in [false, true] {
+            let mut terminal = test_terminal();
+            buffer_pi_report(&mut terminal, false, 1, Some("startup"), Some(reporter));
+            let seq = if hook { 2 } else { 1 };
+            if hook {
+                buffer_pi_report(&mut terminal, true, seq, Some("startup"), Some(reporter));
+            }
+            let marker = terminal.session_report_marker();
+            buffer_pi_report(
+                &mut terminal,
+                hook,
+                seq,
+                Some("rejected"),
+                Some(crate::platform::ProcessIdentity {
+                    start_time: 12,
+                    ..reporter
+                }),
+            );
+            assert_eq!(terminal.session_report_marker(), marker);
+            terminal.set_detected_agent_process_at(Agent::Pi, Instant::now());
+            assert_eq!(terminal.reported_agent_session_id(), Some("startup"));
+            assert_eq!(terminal.reported_agent_session_reporter(), Some(reporter));
+        }
+    }
+
+    #[test]
+    fn buffered_session_report_retention_requires_exact_source_agent_reference_and_sequence() {
+        let reporter = crate::platform::ProcessIdentity {
+            pid: 17,
+            start_time: 11,
+        };
+        for (source, agent, path, seq) in [
+            ("herdr:omp", "pi", "/tmp/buffered.jsonl", 1),
+            ("herdr:pi", "omp", "/tmp/buffered.jsonl", 1),
+            ("herdr:pi", "pi", "/tmp/other.jsonl", 1),
+            ("herdr:pi", "pi", "/tmp/buffered.jsonl", 2),
+        ] {
+            let mut terminal = test_terminal();
+            let marker = terminal.session_report_marker();
+            terminal.set_agent_session_ref_for_session_start(
+                "herdr:pi".into(),
+                "pi".into(),
+                crate::agent_resume::AgentSessionRef::path("/tmp/buffered.jsonl"),
+                Some(1),
+                Some("startup".into()),
+            );
+            terminal.retain_reported_agent_session_id(
+                (marker, Some(seq)),
+                source,
+                agent,
+                crate::agent_resume::AgentSessionRef::path(path).as_ref(),
+                Some("wrong-receipt".into()),
+                Some(reporter),
+            );
+            terminal.set_detected_agent_process_at(Agent::Pi, Instant::now());
+            assert_eq!(terminal.reported_agent_session_id(), None);
+        }
+    }
+
+    #[test]
+    fn buffered_session_report_exit_different_agent_and_restore_retire_transport_metadata() {
+        let reporter = crate::platform::ProcessIdentity {
+            pid: 17,
+            start_time: 11,
+        };
+        for action in ["exit", "different-agent", "restore"] {
+            let mut terminal = test_terminal();
+            buffer_pi_report(&mut terminal, false, 1, Some("startup"), Some(reporter));
+            match action {
+                "exit" => {
+                    terminal.set_detected_state_with_screen_signals_at(
+                        Some(Agent::Pi),
+                        AgentState::Unknown,
+                        false,
+                        false,
+                        false,
+                        true,
+                        Instant::now(),
+                    );
+                }
+                "different-agent" => {
+                    terminal.set_detected_agent_process_at(Agent::Claude, Instant::now());
+                }
+                _ => {
+                    terminal.set_persisted_agent_session(
+                        crate::agent_resume::PersistedAgentSession {
+                            source: "herdr:pi".into(),
+                            agent: "pi".into(),
+                            session_ref: crate::agent_resume::AgentSessionRef::path(
+                                "/tmp/buffered.jsonl",
+                            )
+                            .expect("path"),
+                        },
+                    );
+                }
+            }
+            terminal.set_detected_agent_process_at(Agent::Pi, Instant::now());
+            assert_eq!(terminal.reported_agent_session_id(), None);
+            assert_eq!(terminal.reported_agent_session_reporter(), None);
+        }
     }
 
     #[test]

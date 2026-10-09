@@ -3924,6 +3924,25 @@ impl PaneRuntime {
         .then_some(identity)
     }
 
+    /// Fresh, scalar ownership proof for guarded API enqueue. Never use cached
+    /// detection or wait on the actor command channel for this security check.
+    pub(crate) fn session_reporter_is_foreground(
+        &self,
+        reporter: crate::platform::ProcessIdentity,
+    ) -> bool {
+        #[cfg(unix)]
+        {
+            let foreground = self.io.detection_foreground();
+            crate::platform::session_reporter_is_foreground(reporter, || {
+                foreground.observe().flatten()
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            crate::platform::session_reporter_is_foreground(reporter, || None)
+        }
+    }
+
     pub fn follow_cwd(&self) -> Option<std::path::PathBuf> {
         #[cfg(unix)]
         {
@@ -5276,6 +5295,18 @@ mod tests {
         runtime.child_pid.store(identity.pid, Ordering::Release);
         runtime.cwd_process_exited.store(true, Ordering::Release);
         assert_eq!(runtime.child_process_identity(), None);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn session_reporter_foreground_requires_this_runtime_master() {
+        let (runtime, _rx) = PaneRuntime::test_with_channel(80, 24);
+        let reporter =
+            crate::platform::process_identity(std::process::id()).expect("live reporter");
+        runtime.test_set_child_pid(reporter.pid);
+        assert_eq!(runtime.child_process_identity(), Some(reporter));
+        // A valid root pin does not substitute for this runtime's master ioctl.
+        assert!(!runtime.session_reporter_is_foreground(reporter));
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

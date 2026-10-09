@@ -240,8 +240,8 @@ herdr pane read <pane_id> --source recent-unwrapped --lines 120
 发送输入:
 
 ```bash
-herdr pane send-text <pane_id> <text>
-herdr pane send-keys <pane_id> <key> [key ...]
+herdr pane send-text <pane_id> [--expected-session ID] <text>
+herdr pane send-keys <pane_id> [--expected-session ID] <key> [key ...]
 herdr pane run <pane_id> <command>
 ```
 
@@ -250,6 +250,12 @@ herdr pane run <pane_id> <command>
 标准拼写是 `esc`;也接受 `escape`。
 
 `pane run` 会遵循当前的 bracketed paste 模式,并把文本和 Enter 作为一个原子操作提交。发送命令时优先用它,而不是 `send-text` 加 `send-keys Enter`;单独的发送操作仍是底层操作,不会提交命令。
+
+在 `agent prompt`、`pane send-text` 或 `pane send-keys` 上使用 `--expected-session ID`，可拒绝向不同的已上报原生智能体会话发送输入。请从 `pane get` 或 `agent get` 复制当前的 `agent_session_id`。这是上报的 ID，不是 `agent_session.value`：对 Pi，该值可以是恢复路径，而 Herdr 会单独保留上报的 ID。没有上报 ID 时，带守卫的输入返回 `agent_session_unknown`；ID 不同时返回 `agent_session_mismatch`。两种拒绝都不会泄露实际 ID，也不会发送输入。
+
+`agent prompt` 的目标可以是别名。添加 `--expected-pane ID` 可要求它仍解析到先前观察到的窗格；解析到不同窗格时返回 `expected_pane_mismatch`。两个预期条件可以单独或一起使用，也可与 `--wait` 一起使用。`pane send-text` 和 `pane send-keys` 已经指定精确且规范化的 `pane_id`，因此不接受 `--expected-pane`。
+
+输入入队时，检查与 Herdr 的已上报窗格状态是原子的。它无法检测智能体尚未上报的会话变化。CLI 要求 `expected_agent_session_guard`；缺少支持时，它返回 `expected_agent_session_unsupported`，不发送带守卫的操作，并使用 checked 方法名，因此即使能力检查后服务器被替换，也会在无法确认安全时拒绝操作。拒绝后不要去掉预期条件重试。省略这些标志会保留现有行为和独立的跨窗格输入策略。
 
 从自定义钩子上报智能体状态:
 
@@ -321,7 +327,7 @@ herdr agent list
 herdr agent get <target>
 herdr agent read <target> [--source visible|recent|recent-unwrapped|detection] [--lines N] [--format text|ansi] [--ansi]
 herdr agent send-keys <target> <key> [key ...]
-herdr agent prompt <target> <text> [--wait] [--until STATUS]... [--timeout MS]
+herdr agent prompt <target> <text> [--expected-session ID] [--expected-pane ID] [--wait] [--until STATUS]... [--timeout MS]
 herdr agent rename <target> <name>|--clear
 herdr agent focus <target>
 herdr agent wait <target> [--until STATUS]... [--timeout MS]

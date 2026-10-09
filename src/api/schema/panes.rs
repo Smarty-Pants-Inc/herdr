@@ -364,6 +364,13 @@ pub struct PaneRenameParams {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PaneSendTextParams {
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "super::deserialize_expected_terminal"
+    )]
+    #[schemars(with = "String")]
+    pub expected_agent_session_id: Option<String>,
     pub pane_id: String,
     pub text: String,
     /// Deliberately allow an agent-originated request to target another pane.
@@ -373,6 +380,13 @@ pub struct PaneSendTextParams {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PaneSendKeysParams {
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "super::deserialize_expected_terminal"
+    )]
+    #[schemars(with = "String")]
+    pub expected_agent_session_id: Option<String>,
     pub pane_id: String,
     pub keys: Vec<String>,
     /// Deliberately allow an agent-originated request to target another pane.
@@ -541,6 +555,9 @@ pub struct PaneInfo {
     pub tokens: HashMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_session: Option<AgentSessionInfo>,
+    /// Actual ID from the accepted current report, independent of its resume path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scroll: Option<PaneScrollInfo>,
     pub revision: u64,

@@ -85,15 +85,25 @@ impl App {
         context: crate::api::ApiRequestContext,
         respond_to: std::sync::mpsc::Sender<String>,
     ) -> bool {
-        if !matches!(request.method, crate::api::schema::Method::AgentPrompt(_)) {
+        if !matches!(
+            request.method,
+            crate::api::schema::Method::AgentPrompt(_)
+                | crate::api::schema::Method::AgentPromptSessionChecked(_)
+        ) {
             return false;
+        }
+        if let Some(response) = self.session_checked_guard_denial(&request) {
+            let _ = respond_to.send(response);
+            return true;
         }
         if let Some(response) = self.cross_pane_input_denial(&request, context) {
             let _ = respond_to.send(response);
             return true;
         }
-        let crate::api::schema::Method::AgentPrompt(params) = request.method else {
-            return false;
+        let params = match request.method {
+            crate::api::schema::Method::AgentPrompt(params)
+            | crate::api::schema::Method::AgentPromptSessionChecked(params) => params,
+            _ => return false,
         };
         match self.queue_agent_prompt(request.id, params, context) {
             Ok((id, agent, completion)) => {
@@ -140,6 +150,14 @@ impl App {
             Ok(resolved) => resolved,
             Err(err) => return Err(encode_error_body(id, self.agent_target_error_body(err))),
         };
+        self.check_expected_pane(params.expected_pane_id.as_deref(), &resolved)
+            .map_err(|error| encode_error_body(id.clone(), error))?;
+        self.check_expected_agent_session(
+            params.expected_agent_session_id.as_deref(),
+            resolved.ws_idx,
+            resolved.pane_id,
+        )
+        .map_err(|error| encode_error_body(id.clone(), error))?;
         let Some(terminal_id) = self
             .state
             .workspaces
@@ -500,6 +518,8 @@ mod tests {
             &mut app,
             "req",
             AgentPromptParams {
+                expected_agent_session_id: None,
+                expected_pane_id: None,
                 target: "reviewer".into(),
                 text: "A != B".into(),
                 wait: None,
@@ -601,6 +621,8 @@ mod tests {
             &mut app,
             "req",
             AgentPromptParams {
+                expected_agent_session_id: None,
+                expected_pane_id: None,
                 target: public_pane_id,
                 text: "A != B".into(),
                 wait: None,
@@ -632,6 +654,8 @@ mod tests {
             &mut app,
             "req-raw",
             AgentPromptParams {
+                expected_agent_session_id: None,
+                expected_pane_id: None,
                 target: "reviewer".into(),
                 text: "A != B".into(),
                 wait: None,
@@ -648,6 +672,8 @@ mod tests {
             &mut app,
             "req-label",
             AgentPromptParams {
+                expected_agent_session_id: None,
+                expected_pane_id: None,
                 target: "opencode".into(),
                 text: "wrong target".into(),
                 wait: None,
@@ -676,6 +702,8 @@ mod tests {
             &mut app,
             "req",
             AgentPromptParams {
+                expected_agent_session_id: None,
+                expected_pane_id: None,
                 target: "reviewer".into(),
                 text: "unrelated prompt".into(),
                 wait: None,
@@ -718,6 +746,8 @@ mod tests {
             &mut app,
             "req",
             AgentPromptParams {
+                expected_agent_session_id: None,
+                expected_pane_id: None,
                 target: "reviewer".into(),
                 text: "A != B".into(),
                 wait: None,
@@ -803,6 +833,8 @@ mod tests {
             &mut app,
             "req-pending",
             AgentPromptParams {
+                expected_agent_session_id: None,
+                expected_pane_id: None,
                 target: "reviewer".into(),
                 text: "A != B".into(),
                 wait: None,

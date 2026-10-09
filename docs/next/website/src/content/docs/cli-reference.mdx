@@ -257,8 +257,8 @@ herdr pane read <pane_id> --source recent-unwrapped --lines 120
 Send input:
 
 ```bash
-herdr pane send-text <pane_id> <text>
-herdr pane send-keys <pane_id> <key> [key ...]
+herdr pane send-text <pane_id> [--expected-session ID] <text>
+herdr pane send-keys <pane_id> [--expected-session ID] <key> [key ...]
 herdr pane run <pane_id> [--expected-terminal TERMINAL_ID] <command>
 ```
 
@@ -273,6 +273,12 @@ aliases for `ctrl+c`.
 `pane run` honors live bracketed-paste mode and submits text plus Enter atomically. Prefer it over `send-text` plus `send-keys Enter` for commands; the separate send operations remain low-level and non-submitting.
 
 Use `--expected-terminal <terminal_id>` on `pane run` or `agent start` to refuse a stale pane target. Copy the opaque `terminal_id` from `pane get` or `pane list`; do not derive it from a pane ID, position, or agent name. The server checks the pane's current attachment before it sends input or binds an agent name. An unknown, malformed, or different identity returns `terminal_identity_mismatch` with no input or startup effects. The CLI returns `expected_terminal_unsupported` without sending the guarded operation if the server does not advertise support. It uses guarded method names so replacement by an older server cannot silently remove the check. Without this flag, existing behavior is unchanged. This guard pins the terminal, not the identity of a process or agent session running inside it.
+
+Use `--expected-session ID` on `agent prompt`, `pane send-text`, or `pane send-keys` to refuse input to a different reported native agent session. Copy the current `agent_session_id` from `pane get` or `agent get`. This is the reported ID, not `agent_session.value`: for Pi, that value can be a resume path while Herdr retains the reported ID separately. If no ID is reported, guarded input returns `agent_session_unknown`; a different ID returns `agent_session_mismatch`. Neither refusal reveals the actual ID or sends input.
+
+An `agent prompt` target can be an alias. Add `--expected-pane ID` to require that it still resolves to the observed pane; a different resolution returns `expected_pane_mismatch`. Either expectation can be used alone or together, including with `--wait`. `pane send-text` and `pane send-keys` already target an exact normalized `pane_id`, so they do not accept `--expected-pane`.
+
+The check is atomic with Herdr's reported pane state when input is enqueued. It cannot detect a session change that the agent has not reported. The CLI requires `expected_agent_session_guard`, returns `expected_agent_session_unsupported` without sending the guarded operation when support is absent, and uses checked method names so a server replacement after the capability check fails closed. Do not retry without the expectation after refusal. Omitting these flags preserves existing behavior and the separate cross-pane input policy.
 
 Report agent state from custom hooks:
 
@@ -346,7 +352,7 @@ herdr agent list
 herdr agent get <target>
 herdr agent read <target> [--source visible|recent|recent-unwrapped|detection] [--lines N] [--format text|ansi] [--ansi]
 herdr agent send-keys <target> <key> [key ...]
-herdr agent prompt <target> <text> [--wait] [--until STATUS]... [--timeout MS]
+herdr agent prompt <target> <text> [--expected-session ID] [--expected-pane ID] [--wait] [--until STATUS]... [--timeout MS]
 herdr agent rename <target> <name>|--clear
 herdr agent focus <target>
 herdr agent wait <target> [--until STATUS]... [--timeout MS]

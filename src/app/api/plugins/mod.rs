@@ -3339,6 +3339,7 @@ action = "missing"
                 agent_session_path: None,
                 resume_argv: None,
             },
+            Default::default(),
         );
 
         let root = unique_temp_path("plugin-action-context");

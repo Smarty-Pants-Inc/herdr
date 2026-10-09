@@ -775,6 +775,13 @@
                 }
               ]
             },
+            "agent_session_id": {
+              "description": "Actual ID from the accepted current report, independent of its resume path.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "agent_status": {
               "$ref": "#/schemas/event/$defs/AgentStatus"
             },
@@ -1233,6 +1240,14 @@
             "allow_cross_pane": {
               "description": "Deliberately allow an agent-originated request to target another pane.",
               "type": "boolean"
+            },
+            "expected_agent_session_id": {
+              "description": "Refuse input unless the resolved agent still reports this session ID.",
+              "type": "string"
+            },
+            "expected_pane_id": {
+              "description": "Refuse input unless the target alias resolves to this pane.",
+              "type": "string"
             },
             "target": {
               "type": "string"
@@ -3397,6 +3412,9 @@
               "description": "Deliberately allow an agent-originated request to target another pane.",
               "type": "boolean"
             },
+            "expected_agent_session_id": {
+              "type": "string"
+            },
             "keys": {
               "items": {
                 "type": "string"
@@ -3418,6 +3436,9 @@
             "allow_cross_pane": {
               "description": "Deliberately allow an agent-originated request to target another pane.",
               "type": "boolean"
+            },
+            "expected_agent_session_id": {
+              "type": "string"
             },
             "pane_id": {
               "type": "string"
@@ -5943,6 +5964,23 @@
           "type": "object"
         },
         {
+          "description": "Local JSON only; older servers reject instead of ignoring identity guards.",
+          "properties": {
+            "method": {
+              "const": "agent.prompt_session_checked",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentPromptParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
           "properties": {
             "method": {
               "const": "agent.wait",
@@ -6541,7 +6579,39 @@
         {
           "properties": {
             "method": {
+              "const": "pane.send_text_session_checked",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneSendTextParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "pane.send_keys",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneSendKeysParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "pane.send_keys_session_checked",
               "type": "string"
             },
             "params": {
@@ -7310,6 +7380,13 @@
                 {
                   "type": "null"
                 }
+              ]
+            },
+            "agent_session_id": {
+              "description": "Actual ID from the accepted current report, independent of its resume path.",
+              "type": [
+                "string",
+                "null"
               ]
             },
             "agent_status": {
@@ -8646,6 +8723,13 @@
                 {
                   "type": "null"
                 }
+              ]
+            },
+            "agent_session_id": {
+              "description": "Actual ID from the accepted current report, independent of its resume path.",
+              "type": [
+                "string",
+                "null"
               ]
             },
             "agent_status": {
@@ -11303,6 +11387,11 @@
                 "integer",
                 "null"
               ]
+            },
+            "expected_agent_session_guard": {
+              "default": false,
+              "description": "Supports the local JSON session-checked prompt, text and key methods.",
+              "type": "boolean"
             },
             "expected_terminal_guard": {
               "default": false,

@@ -61,6 +61,69 @@ impl App {
         })
     }
 
+    /// The same App turn resolves, freshly proves the accepted report's pinned
+    /// process is live in this PTY's foreground group, compares the session ID,
+    /// and enqueues input (including focus). Cached detection is not ownership
+    /// evidence. This does not query the agent's unreported internal session.
+    pub(super) fn check_expected_agent_session(
+        &self,
+        expected: Option<&str>,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+    ) -> Result<(), crate::api::schema::ErrorBody> {
+        let Some(expected) = expected else {
+            return Ok(());
+        };
+        let actual = self
+            .state
+            .terminal_id_for_pane(ws_idx, pane_id)
+            .and_then(|id| self.state.terminals.get(&id))
+            .and_then(|terminal| {
+                let reporter = terminal.reported_agent_session_reporter()?;
+                let runtime = self.state.runtime_for_pane_in_workspace(
+                    &self.terminal_runtimes,
+                    ws_idx,
+                    pane_id,
+                )?;
+                if !runtime.session_reporter_is_foreground(reporter) {
+                    return None;
+                }
+                terminal.reported_agent_session_id()
+            });
+        match actual {
+            Some(actual) if actual == expected => Ok(()),
+            Some(_) => Err(crate::api::schema::ErrorBody {
+                code: "agent_session_mismatch".into(),
+                message: format!(
+                    "the target's reported agent session does not match expected {expected:?}"
+                ),
+            }),
+            None => Err(crate::api::schema::ErrorBody {
+                code: "agent_session_unknown".into(),
+                message: format!(
+                    "the target has no accepted current agent session ID for expected {expected:?}"
+                ),
+            }),
+        }
+    }
+
+    pub(super) fn check_expected_pane(
+        &self,
+        expected: Option<&str>,
+        target: &TerminalTarget,
+    ) -> Result<(), crate::api::schema::ErrorBody> {
+        let Some(expected) = expected else {
+            return Ok(());
+        };
+        if self.parse_pane_id(expected) == Some((target.ws_idx, target.pane_id)) {
+            return Ok(());
+        }
+        Err(crate::api::schema::ErrorBody {
+            code: "expected_pane_mismatch".into(),
+            message: "the agent target no longer resolves to the expected pane".into(),
+        })
+    }
+
     pub(crate) fn resolve_terminal_target(
         &self,
         target: &str,
@@ -606,6 +669,7 @@ mod tests {
                     Request {
                         id: "logged".into(),
                         method: Method::PaneSendText(PaneSendTextParams {
+                            expected_agent_session_id: None,
                             pane_id: target_id.clone(),
                             text: "private prompt".into(),
                             allow_cross_pane: false,

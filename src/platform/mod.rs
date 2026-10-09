@@ -83,6 +83,50 @@ pub(crate) struct ProcessIdentity {
     pub(crate) start_time: u64,
 }
 
+/// Prove that the pinned reporter still belongs to this PTY's current foreground
+/// group. The supplied observation must read this pane's master, not a cached
+/// detection result. Only platforms with native generation and job-control
+/// evidence support this proof; other platforms deliberately fail closed.
+pub(crate) fn session_reporter_is_foreground(
+    reporter: ProcessIdentity,
+    observe_foreground: impl FnOnce() -> Option<u32>,
+) -> bool {
+    #[cfg(target_os = "linux")]
+    return observe_session_reporter_foreground(
+        reporter,
+        linux::session_reporter_process_group_id,
+        observe_foreground,
+    );
+    #[cfg(target_os = "macos")]
+    return observe_session_reporter_foreground(
+        reporter,
+        macos::session_reporter_process_group_id,
+        observe_foreground,
+    );
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (reporter, observe_foreground);
+        false
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn observe_session_reporter_foreground(
+    reporter: ProcessIdentity,
+    live_process_group: impl Fn(ProcessIdentity) -> Option<u32>,
+    observe_foreground: impl FnOnce() -> Option<u32>,
+) -> bool {
+    let Some(group) = live_process_group(reporter).filter(|group| *group > 0) else {
+        return false;
+    };
+    if observe_foreground() != Some(group) {
+        return false;
+    }
+    // Bracket the master ioctl with fresh identity/liveness and group checks:
+    // exit, PID reuse, or a job-control group change invalidates the proof.
+    live_process_group(reporter) == Some(group)
+}
+
 /// Linux consumer proof; unsupported platforms deliberately refuse.
 #[cfg(unix)]
 #[derive(Debug, Clone)]
@@ -638,6 +682,106 @@ fn observe_parent_identity(
         && identity_of(child.pid) == Some(child)
         && identity_of(parent.pid) == Some(parent))
     .then_some(parent)
+}
+
+#[cfg(test)]
+mod session_reporter_foreground_tests {
+    use super::*;
+
+    fn reporter() -> ProcessIdentity {
+        ProcessIdentity {
+            pid: 12,
+            start_time: 34,
+        }
+    }
+
+    #[test]
+    fn session_reporter_foreground_requires_fresh_matching_group() {
+        assert!(observe_session_reporter_foreground(
+            reporter(),
+            |_| Some(12),
+            || Some(12),
+        ));
+        for foreground in [None, Some(0), Some(13)] {
+            assert!(!observe_session_reporter_foreground(
+                reporter(),
+                |_| Some(12),
+                || foreground,
+            ));
+        }
+        for group in [None, Some(0)] {
+            assert!(!observe_session_reporter_foreground(
+                reporter(),
+                |_| group,
+                || panic!("unproven reporter must not query the master"),
+            ));
+        }
+    }
+
+    #[test]
+    fn session_reporter_foreground_rechecks_live_generation_and_group_after_ioctl() {
+        for after in [None, Some(0), Some(13)] {
+            let queried = std::cell::Cell::new(false);
+            assert!(!observe_session_reporter_foreground(
+                reporter(),
+                |peer| {
+                    assert_eq!(peer, reporter());
+                    if queried.get() {
+                        after
+                    } else {
+                        Some(12)
+                    }
+                },
+                || {
+                    queried.set(true);
+                    Some(12)
+                },
+            ));
+            assert!(queried.get());
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn session_reporter_foreground_native_rejects_stale_or_dead_reporter() {
+        let live = process_identity(std::process::id()).expect("live reporter");
+        // SAFETY: getpgrp queries this test process and has no pointer arguments.
+        let group = unsafe { libc::getpgrp() } as u32;
+        assert!(session_reporter_is_foreground(live, || Some(group)));
+        assert!(!session_reporter_is_foreground(live, || None));
+        assert!(!session_reporter_is_foreground(live, || {
+            Some(group.wrapping_add(1))
+        }));
+        assert!(!session_reporter_is_foreground(
+            ProcessIdentity {
+                start_time: live.start_time.wrapping_add(1),
+                ..live
+            },
+            || Some(group),
+        ));
+        assert!(!session_reporter_is_foreground(
+            ProcessIdentity {
+                pid: 0,
+                start_time: 0,
+            },
+            || Some(group),
+        ));
+        assert!(!session_reporter_is_foreground(
+            ProcessIdentity {
+                pid: u32::MAX,
+                start_time: 0,
+            },
+            || Some(group),
+        ));
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[test]
+    fn session_reporter_foreground_unsupported_platform_does_not_query_master() {
+        assert!(!session_reporter_is_foreground(reporter(), || {
+            panic!("unsupported foreground proof must fail closed")
+        }));
+    }
 }
 
 #[cfg(test)]

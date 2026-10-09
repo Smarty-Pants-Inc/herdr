@@ -103,11 +103,11 @@ Raw socket method names use dot notation:
 | Workspace | `workspace.create`, `workspace.create_linked`, `workspace.list`, `workspace.get`, `workspace.focus`, `workspace.rename`, `workspace.move`, `workspace.move_block`, `workspace.report_metadata`, `workspace.close` |
 | Worktree | `worktree.list`, `worktree.create`, `worktree.create_project_checked`, `worktree.open`, `worktree.open_project_checked`, `worktree.remove` |
 | Tab | `tab.create`, `tab.list`, `tab.get`, `tab.focus`, `tab.rename`, `tab.move`, `tab.close` |
-| Pane | `pane.split`, `pane.swap`, `pane.move`, `pane.zoom`, `pane.layout`, `pane.process_info`, `pane.neighbor`, `pane.edges`, `pane.focus_direction`, `pane.resize`, `pane.list`, `pane.current`, `pane.get`, `pane.last_input`, `pane.rename`, `pane.send_text`, `pane.send_keys`, `pane.send_input`, `pane.send_input_guarded`, `pane.read`, `pane.report_agent`, `pane.report_agent_session`, `pane.report_metadata`, `pane.clear_agent_authority`, `pane.release_agent`, `pane.close`, `pane.wait_for_output` |
+| Pane | `pane.split`, `pane.swap`, `pane.move`, `pane.zoom`, `pane.layout`, `pane.process_info`, `pane.neighbor`, `pane.edges`, `pane.focus_direction`, `pane.resize`, `pane.list`, `pane.current`, `pane.get`, `pane.last_input`, `pane.rename`, `pane.send_text`, `pane.send_text_session_checked`, `pane.send_keys`, `pane.send_keys_session_checked`, `pane.send_input`, `pane.send_input_guarded`, `pane.read`, `pane.report_agent`, `pane.report_agent_session`, `pane.report_metadata`, `pane.clear_agent_authority`, `pane.release_agent`, `pane.close`, `pane.wait_for_output` |
 | Input consumer (local JSON only) | `pane.input_consumer.enroll`, `pane.input_consumer.cut`, `pane.input_consumer.release` |
 | Popup | `popup.close` |
 | Layout | `layout.export`, `layout.apply`, `layout.apply_restorable`, `layout.set_split_ratio` |
-| Agent | `agent.list`, `agent.get`, `agent.read`, `agent.explain`, `agent.send_keys`, `agent.prompt`, `agent.wait`, `agent.rename`, `agent.focus`, `agent.start`, `agent.start_guarded`, `agent.view.set`, `agent.view.clear` |
+| Agent | `agent.list`, `agent.get`, `agent.read`, `agent.explain`, `agent.send_keys`, `agent.prompt`, `agent.prompt_session_checked`, `agent.wait`, `agent.rename`, `agent.focus`, `agent.start`, `agent.start_guarded`, `agent.view.set`, `agent.view.clear` |
 | Events | `events.subscribe`, `events.wait` |
 | Integrations | `integration.install`, `integration.uninstall` |
 | Plugins | `plugin.link`, `plugin.list`, `plugin.unlink`, `plugin.enable`, `plugin.disable`, `plugin.action.list`, `plugin.action.invoke`, `plugin.log.list`, `plugin.pane.open`, `plugin.pane.focus`, `plugin.pane.close` |
@@ -366,6 +366,24 @@ Check `ping.result.capabilities.expected_terminal_guard == true` before using th
 ```
 
 The guard identifies a terminal, not an agent name, process, or native agent session inside that terminal. It does not change the separate cross-pane input policy.
+
+### Expected agent session guard
+
+`agent.prompt`, `pane.send_text`, and `pane.send_keys` accept an optional `expected_agent_session_id` string. Copy `agent_session_id` from the current `pane.get` or `agent.get` record, not `agent_session.value`. For Pi, the latter can be a resume path; the server retains the reported native ID separately. An unreported ID returns `agent_session_unknown`; a different ID returns `agent_session_mismatch`. Refusals send no input and never include the actual ID.
+
+The server binds an accepted session report to the local socket peer's process ID and start time. At enqueue it also checks that this same process is alive and belongs to the pane's current PTY foreground process group, using a fresh native observation rather than cached agent detection. An exited, suspended, background, unbound, or replaced reporter returns `agent_session_unknown`, even before exit detection updates the pane. This proof is available on Linux and macOS; Windows and unsupported platforms fail closed with `agent_session_unknown`. Short-lived hook reporters cannot authorize later guarded sends after they exit. Omitting the session expectation does not apply this process check.
+
+The bundled Pi and OMP integrations report both the native ID and the unchanged resume path. Older path-only integrations produce `agent_session_unknown`; reinstall the updated integration with `herdr integration install pi` or `herdr integration install omp`, then restart or reload that agent at a safe boundary so it reports the ID.
+
+`agent.prompt` also accepts `expected_pane_id`, which requires its target (including an alias) to resolve to that exact pane. A different resolution returns `expected_pane_mismatch` without input. These expectations can be used separately or together, including with the optional `wait` object. Pane sends already address an exact `pane_id`; they do not have an `expected_pane_id` field. Checks are atomic with Herdr's reported pane state at input enqueue, not with an agent's unreported internal session changes. Omitting the expectations retains existing behavior and does not change cross-pane input policy.
+
+Check `ping.result.capabilities.expected_agent_session_guard == true`. For guarded operations, use `agent.prompt_session_checked`, `pane.send_text_session_checked`, and `pane.send_keys_session_checked`. The checked prompt method requires at least one expectation; checked pane sends require `expected_agent_session_id`. Older servers reject these names instead of silently ignoring the guard, including when replaced between ping and the operation. Do not fall back to the unchecked method after rejection. The CLI uses these aliases for `--expected-session` and for `agent prompt --expected-pane`, and returns `expected_agent_session_unsupported` without sending the operation when the capability is absent.
+
+```json
+{"id":"checked_prompt","method":"agent.prompt_session_checked","params":{"target":"worker","text":"review this change","expected_agent_session_id":"reported_id_from_agent_get","expected_pane_id":"w1:p1","wait":{"until":["idle"],"timeout_ms":30000}}}
+{"id":"checked_text","method":"pane.send_text_session_checked","params":{"pane_id":"w1:p1","text":"hello","expected_agent_session_id":"reported_id_from_pane_get"}}
+{"id":"checked_keys","method":"pane.send_keys_session_checked","params":{"pane_id":"w1:p1","keys":["Enter"],"expected_agent_session_id":"reported_id_from_pane_get"}}
+```
 
 `pane.send_keys` and `pane.send_input.keys` accept Herdr key-combo strings:
 plain printable keys, special keys like `enter` and `esc`, modifier chords

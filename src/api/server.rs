@@ -151,6 +151,9 @@ fn default_capabilities() -> Option<ServerCapabilities> {
         ssh_agent_registration: false,
         guarded_live_handoff: crate::platform::capabilities().live_handoff,
         expected_terminal_guard: true,
+        // Native live-generation and PTY foreground proof is required. Other
+        // platforms deliberately refuse guarded session delivery.
+        expected_agent_session_guard: cfg!(any(target_os = "linux", target_os = "macos")),
         input_consumer: crate::platform::input_consumer_supported(),
     })
 }
@@ -424,7 +427,7 @@ fn restrict_socket_permissions(path: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(test)]
-fn handle_connection(
+pub(crate) fn handle_connection(
     stream: LocalStream,
     api_tx: &ApiRequestSender,
     event_hub: &EventHub,
@@ -528,7 +531,7 @@ fn handle_connection_with_stop(
                             },
                             error.to_string(),
                         ),
-                    )
+                    );
                 }
             };
             write_json_line(
@@ -585,10 +588,11 @@ fn handle_connection_with_stop(
             )?;
             finish_wait_response(&mut stream, response, &request_id, method, changes_ui)
         }
-        Method::AgentPrompt(params) => {
+        Method::AgentPrompt(params) | Method::AgentPromptSessionChecked(params) => {
             let response = prompt_agent(
                 request_id.clone(),
                 params,
+                method == "agent.prompt_session_checked",
                 context,
                 &mut stream,
                 api_tx,
@@ -816,6 +820,7 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::AgentStart(_) => "agent.start",
         Method::AgentStartGuarded(_) => "agent.start_guarded",
         Method::AgentPrompt(_) => "agent.prompt",
+        Method::AgentPromptSessionChecked(_) => "agent.prompt_session_checked",
         Method::AgentWait(_) => "agent.wait",
         Method::PaneSplit(_) => "pane.split",
         Method::PaneSwap(_) => "pane.swap",
@@ -853,7 +858,9 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::PaneLinkResolve(_) => "pane.link.resolve",
         Method::PaneRename(_) => "pane.rename",
         Method::PaneSendText(_) => "pane.send_text",
+        Method::PaneSendTextSessionChecked(_) => "pane.send_text_session_checked",
         Method::PaneSendKeys(_) => "pane.send_keys",
+        Method::PaneSendKeysSessionChecked(_) => "pane.send_keys_session_checked",
         Method::PaneSendInput(_) => "pane.send_input",
         Method::PaneSendInputGuarded(_) => "pane.send_input_guarded",
         Method::PaneRead(_) => "pane.read",
@@ -1359,6 +1366,8 @@ fn caller_timeout_dispatch_uses_timeout_error() {
         Request {
             id: "prompt-timeout".into(),
             method: Method::AgentPrompt(crate::api::schema::AgentPromptParams {
+                expected_agent_session_id: None,
+                expected_pane_id: None,
                 target: "reviewer".into(),
                 text: "review this".into(),
                 wait: None,
@@ -1396,6 +1405,15 @@ mod tests {
     fn input_consumer_capability_is_advertised_only_on_linux() {
         let caps = default_capabilities().expect("capabilities");
         assert_eq!(caps.input_consumer, cfg!(target_os = "linux"));
+    }
+
+    #[test]
+    fn session_reporter_foreground_capability_requires_native_live_proof() {
+        let caps = default_capabilities().expect("capabilities");
+        assert_eq!(
+            caps.expected_agent_session_guard,
+            cfg!(any(target_os = "linux", target_os = "macos"))
+        );
     }
     use std::collections::HashMap;
     use std::io::{BufRead, BufReader, Read};
@@ -1675,7 +1693,9 @@ mod tests {
             // Only the listener/its handlers own senders. Disconnection proves their
             // exit, and receiving anything instead catches dispatch of queued work.
             assert_listener_channel_closed(&mut rx);
-            println!("EMFILE observed; handle dropped during backoff; listener exited after pressure released; queued workspace.rename never dispatched on PID {pid}");
+            println!(
+                "EMFILE observed; handle dropped during backoff; listener exited after pressure released; queued workspace.rename never dispatched on PID {pid}"
+            );
             drop(client);
             let _ = fs::remove_dir_all(config_home);
             return;
@@ -1719,7 +1739,9 @@ mod tests {
         assert_eq!(response["result"]["type"], "pong");
         assert_eq!(std::process::id(), pid);
         assert!(!handle._thread.is_finished());
-        println!("EMFILE observed; one warning during repeated retries; fresh correlated pong on the same PID {pid} and live listener (queued pong required except macOS EOF/reset)");
+        println!(
+            "EMFILE observed; one warning during repeated retries; fresh correlated pong on the same PID {pid} and live listener (queued pong required except macOS EOF/reset)"
+        );
         drop(fresh);
         drop(handle);
         let _ = fs::remove_dir_all(config_home);
@@ -1797,6 +1819,7 @@ mod tests {
             state_labels: HashMap::new(),
             tokens: HashMap::new(),
             agent_session: None,
+            agent_session_id: None,
             scroll: None,
             revision: 0,
         }
@@ -2024,6 +2047,7 @@ mod tests {
                 ssh_agent_registration: false,
                 guarded_live_handoff: true,
                 expected_terminal_guard: true,
+                expected_agent_session_guard: true,
                 input_consumer: false,
             }),
             None,
@@ -2533,6 +2557,7 @@ mod tests {
                             state_labels: HashMap::new(),
                             tokens: HashMap::new(),
                             agent_session: None,
+                            agent_session_id: None,
                             workspace_id: "ws_1".into(),
                             tab_id: "tab_1".into(),
                             pane_id: "pane_1".into(),
