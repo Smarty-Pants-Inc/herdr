@@ -594,7 +594,7 @@ impl PaneTerminal {
         self.ghostty.apply_host_terminal_appearance(appearance)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub fn has_transient_default_color_override(&self) -> bool {
         self.ghostty.has_transient_default_color_override()
     }
