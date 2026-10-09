@@ -248,6 +248,19 @@ fn git_watch_repair_linked_only_common_directory_restored_after_missing_apply() 
     isolated_git_watch_test!(
         git_watch_repair_linked_only_common_directory_restored_after_missing_apply
     );
+    git_watch_repair_linked_only_common_directory_restored_scenario(false);
+}
+
+#[test]
+#[ignore = "performance: 1 s native refresh target; run separately without test contention"]
+fn perf_git_watch_repair_linked_only_common_directory_restored_after_missing_apply() {
+    isolated_git_watch_test!(
+        perf_git_watch_repair_linked_only_common_directory_restored_after_missing_apply
+    );
+    git_watch_repair_linked_only_common_directory_restored_scenario(true);
+}
+
+fn git_watch_repair_linked_only_common_directory_restored_scenario(check_latency: bool) {
     let repo = GitWatchRepo::new("linked-common-gap-main");
     repo.init();
     let linked = GitWatchRepo::new("linked-common-gap-consumer");
@@ -298,7 +311,11 @@ fn git_watch_repair_linked_only_common_directory_restored_after_missing_apply() 
     let start = Instant::now();
     std::fs::rename(&retired, &common).unwrap();
     let (restoration_latency, changed) = drive_git_watch_refresh(&mut app);
-    assert!(start.elapsed() < GIT_WATCH_TEST_TIMEOUT);
+    // Preserve the original total measurement, including the mutation itself,
+    // rather than replacing it with the helper's post-command refresh duration.
+    if check_latency {
+        assert!(start.elapsed() < GIT_WATCH_LATENCY_TARGET);
+    }
     assert!(changed);
     assert_eq!(
         app.state.workspaces[0].cached_git_branch.as_deref(),
@@ -310,14 +327,18 @@ fn git_watch_repair_linked_only_common_directory_restored_after_missing_apply() 
     let start = Instant::now();
     repo.git(&["update-ref", "refs/heads/upstream", &tip]);
     let (ref_latency, changed) = drive_git_watch_refresh(&mut app);
-    assert!(start.elapsed() < GIT_WATCH_TEST_TIMEOUT);
+    if check_latency {
+        assert!(start.elapsed() < GIT_WATCH_LATENCY_TARGET);
+    }
     assert!(changed);
     assert_eq!(app.state.workspaces[0].git_ahead_behind(), Some((0, 0)));
     drain_git_watch_hints(&mut app);
     let start = Instant::now();
     linked.git(&["switch", "-c", "after-common-restoration"]);
     let (branch_latency, changed) = drive_git_watch_refresh(&mut app);
-    assert!(start.elapsed() < GIT_WATCH_TEST_TIMEOUT);
+    if check_latency {
+        assert!(start.elapsed() < GIT_WATCH_LATENCY_TARGET);
+    }
     assert!(changed);
     assert_eq!(
         app.state.workspaces[0].cached_git_branch.as_deref(),
