@@ -799,12 +799,10 @@ fn probe_foreground_process(pid: u32, foreground_pgid: Option<u32>) -> ProcessPr
 
 // These are state-specific transient/safety deadlines, not a pane fallback
 // interval. Stable panes wait only for parsed output/reset and the shared clock.
-#[allow(clippy::too_many_arguments)] // Scheduling mirrors existing independent detector state.
 fn detection_deadline(
     pending_idle: &PendingIdleConfirmation,
     startup_grace_until: Option<std::time::Instant>,
     pending_release: &Mutex<Option<PendingAgentRelease>>,
-    transient_theme: bool,
     acquisition_started_at: Option<std::time::Instant>,
     last_process_check: std::time::Instant,
     self_reported_active: bool,
@@ -826,8 +824,9 @@ fn detection_deadline(
         .and_then(|pending| pending.map(|p| p.until).filter(|until| *until > now));
     include(release_until);
     // Silent replacement by a different agent during suppression still needs
-    // the normal loop's original 50 ms transient observation cadence.
-    if transient_theme || release_until.is_some() {
+    // the normal loop's original 50 ms transient observation cadence. Held
+    // theme overrides use parsed output and the shared clock for owner return.
+    if release_until.is_some() {
         include(Some(now + std::time::Duration::from_millis(50)));
     }
     if let Some(started) = acquisition_started_at {
@@ -899,7 +898,6 @@ fn spawn_basic_detection_task(
                 &pending_idle,
                 agent_startup_grace_until,
                 &pending_release_for_task,
-                false,
                 acquisition_started_at,
                 last_process_check,
                 child_pid.load(Ordering::Acquire) > 0
@@ -2939,7 +2937,6 @@ impl PaneRuntime {
                         &pending_idle,
                         agent_startup_grace_until,
                         &pending_release_for_task,
-                        terminal.has_transient_default_color_override(),
                         acquisition_started_at,
                         last_process_check,
                         child_pid.load(Ordering::Acquire) > 0
@@ -6306,6 +6303,248 @@ mod tests {
         )
         .await
         .expect("re-entering active authority should notify detection reset");
+    }
+
+    #[test]
+    fn detection_deadline_pending_release_retains_50ms_recheck() {
+        use std::time::{Duration, Instant};
+
+        let pending_idle = PendingIdleConfirmation::default();
+        let before = Instant::now();
+        let pending_release = Mutex::new(Some(PendingAgentRelease {
+            agent: Agent::Pi,
+            until: before + Duration::from_secs(2),
+        }));
+        let deadline = detection_deadline(
+            &pending_idle,
+            None,
+            &pending_release,
+            None,
+            before,
+            false,
+            None,
+        )
+        .expect("active release needs a bounded recheck");
+        let after = Instant::now();
+        assert!(deadline >= before + Duration::from_millis(50));
+        assert!(deadline <= after + Duration::from_millis(50));
+        assert_eq!(
+            active_pending_release(&pending_release, after),
+            Some(Agent::Pi)
+        );
+
+        let until = Instant::now() + Duration::from_millis(10);
+        pending_release.lock().unwrap().as_mut().unwrap().until = until;
+        assert_eq!(
+            detection_deadline(
+                &pending_idle,
+                None,
+                &pending_release,
+                None,
+                after,
+                false,
+                None,
+            ),
+            Some(until),
+            "release expiry must preempt the 50 ms recheck"
+        );
+    }
+
+    #[test]
+    fn detection_deadline_expired_pending_release_does_not_spin() {
+        use std::time::{Duration, Instant};
+
+        let now = Instant::now();
+        let pending_idle = PendingIdleConfirmation::default();
+        let pending_release = Mutex::new(Some(PendingAgentRelease {
+            agent: Agent::Pi,
+            until: now - Duration::from_millis(1),
+        }));
+        assert_eq!(
+            detection_deadline(
+                &pending_idle,
+                None,
+                &pending_release,
+                None,
+                now,
+                false,
+                None,
+            ),
+            None,
+            "expired release must wait for an ordinary wake, not re-arm"
+        );
+        assert_eq!(active_pending_release(&pending_release, now), None);
+        assert!(pending_release.lock().unwrap().is_none());
+    }
+
+    // Job control gives the OSC-emitting child its own real foreground group.
+    // Both reads are silent with echo disabled: exiting the owner returns to a
+    // live shell without generating output that could hide a missing idle wake.
+    #[cfg(unix)]
+    async fn runtime_with_held_transient_theme() -> PaneRuntime {
+        let mut cmd = CommandBuilder::new("/bin/sh");
+        cmd.args([
+            "-i",
+            "-c",
+            "stty -echo; sh -c 'printf \"\\033]11;#112233\\007\"; read release'; read hold",
+        ]);
+        cmd.env("PS1", "");
+        cmd.env("PS2", "");
+        cmd.cwd(std::env::temp_dir());
+        apply_pane_terminal_env(&mut cmd);
+        apply_pane_launch_env(&mut cmd, &PaneLaunchEnv::default());
+        let (events, _rx) = mpsc::channel(64);
+        let runtime = PaneRuntime::spawn_command_builder(
+            PaneId::from_raw(42),
+            24,
+            80,
+            0,
+            crate::terminal_theme::TerminalTheme {
+                background: Some(crate::terminal_theme::RgbColor {
+                    r: 0xaa,
+                    g: 0xbb,
+                    b: 0xcc,
+                }),
+                ..Default::default()
+            },
+            None,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+            cmd,
+            "failed to spawn transient theme test shell",
+            SpawnInitialState::default(),
+            AgentDetection::Enabled,
+        )
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !runtime.terminal.has_transient_default_color_override() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("real foreground child must acquire the OSC color override");
+        let shell_pid = runtime.child_pid.load(Ordering::Acquire);
+        assert!(shell_pid > 0);
+        assert_ne!(
+            runtime.io.detection_foreground().observe(),
+            Some(Some(shell_pid)),
+            "override owner must be a distinct foreground job"
+        );
+        assert_transient_theme_background(&runtime, b"\x1b]11;rgb:1111/2222/3333\x1b\\");
+        runtime
+    }
+
+    #[cfg(unix)]
+    fn assert_transient_theme_background(runtime: &PaneRuntime, expected: &[u8]) {
+        let (responses, _rx) = mpsc::channel(1);
+        let result = runtime.terminal.process_pty_bytes(
+            runtime.pane_id,
+            runtime.child_pid.load(Ordering::Acquire),
+            b"\x1b]11;?\x1b\\",
+            &responses,
+        );
+        assert_eq!(
+            result.terminal_responses,
+            vec![Bytes::copy_from_slice(expected)]
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn detection_deadline_held_transient_theme_uses_shared_idle_clock() {
+        use std::time::{Duration, Instant};
+
+        let mut runtime = runtime_with_held_transient_theme().await;
+        // Drive the production scheduler directly to count wakes, rather than
+        // adding instrumentation to the runtime or replacing the restore path.
+        runtime.detect_handle.take().unwrap().abort();
+        tokio::task::yield_now().await;
+        let mut wake = DetectionWake::new(runtime.detection_notify.clone());
+        let reset = Notify::new();
+        let pending_idle = PendingIdleConfirmation::default();
+        let started = Instant::now();
+        let finish = started + Duration::from_secs(2);
+        let mut special_deadlines = 0;
+        let mut wakes = 0;
+        loop {
+            let deadline = detection_deadline(
+                &pending_idle,
+                None,
+                &runtime.pending_release,
+                None,
+                started,
+                false,
+                None,
+            );
+            special_deadlines += usize::from(deadline.is_some());
+            if tokio::time::timeout_at(finish.into(), wake.wait(&reset, deadline))
+                .await
+                .is_err()
+            {
+                break;
+            }
+            wakes += 1;
+            assert!(!runtime.terminal.maybe_restore_host_terminal_theme(
+                runtime.pane_id,
+                runtime.child_pid.load(Ordering::Acquire),
+            ));
+        }
+        assert!(runtime.terminal.has_transient_default_color_override());
+        assert_transient_theme_background(&runtime, b"\x1b]11;rgb:1111/2222/3333\x1b\\");
+        eprintln!(
+            "held OSC override over 2 s: {special_deadlines} special deadlines, {wakes} wakes"
+        );
+        runtime.shutdown();
+        assert_eq!(
+            special_deadlines, 0,
+            "held override alone must not add a deadline"
+        );
+        assert!(
+            wakes <= 8,
+            "expected only the shared 300 ms clock, got {wakes} wakes"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn detection_deadline_owner_exit_restores_theme_on_shared_idle_clock() {
+        use std::time::{Duration, Instant};
+
+        let runtime = runtime_with_held_transient_theme().await;
+        // Counterexample: ordinary idle ticks must not restore a live owner's
+        // colors. Leave the real detection task and owner running throughout.
+        tokio::time::sleep(Duration::from_millis(650)).await;
+        assert!(runtime.terminal.has_transient_default_color_override());
+        assert_transient_theme_background(&runtime, b"\x1b]11;rgb:1111/2222/3333\x1b\\");
+        let content_before = runtime.detection_content_seq.load(Ordering::Relaxed);
+        let released = Instant::now();
+        runtime
+            .try_send_bytes(Bytes::from_static(b"release\n"))
+            .unwrap();
+        // One shared 300 ms tick plus 100 ms for process scheduling and the
+        // observation loop; there is no owner-exit PTY output to wake detection.
+        tokio::time::timeout(Duration::from_millis(400), async {
+            while runtime.terminal.has_transient_default_color_override() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("silent owner exit must restore within the shared idle bound");
+        let latency = released.elapsed();
+        assert_eq!(
+            runtime.io.detection_foreground().observe(),
+            Some(Some(runtime.child_pid.load(Ordering::Acquire))),
+            "restoration must follow a real foreground return to the live shell"
+        );
+        assert_eq!(
+            runtime.detection_content_seq.load(Ordering::Relaxed),
+            content_before,
+            "owner exit must be silent, not rescued by parsed output"
+        );
+        assert_transient_theme_background(&runtime, b"\x1b]11;rgb:aaaa/bbbb/cccc\x1b\\");
+        eprintln!("silent OSC owner exit restored host theme after {latency:?}; live owner unchanged for 650 ms");
+        runtime.shutdown();
     }
 
     #[cfg(unix)]
