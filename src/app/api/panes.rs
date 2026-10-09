@@ -2838,11 +2838,23 @@ mod tests {
             let request = serde_json::from_value(value).unwrap();
             let response: ErrorResponse =
                 serde_json::from_str(&app.handle_api_request(request)).unwrap();
-            assert_eq!(response.error.code, "pane_input_poisoned", "{method}");
+            let unsupported_guard = method.ends_with("_session_checked")
+                && !crate::platform::expected_agent_session_guard_supported();
             assert_eq!(
-                response.error.message,
-                crate::api::schema::PANE_INPUT_POISON_NOTICE
+                response.error.code,
+                if unsupported_guard {
+                    "expected_agent_session_unsupported"
+                } else {
+                    "pane_input_poisoned"
+                },
+                "{method}"
             );
+            if !unsupported_guard {
+                assert_eq!(
+                    response.error.message,
+                    crate::api::schema::PANE_INPUT_POISON_NOTICE
+                );
+            }
             assert!(rx.try_recv().is_err());
             assert!(app.accepted_api_inputs.is_empty());
             assert!(app

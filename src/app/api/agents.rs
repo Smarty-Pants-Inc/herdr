@@ -670,11 +670,14 @@ mod tests {
                 .unwrap();
                 assert_eq!(
                     response.error.code,
-                    if expected.is_some() {
+                    if !crate::platform::expected_agent_session_guard_supported() {
+                        "expected_agent_session_unsupported"
+                    } else if expected.is_some() {
                         "agent_session_unknown"
                     } else {
                         "invalid_request"
                     },
+                    "{method}: {expected:?}",
                 );
                 assert!(input_rx.try_recv().is_err());
                 assert!(app.accepted_api_inputs.is_empty());
