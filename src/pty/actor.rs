@@ -128,7 +128,7 @@ pub(crate) fn agent_session_loss_details(error: &std::io::Error) -> Option<(Opti
         .map(|mismatch| (mismatch.partial_text_consumed, mismatch.flush_failed))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn agent_session_loss_partial_text_consumed(error: &std::io::Error) -> Option<bool> {
     agent_session_loss_details(error).and_then(|(partial, _)| partial)
 }
@@ -141,6 +141,7 @@ impl std::fmt::Display for PaneInputPoisoned {
     }
 }
 impl std::error::Error for PaneInputPoisoned {}
+#[cfg(unix)]
 pub(crate) fn pane_input_poisoned() -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::PermissionDenied, PaneInputPoisoned)
 }
@@ -177,6 +178,7 @@ pub(crate) fn agent_session_lost(
     )
 }
 
+#[cfg(unix)]
 pub(crate) fn agent_session_flush_failed(guard: &SessionInputGuard) -> std::io::Error {
     if let Some(expected) = guard.expected_agent_status {
         if !guard.status_is_current() {
