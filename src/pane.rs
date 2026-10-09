@@ -1456,6 +1456,7 @@ enum PaneRuntimeIo {
     Actor(PtyIoActorHandle),
     #[cfg(test)]
     TestChannel {
+        input_poisoned: AtomicBool,
         sender: mpsc::Sender<Bytes>,
         resize_tx: watch::Sender<(u16, u16, u32, u32)>,
         foreground_cwd: Mutex<Option<std::path::PathBuf>>,
@@ -1463,6 +1464,32 @@ enum PaneRuntimeIo {
 }
 
 impl PaneRuntimeIo {
+    fn input_is_poisoned(&self) -> bool {
+        match self {
+            Self::Actor(actor) => actor.input_is_poisoned(),
+            #[cfg(test)]
+            Self::TestChannel { input_poisoned, .. } => input_poisoned.load(Ordering::Acquire),
+        }
+    }
+    fn clear_input_poison(&self) -> std::io::Result<()> {
+        match self {
+            Self::Actor(actor) => actor.clear_input_poison(),
+            #[cfg(test)]
+            Self::TestChannel { input_poisoned, .. } => {
+                input_poisoned.store(false, Ordering::Release);
+                Ok(())
+            }
+        }
+    }
+    #[cfg(test)]
+    fn test_set_input_poisoned(&self, poisoned: bool) {
+        match self {
+            Self::Actor(actor) => actor.test_set_input_poisoned(poisoned),
+            Self::TestChannel { input_poisoned, .. } => {
+                input_poisoned.store(poisoned, Ordering::Release)
+            }
+        }
+    }
     #[cfg(all(test, unix))]
     pub(crate) fn test_set_before_write(
         &self,
@@ -1624,6 +1651,9 @@ impl PaneRuntimeIo {
         bytes: Bytes,
         source: crate::pty::input_consumer::InputSource,
     ) -> Result<(), mpsc::error::TrySendError<Bytes>> {
+        if self.input_is_poisoned() {
+            return Err(mpsc::error::TrySendError::Closed(bytes));
+        }
         match self {
             PaneRuntimeIo::Actor(actor) => actor.try_write_user_input_with_source(bytes, source),
             #[cfg(test)]
@@ -3758,6 +3788,17 @@ impl PaneRuntime {
     pub(crate) fn input_consumer_epoch_matches(&self, epoch: &str) -> bool {
         self.io.input_consumer_epoch_matches(epoch)
     }
+    pub(crate) fn input_is_poisoned(&self) -> bool {
+        self.io.input_is_poisoned()
+    }
+    pub(crate) fn clear_input_poison(&self) -> std::io::Result<()> {
+        self.io.clear_input_poison()
+    }
+    #[cfg(test)]
+    pub(crate) fn test_set_input_poisoned(&self, poisoned: bool) {
+        self.io.test_set_input_poisoned(poisoned);
+    }
+
     pub(crate) fn try_send_bytes_with_source(
         &self,
         bytes: Bytes,
@@ -4187,6 +4228,7 @@ impl PaneRuntime {
                 pane_id,
                 terminal,
                 io: PaneRuntimeIo::TestChannel {
+                    input_poisoned: AtomicBool::new(false),
                     sender: tx,
                     resize_tx,
                     foreground_cwd: Mutex::new(None),
@@ -5565,6 +5607,7 @@ mod tests {
             pane_id,
             terminal,
             io: PaneRuntimeIo::TestChannel {
+                input_poisoned: AtomicBool::new(false),
                 sender: tx,
                 resize_tx,
                 foreground_cwd: Mutex::new(None),
@@ -5608,6 +5651,7 @@ mod tests {
             pane_id,
             terminal,
             io: PaneRuntimeIo::TestChannel {
+                input_poisoned: AtomicBool::new(false),
                 sender: tx,
                 resize_tx,
                 foreground_cwd: Mutex::new(None),

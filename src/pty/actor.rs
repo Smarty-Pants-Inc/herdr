@@ -24,15 +24,19 @@ struct AgentSessionLost {
     expected_agent_session_id: String,
     /// True means submission text reached the PTY and may have been consumed;
     /// it does not claim that a reader consumed every byte.
-    partial_text_consumed: bool,
+    partial_text_consumed: Option<bool>,
+    flush_failed: bool,
 }
 
 impl std::fmt::Display for AgentSessionLost {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
-            "agent session ownership was lost: {}; partial_text_consumed={}",
-            self.expected_agent_session_id, self.partial_text_consumed
+            "agent session ownership was lost: {}; partial_text_consumed={}; flush_failed={}",
+            self.expected_agent_session_id,
+            self.partial_text_consumed
+                .map_or("unknown", |partial| if partial { "true" } else { "false" }),
+            self.flush_failed
         )
     }
 }
@@ -47,11 +51,33 @@ pub(crate) fn is_agent_session_lost(error: &std::io::Error) -> bool {
         .is_some_and(|cause| cause.is::<AgentSessionLost>())
 }
 
-pub(crate) fn agent_session_loss_partial_text_consumed(error: &std::io::Error) -> Option<bool> {
+pub(crate) fn agent_session_loss_details(error: &std::io::Error) -> Option<(Option<bool>, bool)> {
     error
         .get_ref()
         .and_then(|cause| cause.downcast_ref::<AgentSessionLost>())
-        .map(|loss| loss.partial_text_consumed)
+        .map(|loss| (loss.partial_text_consumed, loss.flush_failed))
+}
+
+#[cfg(test)]
+pub(crate) fn agent_session_loss_partial_text_consumed(error: &std::io::Error) -> Option<bool> {
+    agent_session_loss_details(error).and_then(|(partial, _)| partial)
+}
+
+#[derive(Debug)]
+struct PaneInputPoisoned;
+impl std::fmt::Display for PaneInputPoisoned {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("pane_input_poisoned: input blocked after a failed flush; staged text may remain on the line; inspect or discard it before explicitly clearing input poison")
+    }
+}
+impl std::error::Error for PaneInputPoisoned {}
+pub(crate) fn pane_input_poisoned() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::PermissionDenied, PaneInputPoisoned)
+}
+pub(crate) fn is_pane_input_poisoned(error: &std::io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|cause| cause.is::<PaneInputPoisoned>())
 }
 
 pub(crate) fn agent_session_lost(
@@ -62,7 +88,19 @@ pub(crate) fn agent_session_lost(
         std::io::ErrorKind::PermissionDenied,
         AgentSessionLost {
             expected_agent_session_id: guard.expected_agent_session_id.clone(),
-            partial_text_consumed,
+            partial_text_consumed: Some(partial_text_consumed),
+            flush_failed: false,
+        },
+    )
+}
+
+pub(crate) fn agent_session_flush_failed(guard: &SessionInputGuard) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        AgentSessionLost {
+            expected_agent_session_id: guard.expected_agent_session_id.clone(),
+            partial_text_consumed: None,
+            flush_failed: true,
         },
     )
 }
@@ -147,6 +185,14 @@ mod windows {
     }
 
     impl PtyIoActorHandle {
+        pub(crate) fn input_is_poisoned(&self) -> bool {
+            false
+        }
+        pub(crate) fn clear_input_poison(&self) -> std::io::Result<()> {
+            Ok(())
+        }
+        #[cfg(test)]
+        pub(crate) fn test_set_input_poisoned(&self, _poisoned: bool) {}
         /// ConPTY has no equivalent native foreground reporter proof. Never
         /// enqueue guarded input on this unsupported platform.
         pub(crate) fn queue_guarded_user_input_submission_with_source(

@@ -246,10 +246,11 @@ impl NativePty {
         runner.control_rx = control_rx;
         runner.wake_read_fd = wake.read_fd;
         PtyIoActorHandle {
+            input_poisoned: Arc::clone(&runner.input_poisoned),
             data_tx,
             control_tx,
             wake: wake.writer,
-            user_writes: Arc::new(Mutex::new(UserWriteGate { accepting: true })),
+            user_writes: Arc::clone(&runner.user_writes),
             controls: Arc::clone(&runner.controls),
             response_order: Arc::clone(&runner.response_order),
             foreground_fd: PtyForegroundObserver(Arc::downgrade(&runner.file.foreground)),
@@ -360,7 +361,7 @@ fn lost(receipt: std_mpsc::Receiver<std::io::Result<()>>, partial_text_consumed:
     assert_eq!(
         error.to_string(),
         format!(
-            "agent session ownership was lost: native-session; partial_text_consumed={partial_text_consumed}"
+            "agent session ownership was lost: native-session; partial_text_consumed={partial_text_consumed}; flush_failed=false"
         )
     );
     assert_eq!(
@@ -561,6 +562,93 @@ fn guarded_native_partial_wouldblock_retry_discards_only_remaining_chunk() {
     expected.extend_from_slice(b"response");
     fixture.captured(&expected);
     assert_eq!(runner.current_write_offset, 0);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn guarded_native_flush_failure_poison_blocks_all_input_until_operator_clear() {
+    let fixture = NativePty::new();
+    let mut runner = fixture.runner();
+    let handle = fixture.queue_handle(&mut runner);
+    fixture.control("pause");
+    let receipt = submit(
+        &mut runner,
+        Bytes::from_static(b"staged"),
+        Bytes::from_static(b"\r"),
+        Duration::ZERO,
+        Some(fixture.guard()),
+    );
+    let boundary = runner
+        .flush_pending_writes_once()
+        .expect("text write")
+        .expect("boundary");
+    runner.complete_submission_boundary(boundary);
+    runner.file.force_flush_failure = true;
+    fixture.binding_validity.store(false, Ordering::Release);
+    pump(&mut runner);
+    let loss = receipt.recv().expect("completion").expect_err("flush loss");
+    assert_eq!(
+        super::super::agent_session_loss_details(&loss),
+        Some((None, true))
+    );
+    assert!(handle.input_is_poisoned());
+    assert!(super::super::is_pane_input_poisoned(
+        &runner
+            .begin_handoff()
+            .expect_err("handoff must not clear poison")
+    ));
+    assert_eq!(
+        crate::platform::process_identity(fixture.reporter.pid),
+        Some(fixture.reporter)
+    );
+    assert!(
+        runner.file.as_raw_fd() >= 0,
+        "poison must not close the PTY"
+    );
+    let api = handle
+        .queue_user_input_submission(
+            Bytes::from_static(b"api"),
+            Bytes::from_static(b"\r"),
+            Duration::ZERO,
+        )
+        .expect_err("API refused");
+    assert!(super::super::is_pane_input_poisoned(&api));
+    assert!(
+        handle
+            .try_write_user_input_with_source(
+                Bytes::from_static(b"\r"),
+                InputSource::Client {
+                    connection_id: 42,
+                    principal: None
+                }
+            )
+            .is_err(),
+        "client byte entry uses same poisoned gate"
+    );
+    runner.enqueue_write(Bytes::from_static(b"queued-unguarded"));
+    runner.enqueue_terminal_responses(vec![Bytes::from_static(b"response")]);
+    runner
+        .flush_pending_writes_once()
+        .expect("poison refuses every write");
+    assert!(runner.pending_writes.is_empty());
+    // Even a later successful flush must not clear poison.
+    runner.file.force_flush_failure = false;
+    crate::platform::flush_pty_input(runner.file.as_raw_fd())
+        .expect("operator inspected/discarded staged input");
+    assert!(handle.input_is_poisoned());
+    let (reply, cleared) = std_mpsc::channel();
+    runner.handle_control_command(PtyIoControlCommand::ClearInputPoison(reply));
+    cleared
+        .recv()
+        .expect("clear receipt")
+        .expect("operator clear");
+    assert!(!handle.input_is_poisoned());
+    handle
+        .try_write_user_input(Bytes::from_static(b"healthy"))
+        .expect("explicit clear restores input");
+    runner.drain_data_commands();
+    pump(&mut runner);
+    assert_eq!(fixture.probe_bytes(), b"healthy");
 }
 
 #[cfg(target_os = "linux")]

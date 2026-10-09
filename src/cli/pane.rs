@@ -33,6 +33,7 @@ pub(super) fn run_pane_command(args: &[String]) -> std::io::Result<i32> {
         "swap" => pane_swap(&args[1..]),
         "move" => pane_move(&args[1..]),
         "close" => pane_close(&args[1..]),
+        "clear-input-poison" => pane_clear_input_poison(&args[1..]),
         "send-text" => pane_send_text(&args[1..]),
         "send-keys" => pane_send_keys(&args[1..]),
         "wait-output" => pane_wait_output(&args[1..]),
@@ -1020,6 +1021,35 @@ fn pane_close(args: &[String]) -> std::io::Result<i32> {
     super::runtime::pane_close(super::normalize_pane_id(raw_pane_id))
 }
 
+fn parse_pane_clear_input_poison_args(args: &[String]) -> Result<PaneTarget, clap::Error> {
+    let matches = super::spec::parse_leaf_args(&["pane", "clear-input-poison"], args)?;
+    Ok(PaneTarget {
+        pane_id: super::normalize_pane_id(
+            matches
+                .get_one::<String>("pane_id")
+                .expect("Clap requires the pane target"),
+        ),
+    })
+}
+
+fn pane_clear_input_poison(args: &[String]) -> std::io::Result<i32> {
+    let target = match parse_pane_clear_input_poison_args(args) {
+        Ok(target) => target,
+        Err(error) => {
+            let exit_code = error.exit_code();
+            error.print()?;
+            return Ok(exit_code);
+        }
+    };
+    // Warn before the operator's explicit request can reach the actor.
+    eprintln!("Warning: {}", crate::api::schema::PANE_INPUT_POISON_NOTICE);
+    eprintln!("{}", crate::api::schema::PANE_INPUT_POISON_CLEAR_WARNING);
+    super::print_response(&super::send_request(&Request {
+        id: "cli:pane:clear-input-poison".into(),
+        method: Method::PaneClearInputPoison(target),
+    })?)
+}
+
 fn parse_pane_content_args(
     command: &str,
     payload: &str,
@@ -1768,6 +1798,7 @@ fn print_pane_help() {
     eprintln!("  herdr pane swap --source-pane ID --target-pane ID");
     eprintln!("  {}", pane_move_usage());
     eprintln!("  herdr pane close <pane_id>");
+    eprintln!("  herdr pane clear-input-poison <pane_id>");
     eprintln!(
         "  herdr pane send-text <pane_id> [--expected-session ID] [--allow-cross-pane] <text>"
     );
@@ -1782,6 +1813,17 @@ fn print_pane_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clear_input_poison_parser_requires_one_explicit_pane() {
+        let target = parse_pane_clear_input_poison_args(&args(&["w1:p2"])).unwrap();
+        assert_eq!(target.pane_id, "w1:p2");
+        let value = serde_json::to_value(Method::PaneClearInputPoison(target)).unwrap();
+        assert_eq!(value["method"], "pane.clear_input_poison");
+        for values in [&[][..], &["w1:p2", "extra"][..], &["--current"][..]] {
+            assert!(parse_pane_clear_input_poison_args(&args(values)).is_err());
+        }
+    }
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()

@@ -624,6 +624,11 @@ fn pane_command() -> Command {
                 .arg(flag("no-focus")),
         )
         .subcommand(id_command("close", "pane_id", "Close a pane"))
+        .subcommand(id_command(
+            "clear-input-poison",
+            "pane_id",
+            "Explicitly unblock input after inspecting or discarding staged text",
+        ))
         .subcommand(
             Command::new("send-text")
                 .about("Send literal text to a pane")

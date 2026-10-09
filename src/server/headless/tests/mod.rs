@@ -4320,6 +4320,97 @@ fn with_terminal_session_test_server(
 }
 
 #[test]
+fn poisoned_client_keystrokes_and_paste_show_pane_notice_without_writes() {
+    with_terminal_session_test_server(|server, terminal_id, terminal_id_string, pane_id| {
+        let (runtime, mut input_rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_capacity(80, 24, 8);
+        runtime.test_set_input_poisoned(true);
+        server
+            .app
+            .terminal_runtimes
+            .insert(terminal_id.clone(), runtime);
+        let (writer, control_rx, _render_rx) = test_client_writer();
+        server.clients.insert(
+            1,
+            ClientConnection::new_with_mode(
+                ClientConnectionMode::ClientShell,
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                1,
+                RenderEncoding::SemanticFrame,
+                Some(writer),
+            ),
+        );
+        let key = protocol::ClientPaneInputEvent::from_terminal_key(
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('x'),
+                crossterm::event::KeyModifiers::NONE,
+            )
+            .into(),
+        )
+        .expect("pane key");
+        for event in [
+            key,
+            protocol::ClientPaneInputEvent::TextCommit("x".into()),
+            protocol::ClientPaneInputEvent::Paste("staged".into()),
+        ] {
+            assert!(
+                !server.handle_server_event(ServerEvent::ClientShellPaneInput {
+                    client_id: 1,
+                    pane_id: pane_id.clone(),
+                    events: vec![event],
+                })
+            );
+            let notice = read_server_message(
+                control_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("poison notice"),
+            );
+            assert!(
+                matches!(notice, ServerMessage::Notify { kind: protocol::NotifyKind::Toast, message, body: Some(body) }
+                if message.contains("pane_input_poisoned") && message.contains(&pane_id)
+                && body.contains("Staged text may remain on line")
+                && body.contains(&format!("herdr pane clear-input-poison {pane_id}")))
+            );
+            assert!(
+                input_rx.try_recv().is_err(),
+                "poisoned client must not write"
+            );
+        }
+        server.clients.get_mut(&1).expect("client").mode = ClientConnectionMode::TerminalAttach {
+            terminal_id: terminal_id_string,
+        };
+        for data in [b"x".to_vec(), b"\x1b[200~staged\x1b[201~".to_vec()] {
+            assert!(!server.handle_server_event(ServerEvent::ClientInput { client_id: 1, data }));
+            assert!(
+                matches!(read_server_message(control_rx.recv_timeout(Duration::from_secs(1)).expect("raw poison notice")),
+                ServerMessage::Notify { kind: protocol::NotifyKind::Toast, message, .. } if message.contains(&pane_id))
+            );
+            assert!(input_rx.try_recv().is_err());
+        }
+        let runtime = server
+            .app
+            .terminal_runtimes
+            .get(&terminal_id)
+            .expect("runtime remains open");
+        assert!(runtime.input_is_poisoned(), "input must not clear poison");
+        runtime.test_set_input_poisoned(false);
+        assert!(server.handle_server_event(ServerEvent::ClientInput {
+            client_id: 1,
+            data: b"healthy".to_vec()
+        }));
+        assert_eq!(
+            input_rx.try_recv().expect("healthy input"),
+            Bytes::from_static(b"healthy")
+        );
+        assert!(
+            control_rx.try_recv().is_err(),
+            "healthy input needs no notice"
+        );
+    });
+}
+
+#[test]
 fn terminal_observers_wait_for_synchronized_output_with_or_without_baseline() {
     with_terminal_session_test_server(|server, terminal_id, target, _| {
         let connect = |server: &mut HeadlessServer, client_id| {

@@ -284,6 +284,7 @@ def sink(program, establish_group=True):
     return pid
 reporter = sink(executable)
 os.tcsetpgrp(0, reporter)
+os.kill(reporter, signal.SIGCONT)
 with open(directory + '/reporter.pid', 'w') as file:
     file.write(str(reporter))
 os.mkfifo(control, 0o600)

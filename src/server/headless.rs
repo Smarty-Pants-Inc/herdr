@@ -1244,7 +1244,8 @@ impl HeadlessServer {
                         Ok(true) => self.invalidate_terminal_input_attribution(&terminal_id),
                         Ok(false) => {}
                         Err(err) => {
-                            warn!(client_id, terminal_id = %terminal_id, err = %err, "terminal attach clipboard image paste failed")
+                            warn!(client_id, terminal_id = %terminal_id, err = %err, "terminal attach clipboard image paste failed");
+                            self.notify_client_input_error(client_id, &terminal_id, &err);
                         }
                     }
                 }
@@ -1293,6 +1294,7 @@ impl HeadlessServer {
                     Ok(false) => {}
                     Err(err) => {
                         warn!(client_id, pane_id, err = %err, "client shell clipboard image paste failed");
+                        self.notify_client_input_error(client_id, &pane_id, &err);
                     }
                 }
                 true
@@ -1331,6 +1333,7 @@ impl HeadlessServer {
                     self.client_input_source(client_id),
                 ) {
                     warn!(client_id, terminal_id, err = %err, "client shell popup clipboard image paste failed");
+                    self.notify_client_input_error(client_id, &terminal_id, &err);
                 }
                 true
             }
@@ -1444,6 +1447,7 @@ impl HeadlessServer {
             Ok(false) => {}
             Err(err) => {
                 warn!(client_id, terminal_id = %terminal_id, err = %err, "terminal attach scroll failed");
+                self.notify_client_input_error(client_id, &terminal_id, &err);
             }
         }
         true
@@ -1500,6 +1504,7 @@ impl HeadlessServer {
             Ok(_) => {}
             Err(err) => {
                 warn!(client_id, terminal_id = %terminal_id, err = %err, "terminal attach mouse input failed");
+                self.notify_client_input_error(client_id, &terminal_id, &err);
             }
         }
         true
@@ -1936,11 +1941,111 @@ impl HeadlessServer {
             .is_some_and(|client| matches!(client.mode, ClientConnectionMode::TerminalPending))
     }
 
+    fn notify_client_input_error(
+        &mut self,
+        client_id: u64,
+        target: &str,
+        error: &super::pane_input::ClientInputError,
+    ) {
+        if *error != super::pane_input::ClientInputError::PaneInputPoisoned {
+            return;
+        }
+        let pane_id = self
+            .app
+            .resolve_terminal_target(target)
+            .ok()
+            .and_then(|resolved| self.app.public_pane_id(resolved.ws_idx, resolved.pane_id))
+            .unwrap_or_else(|| target.to_owned());
+        self.send_to_client(client_id, super::pane_input::input_poison_notice(&pane_id));
+    }
+
+    /// Client input poison is a runtime fact, not a client protocol extension.
+    /// Refuse before tracking held keys, promoting clients, or staging paste files.
+    fn reject_poisoned_client_input(&mut self, event: &ServerEvent) -> bool {
+        let (client_id, target, is_pane) = match event {
+            ServerEvent::ClientShellPaneInput {
+                client_id, pane_id, ..
+            } => (*client_id, pane_id.as_str(), true),
+            ServerEvent::ClientShellPopupInput {
+                client_id,
+                terminal_id,
+                ..
+            } => (*client_id, terminal_id.as_str(), false),
+            ServerEvent::ClientClipboardImage {
+                client_id, target, ..
+            } => match target {
+                protocol::ClientClipboardImageTarget::Pane(pane_id) => {
+                    (*client_id, pane_id.as_str(), true)
+                }
+                protocol::ClientClipboardImageTarget::Popup(terminal_id) => {
+                    (*client_id, terminal_id.as_str(), false)
+                }
+                protocol::ClientClipboardImageTarget::DirectTerminal => {
+                    let Some(ClientConnection {
+                        mode: ClientConnectionMode::TerminalAttach { terminal_id },
+                        ..
+                    }) = self.clients.get(client_id)
+                    else {
+                        return false;
+                    };
+                    (*client_id, terminal_id.as_str(), false)
+                }
+            },
+            ServerEvent::ClientInput { client_id, .. }
+            | ServerEvent::ClientAttachScroll { client_id, .. }
+            | ServerEvent::ClientAttachMouse { client_id, .. } => {
+                let Some(ClientConnection {
+                    mode: ClientConnectionMode::TerminalAttach { terminal_id },
+                    ..
+                }) = self.clients.get(client_id)
+                else {
+                    return false;
+                };
+                (*client_id, terminal_id.as_str(), false)
+            }
+            _ => return false,
+        };
+        let runtime = if is_pane {
+            self.app
+                .parse_pane_id(target)
+                .and_then(|(workspace_index, pane_id)| {
+                    self.app.state.runtime_for_pane_in_workspace(
+                        &self.app.terminal_runtimes,
+                        workspace_index,
+                        pane_id,
+                    )
+                })
+        } else {
+            self.runtime_for_terminal_id_string(target)
+        };
+        let Some(runtime) = runtime else {
+            return false;
+        };
+        if super::pane_input::precheck_client_input(runtime).is_ok() {
+            return false;
+        }
+        let pane_id = if is_pane {
+            target.to_owned()
+        } else {
+            self.app
+                .resolve_terminal_target(target)
+                .ok()
+                .and_then(|resolved| self.app.public_pane_id(resolved.ws_idx, resolved.pane_id))
+                .unwrap_or_else(|| target.to_owned())
+        };
+        self.send_to_client(client_id, super::pane_input::input_poison_notice(&pane_id));
+        true
+    }
+
     /// Handles a server event. Returns true if the event requires a re-render.
     fn handle_server_event(&mut self, ev: ServerEvent) -> bool {
         // Consume any bootstrap/deferred receipts before a newer client input can win.
         self.consume_api_input_receipts();
         if self.handoff_in_progress && Self::ignore_client_event_during_handoff(&ev) {
+            return false;
+        }
+
+        if self.reject_poisoned_client_input(&ev) {
             return false;
         }
 
@@ -2212,7 +2317,10 @@ impl HeadlessServer {
                             self.invalidate_terminal_input_attribution(&terminal_id)
                         }
                         Ok(_) => {}
-                        Err(err) => warn!(client_id, terminal_id = %terminal_id, err = %err),
+                        Err(err) => {
+                            warn!(client_id, terminal_id = %terminal_id, err = %err);
+                            self.notify_client_input_error(client_id, &terminal_id, &err);
+                        }
                     }
                 }
                 true
@@ -2530,14 +2638,17 @@ impl HeadlessServer {
                         );
                     }
                     let scroll_before = runtime.scroll_metrics();
-                    if let Err(err) = apply_client_pane_input_events(
+                    let result = apply_client_pane_input_events(
                         runtime,
                         &releases,
                         self.client_input_source(client_id),
-                    ) {
+                    );
+                    let scroll_changed = runtime.scroll_metrics() != scroll_before;
+                    if let Err(err) = result {
                         warn!(client_id, pane_id, err = %err, "targeted client shell release failed");
+                        self.notify_client_input_error(client_id, &pane_id, &err);
                     }
-                    return runtime.scroll_metrics() != scroll_before;
+                    return scroll_changed;
                 }
                 let interaction = client_pane_input_has_interaction(&events);
                 if let Some(client) = self.clients.get_mut(&client_id) {
@@ -2557,6 +2668,7 @@ impl HeadlessServer {
                 };
                 let scroll_before = runtime.scroll_metrics();
                 let mut accepted_interaction = false;
+                let mut rejected = None;
                 for event in &events {
                     match apply_client_pane_input_events(
                         runtime,
@@ -2570,11 +2682,15 @@ impl HeadlessServer {
                         Ok(false) => {}
                         Err(err) => {
                             warn!(client_id, pane_id, err = %err, "targeted client shell input failed");
+                            rejected = Some(err);
                             break;
                         }
                     }
                 }
                 let scroll_changed = runtime.scroll_metrics() != scroll_before;
+                if let Some(err) = rejected {
+                    self.notify_client_input_error(client_id, &pane_id, &err);
+                }
                 // A later enqueue failure does not undo an already accepted prefix.
                 if accepted_interaction {
                     self.media.note_pane_input(
@@ -2639,14 +2755,17 @@ impl HeadlessServer {
                         );
                     }
                     let scroll_before = runtime.scroll_metrics();
-                    if let Err(err) = apply_client_popup_input_events(
+                    let result = apply_client_popup_input_events(
                         runtime,
                         &releases,
                         self.client_input_source(client_id),
-                    ) {
+                    );
+                    let scroll_changed = runtime.scroll_metrics() != scroll_before;
+                    if let Err(err) = result {
                         warn!(client_id, terminal_id, err = %err, "targeted client popup release failed");
+                        self.notify_client_input_error(client_id, &terminal_id, &err);
                     }
-                    return runtime.scroll_metrics() != scroll_before;
+                    return scroll_changed;
                 }
                 let interaction = client_pane_input_has_interaction(&events);
                 if let Some(client) = self.clients.get_mut(&client_id) {
@@ -2663,14 +2782,17 @@ impl HeadlessServer {
                     return foreground_changed | geometry_changed;
                 };
                 let scroll_before = runtime.scroll_metrics();
-                if let Err(err) = apply_client_popup_input_events(
+                let result = apply_client_popup_input_events(
                     runtime,
                     &events,
                     self.client_input_source(client_id),
-                ) {
+                );
+                let scroll_changed = runtime.scroll_metrics() != scroll_before;
+                if let Err(err) = result {
                     warn!(client_id, terminal_id, err = %err, "targeted client popup input failed");
+                    self.notify_client_input_error(client_id, &terminal_id, &err);
                 }
-                foreground_changed | geometry_changed || runtime.scroll_metrics() != scroll_before
+                foreground_changed | geometry_changed || scroll_changed
             }
             ServerEvent::ClientShellEndpointRequestError {
                 client_id,

@@ -146,6 +146,9 @@ impl App {
                         Ok(Err(err)) if crate::pty::actor::is_agent_session_lost(&err) => {
                             super::panes::session_loss_response(id, &err)
                         }
+                        Ok(Err(err)) if crate::pty::actor::is_pane_input_poisoned(&err) => {
+                            encode_error(id, "pane_input_poisoned", err.to_string())
+                        }
                         Ok(Err(err)) if err.kind() == std::io::ErrorKind::TimedOut => {
                             encode_error(id, "timeout", err.to_string())
                         }
@@ -332,6 +335,8 @@ impl App {
         .map_err(|err| {
             if crate::pty::actor::is_agent_session_lost(&err) {
                 super::panes::session_loss_response(id.clone(), &err)
+            } else if crate::pty::actor::is_pane_input_poisoned(&err) {
+                encode_error(id.clone(), "pane_input_poisoned", err.to_string())
             } else {
                 encode_error(id.clone(), "agent_prompt_failed", err.to_string())
             }
