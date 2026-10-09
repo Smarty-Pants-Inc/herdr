@@ -4,27 +4,37 @@ use crate::api::schema::{Method, Request};
 use crate::api::ApiRequestContext;
 use crate::app::terminal_targets::{InputOrigin, TerminalTarget};
 
+fn session_checked_guard_error(
+    supported: bool,
+    method: &Method,
+) -> Option<(&'static str, &'static str)> {
+    let missing = match method {
+        Method::AgentPromptSessionChecked(params) => {
+            params.expected_agent_session_id.is_none() && params.expected_pane_id.is_none()
+        }
+        Method::PaneSendTextSessionChecked(params) => params.expected_agent_session_id.is_none(),
+        Method::PaneSendKeysSessionChecked(params) => params.expected_agent_session_id.is_none(),
+        _ => return None,
+    };
+    if !supported {
+        return Some((
+            "expected_agent_session_unsupported",
+            "expected agent session guards are supported only on Linux",
+        ));
+    }
+    missing.then_some((
+        "invalid_request",
+        "session-checked method requires an identity expectation",
+    ))
+}
+
 impl App {
     pub(super) fn session_checked_guard_denial(&self, request: &Request) -> Option<String> {
-        let missing = match &request.method {
-            Method::AgentPromptSessionChecked(params) => {
-                params.expected_agent_session_id.is_none() && params.expected_pane_id.is_none()
-            }
-            Method::PaneSendTextSessionChecked(params) => {
-                params.expected_agent_session_id.is_none()
-            }
-            Method::PaneSendKeysSessionChecked(params) => {
-                params.expected_agent_session_id.is_none()
-            }
-            _ => false,
-        };
-        missing.then(|| {
-            encode_error(
-                request.id.clone(),
-                "invalid_request",
-                "session-checked method requires an identity expectation",
-            )
-        })
+        session_checked_guard_error(
+            crate::platform::expected_agent_session_guard_supported(),
+            &request.method,
+        )
+        .map(|(code, message)| encode_error(request.id.clone(), code, message))
     }
 
     // This is a policy guard, not caller authentication.
@@ -128,6 +138,94 @@ mod tests {
     use crate::workspace::Workspace;
     use bytes::Bytes;
     use tokio::sync::mpsc::Receiver;
+
+    #[test]
+    fn session_checked_prompt_support_is_required_regardless_of_expectations() {
+        for (session, pane) in [
+            (None, None),
+            (None, Some("w1:p1")),
+            (Some("session"), None),
+            (Some("session"), Some("w1:p1")),
+        ] {
+            let method = Method::AgentPromptSessionChecked(AgentPromptParams {
+                expected_agent_session_id: session.map(str::to_owned),
+                expected_pane_id: pane.map(str::to_owned),
+                target: "agent".into(),
+                text: "prompt".into(),
+                wait: None,
+                allow_cross_pane: true,
+            });
+            assert_eq!(
+                session_checked_guard_error(false, &method).map(|(code, _)| code),
+                Some("expected_agent_session_unsupported")
+            );
+            assert_eq!(
+                session_checked_guard_error(true, &method).map(|(code, _)| code),
+                (session.is_none() && pane.is_none()).then_some("invalid_request")
+            );
+        }
+    }
+
+    #[test]
+    fn session_checked_pane_send_support_is_required_regardless_of_expectations() {
+        for session in [None, Some("session")] {
+            let methods = [
+                Method::PaneSendTextSessionChecked(PaneSendTextParams {
+                    expected_agent_session_id: session.map(str::to_owned),
+                    pane_id: "w1:p1".into(),
+                    text: "text".into(),
+                    allow_cross_pane: true,
+                }),
+                Method::PaneSendKeysSessionChecked(PaneSendKeysParams {
+                    expected_agent_session_id: session.map(str::to_owned),
+                    pane_id: "w1:p1".into(),
+                    keys: vec!["enter".into()],
+                    allow_cross_pane: true,
+                }),
+            ];
+            for method in methods {
+                assert_eq!(
+                    session_checked_guard_error(false, &method).map(|(code, _)| code),
+                    Some("expected_agent_session_unsupported")
+                );
+                assert_eq!(
+                    session_checked_guard_error(true, &method).map(|(code, _)| code),
+                    session.is_none().then_some("invalid_request")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn session_checked_guard_does_not_change_unchecked_methods() {
+        let methods = [
+            Method::AgentPrompt(AgentPromptParams {
+                expected_agent_session_id: Some("session".into()),
+                expected_pane_id: Some("w1:p1".into()),
+                target: "agent".into(),
+                text: "prompt".into(),
+                wait: None,
+                allow_cross_pane: true,
+            }),
+            Method::PaneSendText(PaneSendTextParams {
+                expected_agent_session_id: Some("session".into()),
+                pane_id: "w1:p1".into(),
+                text: "text".into(),
+                allow_cross_pane: true,
+            }),
+            Method::PaneSendKeys(PaneSendKeysParams {
+                expected_agent_session_id: Some("session".into()),
+                pane_id: "w1:p1".into(),
+                keys: vec!["enter".into()],
+                allow_cross_pane: true,
+            }),
+        ];
+        for method in methods {
+            for supported in [false, true] {
+                assert_eq!(session_checked_guard_error(supported, &method), None);
+            }
+        }
+    }
 
     struct Fixture {
         app: App,
