@@ -40,10 +40,11 @@ pub(super) enum SessionCheckedPaneInput {
 pub(super) fn pane_input_completion_response(id: String, result: std::io::Result<()>) -> String {
     match result {
         Ok(()) => encode_success(id, ResponseResult::Ok {}),
+        Err(error) if crate::pty::actor::is_agent_session_lost(&error) => {
+            session_loss_response(id, &error)
+        }
         Err(error) => {
-            let code = if crate::pty::actor::is_agent_session_lost(&error) {
-                "agent_session_lost"
-            } else if error.kind() == std::io::ErrorKind::TimedOut {
+            let code = if error.kind() == std::io::ErrorKind::TimedOut {
                 "timeout"
             } else {
                 "pane_send_failed"
@@ -51,6 +52,22 @@ pub(super) fn pane_input_completion_response(id: String, result: std::io::Result
             encode_error(id, code, error.to_string())
         }
     }
+}
+
+/// The loss-specific optional field does not alter the generic error body or
+/// any frozen endpoint codec. Other errors must not claim partial delivery.
+pub(super) fn session_loss_response(id: String, error: &std::io::Error) -> String {
+    let partial =
+        crate::pty::actor::agent_session_loss_partial_text_consumed(error).unwrap_or(false);
+    serde_json::json!({
+        "id": id,
+        "error": {
+            "code": "agent_session_lost",
+            "message": error.to_string(),
+            "partial_text_consumed": partial
+        }
+    })
+    .to_string()
 }
 
 /// Private/direct String callers have no response sender. They must observe a
@@ -2741,11 +2758,23 @@ mod tests {
 
     #[test]
     fn guarded_pane_completion_maps_only_typed_loss() {
-        let lost = crate::pty::actor::agent_session_lost(&test_guard());
+        let lost = crate::pty::actor::agent_session_lost(&test_guard(), false);
         let response: ErrorResponse =
             serde_json::from_str(&pane_input_completion_response("typed".into(), Err(lost)))
                 .unwrap();
         assert_eq!(response.error.code, "agent_session_lost");
+        let encoded: serde_json::Value = serde_json::from_str(&pane_input_completion_response(
+            "partial".into(),
+            Err(crate::pty::actor::agent_session_lost(&test_guard(), true)),
+        ))
+        .unwrap();
+        assert_eq!(encoded["error"]["partial_text_consumed"], true);
+        let encoded: serde_json::Value = serde_json::from_str(&pane_input_completion_response(
+            "none".into(),
+            Err(crate::pty::actor::agent_session_lost(&test_guard(), false)),
+        ))
+        .unwrap();
+        assert_eq!(encoded["error"]["partial_text_consumed"], false);
         let generic = std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "agent session ownership was lost",
@@ -2761,8 +2790,11 @@ mod tests {
     #[test]
     fn direct_guarded_pane_response_observes_completion_not_enqueue() {
         let (tx, rx) = std::sync::mpsc::channel();
-        tx.send(Err(crate::pty::actor::agent_session_lost(&test_guard())))
-            .unwrap();
+        tx.send(Err(crate::pty::actor::agent_session_lost(
+            &test_guard(),
+            false,
+        )))
+        .unwrap();
         let response: ErrorResponse =
             serde_json::from_str(&complete_direct_pane_input("lost".into(), rx)).unwrap();
         assert_eq!(response.error.code, "agent_session_lost");

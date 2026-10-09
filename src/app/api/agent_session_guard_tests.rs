@@ -2041,12 +2041,39 @@ async fn expected_agent_session_real_pty_queued_new_id_same_native_peer_revokes_
             !response.contains("private-queued-new"),
             "actual replacement ID stays private"
         );
+        let loss: serde_json::Value = serde_json::from_str(&response).expect("loss JSON");
+        assert_eq!(loss["error"]["partial_text_consumed"], false);
         f.completed_bytes(b"");
         let reporter = f.reporter.pid;
         let dir = f.dir.clone();
         drop(f);
         assert!(!std::path::Path::new(&format!("/proc/{reporter}")).exists());
         assert!(!dir.exists());
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expected_agent_session_real_pty_new_id_after_text_before_enter_no_enter() {
+    for method in ["agent.prompt", "agent.prompt_session_checked"] {
+        let mut f = Fixture::with_modes(Agent::Pi, false, true, true);
+        f.report_from_native_socket("private-queued-old", 1).await;
+        let barrier = ActorWriteBarrier::install(&f, 2);
+        let pending = PendingInputSocket::enqueue(&mut f, method).await;
+        barrier.entered();
+        f.completed_bytes(b"prompt");
+        f.report_from_native_socket("private-queued-new", 2).await;
+        assert_eq!(
+            crate::platform::process_identity(f.reporter.pid),
+            Some(f.reporter)
+        );
+        barrier.release();
+        let response = pending.response();
+        assert_error(&response, "agent_session_lost");
+        let response: serde_json::Value = serde_json::from_str(&response).expect("loss JSON");
+        assert_eq!(response["error"]["partial_text_consumed"], true);
+        assert!(!response.to_string().contains("private-queued-new"));
+        f.completed_bytes(b"prompt");
     }
 }
 

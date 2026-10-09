@@ -255,9 +255,11 @@ herdr pane run <pane_id> <command>
 
 `agent prompt` 的目标可以是别名。添加 `--expected-pane ID` 可要求它仍解析到先前观察到的窗格；解析到不同窗格时返回 `expected_pane_mismatch`，不写入任何输入字节。两个预期条件可以单独或一起使用，也可与 `--wait` 一起使用。`pane send-text` 和 `pane send-keys` 已经指定精确且规范化的 `pane_id`，因此不接受 `--expected-pane`。
 
-使用 `--expected-session` 时，服务器在接受请求时固定会话上报者的进程 ID 和启动时间，然后在每次 `write(2)` 前重新检查该进程仍存活且属于此 PTY 的前台进程组。部分写入、重试、任何焦点前缀、文本和延迟的 Enter 都受此检查约束。接受后若失去所有权，会返回 `agent_session_lost`：丢弃请求的剩余字节，不再发送 Enter，但可能已经写入部分文本或前缀。带守卫的发送返回 PTY actor 的完成结果，而非仅确认入队成功；这并不是接收方智能体的确认。由于输入可能已部分写入，出错后不要自动重试或移除预期条件。这些错误绝不会泄露实际会话 ID。
+使用 `--expected-session` 时，服务器在接受请求时固定会话上报者的进程 ID 和启动时间，然后在每次 `write(2)` 前重新检查该进程仍存活且属于此 PTY 的前台进程组。部分写入、重试、任何焦点前缀、文本和延迟的 Enter 都受此检查约束。接受后若失去所有权，会返回 `agent_session_lost`：丢弃剩余输入和 Enter，但可能已经写入部分文本或前缀。如果已写入文本阶段的字节，Linux 会从 actor 的 PTY master 打开其对应的确切 slave，并在返回完成结果前调用 `tcflush(slave, TCIFLUSH)`，丢弃已暂存但尚未读取的输入。此刷新作用于整个 tty，也可能丢弃其他已经暂存的未读输入。它无法撤回读取方已经消费的字节；同一个 Pi 草稿可能仍然保留。
 
-初始检查与接受请求时 Herdr 的已上报窗格状态是原子的。它无法检测智能体尚未上报的会话变化。剩余的原生竞态仅是最后一次实时进程／前台检查与 `write(2)` 之间的内核间隙，而不是 App 到 actor 的队列或延迟 Enter 的等待。CLI 要求 `expected_agent_session_guard`（Linux 和 macOS 支持，Windows 不支持）；缺少支持时，它返回 `expected_agent_session_unsupported`，不发送带守卫的操作，并使用 checked 方法名，因此即使能力检查后服务器被替换，也会在无法确认安全时拒绝操作。省略这些标志会保留现有行为和独立的跨窗格输入策略。
+可选错误字段 `partial_text_consumed` 仅在 `agent_session_lost` 时出现。当且仅当文本阶段的字节已到达 PTY、可能已被消费时，它为 `true`，并不表示读取方已确认接收；当且仅当没有写入任何文本阶段的字节时，它为 `false`。带守卫的发送返回 PTY actor 的完成结果，而非仅确认入队成功；这并不是接收方智能体的确认。由于输入可能已部分写入，出错后不要自动重试或移除预期条件。这些错误绝不会泄露实际会话 ID。
+
+初始检查与接受请求时 Herdr 的已上报窗格状态是原子的。它无法检测智能体尚未上报的会话变化。仍有两类残余竞态：最后一次实时进程／前台原生检查与 `write(2)` 之间的检查／写入间隙，以及所有权丢失／刷新／读取方之间的竞态；读取方可能在刷新前消费已暂存的字节。完成结果和刷新都不保证总写入或总消费字节数为零。App 到 actor 的队列和延迟 Enter 的等待受守卫保护，但不能消除这些原生竞态。CLI 要求 `expected_agent_session_guard`，仅 Linux 支持并通告此能力。macOS 和 Windows 在无法确认安全时拒绝操作；macOS 的原生证明尚待实现。缺少支持时，CLI 返回 `expected_agent_session_unsupported`，不发送带守卫的操作，并使用 checked 方法名，因此即使能力检查后服务器被替换，也会在无法确认安全时拒绝操作。省略这些标志会保留现有行为和独立的跨窗格输入策略。
 
 已知限制：暂停后，恢复或重新加载同一个原生会话不会恢复带守卫发送的资格；请开启新会话（`/new`）或重启智能体。参见[后续问题](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/7577)。
 

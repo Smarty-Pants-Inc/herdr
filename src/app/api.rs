@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, target_os = "linux"))]
 mod agent_session_guard_tests;
 mod agent_view;
 mod agents;

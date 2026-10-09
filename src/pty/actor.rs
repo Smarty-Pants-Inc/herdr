@@ -22,14 +22,17 @@ impl SessionInputGuard {
 #[derive(Debug)]
 struct AgentSessionLost {
     expected_agent_session_id: String,
+    /// True means submission text reached the PTY and may have been consumed;
+    /// it does not claim that a reader consumed every byte.
+    partial_text_consumed: bool,
 }
 
 impl std::fmt::Display for AgentSessionLost {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
-            "agent session ownership was lost: {}",
-            self.expected_agent_session_id
+            "agent session ownership was lost: {}; partial_text_consumed={}",
+            self.expected_agent_session_id, self.partial_text_consumed
         )
     }
 }
@@ -44,11 +47,22 @@ pub(crate) fn is_agent_session_lost(error: &std::io::Error) -> bool {
         .is_some_and(|cause| cause.is::<AgentSessionLost>())
 }
 
-pub(crate) fn agent_session_lost(guard: &SessionInputGuard) -> std::io::Error {
+pub(crate) fn agent_session_loss_partial_text_consumed(error: &std::io::Error) -> Option<bool> {
+    error
+        .get_ref()
+        .and_then(|cause| cause.downcast_ref::<AgentSessionLost>())
+        .map(|loss| loss.partial_text_consumed)
+}
+
+pub(crate) fn agent_session_lost(
+    guard: &SessionInputGuard,
+    partial_text_consumed: bool,
+) -> std::io::Error {
     std::io::Error::new(
         std::io::ErrorKind::PermissionDenied,
         AgentSessionLost {
             expected_agent_session_id: guard.expected_agent_session_id.clone(),
+            partial_text_consumed,
         },
     )
 }
@@ -146,7 +160,7 @@ mod windows {
             // The pin is carried by the common interface, but cannot be proved
             // against ConPTY. Do not substitute process existence for ownership.
             let _ = (guard.reporter, &guard.binding_validity);
-            Err(super::agent_session_lost(&guard))
+            Err(super::agent_session_lost(&guard, false))
         }
 
         pub(crate) fn input_consumer_epoch_matches(&self, _epoch: &str) -> bool {

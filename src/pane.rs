@@ -1656,7 +1656,7 @@ impl PaneRuntimeIo {
                 .queue_guarded_user_input_submission_with_source(text, enter, delay, guard, source),
             // A synthetic channel cannot prove ownership of a PTY master.
             #[cfg(test)]
-            Self::TestChannel { .. } => Err(crate::pty::actor::agent_session_lost(&guard)),
+            Self::TestChannel { .. } => Err(crate::pty::actor::agent_session_lost(&guard, false)),
         }
     }
 

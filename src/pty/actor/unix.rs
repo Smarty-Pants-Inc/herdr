@@ -703,6 +703,9 @@ struct ActiveSubmission {
     enter: Bytes,
     delay: Duration,
     phase: SubmissionPhase,
+    /// Submission text reached the PTY. This remains true after the text
+    /// boundary completes so delayed-Enter loss reports truthful partial input.
+    text_bytes_written: bool,
     reply: std_mpsc::Sender<std::io::Result<()>>,
 }
 
@@ -1095,6 +1098,12 @@ impl PtyIoActorRunner {
                 delay,
                 reply,
             } => {
+                if !crate::platform::expected_agent_session_guard_supported() {
+                    if let Some(guard) = guard.as_ref() {
+                        let _ = reply.send(Err(super::agent_session_lost(guard, false)));
+                        return false;
+                    }
+                }
                 if self.state == ActorState::Running {
                     let phase = if text.is_empty() {
                         SubmissionPhase::WaitingUntil(Instant::now() + delay)
@@ -1112,6 +1121,7 @@ impl PtyIoActorRunner {
                         enter,
                         delay,
                         phase,
+                        text_bytes_written: false,
                         reply,
                     });
                 } else {
@@ -1486,7 +1496,11 @@ impl PtyIoActorRunner {
                         })
                         || !guard.binding_is_current()
                     {
-                        let error = super::agent_session_lost(guard);
+                        let partial_text_consumed = self
+                            .active_submission
+                            .as_ref()
+                            .is_some_and(|submission| submission.text_bytes_written);
+                        let error = super::agent_session_lost(guard, partial_text_consumed);
                         // Single active submission means no request IDs are
                         // needed. Drop only its remaining parts, preserving
                         // unrelated FIFO work and ordered consumer markers.
@@ -1497,6 +1511,17 @@ impl PtyIoActorRunner {
                             )
                         });
                         self.current_write_offset = 0;
+                        if partial_text_consumed {
+                            if let Err(flush_error) =
+                                crate::platform::flush_pty_input(self.file.as_raw_fd())
+                            {
+                                warn!(
+                                    pane = self.pane_id,
+                                    err = %flush_error,
+                                    "failed to flush staged guarded PTY input after session loss"
+                                );
+                            }
+                        }
                         self.fail_active_submission(error);
                         continue;
                     }
@@ -1513,6 +1538,11 @@ impl PtyIoActorRunner {
                 Ok(written) => {
                     if let (Some(source), Some((_, ledger))) = (&write.source, &mut self.consumer) {
                         ledger.record(&chunk[..written], source, Instant::now());
+                    }
+                    if written > 0 && write.boundary == Some(SubmissionBoundary::Text) {
+                        if let Some(submission) = self.active_submission.as_mut() {
+                            submission.text_bytes_written = true;
+                        }
                     }
                     self.current_write_offset += written;
                     if self.current_write_offset >= write.bytes.len() {
@@ -1608,7 +1638,7 @@ fn input_submission_closed_error() -> std::io::Error {
     )
 }
 
-#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[cfg(all(test, target_os = "linux"))]
 mod guard_tests;
 
 #[cfg(test)]
@@ -1698,6 +1728,48 @@ mod tests {
             poll_observer: None,
         };
         (runner, peer)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn guarded_submission_fails_closed_without_linux_slave_flush_proof() {
+        let (mut runner, mut peer) = actor_runner_for_unit_test();
+        peer.set_nonblocking(true).expect("nonblocking peer");
+        let (reply, receipt) = std_mpsc::channel();
+        runner.handle_data_command(PtyIoDataCommand::SubmitUserInput {
+            guard: Some(SessionInputGuard {
+                reporter: crate::platform::ProcessIdentity {
+                    pid: std::process::id(),
+                    start_time: 0,
+                },
+                expected_agent_session_id: "unsupported-session".into(),
+                binding_validity: Weak::new(),
+            }),
+            source: InputSource::Api,
+            text: Bytes::from_static(b"forbidden"),
+            enter: Bytes::from_static(b"\r"),
+            delay: Duration::ZERO,
+            reply,
+        });
+        let error = receipt
+            .recv()
+            .expect("completion")
+            .expect_err("unsupported");
+        assert_eq!(
+            super::super::agent_session_loss_partial_text_consumed(&error),
+            Some(false)
+        );
+        assert!(runner.active_submission.is_none());
+        assert!(runner.pending_writes.is_empty());
+        let mut bytes = [0; 32];
+        assert_eq!(
+            peer.read(&mut bytes).expect_err("nothing written").kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        runner.enqueue_write(Bytes::from_static(b"legacy"));
+        runner.flush_pending_writes_once().expect("legacy write");
+        assert_eq!(peer.read(&mut bytes).expect("legacy input"), 6);
+        assert_eq!(&bytes[..6], b"legacy");
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

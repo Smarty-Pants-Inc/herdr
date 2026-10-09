@@ -87,6 +87,12 @@ impl App {
         let Some(expected) = expected else {
             return Ok(None);
         };
+        if !crate::platform::expected_agent_session_guard_supported() {
+            return Err(crate::api::schema::ErrorBody {
+                code: "expected_agent_session_unsupported".into(),
+                message: "expected agent session guards are supported only on Linux".into(),
+            });
+        }
         let actual = self
             .state
             .terminal_id_for_pane(ws_idx, pane_id)

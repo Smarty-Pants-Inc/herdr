@@ -144,7 +144,7 @@ impl App {
                     let response = match completion.recv() {
                         Ok(Ok(())) => encode_success(id, ResponseResult::AgentPrompted { agent }),
                         Ok(Err(err)) if crate::pty::actor::is_agent_session_lost(&err) => {
-                            encode_error(id, "agent_session_lost", err.to_string())
+                            super::panes::session_loss_response(id, &err)
                         }
                         Ok(Err(err)) if err.kind() == std::io::ErrorKind::TimedOut => {
                             encode_error(id, "timeout", err.to_string())
@@ -330,12 +330,11 @@ impl App {
             )
         }
         .map_err(|err| {
-            let code = if crate::pty::actor::is_agent_session_lost(&err) {
-                "agent_session_lost"
+            if crate::pty::actor::is_agent_session_lost(&err) {
+                super::panes::session_loss_response(id.clone(), &err)
             } else {
-                "agent_prompt_failed"
-            };
-            encode_error(id.clone(), code, err.to_string())
+                encode_error(id.clone(), "agent_prompt_failed", err.to_string())
+            }
         })?;
         // Receipt is issued on enqueue, before the asynchronous submission completes.
         self.accepted_api_inputs.push(resolved.pane_id);

@@ -153,7 +153,7 @@ fn default_capabilities() -> Option<ServerCapabilities> {
         expected_terminal_guard: true,
         // Native live-generation and PTY foreground proof is required. Other
         // platforms deliberately refuse guarded session delivery.
-        expected_agent_session_guard: cfg!(any(target_os = "linux", target_os = "macos")),
+        expected_agent_session_guard: crate::platform::expected_agent_session_guard_supported(),
         input_consumer: crate::platform::input_consumer_supported(),
     })
 }
@@ -1412,7 +1412,7 @@ mod tests {
         let caps = default_capabilities().expect("capabilities");
         assert_eq!(
             caps.expected_agent_session_guard,
-            cfg!(any(target_os = "linux", target_os = "macos"))
+            crate::platform::expected_agent_session_guard_supported()
         );
     }
     use std::collections::HashMap;
