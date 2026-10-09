@@ -3521,7 +3521,9 @@ async fn client_shell_release_under_popup_renders_when_it_resets_scrollback() {
 
 #[tokio::test]
 async fn worktree_discovery_does_not_block_client_typing() {
-    use api::schema::{Method, WorktreeListParams, WorktreeOpenParams};
+    use api::schema::{
+        Method, WorktreeListParams, WorktreeOpenParams, WorktreeOpenProjectCheckedParams,
+    };
 
     let mut server = test_headless_server();
     let mut workspace = crate::workspace::Workspace::test_new("worktree-input");
@@ -3574,10 +3576,22 @@ async fn worktree_discovery_does_not_block_client_typing() {
         (
             false,
             Method::WorktreeOpen(WorktreeOpenParams {
-                workspace_id: Some(workspace_id),
+                workspace_id: Some(workspace_id.clone()),
                 path: Some(repo.display().to_string()),
                 focus: true,
                 ..Default::default()
+            }),
+        ),
+        (
+            false,
+            Method::WorktreeOpenProjectChecked(WorktreeOpenProjectCheckedParams {
+                params: WorktreeOpenParams {
+                    workspace_id: Some(workspace_id),
+                    path: Some(repo.display().to_string()),
+                    focus: true,
+                    ..Default::default()
+                },
+                allow_project_change: false,
             }),
         ),
     ] {
@@ -3628,9 +3642,35 @@ async fn worktree_discovery_does_not_block_client_typing() {
 
 #[tokio::test]
 async fn deferred_worktree_open_disconnect_keeps_other_clients_focus() {
+    exercise_deferred_worktree_endpoint(false, false, true).await;
+}
+
+#[tokio::test]
+async fn deferred_worktree_checked_open_disconnect_keeps_other_clients_focus() {
+    exercise_deferred_worktree_endpoint(true, false, true).await;
+}
+
+#[tokio::test]
+async fn deferred_worktree_checked_open_focus_and_geometry_are_client_local() {
+    exercise_deferred_worktree_endpoint(true, false, false).await;
+}
+
+#[tokio::test]
+async fn deferred_worktree_checked_create_focus_and_geometry_are_client_local() {
+    exercise_deferred_worktree_endpoint(true, true, false).await;
+}
+
+async fn exercise_deferred_worktree_endpoint(checked: bool, create: bool, disconnect: bool) {
     let mut server = test_headless_server();
     let mut source = crate::workspace::Workspace::test_new("pending-open-source");
-    let repo = std::env::temp_dir().join(format!("herdr-disconnected-open-{}", source.id));
+    let fixture_id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let repo = std::env::temp_dir().join(format!(
+        "herdr-deferred-{}-{fixture_id}",
+        std::process::id()
+    ));
     let checkout = repo.with_extension("checkout");
     let git = |args: &[&str]| {
         let output = std::process::Command::new("git")
@@ -3657,16 +3697,18 @@ async fn deferred_worktree_open_disconnect_keeps_other_clients_focus() {
         "-m",
         "initial",
     ]);
-    git(&[
-        "-C",
-        repo.to_str().unwrap(),
-        "worktree",
-        "add",
-        "--quiet",
-        "-b",
-        "pending-open",
-        checkout.to_str().unwrap(),
-    ]);
+    if !create {
+        git(&[
+            "-C",
+            repo.to_str().unwrap(),
+            "worktree",
+            "add",
+            "--quiet",
+            "-b",
+            "pending-open",
+            checkout.to_str().unwrap(),
+        ]);
+    }
     source.identity_cwd = repo.clone();
     let source_id = source.id.clone();
     let mut target = crate::workspace::Workspace::test_new("pending-open-target");
@@ -3677,33 +3719,86 @@ async fn deferred_worktree_open_disconnect_keeps_other_clients_focus() {
     server.app.state.selected = 0;
     let (source_control, _) = connect_matching_test_shell(&mut server, 51);
     let (other_control, _) = connect_matching_test_shell(&mut server, 52);
-    let _ = source_control.recv().unwrap();
-    let _ = other_control.recv().unwrap();
+    // A bootstrap projection has two wire frames (completions and snapshot).
+    // Drain both before observing the later endpoint response.
+    let _ = client_shell_snapshot(&source_control);
+    let _ = client_shell_snapshot(&other_control);
     let original_tab = server.shell_tab_id_for_client(52);
+    let target_tab = server.app.public_tab_id(1, 0).unwrap();
+    let method = if create {
+        api::schema::Method::WorktreeCreateProjectChecked(
+            api::schema::WorktreeCreateProjectCheckedParams {
+                params: api::schema::WorktreeCreateParams {
+                    workspace_id: Some(source_id),
+                    branch: Some("pending-open".into()),
+                    path: Some(checkout.display().to_string()),
+                    focus: true,
+                    ..Default::default()
+                },
+                allow_project_change: false,
+            },
+        )
+    } else {
+        let params = api::schema::WorktreeOpenParams {
+            workspace_id: Some(source_id),
+            branch: Some("pending-open".into()),
+            focus: true,
+            ..Default::default()
+        };
+        if checked {
+            api::schema::Method::WorktreeOpenProjectChecked(
+                api::schema::WorktreeOpenProjectCheckedParams {
+                    params,
+                    allow_project_change: false,
+                },
+            )
+        } else {
+            api::schema::Method::WorktreeOpen(params)
+        }
+    };
 
-    let (entered, release) = crate::worktree::test_list_gate::block(&repo);
+    let discovery_gate = (!create).then(|| crate::worktree::test_list_gate::block(&repo));
     server.handle_server_event(ServerEvent::ClientShellEndpointRequest {
         client_id: 51,
         boot_id: server.client_shell_boot_id.clone(),
         request: Box::new(api::schema::Request {
             id: "open-before-disconnect".into(),
-            method: api::schema::Method::WorktreeOpen(api::schema::WorktreeOpenParams {
-                workspace_id: Some(source_id),
-                branch: Some("pending-open".into()),
-                focus: true,
-                ..Default::default()
-            }),
+            method,
         }),
     });
-    entered
-        .recv_timeout(Duration::from_secs(5))
-        .expect("Git started");
-    server.handle_server_event(ServerEvent::ClientDisconnected { client_id: 51 });
-    release.send(()).unwrap();
+    if let Some((entered, _)) = &discovery_gate {
+        entered
+            .recv_timeout(Duration::from_secs(5))
+            .expect("Git started");
+    }
+    assert!(server.clients[&51].shell_endpoint_command_in_flight);
+    assert!(server.clients[&51]
+        .shell_deferred_navigation_request_id
+        .is_some());
+    assert!(server.clients[&51]
+        .shell_deferred_navigation_response
+        .is_some());
+    assert_eq!(
+        server
+            .tab_geometry_controllers
+            .get(original_tab.as_ref().unwrap()),
+        Some(&51),
+        "receiver attributes geometry to the requesting endpoint"
+    );
+    if disconnect {
+        server.handle_server_event(ServerEvent::ClientDisconnected { client_id: 51 });
+    }
+    if let Some((_, release)) = discovery_gate {
+        release.send(()).unwrap();
+    }
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let event = server.app.event_rx.recv().await.unwrap();
-            let completed = matches!(&event, AppEvent::WorktreeReadFinished(_));
+            let completed = if create {
+                matches!(&event, AppEvent::WorktreeAddFinished(_))
+            } else {
+                matches!(&event, AppEvent::WorktreeReadFinished(_))
+            };
             server.handle_internal_event_with_forwarding(event);
             if completed {
                 break;
@@ -3714,12 +3809,60 @@ async fn deferred_worktree_open_disconnect_keeps_other_clients_focus() {
     .unwrap();
     assert!(
         server.app.state.workspaces[1].worktree_space().is_some(),
-        "open completed successfully"
+        "worktree operation completed successfully"
     );
+    if !disconnect {
+        let response_ready =
+            tokio::time::timeout(Duration::from_secs(5), server.server_event_rx.recv())
+                .await
+                .unwrap()
+                .expect("real deferred endpoint response");
+        server.handle_server_event(response_ready);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let data = loop {
+            let message = read_server_message(
+                source_control
+                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    .expect("matching endpoint response before deadline"),
+            );
+            match message {
+                protocol::ServerMessage::ClientShellEndpointResponseChunk {
+                    request_id,
+                    final_chunk,
+                    data,
+                    ..
+                } => {
+                    assert_eq!(request_id, "open-before-disconnect");
+                    assert!(final_chunk);
+                    break data;
+                }
+                protocol::ServerMessage::EndpointControl { kind, .. }
+                    if matches!(
+                        kind.as_str(),
+                        protocol::endpoint::AGENT_COMPLETIONS_KIND
+                            | protocol::endpoint::ENDPOINT_SNAPSHOT_KIND
+                    ) => {}
+                other => panic!("unexpected control frame before endpoint response: {other:?}"),
+            }
+        };
+        let response: api::schema::SuccessResponse = serde_json::from_slice(&data).unwrap();
+        assert_eq!(response.id, "open-before-disconnect");
+        assert!(matches!(
+            response.result,
+            api::schema::ResponseResult::WorktreeCreated { .. }
+                | api::schema::ResponseResult::WorktreeOpened { .. }
+        ));
+        assert_eq!(
+            server.shell_tab_id_for_client(51).as_deref(),
+            Some(target_tab.as_str())
+        );
+        assert_eq!(server.tab_geometry_controllers.get(&target_tab), Some(&51));
+        assert!(!server.clients[&51].shell_endpoint_command_in_flight);
+    }
     assert_eq!(
         server.shell_tab_id_for_client(52),
         original_tab,
-        "disconnected endpoint must not turn into public navigation"
+        "endpoint completion must not turn into public navigation"
     );
     shutdown_test_runtimes(&mut server);
     git(&[

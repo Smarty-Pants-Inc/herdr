@@ -124,8 +124,14 @@ pub enum Method {
     WorktreeList(WorktreeListParams),
     #[serde(rename = "worktree.create")]
     WorktreeCreate(WorktreeCreateParams),
+    /// Project-checked creation; older servers reject instead of ignoring permission.
+    #[serde(rename = "worktree.create_project_checked")]
+    WorktreeCreateProjectChecked(WorktreeCreateProjectCheckedParams),
     #[serde(rename = "worktree.open")]
     WorktreeOpen(WorktreeOpenParams),
+    /// Project-checked opening; older servers reject instead of ignoring permission.
+    #[serde(rename = "worktree.open_project_checked")]
+    WorktreeOpenProjectChecked(WorktreeOpenProjectCheckedParams),
     #[serde(rename = "worktree.remove")]
     WorktreeRemove(WorktreeRemoveParams),
     #[serde(rename = "tab.create")]

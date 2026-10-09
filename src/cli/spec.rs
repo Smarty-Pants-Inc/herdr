@@ -261,6 +261,10 @@ fn worktree_command() -> Command {
                 .arg(option("base", "REF"))
                 .arg(path_option("path", "PATH"))
                 .arg(option("label", "TEXT"))
+                .arg(
+                    flag("allow-project-change")
+                        .help("Intentionally allow agent sessions to change project ownership"),
+                )
                 .arg(flag("focus"))
                 .arg(flag("no-focus"))
                 .arg(flag("trust-repository")),
@@ -273,6 +277,10 @@ fn worktree_command() -> Command {
                 .arg(path_option("path", "PATH"))
                 .arg(option("branch", "NAME"))
                 .arg(option("label", "TEXT"))
+                .arg(
+                    flag("allow-project-change")
+                        .help("Intentionally allow agent sessions to change project ownership"),
+                )
                 .arg(flag("focus"))
                 .arg(flag("no-focus"))
                 .arg(flag("trust-repository")),
@@ -1278,6 +1286,29 @@ mod tests {
         assert!(String::from_utf8(help)
             .unwrap()
             .contains("Usage: herdr agent rename <TARGET> <NAME>|--clear"));
+    }
+
+    #[test]
+    fn worktree_project_change_flag_matches_pane_move() {
+        let cmd = super::command();
+        let pane_move = command_path(&cmd, &["pane", "move"]);
+        let expected_help = option_arg(pane_move, "allow-project-change").get_help();
+        for subcommand in ["create", "open"] {
+            let worktree_command = command_path(&cmd, &["worktree", subcommand]);
+            let permission = option_arg(worktree_command, "allow-project-change");
+            assert_eq!(permission.get_help(), expected_help);
+            assert!(matches!(permission.get_action(), clap::ArgAction::SetTrue));
+            assert!(!permission.is_required_set());
+            assert!(super::command()
+                .try_get_matches_from(["herdr", "worktree", subcommand, "--allow-project-change"])
+                .is_ok());
+        }
+        for subcommand in ["list", "remove"] {
+            assert!(!has_option(
+                command_path(&cmd, &["worktree", subcommand]),
+                "allow-project-change"
+            ));
+        }
     }
 
     #[test]

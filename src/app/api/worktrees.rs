@@ -70,6 +70,7 @@ impl App {
         &mut self,
         id: String,
         params: WorktreeOpenParams,
+        allow_project_change: bool,
         mut source: WorktreeSource,
         entry: crate::worktree::ExistingWorktree,
     ) -> String {
@@ -92,6 +93,16 @@ impl App {
         let canonical_source = crate::worktree::canonical_or_original(&source.source_checkout_path);
         let target_is_source = canonical_path == canonical_source;
         let already_open = self.open_workspace_idx_for_checkout(&canonical_path);
+        let project_changes = match self.precheck_worktree_memberships(
+            &source,
+            already_open,
+            &canonical_path,
+            allow_project_change,
+            "worktree.open_project_checked",
+        ) {
+            Ok(changes) => changes,
+            Err(message) => return encode_error(id, "project_change_refused", message),
+        };
         let defer_source_created_event = target_is_source && already_open.is_none();
         let created_source_workspace =
             match self.ensure_source_parent_membership(&mut source, !defer_source_created_event) {
@@ -148,6 +159,7 @@ impl App {
         let tab_idx = self.state.workspaces[ws_idx].active_tab;
         let worktree = self.worktree_info_for_entry(&source, entry);
         self.emit_worktree_opened_event(ws_idx, worktree.clone(), already_open.is_some());
+        Self::log_project_changes_with_context(&project_changes, "worktree.open_project_checked");
         encode_success(
             id,
             ResponseResult::WorktreeOpened {
@@ -271,6 +283,30 @@ impl App {
             repo_key: space.key,
             repo_name: space.repo_name,
         })
+    }
+
+    /// Project both membership writes together before creating/focusing anything.
+    /// New workspaces contain only new shells, so only existing holders can
+    /// reclassify surviving sessions. Use the same parent fallback as ensure.
+    fn precheck_worktree_memberships(
+        &self,
+        source: &WorktreeSource,
+        target_workspace_idx: Option<usize>,
+        target_path: &Path,
+        allow_project_change: bool,
+        checked_method: &str,
+    ) -> Result<Vec<super::project_change::ProjectChange>, String> {
+        let mut projected = self.project_topology();
+        if let Some(ws_idx) = source
+            .workspace_idx
+            .or_else(|| self.find_parent_workspace_by_key(&source.repo_key))
+        {
+            projected[ws_idx].checkout_path = Some(source.source_checkout_path.clone());
+        }
+        if let Some(ws_idx) = target_workspace_idx {
+            projected[ws_idx].checkout_path = Some(target_path.to_path_buf());
+        }
+        self.precheck_project_change(&projected, allow_project_change, checked_method)
     }
 
     fn ensure_source_parent_membership(
@@ -407,12 +443,17 @@ impl App {
     }
 
     pub(crate) fn open_workspace_idx_for_checkout(&self, checkout_path: &Path) -> Option<usize> {
-        let canonical_checkout = crate::worktree::canonical_or_original(checkout_path);
+        // A create checks before Git makes the checkout: canonicalize its
+        // existing ancestor so an aliased spelling still finds its workspace.
+        let canonical_checkout = crate::worktree::canonical_or_ancestor(checkout_path);
         let checkout_key = canonical_checkout.display().to_string();
+        let original_key = crate::worktree::canonical_or_original(checkout_path)
+            .display()
+            .to_string();
         self.state.workspaces.iter().position(|ws| {
             if let Some(space) = ws.worktree_space() {
                 // Explicit checkout provenance must not be overridden by shell navigation.
-                return crate::worktree::canonical_or_original(&space.checkout_path)
+                return crate::worktree::canonical_or_ancestor(&space.checkout_path)
                     == canonical_checkout;
             }
 
@@ -421,17 +462,16 @@ impl App {
                     .as_deref()
                     .and_then(crate::workspace::git_space_metadata)
             });
-            if git_space
-                .as_ref()
-                .is_some_and(|metadata| metadata.checkout_key == checkout_key)
-            {
+            if git_space.as_ref().is_some_and(|metadata| {
+                metadata.checkout_key == checkout_key || metadata.checkout_key == original_key
+            }) {
                 return true;
             }
 
             ws.resolved_identity_cwd_from(&self.state.terminals, &self.terminal_runtimes)
                 .as_deref()
                 .is_some_and(|cwd| {
-                    crate::worktree::canonical_or_original(cwd) == canonical_checkout
+                    crate::worktree::canonical_or_ancestor(cwd) == canonical_checkout
                 })
         })
     }
@@ -1043,9 +1083,12 @@ mod tests {
                 repo_name: "herdr".into(),
                 label: None,
                 focus: false,
+                allow_project_change: false,
+                branch: "feature".into(),
+                trust_repository: false,
                 respond_to,
             }),
-            result: Ok(()),
+            result: Ok(None),
         });
 
         let response = response_rx
@@ -2324,10 +2367,25 @@ mod tests {
     #[test]
     fn deferred_api_worktree_create_rejects_checkout_with_remove_in_flight() {
         let repo = create_committed_repo("api-worktree-create-remove-in-flight-repo");
-        let checkout = unique_temp_path("api-worktree-create-remove-in-flight-checkout");
+        // The remove reserved the checkout while it existed (canonical spelling);
+        // Git has already deleted it when the create arrives through an alias
+        // (Windows 8.3 temp names; a symlink on Unix).
+        let root = unique_temp_path("api-worktree-create-remove-in-flight");
+        std::fs::create_dir_all(root.join("real")).unwrap();
+        #[cfg(unix)]
+        let alias = {
+            let alias = root.join("alias");
+            std::os::unix::fs::symlink(root.join("real"), &alias).unwrap();
+            alias
+        };
+        #[cfg(not(unix))]
+        let alias = root.join("real");
+        let checkout = alias.join("checkout");
+        let reserved = std::fs::canonicalize(root.join("real"))
+            .unwrap()
+            .join("checkout");
         let mut app = test_app();
-        app.pending_api_worktree_remove_paths
-            .insert(crate::worktree::canonical_or_original(&checkout), 7);
+        app.pending_api_worktree_remove_paths.insert(reserved, 7);
         let (respond_to, response_rx) = response_channel();
 
         assert!(app.handle_deferred_worktree_api_request(
@@ -2355,6 +2413,7 @@ mod tests {
         assert_eq!(error.error.code, "worktree_operation_in_progress");
         assert!(app.event_rx.try_recv().is_err());
         let _ = std::fs::remove_dir_all(repo);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

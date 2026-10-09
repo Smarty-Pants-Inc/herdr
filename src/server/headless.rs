@@ -3278,9 +3278,11 @@ impl HeadlessServer {
         if matches!(
             &msg.request.method,
             api::schema::Method::WorktreeCreate(_)
+                | api::schema::Method::WorktreeCreateProjectChecked(_)
                 | api::schema::Method::WorktreeRemove(_)
                 | api::schema::Method::WorktreeList(_)
                 | api::schema::Method::WorktreeOpen(_)
+                | api::schema::Method::WorktreeOpenProjectChecked(_)
         ) {
             let read_only = matches!(&msg.request.method, api::schema::Method::WorktreeList(_));
             let deferred_changed = self.app.handle_deferred_worktree_api_request(
