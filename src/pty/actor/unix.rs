@@ -10,6 +10,7 @@ use bytes::Bytes;
 use tokio::sync::mpsc::{self, error::TryRecvError as DataTryRecvError};
 use tracing::{debug, warn};
 
+use super::SessionInputGuard;
 use crate::pty::fd;
 use crate::pty::input_consumer::{
     classify_replies, AuditSink, ConsumerOperation, ConsumerResponse, InputSource, Ledger,
@@ -83,6 +84,7 @@ enum PtyIoDataCommand {
         reply: std_mpsc::Sender<ConsumerResponse>,
     },
     SubmitUserInput {
+        guard: Option<SessionInputGuard>,
         source: InputSource,
         text: Bytes,
         enter: Bytes,
@@ -92,6 +94,11 @@ enum PtyIoDataCommand {
 }
 
 enum PtyIoControlCommand {
+    #[cfg(test)]
+    SetBeforeWrite {
+        callback: Box<dyn FnMut(usize) + Send>,
+        reply: std_mpsc::Sender<()>,
+    },
     BeginHandoff(std_mpsc::Sender<std::io::Result<()>>),
     DuplicateForHandoff(std_mpsc::Sender<std::io::Result<RawFd>>),
     ForegroundProcessGroup(std_mpsc::Sender<Option<u32>>),
@@ -118,6 +125,31 @@ struct UserWriteGate {
 }
 
 impl PtyIoActorHandle {
+    /// Installs a bounded native-test barrier before each write's proof. The
+    /// callback receives a 1-based attempt count since installation. Runner-
+    /// local hooks and full native chunk sizes are preserved.
+    /// Acknowledgment ensures no test races callback installation with enqueue.
+    #[cfg(test)]
+    pub(crate) fn test_set_before_write(
+        &self,
+        callback: Box<dyn FnMut(usize) + Send>,
+    ) -> std::io::Result<()> {
+        let (reply, installed) = std_mpsc::channel();
+        self.control_tx
+            .send(PtyIoControlCommand::SetBeforeWrite { callback, reply })
+            .map_err(|_| input_submission_closed_error())?;
+        self.wake_actor();
+        installed
+            .recv_timeout(Duration::from_secs(2))
+            .map_err(|error| match error {
+                std_mpsc::RecvTimeoutError::Timeout => std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "timed out installing native PTY write barrier",
+                ),
+                std_mpsc::RecvTimeoutError::Disconnected => input_submission_closed_error(),
+            })
+    }
+
     pub(crate) fn queue_input_consumer_operation(
         &self,
         operation: ConsumerOperation,
@@ -206,6 +238,28 @@ impl PtyIoActorHandle {
         delay: Duration,
         source: InputSource,
     ) -> std::io::Result<std_mpsc::Receiver<std::io::Result<()>>> {
+        self.queue_submission(text, enter, delay, None, source)
+    }
+
+    pub(crate) fn queue_guarded_user_input_submission_with_source(
+        &self,
+        text: Bytes,
+        enter: Bytes,
+        delay: Duration,
+        guard: SessionInputGuard,
+        source: InputSource,
+    ) -> std::io::Result<std_mpsc::Receiver<std::io::Result<()>>> {
+        self.queue_submission(text, enter, delay, Some(guard), source)
+    }
+
+    fn queue_submission(
+        &self,
+        text: Bytes,
+        enter: Bytes,
+        delay: Duration,
+        guard: Option<SessionInputGuard>,
+        source: InputSource,
+    ) -> std::io::Result<std_mpsc::Receiver<std::io::Result<()>>> {
         let user_writes = self
             .user_writes
             .lock()
@@ -219,6 +273,7 @@ impl PtyIoActorHandle {
         let (reply_tx, reply_rx) = std_mpsc::channel();
         self.data_tx
             .try_send(PtyIoDataCommand::SubmitUserInput {
+                guard,
                 source: source.user(),
                 text,
                 enter,
@@ -536,6 +591,17 @@ impl PtyForegroundObserver {
 struct ActorPtyFile {
     file: Option<std::fs::File>,
     foreground: Arc<Mutex<Option<RawFd>>>,
+    /// Native tests pause immediately before the proof, not after it. No hook
+    /// or branch exists in production, and the underlying write remains real.
+    #[cfg(test)]
+    before_write: Option<Box<dyn FnMut(usize) + Send>>,
+    /// Separately installed barriers must not replace runner-local hooks.
+    #[cfg(test)]
+    installed_before_write: Option<Box<dyn FnMut(usize) + Send>>,
+    /// Lets native tests invalidate/drop the binding root during the actual
+    /// native proof. No replacement process or foreground answers are mocked.
+    #[cfg(test)]
+    during_guard_proof: Option<Box<dyn FnMut() + Send>>,
 }
 
 impl ActorPtyFile {
@@ -544,6 +610,12 @@ impl ActorPtyFile {
         Self {
             file: Some(file),
             foreground,
+            #[cfg(test)]
+            before_write: None,
+            #[cfg(test)]
+            installed_before_write: None,
+            #[cfg(test)]
+            during_guard_proof: None,
         }
     }
 
@@ -626,6 +698,7 @@ struct PtyIoActorRunner {
 }
 
 struct ActiveSubmission {
+    guard: Option<SessionInputGuard>,
     source: InputSource,
     enter: Bytes,
     delay: Duration,
@@ -1015,6 +1088,7 @@ impl PtyIoActorRunner {
                 }
             }
             PtyIoDataCommand::SubmitUserInput {
+                guard,
                 source,
                 text,
                 enter,
@@ -1033,6 +1107,7 @@ impl PtyIoActorRunner {
                         SubmissionPhase::WritingText
                     };
                     self.active_submission = Some(ActiveSubmission {
+                        guard,
                         source,
                         enter,
                         delay,
@@ -1052,6 +1127,18 @@ impl PtyIoActorRunner {
 
     fn handle_control_command(&mut self, command: PtyIoControlCommand) -> bool {
         match command {
+            #[cfg(test)]
+            PtyIoControlCommand::SetBeforeWrite {
+                mut callback,
+                reply,
+            } => {
+                let mut attempts = 0usize;
+                self.file.installed_before_write = Some(Box::new(move |_| {
+                    attempts += 1;
+                    callback(attempts);
+                }));
+                let _ = reply.send(());
+            }
             PtyIoControlCommand::BeginHandoff(reply) => {
                 self.defer_or_begin_handoff(reply);
             }
@@ -1360,6 +1447,61 @@ impl PtyIoActorRunner {
     fn flush_pending_writes_once(&mut self) -> std::io::Result<Option<SubmissionBoundary>> {
         self.check_consumer();
         while let Some(write) = self.pending_writes.front() {
+            #[cfg(test)]
+            if let Some(before_write) = self.file.before_write.as_mut() {
+                before_write(self.current_write_offset);
+            }
+            #[cfg(test)]
+            if let Some(installed) = self.file.installed_before_write.as_mut() {
+                installed(self.current_write_offset);
+            }
+            // Only Text/Enter belong to the one active submission. Ordinary
+            // writes, terminal replies and consumer markers never inherit its
+            // guard, even when interleaved with its delayed Enter.
+            if matches!(
+                write.boundary,
+                Some(SubmissionBoundary::Text | SubmissionBoundary::Enter)
+            ) {
+                if let Some(guard) = self
+                    .active_submission
+                    .as_ref()
+                    .and_then(|submission| submission.guard.as_ref())
+                {
+                    // Re-prove at EVERY syscall, including the next partial
+                    // chunk and retries after WouldBlock or Interrupted. This
+                    // reads this actor's master directly, without a cached
+                    // observer, process-tree scan, or actor request roundtrip.
+                    // Scalar-only weak-root checks bracket the native proof.
+                    // Each upgrade temporary is dropped within the helper: no
+                    // strong Arc survives across native evidence or write(2).
+                    if !guard.binding_is_current()
+                        || !crate::platform::session_reporter_is_foreground(guard.reporter, || {
+                            #[cfg(test)]
+                            if let Some(during_proof) = self.file.during_guard_proof.as_mut() {
+                                during_proof();
+                            }
+                            crate::platform::foreground_process_group_id_for_tty_fd(
+                                self.file.as_raw_fd(),
+                            )
+                        })
+                        || !guard.binding_is_current()
+                    {
+                        let error = super::agent_session_lost(guard);
+                        // Single active submission means no request IDs are
+                        // needed. Drop only its remaining parts, preserving
+                        // unrelated FIFO work and ordered consumer markers.
+                        self.pending_writes.retain(|pending| {
+                            !matches!(
+                                pending.boundary,
+                                Some(SubmissionBoundary::Text | SubmissionBoundary::Enter)
+                            )
+                        });
+                        self.current_write_offset = 0;
+                        self.fail_active_submission(error);
+                        continue;
+                    }
+                }
+            }
             let chunk = &write.bytes[self.current_write_offset..];
             match self.file.write(chunk) {
                 Ok(0) => {
@@ -1466,6 +1608,9 @@ fn input_submission_closed_error() -> std::io::Error {
     )
 }
 
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod guard_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1520,7 +1665,7 @@ mod tests {
         (handle, peer, read_rx)
     }
 
-    fn actor_runner_for_unit_test() -> (PtyIoActorRunner, UnixStream) {
+    pub(super) fn actor_runner_for_unit_test() -> (PtyIoActorRunner, UnixStream) {
         let (actor_socket, peer) = UnixStream::pair().expect("socket pair");
         actor_socket
             .set_nonblocking(true)

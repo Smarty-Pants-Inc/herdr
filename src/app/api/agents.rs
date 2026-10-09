@@ -79,17 +79,30 @@ impl App {
         encode_success(id, ResponseResult::AgentStarted { agent, argv })
     }
 
+    /// Both published aliases and legacy methods with an optional expectation
+    /// must use actor completion, on every server/client API invocation route.
+    pub(crate) fn api_request_requires_deferred_input(
+        request: &crate::api::schema::Request,
+    ) -> bool {
+        use crate::api::schema::Method;
+        match &request.method {
+            Method::AgentPrompt(_)
+            | Method::AgentPromptSessionChecked(_)
+            | Method::PaneSendTextSessionChecked(_)
+            | Method::PaneSendKeysSessionChecked(_) => true,
+            Method::PaneSendText(params) => params.expected_agent_session_id.is_some(),
+            Method::PaneSendKeys(params) => params.expected_agent_session_id.is_some(),
+            _ => false,
+        }
+    }
+
     pub(crate) fn handle_deferred_agent_api_request(
         &mut self,
         request: crate::api::schema::Request,
         context: crate::api::ApiRequestContext,
         respond_to: std::sync::mpsc::Sender<String>,
     ) -> bool {
-        if !matches!(
-            request.method,
-            crate::api::schema::Method::AgentPrompt(_)
-                | crate::api::schema::Method::AgentPromptSessionChecked(_)
-        ) {
+        if !Self::api_request_requires_deferred_input(&request) {
             return false;
         }
         if let Some(response) = self.session_checked_guard_denial(&request) {
@@ -103,6 +116,26 @@ impl App {
         let params = match request.method {
             crate::api::schema::Method::AgentPrompt(params)
             | crate::api::schema::Method::AgentPromptSessionChecked(params) => params,
+            crate::api::schema::Method::PaneSendText(params)
+            | crate::api::schema::Method::PaneSendTextSessionChecked(params) => {
+                self.defer_session_checked_pane_input(
+                    request.id,
+                    super::panes::SessionCheckedPaneInput::Text(params),
+                    context,
+                    respond_to,
+                );
+                return true;
+            }
+            crate::api::schema::Method::PaneSendKeys(params)
+            | crate::api::schema::Method::PaneSendKeysSessionChecked(params) => {
+                self.defer_session_checked_pane_input(
+                    request.id,
+                    super::panes::SessionCheckedPaneInput::Keys(params),
+                    context,
+                    respond_to,
+                );
+                return true;
+            }
             _ => return false,
         };
         match self.queue_agent_prompt(request.id, params, context) {
@@ -110,6 +143,9 @@ impl App {
                 std::thread::spawn(move || {
                     let response = match completion.recv() {
                         Ok(Ok(())) => encode_success(id, ResponseResult::AgentPrompted { agent }),
+                        Ok(Err(err)) if crate::pty::actor::is_agent_session_lost(&err) => {
+                            encode_error(id, "agent_session_lost", err.to_string())
+                        }
                         Ok(Err(err)) if err.kind() == std::io::ErrorKind::TimedOut => {
                             encode_error(id, "timeout", err.to_string())
                         }
@@ -124,6 +160,32 @@ impl App {
             }
         }
         true
+    }
+
+    fn defer_session_checked_pane_input(
+        &mut self,
+        id: String,
+        input: super::panes::SessionCheckedPaneInput,
+        context: crate::api::ApiRequestContext,
+        respond_to: std::sync::mpsc::Sender<String>,
+    ) {
+        match self.queue_session_checked_pane_input(id.clone(), input, context) {
+            Ok(completion) => {
+                std::thread::spawn(move || {
+                    let result = completion.recv().unwrap_or_else(|_| {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::BrokenPipe,
+                            "pty actor closed",
+                        ))
+                    });
+                    let _ =
+                        respond_to.send(super::panes::pane_input_completion_response(id, result));
+                });
+            }
+            Err(response) => {
+                let _ = respond_to.send(response);
+            }
+        }
     }
 
     fn queue_agent_prompt(
@@ -152,12 +214,13 @@ impl App {
         };
         self.check_expected_pane(params.expected_pane_id.as_deref(), &resolved)
             .map_err(|error| encode_error_body(id.clone(), error))?;
-        self.check_expected_agent_session(
-            params.expected_agent_session_id.as_deref(),
-            resolved.ws_idx,
-            resolved.pane_id,
-        )
-        .map_err(|error| encode_error_body(id.clone(), error))?;
+        let guard = self
+            .capture_expected_agent_session(
+                params.expected_agent_session_id.as_deref(),
+                resolved.ws_idx,
+                resolved.pane_id,
+            )
+            .map_err(|error| encode_error_body(id.clone(), error))?;
         let Some(terminal_id) = self
             .state
             .workspaces
@@ -215,6 +278,7 @@ impl App {
             .and_then(|wait| wait.submission_deadline);
         #[cfg(not(windows))]
         let submit_deadline = None;
+        let mut guarded_prefix = Vec::new();
         if expected_agent == crate::detect::Agent::GithubCopilot {
             // Copilot ignores synthetic Enter after focus loss until it receives focus gained.
             let focus = match crate::ghostty::encode_focus(crate::ghostty::FocusEvent::Gained) {
@@ -223,7 +287,11 @@ impl App {
                     return Err(encode_error(id, "agent_prompt_failed", err.to_string()));
                 }
             };
-            if let Err(err) = runtime.try_send_bytes_with_source(
+            if guard.is_some() {
+                // Focus and prompt are one guarded request: never send an
+                // unguarded packet before the actor's ownership proof.
+                guarded_prefix = focus;
+            } else if let Err(err) = runtime.try_send_bytes_with_source(
                 Bytes::from(focus),
                 crate::pty::input_consumer::InputSource::Api,
             ) {
@@ -243,15 +311,32 @@ impl App {
         let Some(agent) = self.agent_info(resolved.ws_idx, resolved.pane_id) else {
             return Err(agent_not_found(id, &params.target));
         };
-        let completion = runtime
-            .queue_user_input_submission_with_source(
+        let completion = if let Some(guard) = guard {
+            guarded_prefix.extend_from_slice(&text);
+            runtime.queue_guarded_user_input_submission_with_source(
+                Bytes::from(guarded_prefix),
+                Bytes::from(enter),
+                AGENT_PROMPT_SUBMIT_DELAY,
+                guard,
+                crate::pty::input_consumer::InputSource::Api,
+            )
+        } else {
+            runtime.queue_user_input_submission_with_source(
                 Bytes::from(text),
                 Bytes::from(enter),
                 AGENT_PROMPT_SUBMIT_DELAY,
                 submit_deadline,
                 crate::pty::input_consumer::InputSource::Api,
             )
-            .map_err(|err| encode_error(id.clone(), "agent_prompt_failed", err.to_string()))?;
+        }
+        .map_err(|err| {
+            let code = if crate::pty::actor::is_agent_session_lost(&err) {
+                "agent_session_lost"
+            } else {
+                "agent_prompt_failed"
+            };
+            encode_error(id.clone(), code, err.to_string())
+        })?;
         // Receipt is issued on enqueue, before the asynchronous submission completes.
         self.accepted_api_inputs.push(resolved.pane_id);
         Ok((id, agent, completion))
@@ -475,6 +560,98 @@ mod tests {
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
         app
+    }
+
+    fn pane_request_params(
+        pane_id: &str,
+        expected_agent_session_id: Option<&str>,
+        allow_cross_pane: bool,
+    ) -> serde_json::Value {
+        let mut params = serde_json::json!({
+            "pane_id": pane_id,
+            "text": "hello",
+            "keys": ["enter"],
+            "allow_cross_pane": allow_cross_pane,
+        });
+        if let Some(expected) = expected_agent_session_id {
+            params["expected_agent_session_id"] = serde_json::json!(expected);
+        }
+        params
+    }
+
+    #[test]
+    fn deferred_input_route_covers_aliases_and_optional_base_expectations() {
+        for method in [
+            "pane.send_text",
+            "pane.send_text_session_checked",
+            "pane.send_keys",
+            "pane.send_keys_session_checked",
+        ] {
+            for expected in [None, Some("opaque-session")] {
+                let request: crate::api::schema::Request =
+                    serde_json::from_value(serde_json::json!({
+                        "id": "route", "method": method,
+                        "params": pane_request_params(
+                            "w1:p1",
+                            expected,
+                            false,
+                        ),
+                    }))
+                    .expect("pane request");
+                assert_eq!(
+                    App::api_request_requires_deferred_input(&request),
+                    method.ends_with("_session_checked") || expected.is_some(),
+                    "{method}: {expected:?}",
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn deferred_guarded_pane_denials_enqueue_nothing() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let pane = app.public_pane_id(0, pane_id).expect("pane ID");
+        assert!(app.check_expected_agent_session(None, 0, pane_id).is_ok());
+        let (runtime, mut input_rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.state.insert_test_runtime(pane_id, runtime);
+        for method in [
+            "pane.send_text",
+            "pane.send_keys",
+            "pane.send_text_session_checked",
+            "pane.send_keys_session_checked",
+        ] {
+            for expected in [None, Some("opaque-session")] {
+                if expected.is_none() && !method.ends_with("_session_checked") {
+                    continue;
+                }
+                let request = serde_json::from_value(serde_json::json!({
+                    "id": "denied", "method": method,
+                    "params": pane_request_params(&pane, expected, true),
+                }))
+                .expect("pane request");
+                let (respond_to, response_rx) = std::sync::mpsc::channel();
+                assert!(app.handle_deferred_agent_api_request(
+                    request,
+                    Default::default(),
+                    respond_to
+                ));
+                let response: crate::api::schema::ErrorResponse = serde_json::from_str(
+                    &response_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(
+                    response.error.code,
+                    if expected.is_some() {
+                        "agent_session_unknown"
+                    } else {
+                        "invalid_request"
+                    },
+                );
+                assert!(input_rx.try_recv().is_err());
+                assert!(app.accepted_api_inputs.is_empty());
+            }
+        }
     }
 
     fn start_deferred_agent_prompt(

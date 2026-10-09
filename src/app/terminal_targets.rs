@@ -61,18 +61,31 @@ impl App {
         })
     }
 
-    /// The same App turn resolves, freshly proves the accepted report's pinned
-    /// process is live in this PTY's foreground group, compares the session ID,
-    /// and enqueues input (including focus). Cached detection is not ownership
-    /// evidence. This does not query the agent's unreported internal session.
+    /// Compatibility check for tests that do not enqueue input. Production input
+    /// callers must carry the captured evidence to the actual PTY writer.
+    #[cfg(test)]
     pub(super) fn check_expected_agent_session(
         &self,
         expected: Option<&str>,
         ws_idx: usize,
         pane_id: crate::layout::PaneId,
     ) -> Result<(), crate::api::schema::ErrorBody> {
+        self.capture_expected_agent_session(expected, ws_idx, pane_id)
+            .map(|_| ())
+    }
+
+    /// Capture the accepted sidecar's reporter incarnation and opaque session ID
+    /// in the same App step as the initial comparison. The actor must freshly
+    /// prove this reporter owns its master before every syscall, including Enter.
+    /// Neither cached detection nor an unreported internal session is proof.
+    pub(super) fn capture_expected_agent_session(
+        &self,
+        expected: Option<&str>,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+    ) -> Result<Option<crate::pty::actor::SessionInputGuard>, crate::api::schema::ErrorBody> {
         let Some(expected) = expected else {
-            return Ok(());
+            return Ok(None);
         };
         let actual = self
             .state
@@ -88,10 +101,20 @@ impl App {
                 if !runtime.session_reporter_is_foreground(reporter) {
                     return None;
                 }
-                terminal.reported_agent_session_id()
+                Some((
+                    terminal.reported_agent_session_id()?,
+                    reporter,
+                    terminal.reported_agent_session_validity()?,
+                ))
             });
         match actual {
-            Some(actual) if actual == expected => Ok(()),
+            Some((actual, reporter, binding_validity)) if actual == expected => {
+                Ok(Some(crate::pty::actor::SessionInputGuard {
+                    reporter,
+                    expected_agent_session_id: actual.to_owned(),
+                    binding_validity,
+                }))
+            }
             Some(_) => Err(crate::api::schema::ErrorBody {
                 code: "agent_session_mismatch".into(),
                 message: format!(

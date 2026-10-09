@@ -251,11 +251,15 @@ herdr pane run <pane_id> <command>
 
 `pane run` 会遵循当前的 bracketed paste 模式,并把文本和 Enter 作为一个原子操作提交。发送命令时优先用它,而不是 `send-text` 加 `send-keys Enter`;单独的发送操作仍是底层操作,不会提交命令。
 
-在 `agent prompt`、`pane send-text` 或 `pane send-keys` 上使用 `--expected-session ID`，可拒绝向不同的已上报原生智能体会话发送输入。请从 `pane get` 或 `agent get` 复制当前的 `agent_session_id`。这是上报的 ID，不是 `agent_session.value`：对 Pi，该值可以是恢复路径，而 Herdr 会单独保留上报的 ID。没有上报 ID 时，带守卫的输入返回 `agent_session_unknown`；ID 不同时返回 `agent_session_mismatch`。两种拒绝都不会泄露实际 ID，也不会发送输入。
+在 `agent prompt`、`pane send-text` 或 `pane send-keys` 上使用 `--expected-session ID`，可拒绝向不同的已上报原生智能体会话发送输入。请从 `pane get` 或 `agent get` 复制当前的 `agent_session_id`。这是上报的 ID，不是 `agent_session.value`：对 Pi，该值可以是恢复路径，而 Herdr 会单独保留上报的 ID。没有上报 ID 时，带守卫的输入返回 `agent_session_unknown`；ID 不同时返回 `agent_session_mismatch`。这些初始拒绝不会泄露实际 ID，也不会写入任何输入字节。
 
-`agent prompt` 的目标可以是别名。添加 `--expected-pane ID` 可要求它仍解析到先前观察到的窗格；解析到不同窗格时返回 `expected_pane_mismatch`。两个预期条件可以单独或一起使用，也可与 `--wait` 一起使用。`pane send-text` 和 `pane send-keys` 已经指定精确且规范化的 `pane_id`，因此不接受 `--expected-pane`。
+`agent prompt` 的目标可以是别名。添加 `--expected-pane ID` 可要求它仍解析到先前观察到的窗格；解析到不同窗格时返回 `expected_pane_mismatch`，不写入任何输入字节。两个预期条件可以单独或一起使用，也可与 `--wait` 一起使用。`pane send-text` 和 `pane send-keys` 已经指定精确且规范化的 `pane_id`，因此不接受 `--expected-pane`。
 
-输入入队时，检查与 Herdr 的已上报窗格状态是原子的。它无法检测智能体尚未上报的会话变化。CLI 要求 `expected_agent_session_guard`；缺少支持时，它返回 `expected_agent_session_unsupported`，不发送带守卫的操作，并使用 checked 方法名，因此即使能力检查后服务器被替换，也会在无法确认安全时拒绝操作。拒绝后不要去掉预期条件重试。省略这些标志会保留现有行为和独立的跨窗格输入策略。
+使用 `--expected-session` 时，服务器在接受请求时固定会话上报者的进程 ID 和启动时间，然后在每次 `write(2)` 前重新检查该进程仍存活且属于此 PTY 的前台进程组。部分写入、重试、任何焦点前缀、文本和延迟的 Enter 都受此检查约束。接受后若失去所有权，会返回 `agent_session_lost`：丢弃请求的剩余字节，不再发送 Enter，但可能已经写入部分文本或前缀。带守卫的发送返回 PTY actor 的完成结果，而非仅确认入队成功；这并不是接收方智能体的确认。由于输入可能已部分写入，出错后不要自动重试或移除预期条件。这些错误绝不会泄露实际会话 ID。
+
+初始检查与接受请求时 Herdr 的已上报窗格状态是原子的。它无法检测智能体尚未上报的会话变化。剩余的原生竞态仅是最后一次实时进程／前台检查与 `write(2)` 之间的内核间隙，而不是 App 到 actor 的队列或延迟 Enter 的等待。CLI 要求 `expected_agent_session_guard`（Linux 和 macOS 支持，Windows 不支持）；缺少支持时，它返回 `expected_agent_session_unsupported`，不发送带守卫的操作，并使用 checked 方法名，因此即使能力检查后服务器被替换，也会在无法确认安全时拒绝操作。省略这些标志会保留现有行为和独立的跨窗格输入策略。
+
+已知限制：暂停后，恢复或重新加载同一个原生会话不会恢复带守卫发送的资格；请开启新会话（`/new`）或重启智能体。参见[后续问题](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/7577)。
 
 从自定义钩子上报智能体状态:
 

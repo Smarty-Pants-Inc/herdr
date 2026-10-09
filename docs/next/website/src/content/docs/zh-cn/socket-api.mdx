@@ -281,15 +281,17 @@ principal 由服务器解析，每个客户端连接只绑定一次。在 Linux 
 
 ### 预期智能体会话守卫
 
-`agent.prompt`、`pane.send_text` 和 `pane.send_keys` 接受可选的 `expected_agent_session_id` 字符串。请从当前的 `pane.get` 或 `agent.get` 记录复制 `agent_session_id`，不要使用 `agent_session.value`。对于 Pi，后者可以是恢复路径；服务器会单独保留上报的原生 ID。没有上报 ID 时返回 `agent_session_unknown`；ID 不同时返回 `agent_session_mismatch`。拒绝不会发送输入，也绝不包含实际 ID。
+`agent.prompt`、`pane.send_text` 和 `pane.send_keys` 接受可选的 `expected_agent_session_id` 字符串。请从当前的 `pane.get` 或 `agent.get` 记录复制 `agent_session_id`，不要使用 `agent_session.value`。对于 Pi，后者可以是恢复路径；服务器会单独保留上报的原生 ID。没有上报 ID 时返回 `agent_session_unknown`；ID 不同时返回 `agent_session_mismatch`。这些初始拒绝不会写入任何输入字节，也绝不包含实际 ID。
 
-服务器将已接受的会话上报绑定到本地套接字连接方的进程 ID 和启动时间。输入入队时，它还会用实时原生检查，而不是缓存的智能体检测结果，确认同一个进程仍存活，并属于该窗格 PTY 当前的前台进程组。上报进程已退出、已暂停、转入后台、未绑定或被替换时，即使退出检测尚未更新窗格，也会返回 `agent_session_unknown`。此检查支持 Linux 和 macOS；Windows 和未支持的平台会以 `agent_session_unknown` 拒绝。短生命周期的钩子上报进程退出后，不能授权之后的守卫发送。省略会话预期值时，不应用此进程检查。
+服务器将已接受的会话上报绑定到本地套接字连接方的进程 ID 和启动时间。接受请求时，它会用实时原生检查，而不是缓存的智能体检测结果，确认同一个进程仍存活，并属于该窗格 PTY 当前的前台进程组。上报进程已退出、已暂停、转入后台、未绑定或被替换时，即使退出检测尚未更新窗格，也会初始拒绝并返回 `agent_session_unknown`，不写入任何输入字节。此检查支持 Linux 和 macOS；Windows 和未支持的平台会以 `agent_session_unknown` 拒绝。短生命周期的钩子上报进程退出后，不能授权之后的守卫发送。省略会话预期值时，不应用此进程检查。
 
-内置的 Pi 和 OMP 集成会上报原生 ID 和未改变的恢复路径。旧的仅上报路径的集成会返回 `agent_session_unknown`；请运行 `herdr integration install pi` 或 `herdr integration install omp` 重新安装更新后的集成，再在安全的停顿点重启或重新加载该智能体，让它上报 ID。
+固定的上报者和预期 ID 随请求传入 PTY actor。在每次 `write(2)` 前，actor 都针对自身的 PTY master 重新执行实时原生检查，包括部分写入、重试、任何焦点前缀、文本和延迟 300 ms 的 Enter。接受后若失去所有权，会返回 `agent_session_lost`，丢弃请求的剩余字节，不再发送 Enter。可能已经写入部分文本或前缀；此错误不保证总写入字节数为零。会话守卫下的文本和按键发送会等待 actor 的类型化完成结果，而非在入队时返回成功。完成确认的是 PTY 写入，而不是接收方智能体的确认。丢失错误只会显示预期 ID，绝不显示实际 ID；出错后不要自动重试或降级为 unchecked 操作。
 
-`agent.prompt` 还接受 `expected_pane_id`，要求其目标（包括别名）解析到该精确窗格。解析到不同窗格时返回 `expected_pane_mismatch`，不发送输入。这些预期条件可以单独或一起使用，也可与可选的 `wait` 对象一起使用。窗格发送操作已指定精确的 `pane_id`，没有 `expected_pane_id` 字段。输入入队时，检查与 Herdr 的已上报窗格状态是原子的，但不是与智能体尚未上报的内部会话变化保持原子性。省略预期条件会保留现有行为，不改变跨窗格输入策略。
+内置的 Pi 集成版本 11 和 OMP 集成版本 12 会上报原生 ID 和未改变的恢复路径。旧的仅上报路径的集成会返回 `agent_session_unknown`；请运行 `herdr integration install pi` 或 `herdr integration install omp` 重新安装更新后的集成，再在安全的停顿点重启或重新加载该智能体，以加载更新的钩子并上报 ID。这一步加载钩子并不等于从暂停中恢复：恢复或重新加载同一个原生会话不会恢复带守卫发送的资格。请开启新会话（`/new`）或重启智能体；参见[后续问题](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/7577)。
 
-请检查 `ping.result.capabilities.expected_agent_session_guard == true`。带守卫的操作使用 `agent.prompt_session_checked`、`pane.send_text_session_checked` 和 `pane.send_keys_session_checked`。checked prompt 方法要求至少一个预期条件；checked 窗格发送方法要求 `expected_agent_session_id`。旧服务器会拒绝这些名称，而不是静默忽略守卫；即使在 ping 和操作之间被替换也是如此。拒绝后不要回退到 unchecked 方法。CLI 在使用 `--expected-session` 或 `agent prompt --expected-pane` 时使用这些别名；缺少该能力时，它返回 `expected_agent_session_unsupported`，不发送操作。
+`agent.prompt` 还接受 `expected_pane_id`，要求其目标（包括别名）解析到该精确窗格。解析到不同窗格时初始拒绝并返回 `expected_pane_mismatch`，不写入任何输入字节。这些预期条件可以单独或一起使用，也可与可选的 `wait` 对象一起使用。窗格发送操作已指定精确的 `pane_id`，没有 `expected_pane_id` 字段。初始检查与接受请求时 Herdr 的已上报窗格状态是原子的，但不是与智能体尚未上报的内部会话变化保持原子性。剩余的原生竞态仅是最后一次实时进程／前台检查与 `write(2)` 之间的内核间隙，而不是 App 到 actor 的队列或延迟 Enter 的等待。省略预期条件会保留现有行为，不改变跨窗格输入策略。
+
+请检查 `ping.result.capabilities.expected_agent_session_guard == true`（Linux 和 macOS 通告 `true`，Windows 通告 `false`）。带守卫的操作使用 `agent.prompt_session_checked`、`pane.send_text_session_checked` 和 `pane.send_keys_session_checked`。checked prompt 方法要求至少一个预期条件；checked 窗格发送方法要求 `expected_agent_session_id`。旧服务器会以 `invalid_request` 拒绝这些名称，而不是静默忽略守卫；即使在 ping 和操作之间被替换也是如此。拒绝后不要回退到 unchecked 方法。CLI 在使用 `--expected-session` 或 `agent prompt --expected-pane` 时使用这些别名；缺少该能力时，它返回 `expected_agent_session_unsupported`，不发送操作。
 
 ```json
 {"id":"checked_prompt","method":"agent.prompt_session_checked","params":{"target":"worker","text":"review this change","expected_agent_session_id":"reported_id_from_agent_get","expected_pane_id":"w1:p1","wait":{"until":["idle"],"timeout_ms":30000}}}

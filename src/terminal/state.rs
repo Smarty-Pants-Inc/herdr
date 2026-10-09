@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 // Effective state arbitration is intentionally centralized here. Full lifecycle
@@ -151,6 +153,8 @@ struct ReportedAgentSessionId {
     revision: u64,
     id: String,
     reporter: crate::platform::ProcessIdentity,
+    // Queued input holds only Weak references, never ownership of this authority.
+    validity: Arc<AtomicBool>,
 }
 
 /// Pure state for a server-owned terminal.
@@ -300,6 +304,8 @@ impl TerminalState {
         self.detected_agent = crate::detect::parse_agent_label(&snapshot.authority.agent_label);
         self.state = snapshot.authority.state;
         self.hook_authority = Some(snapshot.authority);
+        self.replace_reported_agent_session_id(None);
+        self.buffered_session_reports.clear();
         self.agent_process_acquisition_pending = snapshot.acquisition_pending;
     }
 
@@ -512,7 +518,7 @@ impl TerminalState {
                 });
         if process_exited || (previous_detected_agent != agent && !initial_detection_matches_report)
         {
-            self.reported_agent_session_id = None;
+            self.replace_reported_agent_session_id(None);
         }
         if process_exited || agent != Some(Agent::Codex) || fallback_state == AgentState::Blocked {
             self.codex_prompt_ready = false;
@@ -797,7 +803,8 @@ impl TerminalState {
         seq: Option<u64>,
         now: Instant,
     ) -> Option<TerminalStateMutation> {
-        let mutation = self.apply_hook_authority_at(
+        let had_current_binding = self.reported_agent_session_id().is_some();
+        let Some(mutation) = self.apply_hook_authority_at(
             source,
             agent_label,
             state,
@@ -805,10 +812,22 @@ impl TerminalState {
             session_ref,
             seq,
             now,
-        )?;
+        ) else {
+            // Routing may reclaim a displaced session even when this report is
+            // ignored. Revoke only if it actually displaced current evidence.
+            if had_current_binding && self.reported_agent_session_id().is_none() {
+                self.replace_reported_agent_session_id(None);
+            }
+            return None;
+        };
         self.accepted_session_report_revision =
             self.accepted_session_report_revision.wrapping_add(1);
-        self.reported_agent_session_id = None;
+        // The stale revision hides the previous binding until transport metadata
+        // finalizes this report. Do not revoke same-ID periodic input here.
+        // A report with no reference is a real clear, not a metadata handoff.
+        if self.agent_session_reference().is_none() {
+            self.replace_reported_agent_session_id(None);
+        }
         self.session_report_processing_revision =
             self.session_report_processing_revision.wrapping_add(1);
         Some(mutation)
@@ -1467,10 +1486,11 @@ impl TerminalState {
                 .retain(|(report_source, _), _| report_source != &source);
             self.accepted_session_report_revision =
                 self.accepted_session_report_revision.wrapping_add(1);
-            self.reported_agent_session_id = binding.map(|mut binding| {
+            let binding = binding.map(|mut binding| {
                 binding.revision = self.accepted_session_report_revision;
                 binding
             });
+            self.replace_reported_agent_session_id(binding);
             self.forget_stale_full_lifecycle_hook_session(&source, &agent_label, &session_ref);
             self.reconcile_agent_name_owner(&agent_label, Some(&session_ref));
             self.persisted_agent_session = Some(crate::agent_resume::PersistedAgentSession {
@@ -1625,10 +1645,11 @@ impl TerminalState {
                 revision: self.accepted_session_report_revision,
                 id: id.value,
                 reporter,
+                validity: Arc::new(AtomicBool::new(true)),
             });
         if previous.accepted != self.accepted_session_report_revision {
             if self.current_session_identity_for_persistence().as_ref() == Some(&identity) {
-                self.reported_agent_session_id = binding;
+                self.replace_reported_agent_session_id(binding);
             }
             return;
         }
@@ -1645,6 +1666,34 @@ impl TerminalState {
         {
             pending.binding = binding;
         }
+    }
+
+    // Only accepted replacement/promotion or an explicit clear reaches here.
+    // Discarding buffered/rejected candidates must never revoke current input.
+    fn replace_reported_agent_session_id(&mut self, mut binding: Option<ReportedAgentSessionId>) {
+        if let Some(previous) = self.reported_agent_session_id.as_ref() {
+            if let Some(next) = binding
+                .as_mut()
+                .filter(|next| next.id == previous.id && next.reporter == previous.reporter)
+            {
+                // Raw native ID + exact peer generation, not resume path/source,
+                // defines continuity. Never revive an already revoked cell.
+                next.validity = Arc::clone(&previous.validity);
+            } else {
+                previous.validity.store(false, Ordering::Release);
+            }
+        }
+        self.reported_agent_session_id = binding;
+    }
+
+    /// Revocation token for the same accepted binding exposed by ID/reporter.
+    /// The runtime must upgrade/load it around fresh foreground identity proof;
+    /// keeping only Weak references lets terminal destruction fail closed.
+    pub(crate) fn reported_agent_session_validity(&self) -> Option<Weak<AtomicBool>> {
+        self.reported_agent_session_id()?;
+        self.reported_agent_session_id
+            .as_ref()
+            .map(|reported| Arc::downgrade(&reported.validity))
     }
 
     /// Transport-bound owner of the accepted current report. Live foreground
@@ -1838,7 +1887,7 @@ impl TerminalState {
         &mut self,
         session: crate::agent_resume::PersistedAgentSession,
     ) {
-        self.reported_agent_session_id = None;
+        self.replace_reported_agent_session_id(None);
         self.buffered_session_reports.clear();
         self.persisted_agent_session = Some(session);
     }
@@ -1847,7 +1896,7 @@ impl TerminalState {
         &mut self,
         session: crate::agent_resume::PersistedAgentSession,
     ) {
-        self.reported_agent_session_id = None;
+        self.replace_reported_agent_session_id(None);
         self.buffered_session_reports.clear();
         self.persisted_agent_session = Some(session.clone());
         self.managed_agent_launch_session = Some(session);
@@ -1871,16 +1920,23 @@ impl TerminalState {
         seq: Option<u64>,
         session_start_source: Option<String>,
     ) -> Option<TerminalStateMutation> {
-        let mutation = self.apply_agent_session_ref_for_session_start(
+        let had_current_binding = self.reported_agent_session_id().is_some();
+        let Some(mutation) = self.apply_agent_session_ref_for_session_start(
             source,
             agent_label,
             session_ref,
             seq,
             session_start_source,
-        )?;
+        ) else {
+            if had_current_binding && self.reported_agent_session_id().is_none() {
+                self.replace_reported_agent_session_id(None);
+            }
+            return None;
+        };
         self.accepted_session_report_revision =
             self.accepted_session_report_revision.wrapping_add(1);
-        self.reported_agent_session_id = None;
+        // Hide stale evidence by revision while retain finalizes ID/peer metadata.
+        // Repeated accepted reports must not revoke an unchanged native binding.
         self.session_report_processing_revision =
             self.session_report_processing_revision.wrapping_add(1);
         Some(mutation)
@@ -2265,7 +2321,7 @@ impl TerminalState {
         }
         self.persisted_agent_session = None;
         self.displaced_persisted_session = None;
-        self.reported_agent_session_id = None;
+        self.replace_reported_agent_session_id(None);
         self.buffered_session_reports.clear();
         Some(TerminalStateMutation {
             effective_state_change: self.recompute_effective_state(
@@ -2329,7 +2385,7 @@ impl TerminalState {
             self.clear_agent_name();
         }
         self.hook_authority = None;
-        self.reported_agent_session_id = None;
+        self.replace_reported_agent_session_id(None);
         self.buffered_session_reports.clear();
         self.forget_reported_resume_of(source, agent_label);
         if !preserve_foreign_persisted_session {
@@ -2373,6 +2429,7 @@ impl TerminalState {
         let previous_presentation = self.effective_presentation_for_state_at(previous_state, now);
         let previous_session = self.current_session_identity_for_persistence();
         self.hook_authority = None;
+        self.replace_reported_agent_session_id(None);
         self.set_reported_resume(None);
         self.detected_agent = None;
         self.fallback_state = AgentState::Unknown;
@@ -2793,6 +2850,9 @@ impl TerminalState {
             .is_some_and(|session| self.persisted_agent_session.as_ref() == Some(session))
         {
             self.persisted_agent_session = None;
+            if self.reported_agent_session_id().is_none() {
+                self.replace_reported_agent_session_id(None);
+            }
         }
         self.agent_name = None;
         self.agent_name_owner = None;
@@ -2806,6 +2866,8 @@ impl TerminalState {
         self.fallback_observed_at = None;
         self.hook_authority = None;
         self.persisted_agent_session = None;
+        self.replace_reported_agent_session_id(None);
+        self.buffered_session_reports.clear();
         self.agent_metadata.clear();
         self.metadata_report_agents.clear();
         self.suppressed_full_lifecycle_hook_reports.clear();
@@ -3085,6 +3147,333 @@ mod tests {
             id.map(str::to_string),
             reporter,
         );
+    }
+
+    fn current_pi_binding() -> (TerminalState, crate::platform::ProcessIdentity) {
+        let mut terminal = test_terminal();
+        let reporter = crate::platform::ProcessIdentity {
+            pid: 17,
+            start_time: 11,
+        };
+        buffer_pi_report(&mut terminal, false, 1, Some("original"), Some(reporter));
+        terminal.set_detected_agent_process_at(Agent::Pi, Instant::now());
+        assert_eq!(terminal.reported_agent_session_id(), Some("original"));
+        (terminal, reporter)
+    }
+
+    fn binding_is_valid(validity: &std::sync::Weak<std::sync::atomic::AtomicBool>) -> bool {
+        validity
+            .upgrade()
+            .is_some_and(|cell| cell.load(std::sync::atomic::Ordering::Acquire))
+    }
+
+    #[test]
+    fn reported_session_validity_periodic_same_id_and_peer_reuses_cell() {
+        for hook in [false, true] {
+            let (mut terminal, reporter) = current_pi_binding();
+            let original = terminal.reported_agent_session_validity().expect("binding");
+            for seq in 2..=4 {
+                buffer_pi_report(&mut terminal, hook, seq, Some("original"), Some(reporter));
+                let current = terminal.reported_agent_session_validity().expect("binding");
+                assert!(original.ptr_eq(&current));
+                assert!(binding_is_valid(&original));
+            }
+        }
+    }
+
+    #[test]
+    fn reported_session_validity_new_id_permanently_retires_previous_cell() {
+        let (mut terminal, reporter) = current_pi_binding();
+        let original = terminal.reported_agent_session_validity().expect("binding");
+        // Keep an observation alive to distinguish Release(false) from mere expiry.
+        let original_cell = original.upgrade().expect("owned current cell");
+        buffer_pi_report(&mut terminal, true, 2, Some("replacement"), Some(reporter));
+        let replacement = terminal.reported_agent_session_validity().expect("binding");
+        let replacement_cell = replacement.upgrade().expect("owned current cell");
+        assert!(!original.ptr_eq(&replacement));
+        assert!(!original_cell.load(std::sync::atomic::Ordering::Acquire));
+        assert!(binding_is_valid(&replacement));
+        buffer_pi_report(&mut terminal, true, 3, Some("original"), Some(reporter));
+        let returned = terminal.reported_agent_session_validity().expect("binding");
+        assert!(!original.ptr_eq(&returned));
+        assert!(!replacement.ptr_eq(&returned));
+        assert!(!original_cell.load(std::sync::atomic::Ordering::Acquire));
+        assert!(!replacement_cell.load(std::sync::atomic::Ordering::Acquire));
+        assert!(binding_is_valid(&returned));
+    }
+
+    #[test]
+    fn reported_session_validity_same_id_different_peer_retires_previous_cell() {
+        for replacement in [
+            crate::platform::ProcessIdentity {
+                pid: 18,
+                start_time: 11,
+            },
+            crate::platform::ProcessIdentity {
+                pid: 17,
+                start_time: 12,
+            },
+        ] {
+            let (mut terminal, _) = current_pi_binding();
+            let original = terminal.reported_agent_session_validity().expect("binding");
+            let original_cell = original.upgrade().expect("owned current cell");
+            buffer_pi_report(&mut terminal, true, 2, Some("original"), Some(replacement));
+            let current = terminal.reported_agent_session_validity().expect("binding");
+            assert!(!original.ptr_eq(&current));
+            assert!(!original_cell.load(std::sync::atomic::Ordering::Acquire));
+            assert!(binding_is_valid(&current));
+        }
+    }
+
+    #[test]
+    fn reported_session_validity_clear_restore_exit_and_respawn_retire_cell() {
+        for action in ["clear", "release", "restore", "launch", "exit", "respawn"] {
+            let (mut terminal, reporter) = current_pi_binding();
+            buffer_pi_report(&mut terminal, true, 2, Some("original"), Some(reporter));
+            let original = terminal.reported_agent_session_validity().expect("binding");
+            let original_cell = original.upgrade().expect("owned current cell");
+            match action {
+                "clear" => {
+                    terminal
+                        .clear_hook_authority_with_mutation(Some("herdr:pi"), Some(3))
+                        .expect("accepted clear");
+                }
+                "release" => {
+                    terminal
+                        .release_agent_with_mutation("herdr:pi", "pi", Some(3))
+                        .expect("accepted release");
+                }
+                "restore" | "launch" => {
+                    let session = terminal.persisted_agent_session.clone().unwrap_or_else(|| {
+                        crate::agent_resume::PersistedAgentSession {
+                            source: "herdr:pi".into(),
+                            agent: "pi".into(),
+                            session_ref: crate::agent_resume::AgentSessionRef::path(
+                                "/tmp/restored.jsonl",
+                            )
+                            .expect("path"),
+                        }
+                    });
+                    if action == "restore" {
+                        terminal.set_persisted_agent_session(session);
+                    } else {
+                        terminal.set_managed_agent_launch_session(session);
+                    }
+                }
+                "exit" => {
+                    terminal.set_detected_state_with_screen_signals_at(
+                        Some(Agent::Pi),
+                        AgentState::Unknown,
+                        false,
+                        false,
+                        false,
+                        true,
+                        Instant::now(),
+                    );
+                }
+                _ => terminal.clear_agent_runtime_identity_after_respawn(),
+            }
+            assert!(
+                !original_cell.load(std::sync::atomic::Ordering::Acquire),
+                "{action}"
+            );
+            assert!(
+                terminal.reported_agent_session_validity().is_none(),
+                "{action}"
+            );
+        }
+    }
+
+    #[test]
+    fn reported_session_validity_rejected_same_path_and_sequence_preserve_cell() {
+        for hook in [false, true] {
+            let (mut terminal, reporter) = current_pi_binding();
+            buffer_pi_report(&mut terminal, hook, 2, Some("original"), Some(reporter));
+            let original = terminal.reported_agent_session_validity().expect("binding");
+            let marker = terminal.session_report_marker();
+            buffer_pi_report(
+                &mut terminal,
+                hook,
+                2,
+                Some("rejected"),
+                Some(crate::platform::ProcessIdentity {
+                    start_time: 12,
+                    ..reporter
+                }),
+            );
+            let current = terminal.reported_agent_session_validity().expect("binding");
+            assert_eq!(terminal.session_report_marker(), marker);
+            assert!(original.ptr_eq(&current));
+            assert!(binding_is_valid(&original));
+        }
+    }
+
+    #[test]
+    fn reported_session_validity_buffered_candidate_not_exposed_until_promotion() {
+        let mut terminal = test_terminal();
+        let reporter = crate::platform::ProcessIdentity {
+            pid: 17,
+            start_time: 11,
+        };
+        buffer_pi_report(&mut terminal, false, 1, Some("candidate"), Some(reporter));
+        assert!(terminal.reported_agent_session_validity().is_none());
+        let candidate = std::sync::Arc::downgrade(
+            &terminal
+                .buffered_session_reports
+                .values()
+                .next()
+                .expect("candidate")
+                .binding
+                .as_ref()
+                .expect("metadata")
+                .validity,
+        );
+        buffer_pi_report(&mut terminal, true, 2, Some("selected"), Some(reporter));
+        assert!(terminal.reported_agent_session_validity().is_none());
+        terminal.set_detected_agent_process_at(Agent::Pi, Instant::now());
+        let current = terminal
+            .reported_agent_session_validity()
+            .expect("promoted");
+        assert!(!candidate.ptr_eq(&current));
+        assert!(candidate.upgrade().is_none());
+        assert!(binding_is_valid(&current));
+        assert_eq!(terminal.reported_agent_session_id(), Some("selected"));
+    }
+
+    #[test]
+    fn reported_session_validity_pending_replacement_does_not_revoke_until_promoted() {
+        let (mut terminal, reporter) = current_pi_binding();
+        let original = terminal.reported_agent_session_validity().expect("binding");
+        let original_cell = original.upgrade().expect("owned current cell");
+        let reference = crate::agent_resume::AgentSessionRef::path("/tmp/pending.jsonl");
+        let marker = terminal.session_report_marker();
+        assert!(terminal
+            .set_hook_authority_with_session_ref(
+                "herdr:pi".into(),
+                "pi".into(),
+                AgentState::Working,
+                None,
+                reference.clone(),
+                Some(2),
+            )
+            .is_none());
+        terminal.retain_reported_agent_session_id(
+            (marker, Some(2)),
+            "herdr:pi",
+            "pi",
+            reference.as_ref(),
+            Some("pending".into()),
+            Some(reporter),
+        );
+        let current = terminal
+            .reported_agent_session_validity()
+            .expect("original still current");
+        assert!(original.ptr_eq(&current));
+        assert!(binding_is_valid(&original));
+        assert_eq!(terminal.reported_agent_session_id(), Some("original"));
+        // Pure selection fixture: the pending hook becomes the selected report.
+        terminal
+            .suppressed_full_lifecycle_hook_reports
+            .get_mut("herdr:pi")
+            .expect("pending replacement")
+            .replacement_session_ref = reference;
+        terminal.clear_full_lifecycle_hook_suppression_for_detected_agent(None, Some(Agent::Pi));
+        let promoted = terminal
+            .reported_agent_session_validity()
+            .expect("promoted binding");
+        assert!(!original.ptr_eq(&promoted));
+        assert!(!original_cell.load(std::sync::atomic::Ordering::Acquire));
+        assert!(binding_is_valid(&promoted));
+        assert_eq!(terminal.reported_agent_session_id(), Some("pending"));
+    }
+
+    #[test]
+    fn reported_session_validity_id_only_report_and_initial_detection_keep_cell() {
+        let (mut terminal, reporter) = accepted_startup_session_id();
+        let original = terminal.reported_agent_session_validity().expect("binding");
+        terminal.set_detected_agent_process_at(Agent::Claude, Instant::now());
+        assert!(original.ptr_eq(&terminal.reported_agent_session_validity().expect("binding")));
+        let reference = crate::agent_resume::AgentSessionRef::id("private-startup");
+        let marker = terminal.session_report_marker();
+        terminal
+            .set_agent_session_ref(
+                "herdr:claude".into(),
+                "claude".into(),
+                reference.clone(),
+                Some(2),
+            )
+            .expect("accepted periodic report");
+        // Stale revision is not exposed as ID, reporter, or a new queue token.
+        assert!(terminal.reported_agent_session_id().is_none());
+        assert!(terminal.reported_agent_session_reporter().is_none());
+        assert!(terminal.reported_agent_session_validity().is_none());
+        terminal.retain_reported_agent_session_id(
+            (marker, Some(2)),
+            "herdr:claude",
+            "claude",
+            reference.as_ref(),
+            Some("private-startup".into()),
+            Some(reporter),
+        );
+        assert!(original.ptr_eq(&terminal.reported_agent_session_validity().expect("binding")));
+        assert!(binding_is_valid(&original));
+    }
+
+    #[test]
+    fn reported_session_validity_same_native_id_path_change_keeps_cell() {
+        let (mut terminal, reporter) = current_pi_binding();
+        let original = terminal.reported_agent_session_validity().expect("binding");
+        let reference = crate::agent_resume::AgentSessionRef::path("/tmp/moved.jsonl");
+        let marker = terminal.session_report_marker();
+        terminal
+            .set_agent_session_ref_for_session_start(
+                "herdr:pi".into(),
+                "pi".into(),
+                reference.clone(),
+                Some(2),
+                Some("new".into()),
+            )
+            .expect("allowed path replacement");
+        terminal.retain_reported_agent_session_id(
+            (marker, Some(2)),
+            "herdr:pi",
+            "pi",
+            reference.as_ref(),
+            Some("original".into()),
+            Some(reporter),
+        );
+        let current = terminal.reported_agent_session_validity().expect("binding");
+        assert!(original.ptr_eq(&current));
+        assert!(binding_is_valid(&original));
+        assert_eq!(terminal.agent_session_reference(), reference.as_ref());
+    }
+
+    #[test]
+    fn reported_session_validity_accepted_missing_metadata_retires_cell() {
+        for (id, reporter_present) in [(None, true), (Some("original"), false)] {
+            let (mut terminal, reporter) = current_pi_binding();
+            let original = terminal.reported_agent_session_validity().expect("binding");
+            let original_cell = original.upgrade().expect("owned current cell");
+            buffer_pi_report(
+                &mut terminal,
+                true,
+                2,
+                id,
+                reporter_present.then_some(reporter),
+            );
+            assert!(!original_cell.load(std::sync::atomic::Ordering::Acquire));
+            assert!(terminal.reported_agent_session_validity().is_none());
+        }
+    }
+
+    #[test]
+    fn reported_session_validity_drop_expires_queued_weak_reference() {
+        let (terminal, _) = current_pi_binding();
+        let queued = terminal.reported_agent_session_validity().expect("binding");
+        assert!(binding_is_valid(&queued));
+        drop(terminal);
+        assert!(queued.upgrade().is_none());
+        assert!(!binding_is_valid(&queued));
     }
 
     #[test]

@@ -937,6 +937,10 @@ impl App {
         )
     }
 
+    // Headless production dispatch intercepts all session-checked input with
+    // App::api_request_requires_deferred_input before this synchronous fallback.
+    // Private/direct pane handlers still await bounded actor completion; enqueue
+    // alone is never a successful guarded API response.
     pub(crate) fn handle_api_request_after_internal_events_drained_with_context(
         &mut self,
         request: crate::api::schema::Request,

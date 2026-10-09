@@ -30,6 +30,48 @@ use super::super::api_helpers::{
 use super::super::api_helpers::{METADATA_SOURCE_MAX_CHARS, METADATA_TTL_MAX_MS};
 use super::responses::{encode_error, encode_success};
 
+pub(super) enum SessionCheckedPaneInput {
+    Text(PaneSendTextParams),
+    Keys(PaneSendKeysParams),
+}
+
+/// Interpret only the actor's typed ownership failure as session loss. Generic
+/// permission errors must not be confused with proof that the guard was lost.
+pub(super) fn pane_input_completion_response(id: String, result: std::io::Result<()>) -> String {
+    match result {
+        Ok(()) => encode_success(id, ResponseResult::Ok {}),
+        Err(error) => {
+            let code = if crate::pty::actor::is_agent_session_lost(&error) {
+                "agent_session_lost"
+            } else if error.kind() == std::io::ErrorKind::TimedOut {
+                "timeout"
+            } else {
+                "pane_send_failed"
+            };
+            encode_error(id, code, error.to_string())
+        }
+    }
+}
+
+/// Private/direct String callers have no response sender. They must observe a
+/// bounded completion rather than claiming enqueue means delivery. Production
+/// server routes always wait on a response worker, never on the App loop.
+fn complete_direct_pane_input(
+    id: String,
+    completion: std::sync::mpsc::Receiver<std::io::Result<()>>,
+) -> String {
+    let result = completion
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap_or_else(|error| {
+            let kind = match error {
+                std::sync::mpsc::RecvTimeoutError::Timeout => std::io::ErrorKind::TimedOut,
+                std::sync::mpsc::RecvTimeoutError::Disconnected => std::io::ErrorKind::BrokenPipe,
+            };
+            Err(std::io::Error::new(kind, error))
+        });
+    pane_input_completion_response(id, result)
+}
+
 impl App {
     pub(super) fn handle_pane_split(&mut self, id: String, params: PaneSplitParams) -> String {
         let target = if let Some(target_pane_id) = params.target_pane_id.as_deref() {
@@ -2065,22 +2107,90 @@ impl App {
         encode_success(id, ResponseResult::Ok {})
     }
 
+    pub(super) fn queue_session_checked_pane_input(
+        &mut self,
+        id: String,
+        input: SessionCheckedPaneInput,
+        context: crate::api::ApiRequestContext,
+    ) -> Result<std::sync::mpsc::Receiver<std::io::Result<()>>, String> {
+        let (pane, expected, method) = match &input {
+            SessionCheckedPaneInput::Text(params) => (
+                &params.pane_id,
+                params.expected_agent_session_id.as_deref(),
+                "pane.send_text",
+            ),
+            SessionCheckedPaneInput::Keys(params) => (
+                &params.pane_id,
+                params.expected_agent_session_id.as_deref(),
+                "pane.send_keys",
+            ),
+        };
+        let Some((ws_idx, pane_id)) = self.parse_pane_id(pane) else {
+            return Err(pane_not_found(id, pane));
+        };
+        let guard = self
+            .capture_expected_agent_session(expected, ws_idx, pane_id)
+            .map_err(|error| super::responses::encode_error_body(id.clone(), error))?;
+        let Some(guard) = guard else {
+            return Err(encode_error(
+                id,
+                "agent_session_unknown",
+                "session-checked input requires expected_agent_session_id",
+            ));
+        };
+        // Retain this checked runtime through logging and enqueue; never resolve
+        // the target again after logging or send keys as independent packets.
+        let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
+            return Err(pane_not_found(id, pane));
+        };
+        let bytes = match input {
+            SessionCheckedPaneInput::Text(params) => params.text.into_bytes(),
+            SessionCheckedPaneInput::Keys(params) => encode_api_keys(runtime, &params.keys)
+                .map_err(|key| {
+                    encode_error(id.clone(), "invalid_key", format!("unsupported key {key}"))
+                })?
+                .into_iter()
+                .flatten()
+                .collect(),
+        };
+        self.log_api_input(&id, method, ws_idx, pane_id, context, bytes.len())?;
+        let has_input = !bytes.is_empty();
+        let completion = runtime
+            .queue_guarded_user_input_submission_with_source(
+                Bytes::from(bytes),
+                Bytes::new(),
+                std::time::Duration::ZERO,
+                guard,
+                crate::pty::input_consumer::InputSource::Api,
+            )
+            .map_err(|error| pane_input_completion_response(id, Err(error)))?;
+        // An enqueue receipt invalidates the last-input generation; it does not
+        // claim bytes have reached the PTY. The response awaits actor completion.
+        if has_input {
+            self.accepted_api_inputs.push(pane_id);
+        }
+        Ok(completion)
+    }
+
     pub(super) fn handle_pane_send_text(
         &mut self,
         id: String,
         params: PaneSendTextParams,
         context: crate::api::ApiRequestContext,
     ) -> String {
+        if params.expected_agent_session_id.is_some() {
+            return match self.queue_session_checked_pane_input(
+                id.clone(),
+                SessionCheckedPaneInput::Text(params),
+                context,
+            ) {
+                Ok(completion) => complete_direct_pane_input(id, completion),
+                Err(response) => response,
+            };
+        }
         let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
-        if let Err(error) = self.check_expected_agent_session(
-            params.expected_agent_session_id.as_deref(),
-            ws_idx,
-            pane_id,
-        ) {
-            return super::responses::encode_error_body(id, error);
-        }
         if self.lookup_runtime_sender(ws_idx, pane_id).is_none() {
             return pane_not_found(id, &params.pane_id);
         }
@@ -2257,16 +2367,19 @@ impl App {
         params: PaneSendKeysParams,
         context: crate::api::ApiRequestContext,
     ) -> String {
+        if params.expected_agent_session_id.is_some() {
+            return match self.queue_session_checked_pane_input(
+                id.clone(),
+                SessionCheckedPaneInput::Keys(params),
+                context,
+            ) {
+                Ok(completion) => complete_direct_pane_input(id, completion),
+                Err(response) => response,
+            };
+        }
         let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
-        if let Err(error) = self.check_expected_agent_session(
-            params.expected_agent_session_id.as_deref(),
-            ws_idx,
-            pane_id,
-        ) {
-            return super::responses::encode_error_body(id, error);
-        }
         let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
@@ -2612,6 +2725,70 @@ mod tests {
         detect::{Agent, AgentState},
         workspace::Workspace,
     };
+
+    fn test_guard() -> crate::pty::actor::SessionInputGuard {
+        crate::pty::actor::SessionInputGuard {
+            reporter: crate::platform::ProcessIdentity {
+                pid: 1,
+                start_time: 1,
+            },
+            expected_agent_session_id: "opaque-session".into(),
+            // Error classification and synthetic-channel rejection fixtures must
+            // fail closed; they never authorize a native PTY write.
+            binding_validity: std::sync::Weak::new(),
+        }
+    }
+
+    #[test]
+    fn guarded_pane_completion_maps_only_typed_loss() {
+        let lost = crate::pty::actor::agent_session_lost(&test_guard());
+        let response: ErrorResponse =
+            serde_json::from_str(&pane_input_completion_response("typed".into(), Err(lost)))
+                .unwrap();
+        assert_eq!(response.error.code, "agent_session_lost");
+        let generic = std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "agent session ownership was lost",
+        );
+        let response: ErrorResponse = serde_json::from_str(&pane_input_completion_response(
+            "generic".into(),
+            Err(generic),
+        ))
+        .unwrap();
+        assert_eq!(response.error.code, "pane_send_failed");
+    }
+
+    #[test]
+    fn direct_guarded_pane_response_observes_completion_not_enqueue() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(Err(crate::pty::actor::agent_session_lost(&test_guard())))
+            .unwrap();
+        let response: ErrorResponse =
+            serde_json::from_str(&complete_direct_pane_input("lost".into(), rx)).unwrap();
+        assert_eq!(response.error.code, "agent_session_lost");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(Ok(())).unwrap();
+        let response: SuccessResponse =
+            serde_json::from_str(&complete_direct_pane_input("done".into(), rx)).unwrap();
+        assert!(matches!(response.result, ResponseResult::Ok {}));
+    }
+
+    #[tokio::test]
+    async fn synthetic_channel_cannot_authorize_guarded_input() {
+        let (runtime, mut rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        let error = runtime
+            .queue_guarded_user_input_submission_with_source(
+                Bytes::from_static(b"guarded text"),
+                Bytes::from_static(b"\r"),
+                std::time::Duration::ZERO,
+                test_guard(),
+                crate::pty::input_consumer::InputSource::Api,
+            )
+            .expect_err("a fake channel has no PTY ownership proof");
+        assert!(crate::pty::actor::is_agent_session_lost(&error));
+        assert!(rx.try_recv().is_err());
+    }
 
     fn app_with_test_workspace() -> (App, String) {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();

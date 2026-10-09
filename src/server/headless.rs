@@ -3266,10 +3266,10 @@ impl HeadlessServer {
             return changed;
         }
         let alt_screen_read_spec = self.alt_screen_read_spec(&msg.request);
-        if matches!(
-            &msg.request.method,
-            api::schema::Method::AgentPrompt(_) | api::schema::Method::AgentPromptSessionChecked(_)
-        ) {
+        // Session expectations on base pane methods are just as guarded as
+        // named aliases. Do not acknowledge their enqueue through the sync path.
+        // Public sockets and frame/client-control API invocations converge here.
+        if crate::app::App::api_request_requires_deferred_input(&msg.request) {
             let deferred_changed = self.app.handle_deferred_agent_api_request(
                 msg.request,
                 msg.context,

@@ -1,4 +1,145 @@
 //! Regression tests use an actual raw PTY and an executable byte sink, not a test channel.
+
+#[cfg(target_os = "linux")]
+struct ActorWriteBarrier {
+    entered: std::sync::mpsc::Receiver<()>,
+    release: std::sync::mpsc::Sender<()>,
+}
+
+#[cfg(target_os = "linux")]
+impl ActorWriteBarrier {
+    fn install(f: &Fixture, write_number: usize) -> Self {
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let (ws_idx, pane_id) = f.app.parse_pane_id(&f.pane).expect("pane");
+        f.app
+            .lookup_runtime_sender(ws_idx, pane_id)
+            .expect("native runtime")
+            .test_set_before_write(Box::new(move |attempt| {
+                if attempt == write_number {
+                    entered_tx.send(()).expect("barrier entered");
+                    release_rx
+                        .recv_timeout(Duration::from_secs(2))
+                        .expect("bounded actor release");
+                }
+            }))
+            .expect("install native actor barrier");
+        Self { entered, release }
+    }
+
+    fn entered(&self) {
+        self.entered
+            .recv_timeout(Duration::from_secs(2))
+            .expect("actual native writer reached barrier");
+    }
+
+    fn release(&self) {
+        let _ = self.release.send(());
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for ActorWriteBarrier {
+    fn drop(&mut self) {
+        // Release even while unwinding; never hold a real actor indefinitely.
+        self.release();
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct PendingInputSocket {
+    client: Option<crate::ipc::LocalStream>,
+    done: std::sync::mpsc::Receiver<std::io::Result<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(target_os = "linux")]
+impl PendingInputSocket {
+    async fn enqueue(f: &mut Fixture, method: &str) -> Self {
+        use interprocess::local_socket::traits::Listener as _;
+        use std::io::Write;
+        use std::sync::{atomic::AtomicBool, Arc};
+        let path = f.dir.join("input.sock");
+        let listener = crate::ipc::bind_local_listener(&path).expect("input socket");
+        let mut client = crate::ipc::connect_local_stream(&path).expect("input client");
+        let server = listener.accept().expect("already connected input client");
+        let (api_tx, mut api_rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::api::ApiRequestMessage>();
+        let (done_tx, done) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let result = crate::api::test_handle_connection(
+                server,
+                &api_tx,
+                &crate::api::EventHub::default(),
+                &Arc::new(AtomicBool::new(true)),
+                None,
+            );
+            let _ = done_tx.send(result);
+        });
+        writeln!(
+            client,
+            "{}",
+            serde_json::json!({
+                "id": "queued-native-input", "method": method, "params": {
+                    "pane_id": f.pane, "target": f.pane, "text": "prompt", "keys": ["p", "enter"],
+                    "expected_agent_session_id": "private-queued-old", "allow_cross_pane": true,
+                },
+            })
+        )
+        .expect("send actual input RPC");
+        client.flush().expect("flush actual input RPC");
+        let message = tokio::time::timeout(Duration::from_secs(2), api_rx.recv())
+            .await
+            .expect("input dispatch deadline")
+            .expect("input message");
+        assert!(
+            App::api_request_requires_deferred_input(&message.request),
+            "{method}"
+        );
+        assert!(f.app.handle_deferred_agent_api_request(
+            message.request,
+            message.context,
+            message.respond_to,
+        ));
+        Self {
+            client: Some(client),
+            done,
+            thread: Some(thread),
+        }
+    }
+
+    fn response(mut self) -> String {
+        use std::io::BufRead;
+        self.done
+            .recv_timeout(Duration::from_secs(3))
+            .expect("socket completion deadline")
+            .expect("socket completion");
+        self.thread
+            .take()
+            .expect("socket worker")
+            .join()
+            .expect("socket worker terminal");
+        let mut response = String::new();
+        std::io::BufReader::new(self.client.take().expect("input client"))
+            .read_line(&mut response)
+            .expect("completed socket response");
+        response
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for PendingInputSocket {
+    fn drop(&mut self) {
+        drop(self.client.take());
+        if let Some(thread) = self.thread.take() {
+            if self.done.recv_timeout(Duration::from_secs(3)).is_ok() {
+                let _ = thread.join();
+            } else {
+                tracing::warn!("native input socket worker did not settle by cleanup deadline");
+            }
+        }
+    }
+}
 use super::*;
 use crate::api::schema::{Request, SuccessResponse};
 use crate::detect::{Agent, AgentState};
@@ -222,27 +363,38 @@ with os.fdopen(os.open(control, os.O_RDWR), 'r') as commands:
             command.args([
                 "-c",
                 r#"
-import os, socket, sys, time, tty
+import os, select, socket, sys, tty
 capture, directory = sys.argv[1:]
 tty.setraw(0)
 with open(capture, 'wb', buffering=0) as output:
-    while not os.path.exists(directory + '/report.json'):
-        time.sleep(0.01)
-    with open(directory + '/report.json') as file:
-        request = file.read()
-    with socket.socket(socket.AF_UNIX) as client:
-        client.connect(directory + '/report.sock')
-        client.sendall(request.encode() + b'\n')
-        response = b''
-        while not response.endswith(b'\n'):
-            response += client.recv(4096)
-        with open(directory + '/report.response', 'wb') as file:
-            file.write(response)
+    sequence = 1
     while True:
-        data = os.read(0, 4096)
-        if not data:
-            break
-        output.write(data)
+        suffix = '' if sequence == 1 else '-' + str(sequence)
+        report = directory + '/report' + suffix
+        # The regular file releases an actual kernel-authenticated report from
+        # this SAME living PTY owner. select only bounds observation latency;
+        # the test synchronizes on dispatch/response, never on a timing sleep.
+        if os.path.exists(report + '.json'):
+            with open(report + '.json') as file:
+                request = file.read()
+            with socket.socket(socket.AF_UNIX) as client:
+                client.settimeout(3)
+                client.connect(report + '.sock')
+                client.sendall(request.encode() + b'\n')
+                response = b''
+                while not response.endswith(b'\n'):
+                    data = client.recv(4096)
+                    if not data:
+                        raise EOFError('report socket closed')
+                    response += data
+                with open(report + '.response', 'wb') as file:
+                    file.write(response)
+            sequence += 1
+        if select.select([0], [], [], 0.01)[0]:
+            data = os.read(0, 4096)
+            if not data:
+                break
+            output.write(data)
 "#,
             ]);
             command.arg(&capture);
@@ -431,6 +583,105 @@ with open(capture, 'wb', buffering=0) as output:
             "agent_session_id": id, "agent_session_path": path, "session_start_source": "new",
         }));
         assert_ok(&response);
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn report_from_native_socket(&mut self, id: &str, seq: u64) {
+        use interprocess::local_socket::traits::Listener as _;
+        use std::sync::{atomic::AtomicBool, Arc};
+        let suffix = if seq == 1 {
+            String::new()
+        } else {
+            format!("-{seq}")
+        };
+        let base = self.dir.join(format!("report{suffix}"));
+        let listener = crate::ipc::bind_local_listener(&base.with_extension("sock"))
+            .expect("native reporter socket");
+        listener
+            .set_nonblocking(interprocess::local_socket::ListenerNonblockingMode::Accept)
+            .expect("bounded accept");
+        let (api_tx, mut api_rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::api::ApiRequestMessage>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let server = loop {
+                match listener.accept() {
+                    Ok(server) => break server,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "native reporter accept deadline");
+                        std::thread::yield_now();
+                    }
+                    Err(error) => panic!("native reporter accept: {error}"),
+                }
+            };
+            let result = crate::api::test_handle_connection(
+                server,
+                &api_tx,
+                &crate::api::EventHub::default(),
+                &Arc::new(AtomicBool::new(true)),
+                None,
+            );
+            let _ = done_tx.send(result);
+        });
+        // Publish atomically: the actual reporter must never read a partial JSON file.
+        let staged = base.with_extension("pending");
+        std::fs::write(
+            &staged,
+            serde_json::json!({
+                "id": "native-report", "method": "pane.report_agent_session", "params": {
+                    "pane_id": self.pane, "source": "herdr:pi", "agent": "pi", "seq": seq,
+                    "agent_session_id": id, "session_start_source": "new",
+                },
+            })
+            .to_string(),
+        )
+        .expect("stage actual native report");
+        std::fs::rename(staged, base.with_extension("json")).expect("release actual reporter");
+        let message = tokio::time::timeout(Duration::from_secs(2), api_rx.recv())
+            .await
+            .expect("native report dispatch deadline")
+            .expect("native report message");
+        assert_eq!(message.context.local_peer_identity, Some(self.reporter));
+        assert_eq!(
+            crate::platform::process_identity(self.reporter.pid),
+            Some(self.reporter)
+        );
+        let response = self
+            .app
+            .handle_api_request_after_internal_events_drained_with_context(
+                message.request,
+                message.context,
+            );
+        assert_ok(&response);
+        message
+            .respond_to
+            .send(response)
+            .expect("native report response");
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("native report socket completion deadline")
+            .expect("native report socket");
+        handle.join().expect("native report worker terminal");
+        self.assert_cached_session(id);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn completed_bytes(&self, expected: &[u8]) {
+        // New queued regressions call this only after actor/socket completion
+        // (or the Enter barrier). Observe real sink bytes, not an elapsed sleep.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let actual = std::fs::read(&self.capture).expect("native sink bytes");
+            if actual == expected {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "native bytes {actual:?}, expected {expected:?}"
+            );
+            std::thread::yield_now();
+        }
     }
 
     fn bytes(&self, expected: &[u8]) {
@@ -1735,5 +1986,158 @@ async fn expected_agent_session_real_pty_wait_route_preserves_alias_and_checks_a
         } else {
             b""
         });
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expected_agent_session_real_pty_queued_new_id_same_native_peer_revokes_all_rpc_routes() {
+    for method in [
+        "pane.send_text",
+        "pane.send_text_session_checked",
+        "pane.send_keys",
+        "pane.send_keys_session_checked",
+        "agent.prompt",
+        "agent.prompt_session_checked",
+    ] {
+        let mut f = Fixture::with_modes(Agent::Pi, false, true, true);
+        f.report_from_native_socket("private-queued-old", 1).await;
+        let (ws_idx, pane_id) = f.app.parse_pane_id(&f.pane).expect("pane");
+        let terminal_id = f
+            .app
+            .state
+            .terminal_id_for_pane(ws_idx, pane_id)
+            .expect("terminal");
+        let old_token = f.app.state.terminals[&terminal_id]
+            .reported_agent_session_validity()
+            .expect("old accepted binding");
+        let barrier = ActorWriteBarrier::install(&f, 1);
+        let pending = PendingInputSocket::enqueue(&mut f, method).await;
+        barrier.entered();
+        assert!(old_token
+            .upgrade()
+            .expect("live old root")
+            .load(std::sync::atomic::Ordering::Acquire));
+        assert!(
+            pending.done.try_recv().is_err(),
+            "enqueue must not acknowledge delivery"
+        );
+        f.report_from_native_socket("private-queued-new", 2).await;
+        assert_eq!(
+            crate::platform::process_identity(f.reporter.pid),
+            Some(f.reporter)
+        );
+        assert!(old_token
+            .upgrade()
+            .is_none_or(|cell| !cell.load(std::sync::atomic::Ordering::Acquire)));
+        barrier.release();
+        let response = pending.response();
+        assert_error(&response, "agent_session_lost");
+        assert!(
+            response.contains("private-queued-old"),
+            "caller expectation remains useful"
+        );
+        assert!(
+            !response.contains("private-queued-new"),
+            "actual replacement ID stays private"
+        );
+        f.completed_bytes(b"");
+        let reporter = f.reporter.pid;
+        let dir = f.dir.clone();
+        drop(f);
+        assert!(!std::path::Path::new(&format!("/proc/{reporter}")).exists());
+        assert!(!dir.exists());
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expected_agent_session_real_pty_queued_same_id_periodic_native_report_preserves_all_routes(
+) {
+    for method in [
+        "pane.send_text",
+        "pane.send_text_session_checked",
+        "pane.send_keys",
+        "pane.send_keys_session_checked",
+        "agent.prompt",
+        "agent.prompt_session_checked",
+    ] {
+        let mut f = Fixture::with_modes(Agent::Pi, false, true, true);
+        f.report_from_native_socket("private-queued-old", 1).await;
+        let (ws_idx, pane_id) = f.app.parse_pane_id(&f.pane).expect("pane");
+        let terminal_id = f
+            .app
+            .state
+            .terminal_id_for_pane(ws_idx, pane_id)
+            .expect("terminal");
+        let old_token = f.app.state.terminals[&terminal_id]
+            .reported_agent_session_validity()
+            .expect("original accepted binding");
+        let barrier = ActorWriteBarrier::install(&f, 1);
+        let pending = PendingInputSocket::enqueue(&mut f, method).await;
+        barrier.entered();
+        f.report_from_native_socket("private-queued-old", 2).await;
+        let current = f.app.state.terminals[&terminal_id]
+            .reported_agent_session_validity()
+            .expect("periodic accepted binding");
+        assert!(
+            old_token.ptr_eq(&current),
+            "periodic same ID/peer retains exact cell"
+        );
+        assert!(old_token
+            .upgrade()
+            .expect("retained root")
+            .load(std::sync::atomic::Ordering::Acquire));
+        barrier.release();
+        assert_ok(&pending.response());
+        f.completed_bytes(if method.starts_with("agent.") {
+            b"prompt\r"
+        } else if method.contains("send_keys") {
+            b"p\r"
+        } else {
+            b"prompt"
+        });
+        let reporter = f.reporter.pid;
+        let dir = f.dir.clone();
+        drop(f);
+        assert!(!std::path::Path::new(&format!("/proc/{reporter}")).exists());
+        assert!(!dir.exists());
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expected_agent_session_real_pty_queued_delayed_enter_foreground_switch_is_typed_loss() {
+    for method in ["agent.prompt", "agent.prompt_session_checked"] {
+        let mut f = Fixture::with_job_control(Agent::Pi, true);
+        f.report(Some("private-queued-old"), None, 1);
+        let barrier = ActorWriteBarrier::install(&f, 2);
+        let pending = PendingInputSocket::enqueue(&mut f, method).await;
+        barrier.entered();
+        // The second actual write is delayed Enter. Only text has reached the
+        // real PTY, and a native foreground switch happens before Enter proof.
+        f.completed_bytes(b"prompt");
+        f.control("background");
+        f.assert_cached_session("private-queued-old");
+        assert_eq!(
+            crate::platform::process_identity(f.reporter.pid),
+            Some(f.reporter)
+        );
+        barrier.release();
+        assert_error(&pending.response(), "agent_session_lost");
+        f.completed_bytes(b"prompt");
+        f.control("foreground");
+        let reporter = f.reporter.pid;
+        let controller = f.child.process_id().expect("controller");
+        let fallback: u32 = std::fs::read_to_string(f.dir.join("fallback.pid"))
+            .expect("fallback PID")
+            .parse()
+            .expect("numeric fallback PID");
+        let dir = f.dir.clone();
+        drop(f);
+        for pid in [reporter, controller, fallback] {
+            assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+        }
+        assert!(!dir.exists());
     }
 }

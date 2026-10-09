@@ -1463,6 +1463,20 @@ enum PaneRuntimeIo {
 }
 
 impl PaneRuntimeIo {
+    #[cfg(all(test, unix))]
+    pub(crate) fn test_set_before_write(
+        &self,
+        hook: Box<dyn FnMut(usize) + Send>,
+    ) -> std::io::Result<()> {
+        match self {
+            Self::Actor(actor) => actor.test_set_before_write(hook),
+            Self::TestChannel { .. } => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "before-write hooks require a native PTY actor",
+            )),
+        }
+    }
+
     fn shutdown(&self) {
         match self {
             PaneRuntimeIo::Actor(actor) => actor.shutdown(),
@@ -1626,6 +1640,23 @@ impl PaneRuntimeIo {
                     let _ = sender.try_send(bytes);
                 }
             }
+        }
+    }
+
+    fn queue_guarded_user_input_submission_with_source(
+        &self,
+        text: Bytes,
+        enter: Bytes,
+        delay: std::time::Duration,
+        guard: crate::pty::actor::SessionInputGuard,
+        source: crate::pty::input_consumer::InputSource,
+    ) -> std::io::Result<std::sync::mpsc::Receiver<std::io::Result<()>>> {
+        match self {
+            Self::Actor(actor) => actor
+                .queue_guarded_user_input_submission_with_source(text, enter, delay, guard, source),
+            // A synthetic channel cannot prove ownership of a PTY master.
+            #[cfg(test)]
+            Self::TestChannel { .. } => Err(crate::pty::actor::agent_session_lost(&guard)),
         }
     }
 
@@ -3734,6 +3765,22 @@ impl PaneRuntime {
     ) -> Result<(), mpsc::error::TrySendError<Bytes>> {
         self.io.try_send_bytes_with_source(bytes, source.user())
     }
+    pub(crate) fn queue_guarded_user_input_submission_with_source(
+        &self,
+        text: Bytes,
+        enter: Bytes,
+        delay: std::time::Duration,
+        guard: crate::pty::actor::SessionInputGuard,
+        source: crate::pty::input_consumer::InputSource,
+    ) -> std::io::Result<std::sync::mpsc::Receiver<std::io::Result<()>>> {
+        self.io.queue_guarded_user_input_submission_with_source(
+            text,
+            enter,
+            delay,
+            guard,
+            source.user(),
+        )
+    }
     pub(crate) fn queue_user_input_submission_with_source(
         &self,
         text: Bytes,
@@ -3999,6 +4046,14 @@ impl PaneRuntime {
 
 #[cfg(test)]
 impl PaneRuntime {
+    #[cfg(all(test, unix))]
+    pub(crate) fn test_set_before_write(
+        &self,
+        hook: Box<dyn FnMut(usize) + Send>,
+    ) -> std::io::Result<()> {
+        self.io.test_set_before_write(hook)
+    }
+
     pub(crate) fn test_set_child_pid(&self, pid: u32) {
         self.child_process_identity
             .set(crate::platform::process_identity(pid));

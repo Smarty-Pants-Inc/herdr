@@ -492,6 +492,17 @@ impl TerminalRuntime {
     ) -> Result<(), mpsc::error::TrySendError<Bytes>> {
         self.0.try_send_bytes_with_source(bytes, source)
     }
+    pub(crate) fn queue_guarded_user_input_submission_with_source(
+        &self,
+        text: Bytes,
+        enter: Bytes,
+        delay: std::time::Duration,
+        guard: crate::pty::actor::SessionInputGuard,
+        source: crate::pty::input_consumer::InputSource,
+    ) -> std::io::Result<std::sync::mpsc::Receiver<std::io::Result<()>>> {
+        self.0
+            .queue_guarded_user_input_submission_with_source(text, enter, delay, guard, source)
+    }
     pub(crate) fn queue_user_input_submission_with_source(
         &self,
         text: Bytes,
@@ -639,6 +650,14 @@ impl TerminalRuntime {
 
 #[cfg(test)]
 impl TerminalRuntime {
+    #[cfg(all(test, unix))]
+    pub(crate) fn test_set_before_write(
+        &self,
+        hook: Box<dyn FnMut(usize) + Send>,
+    ) -> std::io::Result<()> {
+        self.0.test_set_before_write(hook)
+    }
+
     #[cfg(unix)]
     pub(crate) fn test_enable_kitty_source_forwarding(&self) {
         self.0.test_enable_kitty_source_forwarding();
