@@ -289,7 +289,7 @@ principal 由服务器解析，每个客户端连接只绑定一次。在 Linux 
 
 `agent_session_lost` 的 `error.partial_text_consumed` 为布尔值或 `null`，`error.flush_failed` 表示打开确切 slave 或执行 `TCIFLUSH` 是否失败。刷新成功时（或未写入文本阶段的字节、无需刷新时），`flush_failed` 为 `false`：当且仅当文本阶段的字节已到达 PTY、可能已被消费时，`partial_text_consumed` 为 `true`；当且仅当没有写入任何文本阶段的字节时，为 `false`。这不是读取方的接收确认。如果打开确切 slave 或执行 `TCIFLUSH` 失败，错误返回 `partial_text_consumed: null`（未知）和 `flush_failed: true`。会话守卫下的文本和按键发送会等待 actor 的类型化完成结果，而非在入队时返回成功。完成确认的是 PTY 写入，而不是接收方智能体的确认。丢失错误只会显示预期 ID，绝不显示实际 ID；出错后不要自动重试或降级为 unchecked 操作。
 
-如果打开确切 slave 或执行 `TCIFLUSH` 失败，Herdr 不会关闭 PTY master，也不会终止用户进程。它会丢弃剩余请求、不发送 Enter，并将窗格输入标记为 **POISONED**。所有 PTY 写入都会以 `pane_input_poisoned` 拒绝，包括客户端按键和无守卫的 API 发送；客户端会看到通知。之后刷新成功也绝不会自动清除此状态。
+如果打开确切 slave 或执行 `TCIFLUSH` 失败，Herdr 不会关闭 PTY master，也不会终止用户进程。它会丢弃剩余请求、不发送 Enter，并将窗格输入标记为 **POISONED**。所有 PTY 写入都会被服务器以类型化错误 `pane_input_poisoned` 拒绝，包括客户端按键和无守卫的 API 发送；服务器还会发送 `Notify`。操作员须显式执行 `herdr pane clear-input-poison <pane>` 才能清除；在已连接客户端中显示该通知的功能仍待 [smarty-dev#7908](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/7908) 实现。之后刷新成功也绝不会自动清除此状态。
 
 只有操作员显式调用 `pane.clear_input_poison`（指定 `pane_id`），或执行 CLI `herdr pane clear-input-poison <pane>` 才能清除。**警告：** 暂存文本可能仍留在输入行上。清除前请检查并丢弃；清除不证明输入行为空，之后的 Enter 可能提交读取方已缓冲的文本。不要自动清除，也不要将清除作为重试策略。
 
