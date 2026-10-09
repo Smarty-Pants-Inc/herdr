@@ -21,6 +21,7 @@ const CLIENT_SHELL_METHODS: &[&str] = &[
     "layout.apply_restorable",
     "layout.set_split_ratio",
     "pane.clear",
+    "pane.clear_input_poison",
     "pane.close",
     "pane.copy_motion",
     "pane.copy_search",
@@ -309,6 +310,7 @@ mod tests {
         // New optional API surface is not part of the frozen generation-1 fixture.
         // Its canonical params and response are covered by schema::tests.
         assert!(actual.remove("pane.last_input").is_some());
+        assert!(actual.remove("pane.clear_input_poison").is_some());
         assert!(actual.remove("layout.apply_restorable").is_some());
         // Additive, safety-guaranteed topology method, not a generation-1 change.
         assert!(actual.remove("pane.move_project_checked").is_some());

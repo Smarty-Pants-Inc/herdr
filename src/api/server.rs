@@ -153,8 +153,8 @@ fn default_capabilities() -> Option<ServerCapabilities> {
         expected_terminal_guard: true,
         // Native live-generation and PTY foreground proof is required. Other
         // platforms deliberately refuse guarded session delivery.
-        expected_agent_session_guard: cfg!(any(target_os = "linux", target_os = "macos")),
-        expected_agent_status_guard: true,
+        expected_agent_session_guard: crate::platform::expected_agent_session_guard_supported(),
+        expected_agent_status_guard: crate::platform::expected_agent_session_guard_supported(),
         input_consumer: crate::platform::input_consumer_supported(),
     })
 }
@@ -849,6 +849,7 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::PaneResize(_) => "pane.resize",
         Method::PaneScroll(_) => "pane.scroll",
         Method::PaneClear(_) => "pane.clear",
+        Method::PaneClearInputPoison(_) => "pane.clear_input_poison",
         Method::PaneEditScrollback(_) => "pane.edit_scrollback",
         Method::PaneSelectionRead(_) => "pane.selection.read",
         Method::PaneCopyMotion(_) => "pane.copy_motion",
@@ -1421,7 +1422,7 @@ mod tests {
         let caps = default_capabilities().expect("capabilities");
         assert_eq!(
             caps.expected_agent_session_guard,
-            cfg!(any(target_os = "linux", target_os = "macos"))
+            crate::platform::expected_agent_session_guard_supported()
         );
     }
     use std::collections::HashMap;
@@ -2070,7 +2071,7 @@ mod tests {
     }
 
     #[test]
-    fn expected_status_guard_is_advertised_by_default_ping() {
+    fn expected_status_guard_is_advertised_only_with_session_guard_support() {
         let (tx, _rx) = mpsc::unbounded_channel();
         let response = handle_request(
             Request {
@@ -2085,7 +2086,11 @@ mod tests {
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
         assert_eq!(
             response["result"]["capabilities"]["expected_agent_status_guard"],
-            true
+            crate::platform::expected_agent_session_guard_supported()
+        );
+        assert_eq!(
+            response["result"]["capabilities"]["expected_agent_status_guard"],
+            response["result"]["capabilities"]["expected_agent_session_guard"]
         );
     }
 

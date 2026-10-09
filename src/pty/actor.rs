@@ -56,14 +56,20 @@ impl SessionInputGuard {
 #[derive(Debug)]
 struct ExpectedStatusMismatch {
     expected: crate::api::schema::AgentStatus,
+    /// Submission text may have reached the PTY, as for session loss.
+    partial_text_consumed: Option<bool>,
+    flush_failed: bool,
 }
 
 impl std::fmt::Display for ExpectedStatusMismatch {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
-            "the target's detected agent status no longer matches expected {:?}",
-            self.expected
+            "the target's detected agent status no longer matches expected {:?}; partial_text_consumed={}; flush_failed={}",
+            self.expected,
+            self.partial_text_consumed
+                .map_or("unknown", |partial| if partial { "true" } else { "false" }),
+            self.flush_failed
         )
     }
 }
@@ -80,14 +86,21 @@ pub(crate) fn is_expected_status_mismatch(error: &std::io::Error) -> bool {
 #[derive(Debug)]
 struct AgentSessionLost {
     expected_agent_session_id: String,
+    /// True means submission text reached the PTY and may have been consumed;
+    /// it does not claim that a reader consumed every byte.
+    partial_text_consumed: Option<bool>,
+    flush_failed: bool,
 }
 
 impl std::fmt::Display for AgentSessionLost {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
-            "agent session ownership was lost: {}",
-            self.expected_agent_session_id
+            "agent session ownership was lost: {}; partial_text_consumed={}; flush_failed={}",
+            self.expected_agent_session_id,
+            self.partial_text_consumed
+                .map_or("unknown", |partial| if partial { "true" } else { "false" }),
+            self.flush_failed
         )
     }
 }
@@ -103,14 +116,54 @@ pub(crate) fn is_agent_session_lost(error: &std::io::Error) -> bool {
         .is_some_and(|cause| cause.is::<AgentSessionLost>())
 }
 
-/// The native actor uses this factory for either failed guard predicate. Keep
-/// status refusal distinct, including when status changed back after the check.
-pub(crate) fn agent_session_lost(guard: &SessionInputGuard) -> std::io::Error {
+/// Shared cleanup metadata for either typed guard refusal. Classification stays
+/// separate so a status mismatch never becomes an agent-session-loss response.
+pub(crate) fn agent_session_loss_details(error: &std::io::Error) -> Option<(Option<bool>, bool)> {
+    let cause = error.get_ref()?;
+    if let Some(loss) = cause.downcast_ref::<AgentSessionLost>() {
+        return Some((loss.partial_text_consumed, loss.flush_failed));
+    }
+    cause
+        .downcast_ref::<ExpectedStatusMismatch>()
+        .map(|mismatch| (mismatch.partial_text_consumed, mismatch.flush_failed))
+}
+
+#[cfg(test)]
+pub(crate) fn agent_session_loss_partial_text_consumed(error: &std::io::Error) -> Option<bool> {
+    agent_session_loss_details(error).and_then(|(partial, _)| partial)
+}
+
+#[derive(Debug)]
+struct PaneInputPoisoned;
+impl std::fmt::Display for PaneInputPoisoned {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("pane_input_poisoned: input blocked after a failed flush; staged text may remain on the line; inspect or discard it before explicitly clearing input poison")
+    }
+}
+impl std::error::Error for PaneInputPoisoned {}
+pub(crate) fn pane_input_poisoned() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::PermissionDenied, PaneInputPoisoned)
+}
+pub(crate) fn is_pane_input_poisoned(error: &std::io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|cause| cause.is::<PaneInputPoisoned>())
+}
+
+/// Keep status refusal distinct, including when it changed back after the check.
+pub(crate) fn agent_session_lost(
+    guard: &SessionInputGuard,
+    partial_text_consumed: bool,
+) -> std::io::Error {
     if let Some(expected) = guard.expected_agent_status {
         if !guard.status_is_current() {
             return std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
-                ExpectedStatusMismatch { expected },
+                ExpectedStatusMismatch {
+                    expected,
+                    partial_text_consumed: Some(partial_text_consumed),
+                    flush_failed: false,
+                },
             );
         }
     }
@@ -118,6 +171,31 @@ pub(crate) fn agent_session_lost(guard: &SessionInputGuard) -> std::io::Error {
         std::io::ErrorKind::PermissionDenied,
         AgentSessionLost {
             expected_agent_session_id: guard.expected_agent_session_id.clone(),
+            partial_text_consumed: Some(partial_text_consumed),
+            flush_failed: false,
+        },
+    )
+}
+
+pub(crate) fn agent_session_flush_failed(guard: &SessionInputGuard) -> std::io::Error {
+    if let Some(expected) = guard.expected_agent_status {
+        if !guard.status_is_current() {
+            return std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                ExpectedStatusMismatch {
+                    expected,
+                    partial_text_consumed: None,
+                    flush_failed: true,
+                },
+            );
+        }
+    }
+    std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        AgentSessionLost {
+            expected_agent_session_id: guard.expected_agent_session_id.clone(),
+            partial_text_consumed: None,
+            flush_failed: true,
         },
     )
 }
@@ -202,6 +280,14 @@ mod windows {
     }
 
     impl PtyIoActorHandle {
+        pub(crate) fn input_is_poisoned(&self) -> bool {
+            false
+        }
+        pub(crate) fn clear_input_poison(&self) -> std::io::Result<()> {
+            Ok(())
+        }
+        #[cfg(test)]
+        pub(crate) fn test_set_input_poisoned(&self, _poisoned: bool) {}
         /// ConPTY has no equivalent native foreground reporter proof. Never
         /// enqueue guarded input on this unsupported platform.
         pub(crate) fn queue_guarded_user_input_submission_with_source(
@@ -215,7 +301,7 @@ mod windows {
             // The pin is carried by the common interface, but cannot be proved
             // against ConPTY. Do not substitute process existence for ownership.
             let _ = (guard.reporter, &guard.binding_validity);
-            Err(super::agent_session_lost(&guard))
+            Err(super::agent_session_lost(&guard, false))
         }
 
         pub(crate) fn input_consumer_epoch_matches(&self, _epoch: &str) -> bool {

@@ -12,6 +12,22 @@ use super::responses::{encode_error, encode_error_body, encode_success};
 
 const AGENT_PROMPT_SUBMIT_DELAY: Duration = Duration::from_millis(300);
 
+/// A typed status refusal uses the same delivery/flush evidence as session loss.
+fn expected_status_mismatch_response(id: String, error: &std::io::Error) -> String {
+    let (partial, flush_failed) =
+        crate::pty::actor::agent_session_loss_details(error).unwrap_or((None, false));
+    serde_json::json!({
+        "id": id,
+        "error": {
+            "code": "expected_status_mismatch",
+            "message": error.to_string(),
+            "partial_text_consumed": partial,
+            "flush_failed": flush_failed
+        }
+    })
+    .to_string()
+}
+
 // Codex's Windows input reader does not surface bracketed paste. It detects the prompt as a
 // "paste burst" and, while that burst is buffered, rewrites a following Enter into a newline
 // instead of submitting. The burst only flushes after an idle timeout, so any size-based delay is
@@ -146,10 +162,13 @@ impl App {
                     let response = match completion.recv() {
                         Ok(Ok(())) => encode_success(id, ResponseResult::AgentPrompted { agent }),
                         Ok(Err(err)) if crate::pty::actor::is_expected_status_mismatch(&err) => {
-                            encode_error(id, "expected_status_mismatch", err.to_string())
+                            expected_status_mismatch_response(id, &err)
                         }
                         Ok(Err(err)) if crate::pty::actor::is_agent_session_lost(&err) => {
-                            encode_error(id, "agent_session_lost", err.to_string())
+                            super::panes::session_loss_response(id, &err)
+                        }
+                        Ok(Err(err)) if crate::pty::actor::is_pane_input_poisoned(&err) => {
+                            encode_error(id, "pane_input_poisoned", err.to_string())
                         }
                         Ok(Err(err)) if err.kind() == std::io::ErrorKind::TimedOut => {
                             encode_error(id, "timeout", err.to_string())
@@ -336,14 +355,15 @@ impl App {
             )
         }
         .map_err(|err| {
-            let code = if crate::pty::actor::is_expected_status_mismatch(&err) {
-                "expected_status_mismatch"
+            if crate::pty::actor::is_expected_status_mismatch(&err) {
+                expected_status_mismatch_response(id.clone(), &err)
             } else if crate::pty::actor::is_agent_session_lost(&err) {
-                "agent_session_lost"
+                super::panes::session_loss_response(id.clone(), &err)
+            } else if crate::pty::actor::is_pane_input_poisoned(&err) {
+                encode_error(id.clone(), "pane_input_poisoned", err.to_string())
             } else {
-                "agent_prompt_failed"
-            };
-            encode_error(id.clone(), code, err.to_string())
+                encode_error(id.clone(), "agent_prompt_failed", err.to_string())
+            }
         })?;
         // Receipt is issued on enqueue, before the asynchronous submission completes.
         self.accepted_api_inputs.push(resolved.pane_id);
@@ -683,6 +703,54 @@ mod tests {
         start_deferred_agent_prompt(app, id, params)
             .recv_timeout(Duration::from_secs(1))
             .expect("agent prompt responds after submission")
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn expected_status_mismatch_response_preserves_native_loss_and_flush_details() {
+        let guard = crate::pty::actor::SessionInputGuard {
+            reporter: crate::platform::process_identity(std::process::id())
+                .expect("live test process"),
+            expected_agent_session_id: "private-status-session".into(),
+            expected_agent_status: Some(crate::api::schema::AgentStatus::Idle),
+            agent_status: std::sync::Weak::new(),
+            status_mismatch: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            binding_validity: std::sync::Weak::new(),
+        };
+        for (error, partial, flush_failed) in [
+            (
+                crate::pty::actor::agent_session_lost(&guard, false),
+                Some(false),
+                false,
+            ),
+            (
+                crate::pty::actor::agent_session_lost(&guard, true),
+                Some(true),
+                false,
+            ),
+            (
+                crate::pty::actor::agent_session_flush_failed(&guard),
+                None,
+                true,
+            ),
+        ] {
+            assert!(crate::pty::actor::is_expected_status_mismatch(&error));
+            assert!(!crate::pty::actor::is_agent_session_lost(&error));
+            assert_eq!(
+                crate::pty::actor::agent_session_loss_details(&error),
+                Some((partial, flush_failed))
+            );
+            let response: serde_json::Value =
+                serde_json::from_str(&expected_status_mismatch_response("status".into(), &error))
+                    .expect("status response JSON");
+            assert_eq!(response["error"]["code"], "expected_status_mismatch");
+            assert_eq!(
+                response["error"]["partial_text_consumed"],
+                serde_json::json!(partial)
+            );
+            assert_eq!(response["error"]["flush_failed"], flush_failed);
+            assert!(response.get("result").is_none());
+        }
     }
 
     #[cfg(windows)]

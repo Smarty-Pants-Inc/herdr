@@ -41,6 +41,28 @@ def sink():
     finally:
         os.close(ready)
     return pid
+def probe():
+    pid = os.fork()
+    if pid == 0:
+        os.setpgid(0, 0)
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        signal.signal(signal.SIGTTIN, signal.SIG_DFL)
+        signal.signal(signal.SIGTTOU, signal.SIG_DFL)
+        # Do not read until the controller has made this process foreground.
+        os.kill(os.getpid(), signal.SIGSTOP)
+        os.set_blocking(0, False)
+        try:
+            data = os.read(0, 4 * 1024 * 1024)
+        except BlockingIOError:
+            data = b''
+        with open(directory + '/probe-bytes', 'wb') as f:
+            f.write(data)
+        os._exit(0)
+    children.add(pid)
+    os.waitpid(pid, os.WUNTRACED)
+    os.tcsetpgrp(0, pid)
+    os.kill(pid, signal.SIGCONT)
+    reap(pid)
 try:
     reporter = sink()
     os.tcsetpgrp(0, reporter)
@@ -58,8 +80,8 @@ try:
         if action == 'pause':
             os.kill(reporter, signal.SIGSTOP)
             os.waitpid(reporter, os.WUNTRACED)
-        elif action in ('dead', 'switch'):
-            if action == 'dead':
+        elif action in ('dead', 'switch') or action.startswith('dead-drain:'):
+            if action != 'switch':
                 os.kill(reporter, signal.SIGKILL)
                 reap(reporter)
             else:
@@ -68,6 +90,21 @@ try:
             fallback = sink()
             os.tcsetpgrp(0, fallback)
             os.kill(fallback, signal.SIGCONT)
+            if action.startswith('dead-drain:'):
+                # These pre-existing tests let the fallback consume the accepted
+                # prefix before loss is observed; do not race the input flush.
+                expected = int(action.split(':')[1])
+                drained_by = time.monotonic() + 2
+                while os.stat(capture).st_size < expected:
+                    if time.monotonic() >= drained_by:
+                        raise TimeoutError('fallback drain')
+                    time.sleep(0.005)
+        elif action == 'park':
+            # The controller does not read the tty. Change native foreground
+            # ownership while preserving every staged byte until loss cleanup.
+            os.tcsetpgrp(0, os.getpgrp())
+        elif action == 'probe':
+            probe()
         elif action == 'stop':
             break
         else:
@@ -212,15 +249,22 @@ impl NativePty {
         runner.control_rx = control_rx;
         runner.wake_read_fd = wake.read_fd;
         PtyIoActorHandle {
+            input_poisoned: Arc::clone(&runner.input_poisoned),
             data_tx,
             control_tx,
             wake: wake.writer,
-            user_writes: Arc::new(Mutex::new(UserWriteGate { accepting: true })),
+            user_writes: Arc::clone(&runner.user_writes),
             controls: Arc::clone(&runner.controls),
             response_order: Arc::clone(&runner.response_order),
             foreground_fd: PtyForegroundObserver(Arc::downgrade(&runner.file.foreground)),
             consumer_epoch: Arc::clone(&runner.consumer_epoch),
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn probe_bytes(&self) -> Vec<u8> {
+        self.control("probe");
+        std::fs::read(self.directory.join("probe-bytes")).expect("one foreground probe read")
     }
 
     fn bytes(&self) -> Vec<u8> {
@@ -311,7 +355,7 @@ fn pump(runner: &mut PtyIoActorRunner) {
     }
 }
 
-fn lost(receipt: std_mpsc::Receiver<std::io::Result<()>>) {
+fn lost(receipt: std_mpsc::Receiver<std::io::Result<()>>, partial_text_consumed: bool) {
     let error = receipt
         .recv_timeout(Duration::from_secs(1))
         .expect("completion")
@@ -319,7 +363,14 @@ fn lost(receipt: std_mpsc::Receiver<std::io::Result<()>>) {
     assert!(super::super::is_agent_session_lost(&error));
     assert_eq!(
         error.to_string(),
-        "agent session ownership was lost: native-session"
+        format!(
+            "agent session ownership was lost: native-session; partial_text_consumed={partial_text_consumed}; flush_failed=false"
+        )
+    );
+    assert_eq!(
+        super::super::agent_session_loss_partial_text_consumed(&error),
+        Some(partial_text_consumed),
+        "typed loss must report whether text reached the PTY"
     );
     assert!(!super::super::is_agent_session_lost(&std::io::Error::new(
         std::io::ErrorKind::PermissionDenied,
@@ -349,7 +400,7 @@ fn guarded_native_dead_before_write_drops_focus_text_enter_only() {
     fixture.control("dead"); // deterministic pause: no actor syscall has run yet
     assert!(crate::platform::process_identity(fixture.reporter.pid).is_none());
     pump(&mut runner);
-    lost(receipt);
+    lost(receipt, false);
     fixture.captured(b"beforeresponsemarker");
     assert_eq!(runner.state, ActorState::Running);
     runner.enqueue_write(Bytes::from_static(b"after"));
@@ -387,7 +438,7 @@ fn guarded_native_foreground_switch_during_enter_deadline_never_enters() {
     );
     runner.enqueue_terminal_responses(vec![Bytes::from_static(b"response")]);
     pump(&mut runner);
-    lost(receipt);
+    lost(receipt, true);
     fixture.captured(b"promptresponse");
 }
 
@@ -506,14 +557,189 @@ fn guarded_native_partial_wouldblock_retry_discards_only_remaining_chunk() {
         "native partial write followed by WouldBlock"
     );
     assert_eq!(runner.pending_writes.len(), 1);
-    fixture.control("dead"); // reap pinned owner; fallback drains already accepted prefix
+    fixture.control(&format!("dead-drain:{accepted}")); // fallback consumes the accepted prefix
     runner.enqueue_terminal_responses(vec![Bytes::from_static(b"response")]);
     pump(&mut runner); // retry must re-prove before writing ANY remaining byte
-    lost(receipt);
+    lost(receipt, true);
     let mut expected = vec![b'x'; accepted];
     expected.extend_from_slice(b"response");
     fixture.captured(&expected);
     assert_eq!(runner.current_write_offset, 0);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn guarded_native_flush_failure_poison_blocks_all_input_until_operator_clear() {
+    let fixture = NativePty::new();
+    let mut runner = fixture.runner();
+    let handle = fixture.queue_handle(&mut runner);
+    fixture.control("pause");
+    let receipt = submit(
+        &mut runner,
+        Bytes::from_static(b"staged"),
+        Bytes::from_static(b"\r"),
+        Duration::ZERO,
+        Some(fixture.guard()),
+    );
+    let boundary = runner
+        .flush_pending_writes_once()
+        .expect("text write")
+        .expect("boundary");
+    runner.complete_submission_boundary(boundary);
+    runner.file.force_flush_failure = true;
+    fixture.binding_validity.store(false, Ordering::Release);
+    pump(&mut runner);
+    let loss = receipt.recv().expect("completion").expect_err("flush loss");
+    assert_eq!(
+        super::super::agent_session_loss_details(&loss),
+        Some((None, true))
+    );
+    assert!(handle.input_is_poisoned());
+    assert!(super::super::is_pane_input_poisoned(
+        &runner
+            .begin_handoff()
+            .expect_err("handoff must not clear poison")
+    ));
+    assert_eq!(
+        crate::platform::process_identity(fixture.reporter.pid),
+        Some(fixture.reporter)
+    );
+    assert!(
+        runner.file.as_raw_fd() >= 0,
+        "poison must not close the PTY"
+    );
+    let api = handle
+        .queue_user_input_submission(
+            Bytes::from_static(b"api"),
+            Bytes::from_static(b"\r"),
+            Duration::ZERO,
+        )
+        .expect_err("API refused");
+    assert!(super::super::is_pane_input_poisoned(&api));
+    assert!(
+        handle
+            .try_write_user_input_with_source(
+                Bytes::from_static(b"\r"),
+                InputSource::Client {
+                    connection_id: 42,
+                    principal: None
+                }
+            )
+            .is_err(),
+        "client byte entry uses same poisoned gate"
+    );
+    runner.enqueue_write(Bytes::from_static(b"queued-unguarded"));
+    runner.enqueue_terminal_responses(vec![Bytes::from_static(b"response")]);
+    runner
+        .flush_pending_writes_once()
+        .expect("poison refuses every write");
+    assert!(runner.pending_writes.is_empty());
+    // Even a later successful flush must not clear poison.
+    runner.file.force_flush_failure = false;
+    crate::platform::flush_pty_input(runner.file.as_raw_fd())
+        .expect("operator inspected/discarded staged input");
+    assert!(handle.input_is_poisoned());
+    let (reply, cleared) = std_mpsc::channel();
+    runner.handle_control_command(PtyIoControlCommand::ClearInputPoison(reply));
+    cleared
+        .recv()
+        .expect("clear receipt")
+        .expect("operator clear");
+    assert!(!handle.input_is_poisoned());
+    handle
+        .try_write_user_input(Bytes::from_static(b"healthy"))
+        .expect("explicit clear restores input");
+    runner.drain_data_commands();
+    pump(&mut runner);
+    assert_eq!(fixture.probe_bytes(), b"healthy");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn guarded_native_loss_after_partial_write_discards_staged_bytes_before_fallback_read() {
+    let fixture = NativePty::new();
+    let mut runner = fixture.runner();
+    fixture.control("pause"); // retain all input on the slave, without a reader
+    let length = 4 * 1024 * 1024;
+    let receipt = submit(
+        &mut runner,
+        Bytes::from(vec![b'x'; length]),
+        Bytes::from_static(b"\r"),
+        Duration::ZERO,
+        Some(fixture.guard()),
+    );
+    assert_eq!(
+        runner.flush_pending_writes_once().expect("partial write"),
+        None
+    );
+    let accepted = runner.current_write_offset;
+    assert!(accepted > 0 && accepted < length, "real accepted prefix");
+    assert_eq!(
+        runner
+            .file
+            .write(b"x")
+            .expect_err("real native EAGAIN")
+            .kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    assert_eq!(runner.pending_writes.len(), 1);
+    fixture.captured(b"");
+
+    // Move foreground ownership to the non-reading controller before the actor
+    // observes loss. Only after cleanup admit a new foreground reader.
+    fixture.control("park");
+    pump(&mut runner);
+    lost(receipt, true);
+    assert!(runner.pending_writes.is_empty());
+    assert!(runner.active_submission.is_none());
+    assert_eq!(runner.current_write_offset, 0);
+    let bytes = fixture.probe_bytes();
+    assert!(!bytes.contains(&b'\r'), "Enter must never reach the probe");
+    assert!(
+        bytes.is_empty(),
+        "staged prefix reached the probe: {} bytes",
+        bytes.len()
+    );
+    fixture.captured(b"");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn guarded_native_loss_before_enter_discards_staged_text_before_fallback_read() {
+    let fixture = NativePty::new();
+    let mut runner = fixture.runner();
+    fixture.control("pause"); // stop consumption BEFORE delivering any text
+    let receipt = submit(
+        &mut runner,
+        Bytes::from_static(b"staged prompt"),
+        Bytes::from_static(b"\r"),
+        Duration::from_millis(300),
+        Some(fixture.guard()),
+    );
+    let boundary = runner
+        .flush_pending_writes_once()
+        .expect("staged text write")
+        .expect("text boundary");
+    assert_eq!(boundary, SubmissionBoundary::Text);
+    runner.complete_submission_boundary(boundary);
+    assert!(matches!(
+        runner.active_submission.as_ref().expect("active").phase,
+        SubmissionPhase::WaitingUntil(_)
+    ));
+    fixture.captured(b"");
+    fixture.control("park");
+    pump(&mut runner); // reject Enter and flush while the replacement is not reading
+    lost(receipt, true);
+    assert!(runner.pending_writes.is_empty());
+    assert!(runner.active_submission.is_none());
+    let bytes = fixture.probe_bytes();
+    assert!(!bytes.contains(&b'\r'), "Enter must never reach the probe");
+    assert!(
+        bytes.is_empty(),
+        "staged text reached the probe: {} bytes",
+        bytes.len()
+    );
+    fixture.captured(b"");
 }
 
 #[test]
@@ -529,7 +755,7 @@ fn guarded_native_rechecks_between_partial_syscalls_in_one_flush() {
         attempts += 1;
         if attempts == 2 {
             observed.store(offset, Ordering::Relaxed);
-            NativePty::control_at(&directory, "dead");
+            NativePty::control_at(&directory, &format!("dead-drain:{offset}"));
         }
     }));
     let length = 4 * 1024 * 1024;
@@ -546,7 +772,7 @@ fn guarded_native_rechecks_between_partial_syscalls_in_one_flush() {
         runner.flush_pending_writes_once().expect("single flush"),
         None
     );
-    lost(receipt);
+    lost(receipt, true);
     let accepted = accepted.load(Ordering::Relaxed);
     assert!(accepted > 0 && accepted < length);
     fixture.captured(&vec![b'x'; accepted]);
@@ -585,7 +811,7 @@ fn guarded_native_queue_completion_text_only_fifo_and_handoff_survive_loss() {
     runner.defer_or_begin_handoff(reply); // accepted work is drained, not forgotten
     assert!(runner.pending_handoff.is_some());
     pump(&mut runner);
-    lost(guarded);
+    lost(guarded, false);
     assert!(!runner.drain_commands()); // starts the later legacy submission
     pump(&mut runner);
     legacy
@@ -621,7 +847,7 @@ fn guarded_native_false_and_expired_binding_drop_input_with_live_reporter() {
             Some(guard),
         );
         pump(&mut runner);
-        lost(receipt);
+        lost(receipt, false);
         fixture.captured(b"");
     }
     assert!(
@@ -655,7 +881,7 @@ fn guarded_native_rechecks_binding_after_proof_without_retaining_root() {
         Some(guard),
     );
     pump(&mut runner);
-    lost(receipt);
+    lost(receipt, false);
     assert!(
         weak.upgrade().is_none(),
         "no strong binding root may cross native proof"
@@ -676,7 +902,7 @@ fn guarded_native_rechecks_binding_after_proof_without_retaining_root() {
         Some(fixture.guard()),
     );
     pump(&mut runner);
-    lost(receipt);
+    lost(receipt, false);
     fixture.captured(b"");
 }
 
@@ -699,7 +925,7 @@ fn guarded_native_binding_invalidated_during_enter_delay_never_enters() {
     fixture.captured(b"prompt");
     fixture.binding_validity.store(false, Ordering::Release);
     pump(&mut runner);
-    lost(receipt);
+    lost(receipt, true);
     fixture.captured(b"prompt");
 }
 
@@ -716,7 +942,11 @@ fn status_guard(fixture: &NativePty) -> (SessionInputGuard, crate::terminal::Ter
     (guard, terminal)
 }
 
-fn status_mismatch(receipt: std_mpsc::Receiver<std::io::Result<()>>) {
+fn status_mismatch(
+    receipt: std_mpsc::Receiver<std::io::Result<()>>,
+    partial_text_consumed: Option<bool>,
+    flush_failed: bool,
+) {
     let error = receipt
         .recv_timeout(Duration::from_secs(1))
         .expect("completion")
@@ -727,6 +957,11 @@ fn status_mismatch(receipt: std_mpsc::Receiver<std::io::Result<()>>) {
     );
     assert!(super::super::is_expected_status_mismatch(&error));
     assert!(error.to_string().contains("detected agent status"));
+    assert_eq!(
+        super::super::agent_session_loss_details(&error),
+        Some((partial_text_consumed, flush_failed)),
+        "status refusal must preserve the shared flush metadata"
+    );
 }
 
 #[test]
@@ -748,15 +983,46 @@ fn guarded_native_status_latch_preserves_error_type_after_change_back() {
         !clone.status_is_current(),
         "refusal is sticky across clones"
     );
-    let error = super::super::agent_session_lost(&clone);
+    for partial in [false, true] {
+        let error = super::super::agent_session_lost(&clone, partial);
+        assert!(super::super::is_expected_status_mismatch(&error));
+        assert!(!super::super::is_agent_session_lost(&error));
+        assert_eq!(
+            super::super::agent_session_loss_details(&error),
+            Some((Some(partial), false))
+        );
+    }
+    let error = super::super::agent_session_flush_failed(&clone);
     assert!(super::super::is_expected_status_mismatch(&error));
     assert!(!super::super::is_agent_session_lost(&error));
+    assert_eq!(
+        super::super::agent_session_loss_details(&error),
+        Some((None, true))
+    );
+    let (matching, _terminal) = status_guard(&fixture);
+    for partial in [false, true] {
+        let error = super::super::agent_session_lost(&matching, partial);
+        assert!(super::super::is_agent_session_lost(&error));
+        assert!(!super::super::is_expected_status_mismatch(&error));
+        assert_eq!(
+            super::super::agent_session_loss_details(&error),
+            Some((Some(partial), false))
+        );
+    }
+    let error = super::super::agent_session_flush_failed(&matching);
+    assert!(super::super::is_agent_session_lost(&error));
+    assert!(!super::super::is_expected_status_mismatch(&error));
+    assert_eq!(
+        super::super::agent_session_loss_details(&error),
+        Some((None, true))
+    );
     let generic = std::io::Error::new(
         std::io::ErrorKind::PermissionDenied,
         "expected_status_mismatch",
     );
     assert!(!super::super::is_expected_status_mismatch(&generic));
     assert!(!super::super::is_agent_session_lost(&generic));
+    assert_eq!(super::super::agent_session_loss_details(&generic), None);
 }
 
 #[test]
@@ -835,7 +1101,7 @@ fn guarded_native_status_flip_before_write_preserves_unrelated_fifo() {
         crate::detect::AgentState::Working,
     );
     pump(&mut runner);
-    status_mismatch(receipt);
+    status_mismatch(receipt, Some(false), false);
     fixture.captured(b"beforeresponsemarker");
     assert_eq!(runner.state, ActorState::Running);
     runner.enqueue_write(Bytes::from_static(b"after"));
@@ -865,7 +1131,7 @@ fn guarded_native_status_rechecked_after_proof_without_retaining_root() {
         Some(guard),
     );
     pump(&mut runner);
-    status_mismatch(receipt);
+    status_mismatch(receipt, Some(false), false);
     fixture.captured(b"");
 
     let (guard, terminal) = status_guard(&fixture);
@@ -882,7 +1148,7 @@ fn guarded_native_status_rechecked_after_proof_without_retaining_root() {
         Some(guard),
     );
     pump(&mut runner);
-    status_mismatch(receipt);
+    status_mismatch(receipt, Some(false), false);
     assert!(
         weak.upgrade().is_none(),
         "no status root crosses native proof"
@@ -913,8 +1179,108 @@ fn guarded_native_status_flip_during_enter_delay_never_enters() {
         crate::detect::AgentState::Working,
     );
     pump(&mut runner);
-    status_mismatch(receipt);
+    status_mismatch(receipt, Some(true), false);
     fixture.captured(b"prompt");
+}
+
+#[test]
+fn guarded_native_status_flip_before_enter_discards_staged_text() {
+    let fixture = NativePty::new();
+    let mut runner = fixture.runner();
+    fixture.control("pause");
+    let (guard, mut terminal) = status_guard(&fixture);
+    let receipt = submit(
+        &mut runner,
+        Bytes::from_static(b"staged prompt"),
+        Bytes::from_static(b"\r"),
+        Duration::from_millis(300),
+        Some(guard),
+    );
+    let boundary = runner
+        .flush_pending_writes_once()
+        .expect("text write")
+        .expect("text boundary");
+    runner.complete_submission_boundary(boundary);
+    fixture.captured(b"");
+    terminal.set_detected_state(
+        Some(crate::detect::Agent::Pi),
+        crate::detect::AgentState::Working,
+    );
+    pump(&mut runner);
+    status_mismatch(receipt, Some(true), false);
+    assert!(runner.pending_writes.is_empty());
+    assert!(runner.active_submission.is_none());
+    assert!(
+        fixture.probe_bytes().is_empty(),
+        "no staged text or Enter remains"
+    );
+    fixture.captured(b"");
+}
+
+#[test]
+fn guarded_native_status_flush_failure_stays_typed_and_poisons_input() {
+    let fixture = NativePty::new();
+    let mut runner = fixture.runner();
+    let handle = fixture.queue_handle(&mut runner);
+    fixture.control("pause");
+    let (guard, mut terminal) = status_guard(&fixture);
+    let receipt = submit(
+        &mut runner,
+        Bytes::from_static(b"staged"),
+        Bytes::from_static(b"\r"),
+        Duration::ZERO,
+        Some(guard),
+    );
+    let boundary = runner
+        .flush_pending_writes_once()
+        .expect("text write")
+        .expect("text boundary");
+    runner.complete_submission_boundary(boundary);
+    runner.file.force_flush_failure = true;
+    terminal.set_detected_state(
+        Some(crate::detect::Agent::Pi),
+        crate::detect::AgentState::Working,
+    );
+    pump(&mut runner);
+    status_mismatch(receipt, None, true);
+    assert!(handle.input_is_poisoned());
+    assert!(runner.pending_writes.is_empty());
+    assert!(runner.active_submission.is_none());
+    let refused = handle
+        .queue_user_input_submission(
+            Bytes::from_static(b"forbidden"),
+            Bytes::from_static(b"\r"),
+            Duration::ZERO,
+        )
+        .expect_err("poison blocks later submissions");
+    assert!(super::super::is_pane_input_poisoned(&refused));
+    assert!(handle
+        .try_write_user_input(Bytes::from_static(b"\r"))
+        .is_err());
+    runner.enqueue_terminal_responses(vec![Bytes::from_static(b"response")]);
+    runner
+        .flush_pending_writes_once()
+        .expect("poison refuses writes");
+    assert!(runner.pending_writes.is_empty());
+    runner.file.force_flush_failure = false;
+    crate::platform::flush_pty_input(runner.file.as_raw_fd()).expect("operator discards text");
+    assert!(
+        handle.input_is_poisoned(),
+        "successful flush alone never clears poison"
+    );
+    let (reply, cleared) = std_mpsc::channel();
+    runner.handle_control_command(PtyIoControlCommand::ClearInputPoison(reply));
+    cleared
+        .recv()
+        .expect("clear receipt")
+        .expect("operator clear");
+    assert!(!handle.input_is_poisoned());
+    handle
+        .try_write_user_input(Bytes::from_static(b"healthy"))
+        .expect("explicit clear restores input");
+    runner.drain_data_commands();
+    pump(&mut runner);
+    assert_eq!(fixture.probe_bytes(), b"healthy");
 }
 
 #[test]
@@ -925,7 +1291,6 @@ fn guarded_native_status_rechecked_between_partial_syscalls() {
     let (guard, terminal) = status_guard(&fixture);
     let terminal = Arc::new(Mutex::new(terminal));
     let during_write = Arc::clone(&terminal);
-    let directory = fixture.directory.clone();
     let accepted = Arc::new(AtomicUsize::new(0));
     let observed = Arc::clone(&accepted);
     let mut attempts = 0;
@@ -937,7 +1302,6 @@ fn guarded_native_status_rechecked_between_partial_syscalls() {
                 Some(crate::detect::Agent::Pi),
                 crate::detect::AgentState::Working,
             );
-            NativePty::control_at(&directory, "dead");
         }
     }));
     let length = 4 * 1024 * 1024;
@@ -952,11 +1316,21 @@ fn guarded_native_status_rechecked_between_partial_syscalls() {
         runner.flush_pending_writes_once().expect("single flush"),
         None
     );
-    status_mismatch(receipt);
+    status_mismatch(receipt, Some(true), false);
     let accepted = accepted.load(Ordering::Relaxed);
     assert!(accepted > 0 && accepted < length);
-    fixture.captured(&vec![b'x'; accepted]);
     assert!(runner.pending_writes.is_empty());
+    assert!(runner.active_submission.is_none());
+    assert_eq!(runner.current_write_offset, 0);
+    assert!(crate::platform::session_reporter_is_foreground(
+        fixture.reporter,
+        || crate::platform::foreground_process_group_id_for_tty_fd(runner.file.as_raw_fd())
+    ));
+    assert!(
+        fixture.probe_bytes().is_empty(),
+        "TCIFLUSH discards staged text"
+    );
+    fixture.captured(b"");
 }
 
 #[test]
@@ -975,7 +1349,7 @@ fn guarded_native_stale_generation_and_wrong_tty_are_not_admitted() {
             Some(guard),
         );
         pump(&mut runner);
-        lost(receipt);
+        lost(receipt, false);
     }
     fixture.captured(b"");
 }

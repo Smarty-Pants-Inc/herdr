@@ -164,6 +164,20 @@ pub(crate) fn pane_tty_identity(master: std::os::fd::RawFd) -> std::io::Result<(
 }
 
 #[cfg(unix)]
+pub(crate) fn flush_pty_input(master: std::os::fd::RawFd) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    return linux::input_consumer::flush_pty_input(master);
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = master;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "PTY input flushing is unsupported on this platform",
+        ))
+    }
+}
+
+#[cfg(unix)]
 pub(crate) fn input_consumer_incarnation(
     fd: std::os::fd::RawFd,
     peer: ProcessIdentity,
@@ -1421,6 +1435,10 @@ pub(crate) const fn capabilities() -> PlatformCapabilities {
         direct_terminal_attach: cfg!(unix),
         preserve_legacy_doubled_escape_input: cfg!(target_os = "macos"),
     }
+}
+
+pub(crate) const fn expected_agent_session_guard_supported() -> bool {
+    cfg!(target_os = "linux")
 }
 
 pub(crate) fn terminal_grid_size() -> std::io::Result<(u16, u16)> {

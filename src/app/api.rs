@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, target_os = "linux"))]
 mod agent_session_guard_tests;
 mod agent_view;
 mod agents;
@@ -1231,6 +1231,9 @@ impl App {
             Method::PaneResize(params) => return self.handle_pane_resize(request.id, params),
             Method::PaneScroll(params) => return self.handle_pane_scroll(request.id, params),
             Method::PaneClear(target) => return self.handle_pane_clear(request.id, target),
+            Method::PaneClearInputPoison(target) => {
+                return self.handle_pane_clear_input_poison(request.id, target);
+            }
             Method::PaneEditScrollback(target) => {
                 return self.handle_pane_edit_scrollback(request.id, target);
             }

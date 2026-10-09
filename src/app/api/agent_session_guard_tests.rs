@@ -56,12 +56,56 @@ struct PendingInputSocket {
 #[cfg(target_os = "linux")]
 impl PendingInputSocket {
     async fn enqueue(f: &mut Fixture, method: &str) -> Self {
-        Self::enqueue_with_params(
-            f,
-            method,
-            serde_json::json!({"expected_agent_session_id": "private-queued-old"}),
+        use interprocess::local_socket::traits::Listener as _;
+        use std::io::Write;
+        use std::sync::{atomic::AtomicBool, Arc};
+        let path = f.dir.join("input.sock");
+        let listener = crate::ipc::bind_local_listener(&path).expect("input socket");
+        let mut client = crate::ipc::connect_local_stream(&path).expect("input client");
+        let server = listener.accept().expect("already connected input client");
+        let (api_tx, mut api_rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::api::ApiRequestMessage>();
+        let (done_tx, done) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let result = crate::api::test_handle_connection(
+                server,
+                &api_tx,
+                &crate::api::EventHub::default(),
+                &Arc::new(AtomicBool::new(true)),
+                None,
+            );
+            let _ = done_tx.send(result);
+        });
+        writeln!(
+            client,
+            "{}",
+            serde_json::json!({
+                "id": "queued-native-input", "method": method, "params": {
+                    "pane_id": f.pane, "target": f.pane, "text": "prompt", "keys": ["p", "enter"],
+                    "expected_agent_session_id": "private-queued-old", "allow_cross_pane": true,
+                },
+            })
         )
-        .await
+        .expect("send actual input RPC");
+        client.flush().expect("flush actual input RPC");
+        let message = tokio::time::timeout(Duration::from_secs(2), api_rx.recv())
+            .await
+            .expect("input dispatch deadline")
+            .expect("input message");
+        assert!(
+            App::api_request_requires_deferred_input(&message.request),
+            "{method}"
+        );
+        assert!(f.app.handle_deferred_agent_api_request(
+            message.request,
+            message.context,
+            message.respond_to,
+        ));
+        Self {
+            client: Some(client),
+            done,
+            thread: Some(thread),
+        }
     }
 
     async fn enqueue_with_params(f: &mut Fixture, method: &str, extra: serde_json::Value) -> Self {
@@ -298,8 +342,6 @@ def sink(program, establish_group=True):
     return pid
 reporter = sink(executable)
 os.tcsetpgrp(0, reporter)
-# Exec may reach cat's read while its group is still backgrounded and stop on
-# SIGTTIN. Resume AFTER foreground transfer, just like every fallback sink.
 os.kill(reporter, signal.SIGCONT)
 with open(directory + '/reporter.pid', 'w') as file:
     file.write(str(reporter))
@@ -2075,12 +2117,39 @@ async fn expected_agent_session_real_pty_queued_new_id_same_native_peer_revokes_
             !response.contains("private-queued-new"),
             "actual replacement ID stays private"
         );
+        let loss: serde_json::Value = serde_json::from_str(&response).expect("loss JSON");
+        assert_eq!(loss["error"]["partial_text_consumed"], false);
         f.completed_bytes(b"");
         let reporter = f.reporter.pid;
         let dir = f.dir.clone();
         drop(f);
         assert!(!std::path::Path::new(&format!("/proc/{reporter}")).exists());
         assert!(!dir.exists());
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expected_agent_session_real_pty_new_id_after_text_before_enter_no_enter() {
+    for method in ["agent.prompt", "agent.prompt_session_checked"] {
+        let mut f = Fixture::with_modes(Agent::Pi, false, true, true);
+        f.report_from_native_socket("private-queued-old", 1).await;
+        let barrier = ActorWriteBarrier::install(&f, 2);
+        let pending = PendingInputSocket::enqueue(&mut f, method).await;
+        barrier.entered();
+        f.completed_bytes(b"prompt");
+        f.report_from_native_socket("private-queued-new", 2).await;
+        assert_eq!(
+            crate::platform::process_identity(f.reporter.pid),
+            Some(f.reporter)
+        );
+        barrier.release();
+        let response = pending.response();
+        assert_error(&response, "agent_session_lost");
+        let response: serde_json::Value = serde_json::from_str(&response).expect("loss JSON");
+        assert_eq!(response["error"]["partial_text_consumed"], true);
+        assert!(!response.to_string().contains("private-queued-new"));
+        f.completed_bytes(b"prompt");
     }
 }
 
@@ -2136,6 +2205,79 @@ async fn expected_agent_session_real_pty_queued_same_id_periodic_native_report_p
         drop(f);
         assert!(!std::path::Path::new(&format!("/proc/{reporter}")).exists());
         assert!(!dir.exists());
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expected_agent_status_real_pty_queued_idle_and_status_omission_allow_delivery() {
+    for method in [
+        "agent.prompt",
+        "agent.prompt_session_checked",
+        "agent.prompt_status_checked",
+    ] {
+        for with_status in [false, true] {
+            if !with_status && method == "agent.prompt_status_checked" {
+                continue;
+            }
+            let mut f = Fixture::with_modes(Agent::Pi, false, true, true);
+            f.report_from_native_socket("private-queued-old", 1).await;
+            let barrier = ActorWriteBarrier::install(&f, 1);
+            let mut params = serde_json::json!({
+                "expected_agent_session_id": "private-queued-old",
+            });
+            if with_status {
+                params["expected_agent_status"] = "idle".into();
+            }
+            let pending = PendingInputSocket::enqueue_with_params(&mut f, method, params).await;
+            barrier.entered();
+            if !with_status {
+                // A session-only guard still permits queued work after an idle-to-working flip.
+                f.set_detected_status(AgentState::Working);
+            }
+            barrier.release();
+            assert_ok(&pending.response());
+            f.completed_bytes(b"prompt\r");
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expected_agent_status_real_pty_session_loss_keeps_delivery_metadata() {
+    for method in [
+        "agent.prompt",
+        "agent.prompt_session_checked",
+        "agent.prompt_status_checked",
+    ] {
+        for write_number in [1, 2] {
+            let mut f = Fixture::with_modes(Agent::Pi, false, true, true);
+            f.report_from_native_socket("private-queued-old", 1).await;
+            let barrier = ActorWriteBarrier::install(&f, write_number);
+            let pending = PendingInputSocket::enqueue_with_params(
+                &mut f,
+                method,
+                serde_json::json!({
+                    "expected_agent_session_id": "private-queued-old", "expected_agent_status": "idle",
+                }),
+            )
+            .await;
+            barrier.entered();
+            let text: &[u8] = if write_number == 2 { b"prompt" } else { b"" };
+            f.completed_bytes(text);
+            f.report_from_native_socket("private-queued-new", 2).await;
+            barrier.release();
+            let response = pending.response();
+            assert_error(&response, "agent_session_lost");
+            let response: serde_json::Value = serde_json::from_str(&response).expect("loss JSON");
+            assert_eq!(
+                response["error"]["partial_text_consumed"],
+                write_number == 2
+            );
+            assert_eq!(response["error"]["flush_failed"], false);
+            assert!(!response.to_string().contains("private-queued-new"));
+            f.completed_bytes(text);
+        }
     }
 }
 
@@ -2297,8 +2439,12 @@ async fn expected_agent_status_real_pty_queued_working_before_first_write_is_sta
             Some(f.reporter)
         );
         barrier.release();
-        assert_error(&pending.response(), "expected_status_mismatch");
-        f.bytes(b"");
+        let response = pending.response();
+        assert_error(&response, "expected_status_mismatch");
+        let response: serde_json::Value = serde_json::from_str(&response).expect("status JSON");
+        assert_eq!(response["error"]["partial_text_consumed"], false);
+        assert_eq!(response["error"]["flush_failed"], false);
+        f.completed_bytes(b"");
     }
 }
 
@@ -2325,9 +2471,13 @@ async fn expected_agent_status_real_pty_working_before_delayed_enter_sends_no_en
         f.completed_bytes(b"prompt");
         f.set_detected_status(AgentState::Working);
         barrier.release();
-        assert_error(&pending.response(), "expected_status_mismatch");
+        let response = pending.response();
+        assert_error(&response, "expected_status_mismatch");
+        let response: serde_json::Value = serde_json::from_str(&response).expect("status JSON");
+        assert_eq!(response["error"]["partial_text_consumed"], true);
+        assert_eq!(response["error"]["flush_failed"], false);
         f.assert_cached_session("private-queued-old");
-        f.bytes(b"prompt");
+        f.completed_bytes(b"prompt");
     }
 }
 

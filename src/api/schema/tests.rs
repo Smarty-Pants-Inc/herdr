@@ -46,6 +46,23 @@ fn protocol_schema_document() -> serde_json::Value {
 }
 
 #[test]
+fn clear_input_poison_method_is_registered_and_advertised() {
+    let value = serde_json::json!({"id":"clear", "method":"pane.clear_input_poison", "params":{"pane_id":"p1"}});
+    let request: Request = serde_json::from_value(value.clone()).unwrap();
+    assert!(matches!(request.method, Method::PaneClearInputPoison(_)));
+    assert_eq!(
+        crate::api::api_method_name(&request.method),
+        "pane.clear_input_poison"
+    );
+    assert!(
+        crate::server::client_commands::supports_client_shell_method_name(
+            "pane.clear_input_poison"
+        )
+    );
+    assert_eq!(serde_json::to_value(request).unwrap(), value);
+}
+
+#[test]
 fn input_consumer_local_methods_are_registered_and_not_endpoint_methods() {
     for (name, params) in [
         (

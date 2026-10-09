@@ -40,9 +40,12 @@ pub(super) enum SessionCheckedPaneInput {
 pub(super) fn pane_input_completion_response(id: String, result: std::io::Result<()>) -> String {
     match result {
         Ok(()) => encode_success(id, ResponseResult::Ok {}),
+        Err(error) if crate::pty::actor::is_agent_session_lost(&error) => {
+            session_loss_response(id, &error)
+        }
         Err(error) => {
-            let code = if crate::pty::actor::is_agent_session_lost(&error) {
-                "agent_session_lost"
+            let code = if crate::pty::actor::is_pane_input_poisoned(&error) {
+                "pane_input_poisoned"
             } else if error.kind() == std::io::ErrorKind::TimedOut {
                 "timeout"
             } else {
@@ -51,6 +54,23 @@ pub(super) fn pane_input_completion_response(id: String, result: std::io::Result
             encode_error(id, code, error.to_string())
         }
     }
+}
+
+/// The loss-specific optional field does not alter the generic error body or
+/// any frozen endpoint codec. Other errors must not claim partial delivery.
+pub(super) fn session_loss_response(id: String, error: &std::io::Error) -> String {
+    let (partial, flush_failed) =
+        crate::pty::actor::agent_session_loss_details(error).unwrap_or((None, false));
+    serde_json::json!({
+        "id": id,
+        "error": {
+            "code": "agent_session_lost",
+            "message": error.to_string(),
+            "partial_text_consumed": partial,
+            "flush_failed": flush_failed
+        }
+    })
+    .to_string()
 }
 
 /// Private/direct String callers have no response sender. They must observe a
@@ -72,7 +92,43 @@ fn complete_direct_pane_input(
     pane_input_completion_response(id, result)
 }
 
+fn precheck_pane_input_poison(id: &str, poisoned: bool) -> Result<(), String> {
+    if poisoned {
+        Err(encode_error(
+            id.to_string(),
+            "pane_input_poisoned",
+            crate::api::schema::PANE_INPUT_POISON_NOTICE,
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 impl App {
+    pub(super) fn handle_pane_clear_input_poison(
+        &mut self,
+        id: String,
+        target: PaneTarget,
+    ) -> String {
+        let Some((ws_idx, pane_id)) = self.parse_pane_id(&target.pane_id) else {
+            return pane_not_found(id, &target.pane_id);
+        };
+        let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
+            return pane_not_found(id, &target.pane_id);
+        };
+        match runtime.clear_input_poison() {
+            Ok(()) => serde_json::json!({
+                "id": id,
+                "result": {
+                    "type": "ok",
+                    "message": crate::api::schema::PANE_INPUT_POISON_CLEAR_WARNING
+                }
+            })
+            .to_string(),
+            Err(error) => encode_error(id, "pane_clear_input_poison_failed", error.to_string()),
+        }
+    }
+
     pub(super) fn handle_pane_split(&mut self, id: String, params: PaneSplitParams) -> String {
         let target = if let Some(target_pane_id) = params.target_pane_id.as_deref() {
             self.parse_pane_id(target_pane_id)
@@ -2128,6 +2184,10 @@ impl App {
         let Some((ws_idx, pane_id)) = self.parse_pane_id(pane) else {
             return Err(pane_not_found(id, pane));
         };
+        let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
+            return Err(pane_not_found(id, pane));
+        };
+        precheck_pane_input_poison(&id, runtime.input_is_poisoned())?;
         let guard = self
             .capture_expected_agent_session(expected, ws_idx, pane_id)
             .map_err(|error| super::responses::encode_error_body(id.clone(), error))?;
@@ -2191,8 +2251,11 @@ impl App {
         let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
-        if self.lookup_runtime_sender(ws_idx, pane_id).is_none() {
+        let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
             return pane_not_found(id, &params.pane_id);
+        };
+        if let Err(response) = precheck_pane_input_poison(&id, runtime.input_is_poisoned()) {
+            return response;
         }
         if let Err(response) = self.log_api_input(
             &id,
@@ -2246,6 +2309,9 @@ impl App {
         else {
             return pane_not_found(id, &params.pane_id);
         };
+        if let Err(response) = precheck_pane_input_poison(&id, runtime.input_is_poisoned()) {
+            return response;
+        }
         let bytes = match super::super::api_helpers::encode_api_input(
             runtime,
             &params.text,
@@ -2383,6 +2449,9 @@ impl App {
         let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
+        if let Err(response) = precheck_pane_input_poison(&id, runtime.input_is_poisoned()) {
+            return response;
+        }
         let encoded_keys = match encode_api_keys(runtime, &params.keys) {
             Ok(encoded_keys) => encoded_keys,
             Err(key) => return encode_error(id, "invalid_key", format!("unsupported key {key}")),
@@ -2742,13 +2811,134 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn api_pane_input_poison_blocks_all_send_methods_until_explicit_clear() {
+        let (mut app, pane_id, mut rx) = app_with_send_key_runtime(8);
+        let internal_pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.terminal_id_for_pane(0, internal_pane_id).unwrap();
+        app.lookup_runtime_sender(0, internal_pane_id)
+            .unwrap()
+            .test_set_input_poisoned(true);
+        for method in [
+            "pane.send_text",
+            "pane.send_keys",
+            "pane.send_input",
+            "pane.send_input_guarded",
+            "pane.send_text_session_checked",
+            "pane.send_keys_session_checked",
+        ] {
+            let mut value = serde_json::json!({
+                "id": "poison", "method": method,
+                "params": {"pane_id": pane_id, "text": "must not send", "keys": ["Enter"],
+                    "allow_cross_pane": true, "expected_terminal": terminal_id.to_string()}
+            });
+            if method.ends_with("_session_checked") {
+                value["params"]["expected_agent_session_id"] = serde_json::json!("unknown-session");
+            }
+            let request = serde_json::from_value(value).unwrap();
+            let response: ErrorResponse =
+                serde_json::from_str(&app.handle_api_request(request)).unwrap();
+            assert_eq!(response.error.code, "pane_input_poisoned", "{method}");
+            assert_eq!(
+                response.error.message,
+                crate::api::schema::PANE_INPUT_POISON_NOTICE
+            );
+            assert!(rx.try_recv().is_err());
+            assert!(app.accepted_api_inputs.is_empty());
+            assert!(app
+                .lookup_runtime_sender(0, internal_pane_id)
+                .unwrap()
+                .input_is_poisoned());
+        }
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "clear".into(),
+            method: crate::api::schema::Method::PaneClearInputPoison(PaneTarget {
+                pane_id: pane_id.clone(),
+            }),
+        });
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(value["result"]["type"], "ok");
+        assert_eq!(
+            value["result"]["message"],
+            crate::api::schema::PANE_INPUT_POISON_CLEAR_WARNING
+        );
+        assert!(!app
+            .lookup_runtime_sender(0, internal_pane_id)
+            .unwrap()
+            .input_is_poisoned());
+        assert!(
+            rx.try_recv().is_err(),
+            "clear must not send or discard staged text"
+        );
+        let request = serde_json::from_value(serde_json::json!({
+            "id": "clean", "method": "pane.send_text", "params": {
+                "pane_id": pane_id, "text": "clean", "allow_cross_pane": true
+            }
+        }))
+        .unwrap();
+        let response: SuccessResponse =
+            serde_json::from_str(&app.handle_api_request(request)).unwrap();
+        assert_eq!(response.result, ResponseResult::Ok {});
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"clean"));
+        let _ = std::fs::remove_file(&app.api_input_log);
+    }
+
+    #[test]
+    fn pane_input_poison_precheck_is_typed_and_never_clears() {
+        for _ in 0..2 {
+            let response = precheck_pane_input_poison("poison", true).unwrap_err();
+            let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+            assert_eq!(error.id, "poison");
+            assert_eq!(error.error.code, "pane_input_poisoned");
+            assert_eq!(
+                error.error.message,
+                crate::api::schema::PANE_INPUT_POISON_NOTICE
+            );
+        }
+        assert!(precheck_pane_input_poison("clean", false).is_ok());
+    }
+
+    #[test]
+    fn clear_input_poison_api_rejects_missing_runtime_or_pane() {
+        let (mut app, pane_id) = app_with_test_workspace();
+        for target in [pane_id, "missing".into()] {
+            let request = crate::api::schema::Request {
+                id: "clear".into(),
+                method: crate::api::schema::Method::PaneClearInputPoison(PaneTarget {
+                    pane_id: target,
+                }),
+            };
+            let response: ErrorResponse =
+                serde_json::from_str(&app.handle_api_request(request)).unwrap();
+            assert_eq!(response.error.code, "pane_not_found");
+        }
+    }
+
     #[test]
     fn guarded_pane_completion_maps_only_typed_loss() {
-        let lost = crate::pty::actor::agent_session_lost(&test_guard());
+        let lost = crate::pty::actor::agent_session_lost(&test_guard(), false);
         let response: ErrorResponse =
             serde_json::from_str(&pane_input_completion_response("typed".into(), Err(lost)))
                 .unwrap();
         assert_eq!(response.error.code, "agent_session_lost");
+        let encoded: serde_json::Value = serde_json::from_str(&pane_input_completion_response(
+            "partial".into(),
+            Err(crate::pty::actor::agent_session_lost(&test_guard(), true)),
+        ))
+        .unwrap();
+        assert_eq!(encoded["error"]["partial_text_consumed"], true);
+        let encoded: serde_json::Value = serde_json::from_str(&pane_input_completion_response(
+            "none".into(),
+            Err(crate::pty::actor::agent_session_lost(&test_guard(), false)),
+        ))
+        .unwrap();
+        assert_eq!(encoded["error"]["partial_text_consumed"], false);
+        assert_eq!(encoded["error"]["flush_failed"], false);
+        let generic_loss = std::io::Error::other("unknown delivery");
+        let encoded: serde_json::Value =
+            serde_json::from_str(&session_loss_response("unknown".into(), &generic_loss)).unwrap();
+        assert!(encoded["error"]["partial_text_consumed"].is_null());
+        assert_eq!(encoded["error"]["flush_failed"], false);
         let generic = std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "agent session ownership was lost",
@@ -2764,8 +2954,11 @@ mod tests {
     #[test]
     fn direct_guarded_pane_response_observes_completion_not_enqueue() {
         let (tx, rx) = std::sync::mpsc::channel();
-        tx.send(Err(crate::pty::actor::agent_session_lost(&test_guard())))
-            .unwrap();
+        tx.send(Err(crate::pty::actor::agent_session_lost(
+            &test_guard(),
+            false,
+        )))
+        .unwrap();
         let response: ErrorResponse =
             serde_json::from_str(&complete_direct_pane_input("lost".into(), rx)).unwrap();
         assert_eq!(response.error.code, "agent_session_lost");

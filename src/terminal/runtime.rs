@@ -485,6 +485,16 @@ impl TerminalRuntime {
     pub(crate) fn input_consumer_epoch_matches(&self, epoch: &str) -> bool {
         self.0.input_consumer_epoch_matches(epoch)
     }
+    pub(crate) fn input_is_poisoned(&self) -> bool {
+        self.0.input_is_poisoned()
+    }
+    pub(crate) fn clear_input_poison(&self) -> std::io::Result<()> {
+        self.0.clear_input_poison()
+    }
+    #[cfg(test)]
+    pub(crate) fn test_set_input_poisoned(&self, poisoned: bool) {
+        self.0.test_set_input_poisoned(poisoned);
+    }
     pub(crate) fn try_send_bytes_with_source(
         &self,
         bytes: Bytes,

@@ -102,6 +102,15 @@ impl App {
                 message: "expected_agent_status requires expected_agent_session_id".into(),
             });
         }
+        let Some(expected) = expected_agent_session_id else {
+            return Ok(None);
+        };
+        if !crate::platform::expected_agent_session_guard_supported() {
+            return Err(crate::api::schema::ErrorBody {
+                code: "expected_agent_session_unsupported".into(),
+                message: "expected agent session guards are supported only on Linux".into(),
+            });
+        }
         let terminal = self
             .state
             .terminal_id_for_pane(ws_idx, pane_id)
@@ -123,9 +132,6 @@ impl App {
             });
         }
 
-        let Some(expected) = expected_agent_session_id else {
-            return Ok(None);
-        };
         let actual = terminal.and_then(|terminal| {
             let reporter = terminal.reported_agent_session_reporter()?;
             let runtime = self.state.runtime_for_pane_in_workspace(
@@ -662,6 +668,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn expected_status_admission_uses_detected_state_not_seen() {
         use crate::api::schema::AgentStatus;
