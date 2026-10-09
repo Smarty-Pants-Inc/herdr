@@ -88,6 +88,7 @@ async fn channel_discovery_undetected_terminal_and_no_transport_have_zero_pty_ef
         AgentRegisterSelfParams {
             pane_id: None,
             session_generation: "generation".into(),
+            draft_guard: false,
             transport: None,
         },
         crate::api::ApiRequestContext::for_local_peer_pid(Some(std::process::id())),
@@ -95,6 +96,58 @@ async fn channel_discovery_undetected_terminal_and_no_transport_have_zero_pty_ef
     assert!(registration.get("error").is_some());
     assert!(input.try_recv().is_err());
 }
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn channel_draft_query_is_read_only_with_unknown_origin_and_unregistered_guard_is_typed() {
+    let (mut app, pane, mut input) = app();
+    let target = app.public_pane_id(0, pane).unwrap();
+    let terminal = app.state.workspaces[0]
+        .terminal_id(pane)
+        .unwrap()
+        .to_string();
+    let query = Request {
+        id: "query".into(),
+        method: Method::AgentDraftState(AgentDraftStateParams {
+            target: target.clone(),
+        }),
+    };
+    assert!(!crate::api::request_changes_ui(&query));
+    assert!(app
+        .cross_pane_input_denial(&query, crate::api::ApiRequestContext::default())
+        .is_none());
+    let (respond_to, response) = std::sync::mpsc::channel();
+    assert!(app.handle_deferred_agent_api_request(
+        query,
+        crate::api::ApiRequestContext::default(),
+        respond_to
+    ));
+    let response = value(response.recv_timeout(Duration::from_secs(1)).unwrap());
+    assert_eq!(
+        response["result"],
+        serde_json::json!({"status":"unknown", "reason":"unregistered"})
+    );
+    let params = AgentPromptGuardedParams {
+        target,
+        text: "literal".into(),
+        expected_terminal: terminal,
+        expected_registration_epoch: "absent".into(),
+        request_id: "guard".into(),
+        if_draft_empty: true,
+        timeout_ms: None,
+        allow_cross_pane: true,
+    };
+    let rejected = value(
+        app.reserve_guarded_prompt(&params)
+            .err()
+            .unwrap()
+            .response("guard".into(), false),
+    );
+    assert_eq!(rejected["error"]["code"], "agent_prompt_rejected");
+    assert_eq!(rejected["error"]["reason"], "unregistered");
+    assert!(input.try_recv().is_err());
+    assert!(app.agent_channels.owners.is_empty());
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[tokio::test]
 async fn channel_expected_terminal_epoch_origin_and_attachment_fail_closed_without_pty() {
@@ -124,6 +177,7 @@ async fn channel_expected_terminal_epoch_origin_and_attachment_fail_closed_witho
         expected_terminal: "wrong-terminal".into(),
         expected_registration_epoch: "epoch".into(),
         request_id: "r".into(),
+        if_draft_empty: false,
         timeout_ms: Some(100),
         allow_cross_pane: true,
     };
@@ -262,7 +316,10 @@ mod rollover_transport {
     }
     fn service(app: &mut App) {
         while let Ok(message) = app.api_rx.try_recv() {
-            if matches!(message.request.method, Method::AgentPromptGuarded(_)) {
+            if matches!(
+                message.request.method,
+                Method::AgentPromptGuarded(_) | Method::AgentDraftState(_)
+            ) {
                 assert!(app.handle_deferred_guarded_agent_prompt(
                     message.request,
                     message.context,
@@ -358,6 +415,7 @@ mod rollover_transport {
                 .to_string(),
             expected_registration_epoch: epoch.into(),
             request_id: format!("prompt-{index}"),
+            if_draft_empty: false,
             text: format!("literal-{index}"),
             timeout_ms: Some(2000),
             allow_cross_pane: true,
@@ -488,6 +546,7 @@ mod rollover_transport {
             AgentRegisterSelfParams {
                 pane_id: None,
                 session_generation: "new-session-generation".into(),
+                draft_guard: false,
                 transport: Some(transport.clone()),
             },
             crate::api::ApiRequestContext::for_local_peer_pid(harness.child.process_id()),

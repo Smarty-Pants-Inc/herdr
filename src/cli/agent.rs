@@ -23,6 +23,7 @@ pub(super) fn run_agent_command(args: &[String]) -> std::io::Result<i32> {
         "list" => agent_list(&args[1..]),
         "get" => agent_get(&args[1..]),
         "channel-info" => channel::channel_info(&args[1..]),
+        "draft-state" => channel::draft_state(&args[1..]),
         "prompt-guarded" => channel::prompt_guarded(&args[1..]),
         "read" => agent_read(&args[1..]),
         "send-keys" => agent_send_keys(&args[1..]),
@@ -776,7 +777,7 @@ fn agent_rename(args: &[String]) -> std::io::Result<i32> {
 fn agent_prompt(args: &[String]) -> std::io::Result<i32> {
     let Some(target) = args.first() else {
         eprintln!(
-            "usage: herdr agent prompt <target> <text> [--wait] [--until STATUS]... [--timeout MS] [--allow-cross-pane]"
+            "usage: herdr agent prompt <target> <text> [--if-draft-empty | --wait [--until STATUS]... [--timeout MS]] [--allow-cross-pane]"
         );
         return Ok(2);
     };
@@ -784,6 +785,26 @@ fn agent_prompt(args: &[String]) -> std::io::Result<i32> {
         eprintln!("agent prompt requires text");
         return Ok(2);
     };
+    // The first two argv remain literal target/text, including flag-shaped text.
+    // Select the guarded route before parsing any legacy wait options so it can
+    // never accidentally reach the typing path or turn-completion machinery.
+    if args[2..].iter().any(|arg| arg == "--if-draft-empty") {
+        let mut if_draft_empty = false;
+        let mut allow_cross_pane = false;
+        for option in &args[2..] {
+            match option.as_str() {
+                "--if-draft-empty" if !if_draft_empty => if_draft_empty = true,
+                "--allow-cross-pane" => allow_cross_pane = true,
+                _ => {
+                    eprintln!(
+                        "agent prompt --if-draft-empty only supports --allow-cross-pane; --wait, --until, --timeout, duplicate guards, and extra arguments are refused before sending"
+                    );
+                    return Ok(2);
+                }
+            }
+        }
+        return channel::prompt_if_draft_empty(target, text, allow_cross_pane);
+    }
     let mut wait = false;
     let mut until = Vec::new();
     let mut timeout_ms = None;
@@ -958,15 +979,16 @@ fn print_agent_help() {
     eprintln!("  herdr agent list");
     eprintln!("  herdr agent get <target>");
     eprintln!("  herdr agent channel-info <target>");
+    eprintln!("  herdr agent draft-state <target>");
     eprintln!(
-        "  herdr agent prompt-guarded <target> <text> --expected-terminal TERMINAL_ID --expected-registration-epoch EPOCH --request-id ID [--timeout-ms MS] [--allow-cross-pane]"
+        "  herdr agent prompt-guarded <target> <text> --expected-terminal TERMINAL_ID --expected-registration-epoch EPOCH --request-id ID [--timeout-ms MS] [--allow-cross-pane] [--if-draft-empty]"
     );
     eprintln!(
         "  herdr agent read <target> [--source visible|recent|recent-unwrapped|detection] [--lines N] [--format text|ansi] [--ansi]"
     );
     eprintln!("  herdr agent send-keys <target> [--allow-cross-pane] <key> [key ...]");
     eprintln!(
-        "  herdr agent prompt <target> <text> [--wait] [--until STATUS]... [--timeout MS] [--allow-cross-pane]"
+        "  herdr agent prompt <target> <text> [--if-draft-empty | --wait [--until STATUS]... [--timeout MS]] [--allow-cross-pane]"
     );
     eprintln!("  herdr agent rename <target> <name>|--clear");
     eprintln!("  herdr agent focus <target>");
@@ -981,7 +1003,7 @@ fn print_agent_help() {
     );
     eprintln!("  targets accept unique agent names and pane ids that currently host agents");
     eprintln!(
-        "  channel-info and prompt-guarded also accept terminal targets without agent detection"
+        "  channel-info, draft-state, and guarded prompts also accept terminal targets without agent detection"
     );
     eprintln!("  kinds: {}", super::spec::agent_kind_values().join("|"));
 }

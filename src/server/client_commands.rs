@@ -14,6 +14,7 @@ const ENDPOINT_RESPONSE_CHUNK_BYTES: usize = 512 * 1024;
 
 const CLIENT_SHELL_METHODS: &[&str] = &[
     "agent.channel_info",
+    "agent.draft_state",
     "agent.prompt_guarded",
     "client_shell.surface.set",
     "command.invoke",
@@ -240,7 +241,7 @@ mod tests {
         }
     }
 
-    fn endpoint_method_shape_digests() -> BTreeMap<String, String> {
+    fn endpoint_method_shape_digests(legacy_guarded_prompt: bool) -> BTreeMap<String, String> {
         let schema = serde_json::to_value(schemars::schema_for!(crate::api::schema::Request))
             .expect("request schema");
         let definitions = schema
@@ -277,6 +278,30 @@ mod tests {
                 collect_schema_refs(definition, &mut referenced_names);
                 selected_definitions.insert(name, normalized_wire_schema(definition));
             }
+            if legacy_guarded_prompt && *method == "agent.prompt_guarded" {
+                // #176's legacy JSON contract stays frozen. Exclude ONLY the optional
+                // AgentPromptGuardedParams.if_draft_empty property: it is separately
+                // advertised by guarded_agent_prompt_if_draft_empty, and the CLI
+                // requires channel_info.draft_guard == true before sending it. Old
+                // servers could otherwise ignore this load-bearing flag and submit.
+                // Keep all other fields, required entries, refs and request branches;
+                // the full guarded shape is independently frozen below.
+                let params = selected_definitions
+                    .get_mut("AgentPromptGuardedParams")
+                    .expect("guarded prompt params definition");
+                assert!(!params["required"]
+                    .as_array()
+                    .expect("required guarded params")
+                    .iter()
+                    .any(|field| field == "if_draft_empty"));
+                assert_eq!(
+                    params["properties"]
+                        .as_object_mut()
+                        .expect("guarded params properties")
+                        .remove("if_draft_empty"),
+                    Some(serde_json::json!({"type": "boolean"}))
+                );
+            }
             let shape = serde_json::json!({
                 "request": normalized_wire_schema(branch),
                 "definitions": selected_definitions,
@@ -295,7 +320,7 @@ mod tests {
             "/tests/fixtures/endpoint-method-shapes-v1.json"
         )))
         .expect("endpoint method shape fixture");
-        let mut actual = endpoint_method_shape_digests();
+        let mut actual = endpoint_method_shape_digests(true);
         // Freeze additive methods separately without rewriting the published fixture.
         assert_eq!(
             actual.remove("agent.channel_info").as_deref(),
@@ -316,6 +341,7 @@ mod tests {
 
         // New optional API surface is not part of the frozen generation-1 fixture.
         // Its canonical params and response are covered by schema::tests.
+        assert!(actual.remove("agent.draft_state").is_some());
         assert!(actual.remove("pane.last_input").is_some());
         assert!(actual.remove("layout.apply_restorable").is_some());
         // Additive, safety-guaranteed topology method, not a generation-1 change.
@@ -331,9 +357,104 @@ mod tests {
     }
 
     #[test]
+    fn draft_guarded_endpoint_shape_is_separately_frozen_and_opt_in() {
+        assert_eq!(
+            endpoint_method_shape_digests(false)
+                .get("agent.prompt_guarded")
+                .map(String::as_str),
+            Some("bd40c327ee86565c527641a10d3fceb74f5f797e69bf9f3bdbdf0f55c13c413b")
+        );
+        let schema = serde_json::to_value(schemars::schema_for!(
+            crate::api::schema::AgentPromptGuardedParams
+        ))
+        .unwrap();
+        assert_eq!(
+            schema["properties"]["if_draft_empty"],
+            serde_json::json!({"type": "boolean"})
+        );
+        assert!(!schema["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|field| field == "if_draft_empty"));
+        let mut wire = serde_json::json!({
+            "id": "guarded", "method": "agent.prompt_guarded", "params": {
+                "target": "pane", "text": "literal", "expected_terminal": "term",
+                "expected_registration_epoch": "epoch", "request_id": "caller"
+            }
+        });
+        for flag in [None, Some(false), Some(true)] {
+            if let Some(flag) = flag {
+                wire["params"]["if_draft_empty"] = flag.into();
+            }
+            let request: crate::api::schema::Request =
+                serde_json::from_value(wire.clone()).unwrap();
+            assert!(supports_client_shell_method(&request.method));
+            let Method::AgentPromptGuarded(params) = &request.method else {
+                panic!("expected guarded prompt");
+            };
+            assert_eq!(params.if_draft_empty, flag.unwrap_or(false));
+            let serialized = serde_json::to_value(request).unwrap();
+            if flag == Some(true) {
+                assert_eq!(serialized, wire);
+            } else {
+                assert!(serialized["params"].get("if_draft_empty").is_none());
+            }
+        }
+        for invalid in [serde_json::Value::Null, "true".into(), 1.into()] {
+            wire["params"]["if_draft_empty"] = invalid;
+            assert!(serde_json::from_value::<crate::api::schema::Request>(wire.clone()).is_err());
+        }
+    }
+
+    #[test]
+    fn draft_state_endpoint_is_advertised_read_only_and_target_only() {
+        assert!(supported_client_shell_method_names().contains(&"agent.draft_state"));
+        assert!(supports_client_shell_method_name("agent.draft_state"));
+        let schema = serde_json::to_value(schemars::schema_for!(
+            crate::api::schema::AgentDraftStateParams
+        ))
+        .unwrap();
+        assert_eq!(
+            schema["properties"],
+            serde_json::json!({"target": {"type": "string"}})
+        );
+        assert_eq!(schema["required"], serde_json::json!(["target"]));
+        assert_eq!(schema["additionalProperties"], false);
+        let wire = serde_json::json!({
+            "id": "draft", "method": "agent.draft_state", "params": {"target": "pane"}
+        });
+        let request: crate::api::schema::Request = serde_json::from_value(wire.clone()).unwrap();
+        assert!(supports_client_shell_method(&request.method));
+        assert!(!crate::api::request_changes_ui(&request));
+        assert_eq!(
+            crate::api::api_method_name(&request.method),
+            "agent.draft_state"
+        );
+        assert_eq!(serde_json::to_value(request).unwrap(), wire);
+        for field in [
+            "text",
+            "empty",
+            "chars",
+            "hold",
+            "if_draft_empty",
+            "timeout_ms",
+        ] {
+            let mut invalid = wire.clone();
+            invalid["params"][field] = true.into();
+            assert!(serde_json::from_value::<crate::api::schema::Request>(invalid).is_err());
+        }
+        for params in [serde_json::json!({}), serde_json::json!({"target": null})] {
+            let mut invalid = wire.clone();
+            invalid["params"] = params;
+            assert!(serde_json::from_value::<crate::api::schema::Request>(invalid).is_err());
+        }
+    }
+
+    #[test]
     fn restorable_layout_endpoint_shape_is_separately_frozen() {
         assert_eq!(
-            endpoint_method_shape_digests()
+            endpoint_method_shape_digests(false)
                 .get("layout.apply_restorable")
                 .map(String::as_str),
             Some("cde5f69cacb72e37d9dd3d98fdf59c6d7589efdef315571056765ad08e744fe3")

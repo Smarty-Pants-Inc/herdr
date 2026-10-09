@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### Added
+- `herdr agent prompt <target> <text> --if-draft-empty` submits only through a registered channel that advertises draft guarding, pins the terminal and registration epoch, and sends once without typing into the terminal or falling back. Pi checks that the editor is empty and no dialog, custom UI, or editor hold is active at admission; existing drafts are left untouched. The same guard is available on `agent prompt-guarded`. `herdr agent draft-state <target>` reports read-only empty/character-count/hold metadata without exposing draft text; unavailable state is reported as unknown. (#5938)
+
 ## [0.9.3] - 2026-09-29
 
 This is a hotfix release for v0.9.2. See the v0.9.2 notes for the full feature release: https://github.com/herdrdev/herdr/releases/tag/v0.9.2

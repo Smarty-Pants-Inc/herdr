@@ -717,6 +717,7 @@ type ChannelConnection = {
   generation: string;
   closed: boolean;
   acks: Record<string, any>[];
+  draftStates: Record<string, any>[];
 };
 
 async function startChannelServer(
@@ -752,6 +753,7 @@ async function startChannelServer(
             generation: request.params.session_generation,
             closed: false,
             acks: [],
+            draftStates: [],
           };
           connections.push(connection);
           const response = {
@@ -767,6 +769,8 @@ async function startChannelServer(
           else socket.write(`${JSON.stringify(response)}\n`);
         } else if (request.type === "ack" && connection) {
           connection.acks.push(request);
+        } else if (request.type === "draft_state" && connection) {
+          connection.draftStates.push(request);
         } else {
           reports.push(request);
           socket.end("{}\n");
@@ -949,7 +953,7 @@ registeredChannelTest("Pi waits for a whole correlated registration response the
 for (const receipt of [
   { status: "accepted", duplicate: true },
   { status: "queued", duplicate: true },
-  ...["no_session", "session_changed", "payload_mismatch", "shutting_down", "admission_refused", "unsupported"]
+  ...["no_session", "session_changed", "payload_mismatch", "shutting_down", "admission_refused", "unsupported", "unknown", "draft_present", "ui_hold", "expired"]
     .map((reason) => ({ status: "rejected", reason, duplicate: true })),
 ] as const) {
   registeredChannelTest(`Pi maps typed ${receipt.status} ${"reason" in receipt ? receipt.reason : "receipt"} to snake_case ACK`, async () => {
@@ -1654,4 +1658,535 @@ registeredChannelTest("Pi reload/session_shutdown idempotently closes the old so
   old.handlers.get("agent_start")?.({}, channelContext());
   await Bun.sleep(30);
   expect(reports).toHaveLength(before);
+});
+
+// Draft access is deliberately a UI fixture, not terminal/screen capture. These tests prove
+// transport redaction and callback ordering; they do not qualify real Pi core admission.
+function draftContext(ui: Record<string, any> = {}) {
+  return {
+    ...channelContext(),
+    ui: { getEditorText: () => "", holdState: () => undefined, ...ui },
+  };
+}
+
+function guardedDeliver(connection: ChannelConnection, requestId = "guarded", text = "remote prompt", guard = true) {
+  connection.socket.write(`${JSON.stringify({
+    ...delivery(connection, requestId, text), if_draft_empty: guard,
+    ...(guard ? { deadline_ms: Date.now() + 60_000 } : {}),
+  })}\n`);
+}
+
+function queryDraft(connection: ChannelConnection, requestId = "draft-query", fields: Record<string, unknown> = {}) {
+  connection.socket.write(`${JSON.stringify({
+    type: "draft_state", registration_epoch: connection.epoch,
+    request_id: requestId, session_generation: connection.generation, ...fields,
+  })}\n`);
+}
+
+registeredChannelTest("Pi draft guard advertises only callable editor/hold APIs alongside receipt ingress", async () => {
+  const { connections } = await startChannelServer();
+  const asset = await loadChannelAsset(accepted);
+  const contexts = [
+    draftContext(), channelContext(), draftContext({ getEditorText: undefined }),
+    draftContext({ holdState: undefined }), draftContext({ getEditorText: "not callable" }),
+    draftContext({ holdState: "not callable" }),
+  ];
+  for (const [index, context] of contexts.entries()) {
+    await asset.handlers.get("session_start")?.({}, context);
+    await waitFor(() => connections.length === index + 1);
+    expect(connections[index].registration.params.draft_guard === true).toBe(index === 0);
+  }
+  expect(asset.calls).toEqual([]);
+});
+
+registeredChannelTest("Pi draft guard remains unregistered without receipt ingress even with UI APIs", async () => {
+  const { connections, reports } = await startChannelServer();
+  const asset = await loadChannelAsset();
+  await asset.handlers.get("session_start")?.({}, draftContext());
+  await waitFor(() => reports.length === 1);
+  expect(connections).toEqual([]);
+  expect(asset.calls).toEqual([]);
+});
+
+for (const draft of ["in-progress draft", " ", "\t\r\n  ", "\u00a0\u200b", "👩🏽‍💻 e\u0301 羊\n"]) {
+  registeredChannelTest(`Pi guarded nonempty draft stays byte-identical ${JSON.stringify(draft)}`, async () => {
+    const { connections } = await startChannelServer();
+    const asset = await loadChannelAsset(accepted);
+    let editor = draft;
+    let mutations = 0;
+    let fallbackCalls = 0;
+    Object.assign(asset.pi, { sendUserMessage: () => { fallbackCalls += 1; } });
+    await asset.handlers.get("session_start")?.({}, draftContext({
+      getEditorText: () => editor,
+      setEditorText: (value: string) => { mutations += 1; editor = value; },
+      pasteToEditor: (value: string) => { mutations += 1; editor += value; },
+    }));
+    await waitFor(() => connections.length === 1);
+    guardedDeliver(connections[0]);
+    await waitFor(() => connections[0].acks.length === 1);
+    expect(connections[0].acks[0]).toEqual({
+      type: "ack", registration_epoch: "epoch-1", request_id: "guarded",
+      session_generation: "session-1", status: "rejected", reason: "draft_present",
+    });
+    expect(Buffer.from(editor)).toEqual(Buffer.from(draft));
+    expect(asset.calls).toEqual([]);
+    expect(mutations).toBe(0);
+    expect(fallbackCalls).toBe(0);
+  });
+}
+
+registeredChannelTest("Pi guarded empty draft submits exactly once and leaves editor empty", async () => {
+  const { connections } = await startChannelServer();
+  let editor = "";
+  let mutations = 0;
+  const asset = await loadChannelAsset(async (request) => {
+    expect(editor).toBe("");
+    return accepted(request);
+  });
+  await asset.handlers.get("session_start")?.({}, draftContext({
+    getEditorText: () => editor,
+    setEditorText: (value: string) => { mutations += 1; editor = value; },
+    pasteToEditor: (value: string) => { mutations += 1; editor += value; },
+  }));
+  await waitFor(() => connections.length === 1);
+  guardedDeliver(connections[0]);
+  await waitFor(() => connections[0].acks.length === 1);
+  guardedDeliver(connections[0]);
+  await waitFor(() => connections[0].acks.length === 2);
+  expect(asset.calls).toEqual([{
+    registrationEpoch: "epoch-1", requestId: "guarded", sessionGeneration: "session-1",
+    text: "remote prompt", deliverAs: "followUp", expandPromptTemplates: false,
+  }]);
+  expect(connections[0].acks[1]).toMatchObject({ status: "accepted", duplicate: true });
+  expect(editor).toBe("");
+  expect(mutations).toBe(0);
+});
+
+registeredChannelTest("Pi guarded checks and invokes in the same socket callback before any microtask, then waits only for receipt", async () => {
+  const { connections } = await startChannelServer();
+  let insideData = false;
+  net.createConnection = ((...args: unknown[]) => {
+    const socket = Reflect.apply(originalCreateConnection, net, args) as net.Socket;
+    const on = socket.on;
+    socket.on = function (event: string, handler: (...values: any[]) => void) {
+      if (event !== "data") return Reflect.apply(on, this, [event, handler]);
+      return Reflect.apply(on, this, [event, (...values: any[]) => {
+        insideData = true;
+        try { handler(...values); } finally { insideData = false; }
+      }]);
+    } as typeof socket.on;
+    return socket;
+  }) as typeof net.createConnection;
+  const order: string[] = [];
+  const pending = deferred<AdmissionReceipt>();
+  const asset = await loadChannelAsset(() => {
+    expect(insideData).toBe(true);
+    order.push("submit");
+    return pending.promise;
+  });
+  await asset.handlers.get("session_start")?.({}, draftContext({
+    getEditorText() {
+      expect(insideData).toBe(true);
+      order.push("editor");
+      queueMicrotask(() => order.push("microtask"));
+      return "";
+    },
+    holdState() { expect(insideData).toBe(true); order.push("hold"); return undefined; },
+  }));
+  await waitFor(() => connections.length === 1);
+  guardedDeliver(connections[0]);
+  await waitFor(() => order.includes("microtask"));
+  expect(order).toEqual(["editor", "hold", "submit", "microtask"]);
+  expect(asset.calls).toHaveLength(1);
+  expect(connections[0].acks).toEqual([]);
+  pending.resolve({ status: "queued", sessionGeneration: "session-1" });
+  await waitFor(() => connections[0].acks.length === 1);
+  expect(connections[0].acks[0].status).toBe("queued");
+});
+
+for (const inputBeforeCheck of [true, false]) {
+  registeredChannelTest(`Pi guarded queued keystroke race isolates the prompt and preserves the draft (input before check: ${inputBeforeCheck})`, async () => {
+    const { connections } = await startChannelServer();
+    const queuedInput = " \tuser keystrokes 👩🏽‍💻 e\u0301\n";
+    const remotePrompt = "isolated remote follow-up";
+    let editor = "";
+    let mutations = 0;
+    const pending = deferred<AdmissionReceipt>();
+    const asset = await loadChannelAsset((request) => {
+      expect(editor).toBe("");
+      expect(request.text).toBe(remotePrompt);
+      return pending.promise;
+    });
+    await asset.handlers.get("session_start")?.({}, draftContext({
+      getEditorText: () => {
+        if (!inputBeforeCheck) queueMicrotask(() => { editor = queuedInput; });
+        return editor;
+      },
+      setEditorText: (value: string) => { mutations += 1; editor = value; },
+      pasteToEditor: (value: string) => { mutations += 1; editor += value; },
+    }));
+    await waitFor(() => connections.length === 1);
+    const connection = connections[0];
+    if (inputBeforeCheck) {
+      queueMicrotask(() => { editor = queuedInput; });
+      await Promise.resolve();
+    }
+    guardedDeliver(connection, "keystroke-race", remotePrompt);
+    await waitFor(() => editor === queuedInput && (inputBeforeCheck ? connection.acks.length === 1 : asset.calls.length === 1));
+    if (inputBeforeCheck) {
+      expect(asset.calls).toEqual([]);
+      expect(connection.acks[0]).toMatchObject({ status: "rejected", reason: "draft_present" });
+    } else {
+      expect(connection.acks).toEqual([]); // Awaiting only receipt cannot consume later keystrokes.
+      expect(asset.calls.map((request) => request.text)).toEqual([remotePrompt]);
+      pending.resolve({ status: "queued", sessionGeneration: "session-1" });
+      await waitFor(() => connection.acks.length === 1);
+      expect(connection.acks[0].status).toBe("queued");
+    }
+    expect(Buffer.from(editor)).toEqual(Buffer.from(queuedInput));
+    expect(mutations).toBe(0);
+  });
+}
+
+for (const hold of ["dialog", "custom", "editor"]) {
+  registeredChannelTest(`Pi guarded active ${hold} hold refuses ingress`, async () => {
+    const { connections } = await startChannelServer();
+    const asset = await loadChannelAsset(accepted);
+    await asset.handlers.get("session_start")?.({}, draftContext({ holdState: () => hold }));
+    await waitFor(() => connections.length === 1);
+    guardedDeliver(connections[0]);
+    await waitFor(() => connections[0].acks.length === 1);
+    expect(connections[0].acks[0]).toMatchObject({ status: "rejected", reason: "ui_hold" });
+    expect(asset.calls).toEqual([]);
+  });
+}
+
+const unavailableDraftUIs: Array<[string, () => Record<string, any> | undefined, string?]> = [
+  ["missing UI", () => undefined],
+  ["missing editor getter", () => ({ getEditorText: undefined, holdState: () => undefined })],
+  ["missing hold API", () => ({ getEditorText: () => "", holdState: undefined })],
+  ["throwing editor getter", () => ({ getEditorText: () => { throw new Error("secret draft"); }, holdState: () => undefined })],
+  ["throwing hold API", () => ({ getEditorText: () => "", holdState: () => { throw new Error("secret hold"); } })],
+  ["non-string editor", () => ({ getEditorText: () => 123, holdState: () => undefined })],
+  ["async editor", () => ({ getEditorText: async () => "", holdState: () => undefined })],
+  ["async hold", () => ({ getEditorText: () => "", holdState: async () => undefined }), "ui_hold"],
+  ["invalid hold", () => ({ getEditorText: () => "", holdState: () => "invented secret" }), "ui_hold"],
+  ["null hold", () => ({ getEditorText: () => "", holdState: () => null }), "ui_hold"],
+  ["false hold", () => ({ getEditorText: () => "", holdState: () => false }), "ui_hold"],
+  ["object hold", () => ({ getEditorText: () => "", holdState: () => ({ text: "secret hold" }) }), "ui_hold"],
+  ["throwing getter property", () => ({ get getEditorText() { throw new Error("secret property"); }, holdState: () => undefined })],
+  ["throwing hold property", () => ({ getEditorText: () => "", get holdState() { throw new Error("secret property"); } })],
+];
+
+for (const [name, makeUI, guardReason = "unknown"] of unavailableDraftUIs) {
+  registeredChannelTest(`Pi guarded and draft query fail closed (${guardReason}/unknown) for ${name}`, async () => {
+    const { connections } = await startChannelServer();
+    const asset = await loadChannelAsset(accepted);
+    const context = { ...channelContext(), ui: makeUI() };
+    await asset.handlers.get("session_start")?.({}, context);
+    await waitFor(() => connections.length === 1);
+    const connection = connections[0];
+    guardedDeliver(connection);
+    queryDraft(connection);
+    await waitFor(() => connection.acks.length === 1 && connection.draftStates.length === 1);
+    expect(connection.acks[0]).toMatchObject({ status: "rejected", reason: guardReason });
+    expect(connection.draftStates[0]).toEqual({
+      type: "draft_state", registration_epoch: "epoch-1", request_id: "draft-query",
+      session_generation: "session-1", unknown: true,
+    });
+    expect(asset.calls).toEqual([]);
+    expect(JSON.stringify([...connection.acks, ...connection.draftStates])).not.toContain("secret");
+  });
+}
+
+registeredChannelTest("Pi guarded APIs removed after registration fail closed without hiding unguarded ingress", async () => {
+  const { connections } = await startChannelServer();
+  const asset = await loadChannelAsset(accepted);
+  const context = draftContext();
+  await asset.handlers.get("session_start")?.({}, context);
+  await waitFor(() => connections.length === 1);
+  expect(connections[0].registration.params.draft_guard).toBe(true);
+  context.ui.holdState = undefined;
+  guardedDeliver(connections[0]);
+  await waitFor(() => connections[0].acks.length === 1);
+  expect(connections[0].acks[0].reason).toBe("unknown");
+  deliver(connections[0], "unguarded");
+  await waitFor(() => connections[0].acks.length === 2);
+  expect(asset.calls.map((call) => call.requestId)).toEqual(["unguarded"]);
+});
+
+for (const guardedFirst of [false, true]) {
+  registeredChannelTest(`Pi guarded duplicate flag mismatch is rejected pending and completed (${guardedFirst})`, async () => {
+    const { connections } = await startChannelServer();
+    const pending = deferred<AdmissionReceipt>();
+    const asset = await loadChannelAsset(() => pending.promise);
+    await asset.handlers.get("session_start")?.({}, draftContext());
+    await waitFor(() => connections.length === 1);
+    const connection = connections[0];
+    guardedDeliver(connection, "same-id", "hello", guardedFirst);
+    await waitFor(() => asset.calls.length === 1);
+    guardedDeliver(connection, "same-id", "hello", guardedFirst);
+    guardedDeliver(connection, "same-id", "hello", !guardedFirst);
+    // The mismatch ACK also fences parsing of the matching pending duplicate before receipt.
+    await waitFor(() => connection.acks.length === 1);
+    expect(connection.acks[0].reason).toBe("payload_mismatch");
+    pending.resolve({ status: "accepted", sessionGeneration: "session-1" });
+    await waitFor(() => connection.acks.length === 2);
+    expect(connection.acks[1]).toMatchObject({ status: "accepted", duplicate: true });
+    guardedDeliver(connection, "same-id", "hello", !guardedFirst);
+    await waitFor(() => connection.acks.length === 3);
+    expect(connection.acks[2].reason).toBe("payload_mismatch");
+    expect(asset.calls).toHaveLength(1);
+  });
+}
+
+registeredChannelTest("Pi guarded refusal is retained across draft edits; absent and false guards share old identity", async () => {
+  const { connections } = await startChannelServer();
+  const asset = await loadChannelAsset(accepted);
+  let editor = "private draft";
+  await asset.handlers.get("session_start")?.({}, draftContext({ getEditorText: () => editor }));
+  await waitFor(() => connections.length === 1);
+  const connection = connections[0];
+  guardedDeliver(connection);
+  await waitFor(() => connection.acks.length === 1);
+  editor = ""; // A user's later edit must not turn a retried rejection into an admission.
+  guardedDeliver(connection);
+  await waitFor(() => connection.acks.length === 2);
+  expect(connection.acks[1]).toMatchObject({ reason: "draft_present", duplicate: true });
+  guardedDeliver(connection, "guarded", "remote prompt", false);
+  await waitFor(() => connection.acks.length === 3);
+  expect(connection.acks[2].reason).toBe("payload_mismatch");
+  deliver(connection, "old", "hello");
+  await waitFor(() => connection.acks.length === 4);
+  guardedDeliver(connection, "old", "hello", false);
+  await waitFor(() => connection.acks.length === 5);
+  expect(connection.acks[4]).toMatchObject({ status: "accepted", duplicate: true });
+  expect(asset.calls).toHaveLength(1);
+});
+
+registeredChannelTest("Pi guarded retired-epoch requests are fenced even when the guard flag changes", async () => {
+  const { connections } = await startChannelServer();
+  const pending = deferred<AdmissionReceipt>();
+  const asset = await loadChannelAsset((request) => request.registrationEpoch === "epoch-1" ? pending.promise : accepted(request));
+  await asset.handlers.get("session_start")?.({}, draftContext());
+  await waitFor(() => connections.length === 1);
+  const old = connections[0];
+  guardedDeliver(old, "same-id", "hello");
+  await waitFor(() => asset.calls.length === 1);
+  rotate(old);
+  await waitFor(() => connections.length === 2 && old.closed);
+  const fresh = connections[1];
+  for (const guard of [true, false]) {
+    fresh.socket.write(`${JSON.stringify({ ...delivery(old, "same-id", "hello"), if_draft_empty: guard })}\n`);
+  }
+  pending.resolve({ status: "accepted", sessionGeneration: "session-1" });
+  await Bun.sleep(30);
+  expect(fresh.acks).toEqual([]);
+  expect(asset.calls).toHaveLength(1);
+  guardedDeliver(fresh, "same-id", "hello");
+  await waitFor(() => fresh.acks.length === 1);
+  guardedDeliver(fresh, "same-id", "hello", false);
+  await waitFor(() => fresh.acks.length === 2);
+  expect(fresh.acks[1].reason).toBe("payload_mismatch");
+  expect(asset.calls).toHaveLength(2);
+  expect(old.acks).toEqual([]);
+});
+
+registeredChannelTest("Pi guarded rejects nonboolean flags without interpreting truthy input as permission", async () => {
+  const { connections } = await startChannelServer();
+  const asset = await loadChannelAsset(accepted);
+  await asset.handlers.get("session_start")?.({}, draftContext());
+  await waitFor(() => connections.length === 1);
+  const connection = connections[0];
+  for (const flag of ["true", "false", 0, 1, null, {}, []]) {
+    connection.socket.write(`${JSON.stringify({ ...delivery(connection), if_draft_empty: flag })}\n`);
+  }
+  await Bun.sleep(30);
+  expect(asset.calls).toEqual([]);
+  expect(connection.acks).toEqual([]);
+});
+
+for (const [draft, hold] of [["", undefined], [" \n🐑e\u0301", "dialog"], ["secret: 🎉", "custom"], ["\t", "editor"]] as const) {
+  registeredChannelTest(`Pi draft query returns typed redacted read-only state ${JSON.stringify([draft, hold])}`, async () => {
+    const { connections } = await startChannelServer();
+    let mutations = 0;
+    const asset = await loadChannelAsset(accepted);
+    await asset.handlers.get("session_start")?.({}, draftContext({
+      getEditorText: () => draft, holdState: () => hold,
+      setEditorText: () => { mutations += 1; }, pasteToEditor: () => { mutations += 1; },
+    }));
+    await waitFor(() => connections.length === 1);
+    const connection = connections[0];
+    queryDraft(connection, "read-only", { text: "caller-supplied secret", empty: true, chars: 0, hold: null });
+    await waitFor(() => connection.draftStates.length === 1);
+    expect(connection.draftStates[0]).toEqual({
+      type: "draft_state", registration_epoch: "epoch-1", request_id: "read-only",
+      session_generation: "session-1", empty: draft.length === 0,
+      chars: Array.from(draft).length, hold: hold ?? null,
+    });
+    expect(typeof connection.draftStates[0].empty).toBe("boolean");
+    expect(Number.isSafeInteger(connection.draftStates[0].chars)).toBe(true);
+    expect(connection.draftStates[0]).not.toHaveProperty("text");
+    expect(connection.draftStates[0]).not.toHaveProperty("draft");
+    expect(JSON.stringify(connection.draftStates)).not.toContain("secret");
+    expect(asset.calls).toEqual([]);
+    expect(connection.acks).toEqual([]);
+    expect(mutations).toBe(0);
+  });
+}
+
+registeredChannelTest("Pi draft query is fresh, not a delivery reservation or permission for a later guarded prompt", async () => {
+  const { connections } = await startChannelServer();
+  const asset = await loadChannelAsset(accepted);
+  let editor = "";
+  await asset.handlers.get("session_start")?.({}, draftContext({ getEditorText: () => editor }));
+  await waitFor(() => connections.length === 1);
+  const connection = connections[0];
+  queryDraft(connection, "shared-id");
+  await waitFor(() => connection.draftStates.length === 1);
+  expect(connection.draftStates[0].empty).toBe(true);
+  editor = "user typed after the snapshot";
+  queryDraft(connection, "shared-id");
+  await waitFor(() => connection.draftStates.length === 2);
+  expect(connection.draftStates[1].empty).toBe(false);
+  guardedDeliver(connection, "shared-id", "hello");
+  await waitFor(() => connection.acks.length === 1);
+  expect(connection.acks[0].reason).toBe("draft_present");
+  expect(asset.calls).toEqual([]);
+});
+
+registeredChannelTest("Pi draft query ignores invalid correlation and changed session without observing the editor", async () => {
+  const { connections } = await startChannelServer();
+  const asset = await loadChannelAsset(accepted);
+  let reads = 0;
+  const context = draftContext({ getEditorText: () => { reads += 1; return "private"; } });
+  await asset.handlers.get("session_start")?.({}, context);
+  await waitFor(() => connections.length === 1);
+  const connection = connections[0];
+  for (const fields of [
+    { registration_epoch: "old" }, { session_generation: "old" }, { request_id: "" },
+    { request_id: 1 }, { request_id: null }, { request_id: "🐑".repeat(257) },
+    { registration_epoch: null }, { session_generation: null },
+  ]) queryDraft(connection, "invalid", fields);
+  context.userMessageSessionGeneration = "session-2";
+  queryDraft(connection);
+  await Bun.sleep(30);
+  expect(reads).toBe(0);
+  expect(connection.draftStates).toEqual([]);
+  expect(asset.calls).toEqual([]);
+});
+
+registeredChannelTest("Pi guarded expired delayed frame rejects before UI access and preserves draft byte-identically", async () => {
+  const { connections } = await startChannelServer();
+  const asset = await loadChannelAsset(accepted);
+  const editor = " \tprivate unsent draft 👩🏽‍💻 e\u0301\n";
+  let reads = 0;
+  let mutations = 0;
+  await asset.handlers.get("session_start")?.({}, draftContext({
+    getEditorText: () => { reads += 1; return editor; },
+    holdState: () => { reads += 1; return undefined; },
+    setEditorText: () => { mutations += 1; }, pasteToEditor: () => { mutations += 1; },
+  }));
+  await waitFor(() => connections.length === 1);
+  const connection = connections[0];
+  const frame = { ...delivery(connection, "expired"), if_draft_empty: true, deadline_ms: Date.now() + 10 };
+  const before = Buffer.from(editor);
+  await Bun.sleep(20); // A frame delayed in transit arrives after its first-reservation deadline.
+  connection.socket.write(`${JSON.stringify(frame)}\n`);
+  await waitFor(() => connection.acks.length === 1);
+  expect(connection.acks[0]).toMatchObject({ status: "rejected", reason: "expired" });
+  expect(asset.calls).toEqual([]);
+  expect(reads).toBe(0);
+  expect(mutations).toBe(0);
+  expect(Buffer.from(editor)).toEqual(before);
+  // Expiry is a retained result. A later timeout/deadline value is not payload identity and
+  // cannot renew the first reservation or change a rejected request into an admission.
+  guardedDeliver(connection, "expired", "hello");
+  await waitFor(() => connection.acks.length === 2);
+  expect(connection.acks[1]).toMatchObject({ reason: "expired", duplicate: true });
+  expect(asset.calls).toEqual([]);
+});
+
+for (const [name, deadline] of [
+  ["missing", undefined], ["null", null], ["string", "9999999999999"],
+  ["fractional", 9999999999999.5], ["unsafe", Number.MAX_SAFE_INTEGER + 1],
+  ["object", {}], ["array", []],
+] as const) {
+  registeredChannelTest(`Pi guarded deadline ${name} fails closed unknown before UI access`, async () => {
+    const { connections } = await startChannelServer();
+    const asset = await loadChannelAsset(accepted);
+    let reads = 0;
+    await asset.handlers.get("session_start")?.({}, draftContext({
+      getEditorText: () => { reads += 1; return "private draft"; },
+      holdState: () => { reads += 1; return undefined; },
+    }));
+    await waitFor(() => connections.length === 1);
+    const connection = connections[0];
+    connection.socket.write(`${JSON.stringify({ ...delivery(connection), if_draft_empty: true, deadline_ms: deadline })}\n`);
+    await waitFor(() => connection.acks.length === 1);
+    expect(connection.acks[0]).toMatchObject({ status: "rejected", reason: "unknown" });
+    expect(asset.calls).toEqual([]);
+    expect(reads).toBe(0);
+  });
+}
+
+registeredChannelTest("Pi guarded deadline elapsed during synchronous UI inspection refuses before submit", async () => {
+  const { connections } = await startChannelServer();
+  const asset = await loadChannelAsset(accepted);
+  const deadline = Date.now() + 60_000;
+  const originalNow = Date.now;
+  try {
+    await asset.handlers.get("session_start")?.({}, draftContext({
+      getEditorText: () => "",
+      holdState: () => {
+        Date.now = () => deadline;
+        queueMicrotask(() => { Date.now = originalNow; });
+        return undefined;
+      },
+    }));
+    await waitFor(() => connections.length === 1);
+    const connection = connections[0];
+    connection.socket.write(`${JSON.stringify({ ...delivery(connection), if_draft_empty: true, deadline_ms: deadline })}\n`);
+    await waitFor(() => connection.acks.length === 1);
+    expect(connection.acks[0]).toMatchObject({ status: "rejected", reason: "expired" });
+    expect(asset.calls).toEqual([]);
+  } finally {
+    Date.now = originalNow;
+  }
+});
+
+for (const deadline of ["1e999", "-1e999"]) {
+  registeredChannelTest(`Pi guarded deadline nonfinite ${deadline} fails closed unknown`, async () => {
+    const { connections } = await startChannelServer();
+    const asset = await loadChannelAsset(accepted);
+    await asset.handlers.get("session_start")?.({}, draftContext());
+    await waitFor(() => connections.length === 1);
+    const connection = connections[0];
+    // JSON.parse accepts exponent overflow as Infinity; validation must still reject it.
+    const frame = JSON.stringify({ ...delivery(connection), if_draft_empty: true, deadline_ms: "deadline-placeholder" });
+    connection.socket.write(`${frame.replace('"deadline-placeholder"', deadline)}\n`);
+    await waitFor(() => connection.acks.length === 1);
+    expect(connection.acks[0]).toMatchObject({ status: "rejected", reason: "unknown" });
+    expect(asset.calls).toEqual([]);
+  });
+}
+
+registeredChannelTest("Pi guarded expiry after possible admission does not invent a rejection or resubmit", async () => {
+  const { connections } = await startChannelServer();
+  const pending = deferred<AdmissionReceipt>();
+  const asset = await loadChannelAsset(() => pending.promise);
+  await asset.handlers.get("session_start")?.({}, draftContext());
+  await waitFor(() => connections.length === 1);
+  const connection = connections[0];
+  const deadline = Date.now() + 100;
+  connection.socket.write(`${JSON.stringify({ ...delivery(connection), if_draft_empty: true, deadline_ms: deadline })}\n`);
+  await waitFor(() => asset.calls.length === 1);
+  await Bun.sleep(Math.max(0, deadline - Date.now()) + 10);
+  expect(Date.now() >= deadline).toBe(true);
+  expect(connection.acks).toEqual([]); // No proof of non-admission while the receipt is pending.
+  pending.reject(new Error("possibly admitted before timeout"));
+  await waitFor(() => connection.closed && connections.length === 2);
+  expect(connection.acks).toEqual([]); // Herdr must retain delivery_unknown, never expired/zero sent.
+  expect(connections[1].acks).toEqual([]);
+  expect(asset.calls).toHaveLength(1);
 });

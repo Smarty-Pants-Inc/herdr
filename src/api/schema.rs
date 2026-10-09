@@ -173,6 +173,8 @@ pub enum Method {
     AgentRegisterSelf(AgentRegisterSelfParams),
     #[serde(rename = "agent.channel_info")]
     AgentChannelInfo(AgentChannelInfoParams),
+    #[serde(rename = "agent.draft_state")]
+    AgentDraftState(AgentDraftStateParams),
     #[serde(rename = "agent.prompt_guarded")]
     AgentPromptGuarded(AgentPromptGuardedParams),
     #[serde(rename = "agent.wait")]

@@ -30,6 +30,10 @@ const CHANNEL_REASONS = new Set([
   "shutting_down",
   "admission_refused",
   "unsupported",
+  "unknown",
+  "draft_present",
+  "ui_hold",
+  "expired",
 ]);
 
 function enabled() {
@@ -242,7 +246,13 @@ export default function (pi) {
   // number of registrations over the extension's lifetime.
   const usedEpochs = new Set<string>();
   const recentEpochs: string[] = [];
-  type LedgerEntry = { epoch: string; text: string; receipt?: Record<string, any>; duplicate: boolean };
+  type LedgerEntry = {
+    epoch: string;
+    text: string;
+    ifDraftEmpty: boolean;
+    receipt?: Record<string, any>;
+    duplicate: boolean;
+  };
   const ledger = new Map<string, LedgerEntry>();
   // Keep unresolved calls counted across reconnect/session replacement: an old callback must not
   // free a newer request's slot, and repeated replacement cannot create unlimited pending calls.
@@ -364,6 +374,60 @@ export default function (pi) {
     sendChannelFrame(socket, token, frame);
   }
 
+  function draftGuardAvailable(ctx: any): boolean {
+    try {
+      return typeof pi.submitUserMessage === "function" &&
+        typeof ctx?.ui?.getEditorText === "function" &&
+        typeof ctx?.ui?.holdState === "function";
+    } catch {
+      return false;
+    }
+  }
+
+  function readDraftSnapshot(): { empty: boolean; chars: number; hold: unknown } | undefined {
+    try {
+      const ui = currentContext?.ui;
+      if (typeof ui?.getEditorText !== "function" || typeof ui?.holdState !== "function") return undefined;
+      // These are synchronous snapshots, not a UI lock. Never scrape terminal output, retain
+      // draft text, or use editor-mutating/typing APIs. A non-string draft fails closed.
+      const draft = ui.getEditorText();
+      if (typeof draft !== "string") return undefined;
+      const hold = ui.holdState();
+      let chars = 0;
+      // Count Unicode code points without allocating a second copy of the private draft.
+      for (const _char of draft) chars += 1;
+      return { empty: draft.length === 0, chars, hold };
+    } catch {
+      return undefined;
+    }
+  }
+
+  function handleDraftState(socket: any, token: number, frame: Record<string, any>) {
+    if (
+      token !== channelGeneration ||
+      socket !== channelSocket ||
+      !channelReady ||
+      channelClosing ||
+      socket.destroyed ||
+      frame.registration_epoch !== channelEpoch ||
+      frame.session_generation !== channelSessionGeneration ||
+      currentContext?.userMessageSessionGeneration !== channelSessionGeneration ||
+      !validChannelId(frame.request_id)
+    ) return;
+    const state = readDraftSnapshot();
+    const known = state && (state.hold === undefined || state.hold === "dialog" ||
+      state.hold === "custom" || state.hold === "editor");
+    // Construct a whitelist-only reply; caller fields, exception messages, foreign hold values
+    // and draft text are never echoed. Queries neither reserve IDs nor authorize submissions.
+    sendChannelFrame(socket, token, {
+      type: "draft_state",
+      registration_epoch: channelEpoch,
+      request_id: frame.request_id,
+      session_generation: channelSessionGeneration,
+      ...(known ? { empty: state.empty, chars: state.chars, hold: state.hold ?? null } : { unknown: true }),
+    });
+  }
+
   function handleDeliver(socket: any, token: number, frame: Record<string, any>) {
     if (
       token !== channelGeneration ||
@@ -374,7 +438,8 @@ export default function (pi) {
       frame.session_generation !== channelSessionGeneration ||
       !validChannelId(frame.request_id) ||
       typeof frame.text !== "string" ||
-      frame.text.length === 0
+      frame.text.length === 0 ||
+      (frame.if_draft_empty !== undefined && typeof frame.if_draft_empty !== "boolean")
     ) {
       return;
     }
@@ -382,9 +447,10 @@ export default function (pi) {
     const requestId = frame.request_id;
     const registrationEpoch = channelEpoch;
     const expectedSessionGeneration = channelSessionGeneration;
+    const ifDraftEmpty = frame.if_draft_empty === true;
     const prior = ledger.get(requestId);
     if (prior) {
-      if (prior.text !== frame.text) {
+      if (prior.text !== frame.text || prior.ifDraftEmpty !== ifDraftEmpty) {
         acknowledge(
           socket,
           token,
@@ -416,7 +482,7 @@ export default function (pi) {
       return;
     }
 
-    const entry: LedgerEntry = { epoch: registrationEpoch, text: frame.text, duplicate: false };
+    const entry: LedgerEntry = { epoch: registrationEpoch, text: frame.text, ifDraftEmpty, duplicate: false };
     ledger.set(requestId, entry); // Reserve before invoking Pi, including known capacity failures.
     if (inflight.size >= MAX_CHANNEL_INFLIGHT) {
       entry.receipt = receiptForError("admission_refused", expectedSessionGeneration);
@@ -425,7 +491,7 @@ export default function (pi) {
     }
     inflight.add(entry);
     const text = frame.text;
-    const call = Promise.resolve().then(async () => {
+    const admit = async () => {
       if (
         token !== channelGeneration ||
         socket !== channelSocket ||
@@ -435,6 +501,18 @@ export default function (pi) {
         typeof pi.submitUserMessage !== "function"
       ) {
         return receiptForError("session_changed", expectedSessionGeneration);
+      }
+      if (ifDraftEmpty) {
+        if (!Number.isSafeInteger(frame.deadline_ms)) return receiptForError("unknown", expectedSessionGeneration);
+        if (Date.now() >= frame.deadline_ms) return receiptForError("expired", expectedSessionGeneration);
+        const state = readDraftSnapshot();
+        if (!state) return receiptForError("unknown", expectedSessionGeneration);
+        if (!state.empty) return receiptForError("draft_present", expectedSessionGeneration);
+        // The public API's only no-hold sentinel is undefined. Even an unfamiliar or malformed
+        // non-undefined hold must refuse admission; only draft queries require the known union.
+        if (state.hold !== undefined) return receiptForError("ui_hold", expectedSessionGeneration);
+        // Slow synchronous UI implementations cannot extend the first-reservation deadline.
+        if (Date.now() >= frame.deadline_ms) return receiptForError("expired", expectedSessionGeneration);
       }
       try {
         // This is the receipt-returning Pi ingress. The old void API is intentionally not a
@@ -451,7 +529,11 @@ export default function (pi) {
       } catch {
         return undefined; // Possible admission without a usable receipt is unknown, not rejection.
       }
-    });
+    };
+    // Guarded ingress must run in this very socket callback: no await, Promise scheduling or
+    // event-loop gap between observing the editor/hold and invoking submitUserMessage. Only
+    // its receipt is awaited. Preserve the existing deferred/fenced path for unguarded input.
+    const call = ifDraftEmpty ? admit() : Promise.resolve().then(admit);
     void call.then((receipt) => {
       inflight.delete(entry);
       pruneEpochs();
@@ -563,7 +645,10 @@ export default function (pi) {
         `${JSON.stringify({
           id: registrationId,
           method: "agent.register_self",
-          params: { session_generation: expectedSessionGeneration },
+          params: {
+            session_generation: expectedSessionGeneration,
+            ...(draftGuardAvailable(ctx) ? { draft_guard: true } : {}),
+          },
         })}\n`,
       );
     });
@@ -625,6 +710,8 @@ export default function (pi) {
         }
         if (isRecord(parsed) && parsed.type === "deliver") {
           handleDeliver(socket, token, parsed);
+        } else if (isRecord(parsed) && parsed.type === "draft_state") {
+          handleDraftState(socket, token, parsed);
         } else if (isRecord(parsed) && parsed.type === "rotate") {
           handleRotate(socket, token, parsed);
         }

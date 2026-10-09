@@ -1239,6 +1239,19 @@
           ],
           "type": "object"
         },
+        "AgentDraftStateParams": {
+          "additionalProperties": false,
+          "description": "A read-only observation, never authority for a later prompt.",
+          "properties": {
+            "target": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "target"
+          ],
+          "type": "object"
+        },
         "AgentPromptGuardedParams": {
           "properties": {
             "allow_cross_pane": {
@@ -1249,6 +1262,9 @@
             },
             "expected_terminal": {
               "type": "string"
+            },
+            "if_draft_empty": {
+              "type": "boolean"
             },
             "request_id": {
               "type": "string"
@@ -1355,6 +1371,9 @@
         },
         "AgentRegisterSelfParams": {
           "properties": {
+            "draft_guard": {
+              "type": "boolean"
+            },
             "pane_id": {
               "type": [
                 "string",
@@ -5812,6 +5831,22 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/AgentChannelInfoParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "agent.draft_state",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentDraftStateParams"
             }
           },
           "required": [

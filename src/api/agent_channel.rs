@@ -14,12 +14,16 @@ use std::time::{Duration, Instant};
 
 use interprocess::TryClone as _;
 
-use crate::api::schema::{AdmissionAck, AdmissionStatus, AgentChannelInfoParams, Method, Request};
+use crate::api::schema::{
+    AdmissionAck, AdmissionStatus, AgentChannelInfoParams, AgentDraftStateResult, DraftStateAck,
+    DraftStateUnknownReason, Method, Request,
+};
 use crate::ipc::{
     poll_local_stream_read_count, set_local_stream_polling, LocalStream, LocalStreamReadCount,
 };
 use crate::platform::ProcessIdentity;
 
+pub(crate) const DRAFT_STATE_TIMEOUT: Duration = Duration::from_secs(2);
 pub(crate) const MAX_FRAME_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_LEDGER_KEYS: usize = 256;
 pub(crate) const MAX_LEDGER_BYTES: usize = 16 * 1024 * 1024;
@@ -30,6 +34,8 @@ pub(crate) const MAX_IN_FLIGHT: usize = 32;
 pub(crate) const MAX_ID_BYTES: usize = 256;
 pub(crate) const MAX_RECEIPT_WAITERS: usize = 128;
 pub(crate) const MAX_WAITERS_PER_REQUEST: usize = 8;
+// JSON integers exchanged with JavaScript must be exactly representable.
+const MAX_SAFE_JSON_INTEGER: u64 = 9_007_199_254_740_991;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Outcome {
@@ -42,6 +48,9 @@ impl Outcome {
             code,
             reason: reason.into(),
         }
+    }
+    pub(crate) fn draft_unknown(reason: DraftStateUnknownReason) -> Self {
+        Self::Receipt(serde_json::json!(AgentDraftStateResult::Unknown { reason }))
     }
     pub(crate) fn response(&self, id: String, duplicate: bool) -> String {
         let value = match self {
@@ -67,15 +76,28 @@ impl Outcome {
     }
 }
 
+#[derive(serde::Deserialize)]
+struct ReceiptKind {
+    #[serde(rename = "type")]
+    kind: String,
+}
+
 #[derive(Debug)]
 struct RequestState {
     possible_dispatch: bool,
     complete_dispatch: bool,
     outcome: Option<Outcome>,
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeliveryKind {
+    Prompt { if_draft_empty: bool },
+    DraftState,
+}
+
 #[derive(Debug)]
 pub(crate) struct Delivery {
     text: String,
+    kind: DeliveryKind,
     frame: Vec<u8>,
     deadline: Instant,
     state: Mutex<RequestState>,
@@ -127,7 +149,9 @@ impl Delivery {
             return;
         };
         if state.outcome.is_none() {
-            state.outcome = Some(if state.possible_dispatch {
+            state.outcome = Some(if self.kind == DeliveryKind::DraftState {
+                Outcome::draft_unknown(DraftStateUnknownReason::Unknown)
+            } else if state.possible_dispatch {
                 Outcome::failure(
                     "delivery_unknown",
                     "channel lost after possible admission; do not replay",
@@ -141,9 +165,16 @@ impl Delivery {
             self.completed.notify_all();
         }
     }
+    fn expire(&self) {
+        if self.kind == DeliveryKind::DraftState {
+            self.finish(Outcome::draft_unknown(DraftStateUnknownReason::Timeout));
+        } else {
+            self.cancel();
+        }
+    }
     pub(crate) fn wait(&self) -> Outcome {
         let Ok(mut state) = self.state.lock() else {
-            return Outcome::failure("delivery_unknown", "request state unavailable");
+            return self.state_unavailable();
         };
         loop {
             if let Some(outcome) = &state.outcome {
@@ -151,7 +182,9 @@ impl Delivery {
             }
             let remaining = self.deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                let outcome = if state.possible_dispatch {
+                let outcome = if self.kind == DeliveryKind::DraftState {
+                    Outcome::draft_unknown(DraftStateUnknownReason::Timeout)
+                } else if state.possible_dispatch {
                     Outcome::failure(
                         "delivery_unknown",
                         "receipt timed out after possible admission; do not replay",
@@ -168,8 +201,15 @@ impl Delivery {
             }
             match self.completed.wait_timeout(state, remaining) {
                 Ok((next, _)) => state = next,
-                Err(_) => return Outcome::failure("delivery_unknown", "request state unavailable"),
+                Err(_) => return self.state_unavailable(),
             }
+        }
+    }
+    fn state_unavailable(&self) -> Outcome {
+        if self.kind == DeliveryKind::DraftState {
+            Outcome::draft_unknown(DraftStateUnknownReason::Unknown)
+        } else {
+            Outcome::failure("delivery_unknown", "request state unavailable")
         }
     }
     fn pending(&self) -> bool {
@@ -197,6 +237,7 @@ pub(crate) struct Channel {
     active: AtomicBool,
     ready: AtomicBool,
     rotating: AtomicBool,
+    draft_guard: AtomicBool,
     /// Serializes revocation with each actual socket write, never with App access.
     effect: Mutex<()>,
     waiters: Arc<AtomicUsize>,
@@ -232,6 +273,7 @@ impl Channel {
                 active: AtomicBool::new(true),
                 ready: AtomicBool::new(false),
                 rotating: AtomicBool::new(false),
+                draft_guard: AtomicBool::new(false),
                 effect: Mutex::new(()),
                 // Receipt threads still holding older epochs share this owner's budget.
                 waiters: previous
@@ -252,6 +294,13 @@ impl Channel {
     pub(crate) fn is_ready(&self) -> bool {
         self.is_active() && self.ready.load(Ordering::Acquire)
     }
+    /// Set from attributed registration before the channel is installed or ready.
+    pub(crate) fn set_draft_guard(&self, supported: bool) {
+        self.draft_guard.store(supported, Ordering::Release);
+    }
+    pub(crate) fn supports_draft_guard(&self) -> bool {
+        self.draft_guard.load(Ordering::Acquire)
+    }
     pub(crate) fn mark_ready(&self) {
         self.ready.store(true, Ordering::Release);
     }
@@ -267,6 +316,7 @@ impl Channel {
         }
     }
     /// Historical lookup only: even an unseen key can never enqueue on a retired epoch.
+    #[cfg(test)]
     pub(crate) fn duplicate(
         &self,
         request_id: &str,
@@ -276,20 +326,45 @@ impl Channel {
             .ledger
             .lock()
             .map_err(|_| Outcome::failure("agent_channel_unavailable", "ledger unavailable"))?;
-        Self::lookup_duplicate(&ledger, request_id, text)
+        Self::lookup_duplicate(
+            &ledger,
+            request_id,
+            text,
+            DeliveryKind::Prompt {
+                if_draft_empty: false,
+            },
+        )
+    }
+    pub(crate) fn duplicate_prompt(
+        &self,
+        request_id: &str,
+        text: &str,
+        if_draft_empty: bool,
+    ) -> Result<Option<Reservation>, Outcome> {
+        let ledger = self
+            .ledger
+            .lock()
+            .map_err(|_| Outcome::failure("agent_channel_unavailable", "ledger unavailable"))?;
+        Self::lookup_duplicate(
+            &ledger,
+            request_id,
+            text,
+            DeliveryKind::Prompt { if_draft_empty },
+        )
     }
     fn lookup_duplicate(
         ledger: &Ledger,
         request_id: &str,
         text: &str,
+        kind: DeliveryKind,
     ) -> Result<Option<Reservation>, Outcome> {
         let Some(existing) = ledger.requests.get(request_id) else {
             return Ok(None);
         };
-        if existing.text != text {
+        if existing.text != text || existing.kind != kind {
             return Err(Outcome::failure(
                 "payload_mismatch",
-                "request ID already reserved with different text",
+                "request ID already reserved with different payload or request kind",
             ));
         }
         Ok(Some((existing.clone(), true, existing.waiter()?)))
@@ -302,10 +377,41 @@ impl Channel {
                 ledger.requests.values().all(|delivery| !delivery.pending())
             })
     }
+    #[cfg(test)]
     pub(crate) fn reserve(
         &self,
         request_id: String,
         text: String,
+        timeout: Duration,
+    ) -> Result<Reservation, Outcome> {
+        self.reserve_prompt(request_id, text, false, timeout)
+    }
+    pub(crate) fn reserve_prompt(
+        &self,
+        request_id: String,
+        text: String,
+        if_draft_empty: bool,
+        timeout: Duration,
+    ) -> Result<Reservation, Outcome> {
+        self.reserve_request(
+            request_id,
+            text,
+            DeliveryKind::Prompt { if_draft_empty },
+            timeout,
+        )
+    }
+    pub(crate) fn reserve_draft_state(
+        &self,
+        request_id: String,
+        timeout: Duration,
+    ) -> Result<Reservation, Outcome> {
+        self.reserve_request(request_id, String::new(), DeliveryKind::DraftState, timeout)
+    }
+    fn reserve_request(
+        &self,
+        request_id: String,
+        text: String,
+        kind: DeliveryKind,
         timeout: Duration,
     ) -> Result<Reservation, Outcome> {
         if !self.is_ready() && !self.rotating.load(Ordering::Acquire) {
@@ -318,7 +424,7 @@ impl Channel {
             .ledger
             .lock()
             .map_err(|_| Outcome::failure("agent_channel_unavailable", "ledger unavailable"))?;
-        if let Some(duplicate) = Self::lookup_duplicate(&ledger, &request_id, &text)? {
+        if let Some(duplicate) = Self::lookup_duplicate(&ledger, &request_id, &text, kind)? {
             return Ok(duplicate);
         }
         if self.rotating.load(Ordering::Acquire) {
@@ -335,10 +441,42 @@ impl Channel {
                 "channel revoked before reservation",
             ));
         }
-        let frame = serde_json::json!({"type":"deliver","registration_epoch":self.epoch,
-            "request_id":request_id,"session_generation":self.session_generation,"text":text})
-        .to_string();
-        let mut frame = frame.into_bytes();
+        // Capability refusals happen before reservation/queue effects. Existing keys
+        // were checked first so their immutable outcomes remain readable.
+        if !self.supports_draft_guard() {
+            match kind {
+                DeliveryKind::Prompt {
+                    if_draft_empty: true,
+                } => {
+                    return Err(Outcome::failure("agent_prompt_rejected", "unsupported"));
+                }
+                DeliveryKind::DraftState => {
+                    return Err(Outcome::draft_unknown(DraftStateUnknownReason::Unsupported));
+                }
+                _ => {}
+            }
+        }
+        let deadline = Instant::now() + timeout;
+        let mut frame = serde_json::json!({"registration_epoch":self.epoch,
+            "request_id":request_id,"session_generation":self.session_generation});
+        match kind {
+            DeliveryKind::Prompt { if_draft_empty } => {
+                frame["type"] = "deliver".into();
+                frame["text"] = text.clone().into();
+                if if_draft_empty {
+                    let deadline_ms = std::time::SystemTime::now()
+                        .checked_add(timeout)
+                        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+                        .filter(|millis| *millis <= MAX_SAFE_JSON_INTEGER)
+                        .ok_or_else(|| Outcome::failure("agent_prompt_rejected", "unknown"))?;
+                    frame["if_draft_empty"] = true.into();
+                    frame["deadline_ms"] = deadline_ms.into();
+                }
+            }
+            DeliveryKind::DraftState => frame["type"] = "draft_state".into(),
+        }
+        let mut frame = frame.to_string().into_bytes();
         frame.push(b'\n');
         let retained_bytes = frame.len() + text.len();
         if frame.len() > MAX_FRAME_BYTES {
@@ -363,8 +501,9 @@ impl Channel {
         }
         let delivery = Arc::new(Delivery {
             text,
+            kind,
             frame,
-            deadline: Instant::now() + timeout,
+            deadline,
             state: Mutex::new(RequestState {
                 possible_dispatch: false,
                 complete_dispatch: false,
@@ -381,10 +520,11 @@ impl Channel {
             self.rotating.store(true, Ordering::Release);
         }
         if self.outbound.try_send(delivery.clone()).is_err() {
-            delivery.finish(Outcome::failure(
-                "agent_channel_capacity",
-                "dispatch queue unavailable",
-            ));
+            delivery.finish(if kind == DeliveryKind::DraftState {
+                Outcome::draft_unknown(DraftStateUnknownReason::Unknown)
+            } else {
+                Outcome::failure("agent_channel_capacity", "dispatch queue unavailable")
+            });
         }
         Ok((delivery, false, waiter))
     }
@@ -403,6 +543,9 @@ impl Channel {
         let Some(delivery) = ledger.requests.get(&ack.request_id) else {
             return Err(io::Error::other("ACK for unreserved request"));
         };
+        if !matches!(delivery.kind, DeliveryKind::Prompt { .. }) {
+            return Err(io::Error::other("admission ACK for draft query"));
+        }
         // A peer may only acknowledge a frame we started dispatching.
         if !delivery
             .state
@@ -436,6 +579,67 @@ impl Channel {
             Outcome::Receipt(result)
         };
         delivery.finish(outcome);
+        Ok(())
+    }
+    fn draft_ack(&self, ack: DraftStateAck) -> io::Result<()> {
+        let (kind, epoch, request_id, generation, result) = match ack {
+            DraftStateAck::Known(ack) => {
+                if ack.chars > MAX_SAFE_JSON_INTEGER || ack.empty != (ack.chars == 0) {
+                    return Err(io::Error::other("invalid draft observation bounds"));
+                }
+                (
+                    ack.kind,
+                    ack.registration_epoch,
+                    ack.request_id,
+                    ack.session_generation,
+                    AgentDraftStateResult::Known {
+                        empty: ack.empty,
+                        chars: ack.chars,
+                        hold: ack.hold,
+                    },
+                )
+            }
+            DraftStateAck::Unknown(ack) => {
+                if !ack.unknown {
+                    return Err(io::Error::other("invalid unknown draft observation"));
+                }
+                (
+                    ack.kind,
+                    ack.registration_epoch,
+                    ack.request_id,
+                    ack.session_generation,
+                    AgentDraftStateResult::Unknown {
+                        reason: DraftStateUnknownReason::Unknown,
+                    },
+                )
+            }
+        };
+        if !self.is_active()
+            || kind != "draft_state"
+            || epoch != self.epoch
+            || generation != self.session_generation
+        {
+            return Err(io::Error::other("uncorrelated draft receipt"));
+        }
+        let ledger = self
+            .ledger
+            .lock()
+            .map_err(|_| io::Error::other("ledger unavailable"))?;
+        let delivery = ledger
+            .requests
+            .get(&request_id)
+            .ok_or_else(|| io::Error::other("draft receipt for unreserved request"))?;
+        if delivery.kind != DeliveryKind::DraftState
+            || !delivery
+                .state
+                .lock()
+                .is_ok_and(|state| state.complete_dispatch)
+        {
+            return Err(io::Error::other(
+                "draft receipt before complete query dispatch",
+            ));
+        }
+        delivery.finish(Outcome::Receipt(serde_json::json!(result)));
         Ok(())
     }
 }
@@ -598,6 +802,9 @@ fn write_rotation(
     );
     let control = Delivery {
         text: String::new(),
+        kind: DeliveryKind::Prompt {
+            if_draft_empty: false,
+        },
         frame: frame.into_bytes(),
         deadline: Instant::now() + Duration::from_secs(2),
         state: Mutex::new(RequestState {
@@ -677,10 +884,20 @@ fn read_acks(
                 }
                 for byte in &bytes[..count] {
                     if *byte == b'\n' {
-                        let ack = serde_json::from_slice::<AdmissionAck>(&input)
-                            .map_err(io::Error::other)?;
+                        // Both receipt kinds use the same bounded parser and ledger.
+                        let frame: ReceiptKind =
+                            serde_json::from_slice(&input).map_err(io::Error::other)?;
+                        // Decode from the original bytes, not a Value map that silently
+                        // collapses duplicate fields in correlation/payload data.
+                        match frame.kind.as_str() {
+                            "ack" => channel
+                                .ack(serde_json::from_slice(&input).map_err(io::Error::other)?)?,
+                            "draft_state" => channel.draft_ack(
+                                serde_json::from_slice(&input).map_err(io::Error::other)?,
+                            )?,
+                            _ => return Err(io::Error::other("unexpected agent receipt kind")),
+                        }
                         input.clear();
-                        channel.ack(ack)?;
                     } else {
                         if input.len() >= MAX_FRAME_BYTES {
                             return Err(io::Error::other("agent ACK frame exceeded capacity"));
@@ -719,8 +936,13 @@ fn write_delivery(
                 Err(io::Error::other("partial frame cancelled"))
             };
         }
-        if Instant::now() >= delivery.deadline || !attachment_valid() {
-            delivery.cancel();
+        let expired = Instant::now() >= delivery.deadline;
+        if expired || !attachment_valid() {
+            if expired {
+                delivery.expire();
+            } else {
+                delivery.cancel();
+            }
             return if offset == 0 {
                 Ok(())
             } else {
@@ -732,9 +954,14 @@ fn write_delivery(
             .effect
             .lock()
             .map_err(|_| io::Error::other("channel gate unavailable"))?;
-        if !channel.is_active() || Instant::now() >= delivery.deadline || !native_valid() {
+        let expired = Instant::now() >= delivery.deadline;
+        if !channel.is_active() || expired || !native_valid() {
             drop(effect);
-            delivery.cancel();
+            if expired {
+                delivery.expire();
+            } else {
+                delivery.cancel();
+            }
             return if offset == 0 {
                 Ok(())
             } else {

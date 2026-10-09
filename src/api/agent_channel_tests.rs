@@ -1026,3 +1026,417 @@ fn channel_ack_parser_is_closed_typed_and_complete() {
     invalid["reason"] = "invented".into();
     assert!(serde_json::from_value::<AdmissionAck>(invalid).is_err());
 }
+
+#[test]
+fn channel_draft_guard_identity_deadline_and_retired_duplicate_are_immutable() {
+    let (channel, receiver) = channel();
+    channel.set_draft_guard(true);
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let (delivery, duplicate, _waiter) = channel
+        .reserve_prompt("r".into(), "literal".into(), true, Duration::from_secs(1))
+        .unwrap();
+    assert!(!duplicate);
+    let frame: serde_json::Value = serde_json::from_slice(&delivery.frame).unwrap();
+    assert_eq!(frame["if_draft_empty"], true);
+    let deadline = frame["deadline_ms"].as_u64().unwrap();
+    let after = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    assert!((before + 1000..=after + 1000).contains(&deadline));
+    assert!(deadline <= MAX_SAFE_JSON_INTEGER);
+    let (same, duplicate, _waiter2) = channel
+        .reserve_prompt("r".into(), "literal".into(), true, Duration::from_secs(10))
+        .unwrap();
+    assert!(duplicate);
+    assert!(Arc::ptr_eq(&same, &delivery));
+    assert_eq!(same.frame, delivery.frame); // A retry never extends receiver admission authority.
+    assert_eq!(
+        code(
+            channel
+                .reserve_prompt("r".into(), "literal".into(), false, Duration::from_secs(1))
+                .err()
+                .unwrap()
+        ),
+        "payload_mismatch"
+    );
+    assert_eq!(
+        code(
+            channel
+                .reserve_draft_state("r".into(), Duration::from_secs(1))
+                .err()
+                .unwrap()
+        ),
+        "payload_mismatch"
+    );
+    write_delivery(&mut Vec::new(), &channel, &delivery, || true, || true).unwrap();
+    channel.ack(ack(AdmissionStatus::Accepted)).unwrap();
+    let first = delivery.wait();
+    channel.revoke();
+    let (old, duplicate, _waiter3) = channel
+        .duplicate_prompt("r", "literal", true)
+        .unwrap()
+        .unwrap();
+    assert!(duplicate);
+    assert_eq!(old.wait(), first);
+    assert_eq!(
+        code(
+            channel
+                .duplicate_prompt("r", "literal", false)
+                .err()
+                .unwrap()
+        ),
+        "payload_mismatch"
+    );
+    assert_eq!(receiver.try_iter().count(), 1);
+}
+
+#[test]
+fn channel_draft_guard_expired_before_dispatch_writes_nothing_and_keeps_legacy_frame() {
+    let (channel, receiver) = channel();
+    channel.set_draft_guard(true);
+    let (guarded, _, _waiter) = channel
+        .reserve_prompt("expired".into(), "literal".into(), true, Duration::ZERO)
+        .unwrap();
+    let mut socket = Vec::new();
+    write_delivery(
+        &mut socket,
+        &channel,
+        &guarded,
+        || panic!("expired before attribution"),
+        || true,
+    )
+    .unwrap();
+    assert!(socket.is_empty());
+    assert_eq!(code(guarded.wait()), "agent_channel_unavailable");
+    assert!(!guarded.state.lock().unwrap().possible_dispatch);
+    let (legacy, _, _waiter2) = channel
+        .reserve_prompt(
+            "legacy".into(),
+            "literal".into(),
+            false,
+            Duration::from_secs(1),
+        )
+        .unwrap();
+    let frame: serde_json::Value = serde_json::from_slice(&legacy.frame).unwrap();
+    assert!(frame.get("if_draft_empty").is_none());
+    assert!(frame.get("deadline_ms").is_none());
+    assert_eq!(receiver.try_iter().count(), 2);
+}
+
+#[test]
+fn channel_draft_guard_missing_capability_refuses_before_ledger_or_dispatch() {
+    let (channel, receiver) = channel();
+    assert!(!channel.supports_draft_guard());
+    let outcome = channel
+        .reserve_prompt("r".into(), "literal".into(), true, Duration::from_secs(1))
+        .err()
+        .unwrap();
+    let response: serde_json::Value =
+        serde_json::from_str(&outcome.response("caller".into(), false)).unwrap();
+    assert_eq!(response["error"]["code"], "agent_prompt_rejected");
+    assert_eq!(response["error"]["reason"], "unsupported");
+    assert_eq!(
+        channel
+            .reserve_draft_state("q".into(), Duration::from_secs(1))
+            .err()
+            .unwrap(),
+        Outcome::draft_unknown(DraftStateUnknownReason::Unsupported)
+    );
+    assert!(channel.ledger.lock().unwrap().requests.is_empty());
+    assert_eq!(channel.waiters.load(Ordering::Acquire), 0);
+    assert!(receiver.try_recv().is_err());
+    // The capability does not disable the established unguarded path.
+    assert!(channel
+        .reserve("legacy".into(), "literal".into(), Duration::from_secs(1))
+        .is_ok());
+}
+
+#[test]
+fn channel_draft_guard_rejection_reasons_remain_typed_and_retained() {
+    for (reason, expected) in [
+        (AdmissionReason::DraftPresent, "draft_present"),
+        (AdmissionReason::UiHold, "ui_hold"),
+        (AdmissionReason::Unknown, "unknown"),
+        (AdmissionReason::Expired, "expired"),
+    ] {
+        let (channel, receiver) = channel();
+        channel.set_draft_guard(true);
+        let (delivery, _, _waiter) = channel
+            .reserve_prompt("r".into(), "literal".into(), true, Duration::from_secs(1))
+            .unwrap();
+        write_delivery(&mut Vec::new(), &channel, &delivery, || true, || true).unwrap();
+        let mut rejection = ack(AdmissionStatus::Rejected);
+        rejection.reason = Some(reason);
+        channel.ack(rejection).unwrap();
+        let response: serde_json::Value =
+            serde_json::from_str(&delivery.wait().response("caller".into(), false)).unwrap();
+        assert_eq!(response["error"]["reason"], expected);
+        channel.revoke();
+        let (retained, duplicate, _waiter2) = channel
+            .duplicate_prompt("r", "literal", true)
+            .unwrap()
+            .unwrap();
+        assert!(duplicate);
+        assert_eq!(retained.wait(), delivery.wait());
+        assert_eq!(receiver.try_iter().count(), 1);
+    }
+}
+
+fn draft_ack_value() -> serde_json::Value {
+    serde_json::json!({"type":"draft_state", "registration_epoch":"epoch_test", "request_id":"q",
+        "session_generation":"session_test", "empty":true, "chars":0, "hold":null})
+}
+
+#[test]
+fn channel_draft_query_known_and_unknown_project_no_text_or_correlation() {
+    for (empty, chars, hold) in [
+        (true, 0, serde_json::Value::Null),
+        (false, 5, "dialog".into()),
+        (true, 0, "custom".into()),
+        (false, 8, "editor".into()),
+    ] {
+        let (channel, receiver) = channel();
+        channel.set_draft_guard(true);
+        let (query, _, _waiter) = channel
+            .reserve_draft_state("q".into(), Duration::from_secs(1))
+            .unwrap();
+        let mut bytes = Vec::new();
+        write_delivery(&mut bytes, &channel, &query, || true, || true).unwrap();
+        let frame: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(frame["type"], "draft_state");
+        assert!(frame.get("text").is_none());
+        assert_eq!(frame.as_object().unwrap().len(), 4);
+        let mut receipt = draft_ack_value();
+        receipt["empty"] = empty.into();
+        receipt["chars"] = chars.into();
+        receipt["hold"] = hold.clone();
+        channel
+            .draft_ack(serde_json::from_value(receipt).unwrap())
+            .unwrap();
+        let response: serde_json::Value =
+            serde_json::from_str(&query.wait().response("caller".into(), false)).unwrap();
+        assert_eq!(
+            response["result"],
+            serde_json::json!({"status":"known", "empty":empty, "chars":chars, "hold":hold})
+        );
+        assert_eq!(receiver.try_iter().count(), 1);
+    }
+    let (channel, _receiver) = channel();
+    channel.set_draft_guard(true);
+    let (query, _, _waiter) = channel
+        .reserve_draft_state("q".into(), Duration::from_secs(1))
+        .unwrap();
+    write_delivery(&mut Vec::new(), &channel, &query, || true, || true).unwrap();
+    channel.draft_ack(serde_json::from_value(serde_json::json!({"type":"draft_state", "registration_epoch":"epoch_test", "request_id":"q", "session_generation":"session_test", "unknown":true})).unwrap()).unwrap();
+    assert_eq!(
+        query.wait(),
+        Outcome::draft_unknown(DraftStateUnknownReason::Unknown)
+    );
+}
+
+#[test]
+fn channel_draft_query_parser_and_correlation_fail_closed() {
+    let base = draft_ack_value();
+    for duplicate in ["\"request_id\":\"q\"", "\"chars\":0"] {
+        let bytes = format!("{{{},{}", duplicate, &base.to_string()[1..]);
+        assert!(
+            serde_json::from_str::<DraftStateAck>(&bytes).is_err(),
+            "duplicate field: {duplicate}"
+        );
+    }
+    for field in [
+        "type",
+        "registration_epoch",
+        "request_id",
+        "session_generation",
+        "empty",
+        "chars",
+        "hold",
+    ] {
+        let mut absent = base.clone();
+        absent.as_object_mut().unwrap().remove(field);
+        assert!(
+            serde_json::from_value::<DraftStateAck>(absent).is_err(),
+            "missing {field}"
+        );
+    }
+    for (field, invalid) in [
+        ("text", "private draft".into()),
+        ("chars", (-1).into()),
+        ("chars", 1.5.into()),
+        ("chars", "0".into()),
+        ("empty", serde_json::Value::Null),
+        ("hold", "unknown".into()),
+        ("unknown", true.into()),
+    ] {
+        let mut invalid_frame = base.clone();
+        invalid_frame[field] = invalid;
+        assert!(
+            serde_json::from_value::<DraftStateAck>(invalid_frame).is_err(),
+            "invalid {field}"
+        );
+    }
+    let (channel, _receiver) = channel();
+    channel.set_draft_guard(true);
+    let (query, _, _waiter) = channel
+        .reserve_draft_state("q".into(), Duration::from_secs(1))
+        .unwrap();
+    assert!(channel
+        .draft_ack(serde_json::from_value(base.clone()).unwrap())
+        .is_err());
+    write_delivery(&mut Vec::new(), &channel, &query, || true, || true).unwrap();
+    for field in [
+        "type",
+        "registration_epoch",
+        "request_id",
+        "session_generation",
+    ] {
+        let mut wrong = base.clone();
+        wrong[field] = "other".into();
+        assert!(channel
+            .draft_ack(serde_json::from_value(wrong).unwrap())
+            .is_err());
+        assert!(query.pending());
+    }
+    for chars in [1, MAX_SAFE_JSON_INTEGER + 1] {
+        let mut wrong = base.clone();
+        wrong["chars"] = chars.into();
+        assert!(channel
+            .draft_ack(serde_json::from_value(wrong).unwrap())
+            .is_err());
+    }
+    let unknown_false = serde_json::json!({"type":"draft_state", "registration_epoch":"epoch_test", "request_id":"q", "session_generation":"session_test", "unknown":false});
+    assert!(channel
+        .draft_ack(serde_json::from_value(unknown_false).unwrap())
+        .is_err());
+    let mut admission = ack(AdmissionStatus::Accepted);
+    admission.request_id = "q".into();
+    assert!(channel.ack(admission).is_err());
+    assert_eq!(
+        code(
+            channel
+                .reserve_prompt("q".into(), String::new(), false, Duration::from_secs(1))
+                .err()
+                .unwrap()
+        ),
+        "payload_mismatch"
+    );
+    let (prompt, _, _waiter2) = channel
+        .reserve("p".into(), "literal".into(), Duration::from_secs(1))
+        .unwrap();
+    write_delivery(&mut Vec::new(), &channel, &prompt, || true, || true).unwrap();
+    let mut wrong_kind = base;
+    wrong_kind["request_id"] = "p".into();
+    assert!(channel
+        .draft_ack(serde_json::from_value(wrong_kind).unwrap())
+        .is_err());
+}
+
+#[test]
+fn channel_draft_query_timeout_is_bounded_retained_and_separate_from_prompt_uncertainty() {
+    for dispatch in [false, true] {
+        let (channel, receiver) = channel();
+        channel.set_draft_guard(true);
+        let (query, _, _waiter) = channel
+            .reserve_draft_state("q".into(), Duration::from_millis(15))
+            .unwrap();
+        if dispatch {
+            write_delivery(&mut Vec::new(), &channel, &query, || true, || true).unwrap();
+        }
+        assert_eq!(
+            query.wait(),
+            Outcome::draft_unknown(DraftStateUnknownReason::Timeout)
+        );
+        if dispatch {
+            channel
+                .draft_ack(serde_json::from_value(draft_ack_value()).unwrap())
+                .unwrap();
+        }
+        let (duplicate, is_duplicate, _waiter2) = channel
+            .reserve_draft_state("q".into(), Duration::from_secs(1))
+            .unwrap();
+        assert!(is_duplicate);
+        assert_eq!(
+            duplicate.wait(),
+            Outcome::draft_unknown(DraftStateUnknownReason::Timeout)
+        );
+        assert_eq!(receiver.try_iter().count(), 1);
+    }
+    let (channel, _receiver) = channel();
+    channel.set_draft_guard(true);
+    let (query, _, _waiter) = channel
+        .reserve_draft_state("q".into(), Duration::ZERO)
+        .unwrap();
+    let mut bytes = Vec::new();
+    write_delivery(&mut bytes, &channel, &query, || true, || true).unwrap();
+    assert!(bytes.is_empty());
+    assert_eq!(
+        query.wait(),
+        Outcome::draft_unknown(DraftStateUnknownReason::Timeout)
+    );
+    let (prompt, _, _waiter2) = channel
+        .reserve_prompt(
+            "r".into(),
+            "literal".into(),
+            true,
+            Duration::from_millis(15),
+        )
+        .unwrap();
+    write_delivery(&mut bytes, &channel, &prompt, || true, || true).unwrap();
+    assert_eq!(code(prompt.wait()), "delivery_unknown");
+}
+
+#[test]
+fn channel_draft_queries_share_dispatch_and_waiter_budgets_with_prompts() {
+    let (channel, receiver) = channel();
+    channel.set_draft_guard(true);
+    for index in 0..MAX_IN_FLIGHT {
+        if index % 2 == 0 {
+            let _ = reserve(&channel, &format!("p{index}"));
+        } else {
+            let _ = channel
+                .reserve_draft_state(format!("q{index}"), Duration::from_secs(1))
+                .unwrap();
+        }
+    }
+    assert_eq!(
+        code(
+            channel
+                .reserve_draft_state("overflow".into(), Duration::from_secs(1))
+                .err()
+                .unwrap()
+        ),
+        "agent_channel_capacity"
+    );
+    assert_eq!(receiver.try_iter().count(), MAX_IN_FLIGHT);
+    let (channel, receiver) = self::channel();
+    channel.set_draft_guard(true);
+    let waiters: Vec<_> = (0..MAX_WAITERS_PER_REQUEST)
+        .map(|_| {
+            channel
+                .reserve_draft_state("q".into(), Duration::from_secs(1))
+                .unwrap()
+                .2
+        })
+        .collect();
+    assert_eq!(
+        code(
+            channel
+                .reserve_draft_state("q".into(), Duration::from_secs(1))
+                .err()
+                .unwrap()
+        ),
+        "agent_channel_capacity"
+    );
+    assert_eq!(
+        channel.waiters.load(Ordering::Acquire),
+        MAX_WAITERS_PER_REQUEST
+    );
+    assert_eq!(receiver.try_iter().count(), 1);
+    drop(waiters);
+    assert_eq!(channel.waiters.load(Ordering::Acquire), 0);
+}
