@@ -154,3 +154,245 @@ fn initial_focus_other_focused_viewer_reports_gained() {
 fn initial_focus_unknown_outer_focus_reports_lost() {
     assert_initial_focus(&[None], false, true, false, &["1b5b4f"]);
 }
+
+fn prepare_initial_focus_transition(server: &mut HeadlessServer, focused: bool) {
+    server.app.state.active = Some(0);
+    let mut client = ClientConnection::new(
+        (80, 24),
+        crate::kitty_graphics::HostCellSize::default(),
+        1,
+        RenderEncoding::SemanticFrame,
+        None,
+    );
+    client.outer_terminal_focus = Some(focused);
+    server.clients.insert(1, client);
+    server.foreground_client_id = Some(1);
+    server.sync_foreground_client_state();
+    server.app.accept_current_focus_without_events();
+}
+
+#[derive(Clone, Copy)]
+enum InitialFocusOrder {
+    EnabledTransitionHandler,
+    EnabledHandlerTransition,
+    TransitionEnabledHandler,
+}
+
+fn assert_initial_focus_transition_order(focused: bool, order: InitialFocusOrder) {
+    with_terminal_session_test_server(|server, terminal_id, _, _| {
+        let pane_id = server.app.state.workspaces[0].tabs[0].root_pane;
+        let (runtime, mut input_rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        server
+            .app
+            .terminal_runtimes
+            .insert(terminal_id.clone(), runtime);
+        prepare_initial_focus_transition(server, !focused);
+        let transition = ServerEvent::ClientShellFocus {
+            client_id: 1,
+            focused,
+        };
+        let initial = AppEvent::TerminalFocusReportingEnabled { pane_id };
+        let enable = |server: &HeadlessServer| {
+            server
+                .app
+                .terminal_runtimes
+                .get(&terminal_id)
+                .expect("ordered focus runtime")
+                .test_process_pty_bytes(b"\x1b[?1004h");
+        };
+
+        match order {
+            InitialFocusOrder::EnabledTransitionHandler => {
+                // The parser has enabled the mode, but its queued event has not
+                // reached the server. A client transition overtakes that event.
+                enable(server);
+                assert!(server.handle_server_event(transition));
+                server.handle_internal_event_with_forwarding(initial);
+            }
+            InitialFocusOrder::EnabledHandlerTransition => {
+                enable(server);
+                server.handle_internal_event_with_forwarding(initial);
+                assert!(server.handle_server_event(transition));
+            }
+            InitialFocusOrder::TransitionEnabledHandler => {
+                assert!(server.handle_server_event(transition));
+                assert!(
+                    input_rx.try_recv().is_err(),
+                    "mode-off transition emitted input"
+                );
+                enable(server);
+                server.handle_internal_event_with_forwarding(initial);
+            }
+        }
+
+        let changed = Bytes::from_static(if focused { b"\x1b[I" } else { b"\x1b[O" });
+        let expected = match order {
+            InitialFocusOrder::EnabledHandlerTransition => {
+                let previous = Bytes::from_static(if focused { b"\x1b[O" } else { b"\x1b[I" });
+                vec![previous, changed]
+            }
+            _ => vec![changed],
+        };
+        let mut actual = Vec::new();
+        while let Ok(bytes) = input_rx.try_recv() {
+            actual.push(bytes);
+        }
+        assert_eq!(
+            actual, expected,
+            "initial focus report duplicated or suppressed"
+        );
+    });
+}
+
+#[test]
+fn initial_focus_queued_enable_after_gained_transition_reports_once() {
+    assert_initial_focus_transition_order(true, InitialFocusOrder::EnabledTransitionHandler);
+}
+
+#[test]
+fn initial_focus_queued_enable_after_lost_transition_reports_once() {
+    assert_initial_focus_transition_order(false, InitialFocusOrder::EnabledTransitionHandler);
+}
+
+#[test]
+fn initial_focus_handler_before_gained_transition_reports_both_states() {
+    assert_initial_focus_transition_order(true, InitialFocusOrder::EnabledHandlerTransition);
+}
+
+#[test]
+fn initial_focus_handler_before_lost_transition_reports_both_states() {
+    assert_initial_focus_transition_order(false, InitialFocusOrder::EnabledHandlerTransition);
+}
+
+#[test]
+fn initial_focus_gained_transition_before_enable_still_reports_once() {
+    assert_initial_focus_transition_order(true, InitialFocusOrder::TransitionEnabledHandler);
+}
+
+#[test]
+fn initial_focus_lost_transition_before_enable_still_reports_once() {
+    assert_initial_focus_transition_order(false, InitialFocusOrder::TransitionEnabledHandler);
+}
+
+// The real PTY reader must publish the enable event. Hold that exact event
+// until after ClientShellFocus, then count the bytes received by the child.
+fn assert_native_initial_focus_transition(focused: bool) {
+    with_terminal_session_test_server(|server, terminal_id, _, _| {
+        let pane_id = server.app.state.workspaces[0].tabs[0].root_pane;
+        prepare_initial_focus_transition(server, !focused);
+        let script = r#"stty raw -echo min 1 time 0 || exit 1
+printf '\033[?1004h'
+first=$(dd bs=1 count=3 2>/dev/null | od -An -tx1 | tr -d ' \n')
+stty min 0 time 10
+extra=$(dd bs=1 count=3 2>/dev/null | od -An -tx1 | tr -d ' \n')
+printf '\r\nORDERED_FOCUS:%s%s:END\r\n' "$first" "$extra"
+stty min 1 time 0
+dd bs=1 count=1 >/dev/null 2>&1
+"#;
+        let runtime = crate::terminal::TerminalRuntime::spawn_argv_command(
+            pane_id,
+            24,
+            80,
+            std::env::temp_dir(),
+            &["/bin/sh".into(), "-c".into(), script.into()],
+            &crate::pane::PaneLaunchEnv::default(),
+            crate::pane::AgentDetection::Disabled,
+            0,
+            crate::terminal_theme::TerminalTheme::default(),
+            None,
+            server.app.event_tx.clone(),
+            server.app.render_notify.clone(),
+            server.app.render_dirty.clone(),
+        )
+        .expect("spawn ordered focus PTY child");
+        server
+            .app
+            .terminal_runtimes
+            .insert(terminal_id.clone(), runtime);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut held_events = Vec::new();
+        let initial = loop {
+            match server.app.event_rx.try_recv() {
+                Ok(event) => {
+                    if matches!(&event, AppEvent::TerminalFocusReportingEnabled { pane_id: id } if *id == pane_id)
+                    {
+                        break Some(event);
+                    }
+                    held_events.push(event);
+                }
+                Err(_) if Instant::now() >= deadline => break None,
+                Err(_) => std::thread::sleep(Duration::from_millis(5)),
+            }
+        };
+        let captured_enable = initial.is_some();
+        let mut transition_handled = false;
+        if let Some(initial) = initial {
+            // Receipt proves the native parser enabled the mode. Do not drain
+            // internal events before this overtaking client focus transition.
+            transition_handled = server.handle_server_event(ServerEvent::ClientShellFocus {
+                client_id: 1,
+                focused,
+            });
+            server.handle_internal_event_with_forwarding(initial);
+        }
+        for event in held_events {
+            server.handle_internal_event_with_forwarding(event);
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let (screen, completed) = loop {
+            while let Ok(event) = server.app.event_rx.try_recv() {
+                server.handle_internal_event_with_forwarding(event);
+            }
+            let screen = server
+                .app
+                .terminal_runtimes
+                .get(&terminal_id)
+                .expect("owned ordered focus runtime")
+                .detection_text();
+            let completed = screen
+                .lines()
+                .any(|line| line.contains("ORDERED_FOCUS:") && line.contains(":END"));
+            if completed || !captured_enable || Instant::now() >= deadline {
+                break (screen, completed);
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        // Always reap the owned child before red-result assertions. Its final
+        // blocking read prevents PaneExited from deleting the runtime first.
+        server
+            .app
+            .terminal_runtimes
+            .remove(&terminal_id)
+            .expect("owned ordered focus runtime")
+            .shutdown();
+        assert!(
+            captured_enable,
+            "native focus enable event timed out; screen: {screen:?}"
+        );
+        assert!(
+            transition_handled,
+            "client focus transition was not handled"
+        );
+        assert!(
+            completed,
+            "ordered focus child timed out; screen: {screen:?}"
+        );
+        let hex = if focused { "1b5b49" } else { "1b5b4f" };
+        let marker = format!("ORDERED_FOCUS:{hex}:END");
+        assert!(
+            screen.contains(&marker),
+            "expected exactly one report: {marker}; screen: {screen:?}"
+        );
+    });
+}
+
+#[test]
+fn initial_focus_native_queued_enable_after_gained_transition_reports_once() {
+    assert_native_initial_focus_transition(true);
+}
+
+#[test]
+fn initial_focus_native_queued_enable_after_lost_transition_reports_once() {
+    assert_native_initial_focus_transition(false);
+}

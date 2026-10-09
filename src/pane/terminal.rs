@@ -197,6 +197,8 @@ pub(crate) struct GhosttyPaneCore {
     #[cfg(test)]
     pub dirty_collection_hook: Option<Box<dyn FnOnce() + Send>>,
     pub terminal: crate::ghostty::Terminal,
+    // Consumed only by successful focus input admission, not by mode-off or rendering.
+    initial_focus_pending: bool,
     synchronized_output_epoch: u64,
     #[cfg(windows)]
     recent_fallback: windows_recent_fallback::Cache,
@@ -439,8 +441,16 @@ impl PaneTerminal {
         self.ghostty.bracketed_paste_enabled()
     }
 
-    pub fn focus_reporting_enabled(&self) -> bool {
-        self.ghostty.focus_reporting_enabled()
+    pub(crate) fn initial_focus_pending(&self) -> bool {
+        self.ghostty.initial_focus_pending()
+    }
+
+    pub(super) fn try_send_focus_event(
+        &self,
+        event: crate::ghostty::FocusEvent,
+        send: impl FnOnce(Bytes) -> bool,
+    ) -> bool {
+        self.ghostty.try_send_focus_event(event, send)
     }
 
     pub fn mouse_reporting_enabled(&self) -> bool {
@@ -1178,6 +1188,7 @@ impl GhosttyPaneTerminal {
                 #[cfg(test)]
                 dirty_collection_hook: None,
                 terminal,
+                initial_focus_pending: false,
                 synchronized_output_epoch: 0,
                 #[cfg(windows)]
                 recent_fallback: windows_recent_fallback::Cache::default(),
@@ -1422,6 +1433,9 @@ impl GhosttyPaneTerminal {
                 .terminal
                 .mode_get(crate::ghostty::MODE_FOCUS_EVENT)
                 .unwrap_or(false);
+        if focus_reporting_enabled {
+            core.initial_focus_pending = true;
+        }
         let terminal_bells = core.terminal.take_bell_count();
         let clipboard_writes = core.terminal.take_clipboard_writes();
         let reported_cwd = core
@@ -1850,8 +1864,42 @@ impl GhosttyPaneTerminal {
         self.mode_enabled(crate::ghostty::MODE_BRACKETED_PASTE)
     }
 
+    #[cfg(test)]
     pub fn focus_reporting_enabled(&self) -> bool {
         self.mode_enabled(crate::ghostty::MODE_FOCUS_EVENT)
+    }
+
+    pub(crate) fn initial_focus_pending(&self) -> bool {
+        self.core
+            .lock()
+            .is_ok_and(|core| core.initial_focus_pending)
+    }
+
+    pub(super) fn try_send_focus_event(
+        &self,
+        event: crate::ghostty::FocusEvent,
+        send: impl FnOnce(Bytes) -> bool,
+    ) -> bool {
+        let Ok(mut core) = self.core.lock() else {
+            return false;
+        };
+        if !core
+            .terminal
+            .mode_get(crate::ghostty::MODE_FOCUS_EVENT)
+            .unwrap_or(false)
+        {
+            return false;
+        }
+        let Ok(bytes) = crate::ghostty::encode_focus(event) else {
+            return false;
+        };
+        // Keep admission and clear serialized with PTY mode changes. This callback
+        // only tries the input queue; it must not wait for capacity or lock core.
+        if !send(Bytes::from(bytes)) {
+            return false;
+        }
+        core.initial_focus_pending = false;
+        true
     }
 
     pub fn mouse_reporting_enabled(&self) -> bool {
@@ -4170,6 +4218,42 @@ mod tests {
                 .request_render,
             "synchronized output must retain its render suppression"
         );
+    }
+
+    #[test]
+    fn initial_focus_pending_tracks_enable_and_successful_delivery() {
+        let (tx, _rx) = mpsc::channel(4);
+        let terminal = crate::ghostty::Terminal::new(80, 24, 100).unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+        let pane_id = PaneId::from_raw(1);
+
+        assert!(!pane.initial_focus_pending());
+        pane.process_pty_bytes(pane_id, 0, b"\x1b[?100", &tx);
+        assert!(!pane.initial_focus_pending(), "fragment is not enabled yet");
+        pane.process_pty_bytes(pane_id, 0, b"4h", &tx);
+        assert!(pane.initial_focus_pending());
+        assert!(!pane.try_send_focus_event(crate::ghostty::FocusEvent::Gained, |_| false));
+        assert!(
+            pane.initial_focus_pending(),
+            "failed admission retains pending"
+        );
+        assert!(
+            pane.try_send_focus_event(crate::ghostty::FocusEvent::Lost, |bytes| {
+                assert_eq!(bytes, Bytes::from_static(b"\x1b[O"));
+                assert!(pane.core.try_lock().is_err(), "admission holds core lock");
+                true
+            })
+        );
+        assert!(!pane.initial_focus_pending());
+
+        pane.process_pty_bytes(pane_id, 0, b"\x1b[?1004h", &tx);
+        assert!(
+            !pane.initial_focus_pending(),
+            "repeat enable must not rearm"
+        );
+        pane.process_pty_bytes(pane_id, 0, b"\x1b[?1004l", &tx);
+        pane.process_pty_bytes(pane_id, 0, b"\x1b[?1004h", &tx);
+        assert!(pane.initial_focus_pending(), "new off-to-on rearms pending");
     }
 
     #[test]

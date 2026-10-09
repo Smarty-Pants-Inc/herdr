@@ -413,6 +413,17 @@ impl HeadlessServer {
         let Some((workspace_index, _)) = self.app.find_pane(pane_id) else {
             return;
         };
+        let Some(runtime) = self.app.state.runtime_for_pane_in_workspace(
+            &self.app.terminal_runtimes,
+            workspace_index,
+            pane_id,
+        ) else {
+            return;
+        };
+        // A normal focus transition may have already satisfied this queued enable.
+        if !runtime.initial_focus_pending() {
+            return;
+        }
         let focused = self.clients.iter().any(|(&client_id, client)| {
             client.is_active_shell_client()
                 && client.outer_terminal_focus == Some(true)
