@@ -349,7 +349,7 @@ herdr agent explain --file PATH --agent LABEL [--json|--verbose]
 
 ```bash
 herdr agent channel-info <target>
-herdr agent draft-state <target>
+herdr agent draft-state <target> [--allow-cross-pane]
 herdr agent prompt <target> <text> --if-draft-empty [--allow-cross-pane]
 herdr agent prompt-guarded <target> <text> --expected-terminal TERMINAL_ID --expected-registration-epoch EPOCH --request-id ID [--timeout-ms MS] [--allow-cross-pane] [--if-draft-empty]
 ```
@@ -364,7 +364,7 @@ herdr agent prompt-guarded <target> <text> --expected-terminal TERMINAL_ID --exp
 
 ガード付きフレームは期限を持ちます。Pi は上記の確認と submit 呼び出しの前に、期限切れを同期的に `expired` で拒否し、送信もエディタ変更も行いません。期限の欠落・不正は `unknown` で拒否します。ソケット配信前の型付き失敗は未送信を意味しますが、受け入れの可能性がある後の確認喪失は引き続き `delivery_unknown` であり、再送してはいけません。
 
-`agent draft-state` は登録済みチャネルを使う読み取り専用の観測で、既定の問い合わせタイムアウトは 2 秒です。結果は `{status: "known", empty, chars, hold}` で、`empty` は boolean、`chars` は整数の文字数、`hold` は `null`（hold なし）、`"dialog"`、`"custom"`、`"editor"` のいずれかです。ドラフト本文は返しません。取得できない場合は `{status: "unknown", reason}` を返し、理由は `unregistered`（チャネルなし）、`unsupported`（能力なし）、`timeout`（期限内の応答なし）、`unknown`（観測不能）です。unknown は空のドラフトを意味しません。この問い合わせは後の送信を許可するものではなく、ガード付きプロンプトは受け入れ時に再確認します。
+`agent draft-state` は登録済みチャネルを使う読み取り専用の観測で、既定の問い合わせタイムアウトは 2 秒です。結果は `{status: "known", empty, hold}` で、`empty` は boolean、`hold` は `null`（hold なし）、`"dialog"`、`"custom"`、`"editor"` のいずれかです。ドラフト本文も長さも返しません。問い合わせにはプロンプトと同じ自分のペイン/別ペインの権限ポリシーが適用されます。エージェントから別ペインへの問い合わせには明示的な `--allow-cross-pane` が必要で、CLI が暗黙に許可を追加することはありません。許可なしでは、別ペインのエージェントからの呼び出しは `cross_pane_input_denied`、呼び出し元を観測できない場合は `input_origin_unknown` で拒否します。このフラグはチャネルやターミナル識別子の検証を回避しません。TARGET はリテラルです。フラグ形の対象を明示的な許可付きで指定するには `herdr agent draft-state --allow-cross-pane -- --allow-cross-pane` を使います。取得できない場合は `{status: "unknown", reason}` を返し、理由は `unregistered`（チャネルなし）、`unsupported`（能力なし）、`timeout`（期限内の応答なし）、`unknown`（観測不能）です。unknown は空のドラフトを意味しません。この問い合わせは後の送信を許可するものではなく、ガード付きプロンプトは受け入れ時に再確認します。
 
 成功時は、活動中セッションの入力に受け入れられた `status: "accepted"`、またはそのセッションの後続キューに入った `"queued"` と、固定したターミナル、epoch、リクエスト ID、セッション世代を返します。ターンの完了や成功は保証しません。同じ epoch 内の同じ ID、完全に同じテキスト、同じ `if_draft_empty` 値は、再送せずに最初の結果を共有します。テキストまたはガード値の変更は `payload_mismatch` です。新しい ID は新規リクエストであり、安全な再試行ではありません。
 

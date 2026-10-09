@@ -374,7 +374,7 @@ Use `pane send-text`, `pane send-keys`, `pane run`, and `terminal attach` for or
 
 ```bash
 herdr agent channel-info <target>
-herdr agent draft-state <target>
+herdr agent draft-state <target> [--allow-cross-pane]
 herdr agent prompt <target> <text> --if-draft-empty [--allow-cross-pane]
 herdr agent prompt-guarded <target> <text> --expected-terminal TERMINAL_ID --expected-registration-epoch EPOCH --request-id ID [--timeout-ms MS] [--allow-cross-pane] [--if-draft-empty]
 ```
@@ -398,7 +398,7 @@ On `prompt-guarded`, `--if-draft-empty` also preflights the capability and retai
 
 Guarded frames carry a deadline; Pi synchronously rejects expired frames with `expired` before the checks and submit invocation, without submitting or mutating the editor. Missing or invalid guarded expiry is rejected with `unknown`. A typed failure before socket dispatch means nothing was sent; receipt loss after possible admission remains `delivery_unknown`, never a replay opportunity.
 
-`agent draft-state` is a read-only, redacted observation over the registered channel, with a default two-second query timeout. Its result is `{status: "known", empty, chars, hold}`: `empty` is boolean, `chars` is an integer count, and `hold` is `null` (no hold), `"dialog"`, `"custom"`, or `"editor"`. Draft text is never returned. Otherwise it returns `{status: "unknown", reason}` with `unregistered` (no channel), `unsupported` (no capability), `timeout` (no timely reply), or `unknown` (unobservable state). Unknown is not an empty draft. A query is not authorization for a later send; the guarded prompt rechecks at admission.
+`agent draft-state` is a read-only, redacted observation over the registered channel, with a default two-second query timeout. Its result is `{status: "known", empty, hold}`: `empty` is boolean and `hold` is `null` (no hold), `"dialog"`, `"custom"`, or `"editor"`. Neither draft text nor draft length is returned. The query enforces the same self/cross-pane permission policy as prompts: agent-originated queries to another pane require explicit `--allow-cross-pane`; the CLI never adds this override implicitly. Without the override, a different-pane agent caller receives `cross_pane_input_denied` and an unobservable caller origin receives `input_origin_unknown`. The flag does not bypass channel or terminal identity checks. TARGET is literal; use `herdr agent draft-state --allow-cross-pane -- --allow-cross-pane` to query a flag-shaped target with an explicit override. Otherwise it returns `{status: "unknown", reason}` with `unregistered` (no channel), `unsupported` (no capability), `timeout` (no timely reply), or `unknown` (unobservable state). Unknown is not an empty draft. A query is not authorization for a later send; the guarded prompt rechecks at admission.
 
 Success returns `status: "accepted"` (admitted to the active session's input) or `"queued"` (admitted to that session's follow-up queue), plus the pinned terminal, epoch, request ID, and session generation. Neither status promises that a model turn finished or succeeded. Within one epoch, the same request ID, exact text, and `if_draft_empty` value share the first outcome without another submission; changing the text or guard value returns `payload_mismatch`. A new ID is a new request, not a safe retry.
 

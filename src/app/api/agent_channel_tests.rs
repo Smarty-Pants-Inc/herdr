@@ -98,7 +98,8 @@ async fn channel_discovery_undetected_terminal_and_no_transport_have_zero_pty_ef
 }
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[tokio::test]
-async fn channel_draft_query_is_read_only_with_unknown_origin_and_unregistered_guard_is_typed() {
+async fn channel_draft_query_refuses_unknown_origin_before_reservation_and_unregistered_guard_is_typed(
+) {
     let (mut app, pane, mut input) = app();
     let target = app.public_pane_id(0, pane).unwrap();
     let terminal = app.state.workspaces[0]
@@ -109,12 +110,17 @@ async fn channel_draft_query_is_read_only_with_unknown_origin_and_unregistered_g
         id: "query".into(),
         method: Method::AgentDraftState(AgentDraftStateParams {
             target: target.clone(),
+            allow_cross_pane: false,
         }),
     };
     assert!(!crate::api::request_changes_ui(&query));
-    assert!(app
-        .cross_pane_input_denial(&query, crate::api::ApiRequestContext::default())
-        .is_none());
+    assert_eq!(
+        value(
+            app.cross_pane_input_denial(&query, crate::api::ApiRequestContext::default())
+                .expect("unknown caller denied")
+        )["error"]["code"],
+        "input_origin_unknown"
+    );
     let (respond_to, response) = std::sync::mpsc::channel();
     assert!(app.handle_deferred_agent_api_request(
         query,
@@ -122,8 +128,22 @@ async fn channel_draft_query_is_read_only_with_unknown_origin_and_unregistered_g
         respond_to
     ));
     let response = value(response.recv_timeout(Duration::from_secs(1)).unwrap());
+    assert_eq!(response["error"]["code"], "input_origin_unknown");
+    assert!(response.get("result").is_none());
+    let (respond_to, response) = std::sync::mpsc::channel();
+    assert!(app.handle_deferred_agent_api_request(
+        Request {
+            id: "query-opt-in".into(),
+            method: Method::AgentDraftState(AgentDraftStateParams {
+                target: target.clone(),
+                allow_cross_pane: true,
+            })
+        },
+        crate::api::ApiRequestContext::default(),
+        respond_to,
+    ));
     assert_eq!(
-        response["result"],
+        value(response.recv_timeout(Duration::from_secs(1)).unwrap())["result"],
         serde_json::json!({"status":"unknown", "reason":"unregistered"})
     );
     let params = AgentPromptGuardedParams {
@@ -146,6 +166,63 @@ async fn channel_draft_query_is_read_only_with_unknown_origin_and_unregistered_g
     assert_eq!(rejected["error"]["reason"], "unregistered");
     assert!(input.try_recv().is_err());
     assert!(app.agent_channels.owners.is_empty());
+}
+
+#[tokio::test]
+async fn channel_draft_query_default_endpoint_context_denies_before_any_channel_frame() {
+    let (mut app, pane, mut input) = app();
+    let terminal = app.state.workspaces[0].terminal_id(pane).unwrap().clone();
+    let root = crate::platform::process_identity(std::process::id()).unwrap();
+    let (channel, frames) = Channel::new(
+        terminal.to_string(),
+        "epoch".into(),
+        "session".into(),
+        root,
+        root,
+        app.state.workspaces[0].id.clone(),
+        pane,
+        None,
+    );
+    channel.mark_ready();
+    channel.set_draft_guard(true);
+    app.agent_channels
+        .owners
+        .insert(terminal.to_string(), channel.clone());
+    app.terminal_runtimes.bind_agent_channel(terminal, &channel);
+    let target = app.public_pane_id(0, pane).unwrap();
+    // Client-shell dispatch carries no local peer pin: it must fail the exact
+    // prompt policy, even with a registered target, before query reservation.
+    let request = Request {
+        id: "endpoint-default".into(),
+        method: Method::AgentDraftState(AgentDraftStateParams {
+            target: target.clone(),
+            allow_cross_pane: false,
+        }),
+    };
+    let (respond_to, response) = std::sync::mpsc::channel();
+    assert!(app.handle_deferred_agent_api_request(
+        request,
+        crate::api::ApiRequestContext::default(),
+        respond_to
+    ));
+    let response = value(response.recv_timeout(Duration::from_secs(1)).unwrap());
+    assert_eq!(response["error"]["code"], "input_origin_unknown");
+    assert!(response.get("result").is_none());
+    assert!(
+        frames.try_recv().is_err(),
+        "unknown endpoint dispatched a query"
+    );
+    assert!(input.try_recv().is_err());
+    let allowed = Request {
+        id: "endpoint-explicit".into(),
+        method: Method::AgentDraftState(AgentDraftStateParams {
+            target,
+            allow_cross_pane: true,
+        }),
+    };
+    assert!(app
+        .cross_pane_input_denial(&allowed, crate::api::ApiRequestContext::default())
+        .is_none());
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]

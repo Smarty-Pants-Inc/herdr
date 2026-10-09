@@ -3,7 +3,7 @@
 ## Unreleased
 
 ### Added
-- `herdr agent prompt <target> <text> --if-draft-empty` submits only through a registered channel that advertises draft guarding, pins the terminal and registration epoch, and sends once without typing into the terminal or falling back. Pi checks that the editor is empty and no dialog, custom UI, or editor hold is active at admission; existing drafts are left untouched. The same guard is available on `agent prompt-guarded`. `herdr agent draft-state <target>` reports read-only empty/character-count/hold metadata without exposing draft text; unavailable state is reported as unknown. (#5938)
+- `herdr agent prompt <target> <text> --if-draft-empty` submits only through a registered channel that advertises draft guarding, pins the terminal and registration epoch, and sends once without typing into the terminal or falling back. Pi checks that the editor is empty and no dialog, custom UI, or editor hold is active at admission; existing drafts are left untouched. The same guard is available on `agent prompt-guarded`. `herdr agent draft-state <target> [--allow-cross-pane]` reports only read-only empty/hold metadata without exposing draft text or length and enforces the same self/cross-pane permission policy as prompts; unavailable state is reported as unknown. (#5938)
 
 ## [0.9.3] - 2026-09-29
 

@@ -317,8 +317,12 @@ impl App {
         respond_to: std::sync::mpsc::Sender<String>,
     ) -> bool {
         if let Method::AgentDraftState(params) = &request.method {
-            // A read-only socket query bypasses input policy and never acquires a
-            // PTY writer, focus, or stale caller observation as submission authority.
+            // Observation is read-only, but its caller attribution is the same
+            // policy as prompts. Refuse before reserving or sending a query frame.
+            if let Some(response) = self.cross_pane_input_denial(&request, context) {
+                let _ = respond_to.send(response);
+                return true;
+            }
             let reservation = self.reserve_draft_state(params);
             Self::respond_channel_reservation(request.id, reservation, respond_to);
             return true;

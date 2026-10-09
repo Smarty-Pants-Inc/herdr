@@ -1028,6 +1028,48 @@ fn channel_ack_parser_is_closed_typed_and_complete() {
 }
 
 #[test]
+fn channel_guarded_deadline_samples_wall_first_and_descheduling_only_shortens_authority() {
+    let timeout = Duration::from_secs(1);
+    let monotonic_base = Instant::now();
+    let wall_base = std::time::UNIX_EPOCH + Duration::from_micros(1_234_567);
+    for gap in [Duration::ZERO, Duration::from_secs(30)] {
+        let sampled_wall = Cell::new(false);
+        let elapsed = Cell::new(Duration::ZERO);
+        let (deadline, wire_deadline) = sample_deadlines(
+            timeout,
+            true,
+            || {
+                assert_eq!(elapsed.get(), Duration::ZERO, "wall must be sampled first");
+                sampled_wall.set(true);
+                elapsed.set(gap); // Simulate descheduling immediately after wall sampling.
+                wall_base
+            },
+            || {
+                assert!(sampled_wall.get(), "monotonic sampled before wall");
+                monotonic_base + elapsed.get()
+            },
+        )
+        .unwrap();
+        assert_eq!(deadline, monotonic_base + gap + timeout);
+        assert_eq!(wire_deadline, Some(2234)); // Millisecond truncation is conservative too.
+        let wall_expiry = std::time::UNIX_EPOCH + Duration::from_millis(wire_deadline.unwrap());
+        assert!(
+            wall_expiry.duration_since(wall_base).unwrap()
+                <= deadline.duration_since(monotonic_base)
+        );
+    }
+    let (deadline, wire_deadline) = sample_deadlines(
+        timeout,
+        false,
+        || panic!("unguarded requests do not sample wall time"),
+        || monotonic_base,
+    )
+    .unwrap();
+    assert_eq!(deadline, monotonic_base + timeout);
+    assert_eq!(wire_deadline, None);
+}
+
+#[test]
 fn channel_draft_guard_identity_deadline_and_retired_duplicate_are_immutable() {
     let (channel, receiver) = channel();
     channel.set_draft_guard(true);
@@ -1186,18 +1228,41 @@ fn channel_draft_guard_rejection_reasons_remain_typed_and_retained() {
     }
 }
 
+#[test]
+fn channel_draft_query_rejects_chars_even_in_an_otherwise_valid_receipt() {
+    assert!(
+        serde_json::from_value::<AgentDraftStateResult>(serde_json::json!({
+            "status":"known", "empty":true, "chars":0, "hold":null
+        }))
+        .is_err()
+    );
+    for chars in [
+        serde_json::json!(0),
+        serde_json::json!(7),
+        serde_json::json!(9007199254740992u64),
+        serde_json::json!("private data"),
+    ] {
+        let receipt = serde_json::json!({"type":"draft_state", "registration_epoch":"epoch_test", "request_id":"q",
+            "session_generation":"session_test", "empty":true, "chars":chars, "hold":null});
+        assert!(
+            serde_json::from_value::<DraftStateAck>(receipt).is_err(),
+            "chars must never be accepted"
+        );
+    }
+}
+
 fn draft_ack_value() -> serde_json::Value {
     serde_json::json!({"type":"draft_state", "registration_epoch":"epoch_test", "request_id":"q",
-        "session_generation":"session_test", "empty":true, "chars":0, "hold":null})
+        "session_generation":"session_test", "empty":true, "hold":null})
 }
 
 #[test]
 fn channel_draft_query_known_and_unknown_project_no_text_or_correlation() {
-    for (empty, chars, hold) in [
-        (true, 0, serde_json::Value::Null),
-        (false, 5, "dialog".into()),
-        (true, 0, "custom".into()),
-        (false, 8, "editor".into()),
+    for (empty, hold) in [
+        (true, serde_json::Value::Null),
+        (false, "dialog".into()),
+        (true, "custom".into()),
+        (false, "editor".into()),
     ] {
         let (channel, receiver) = channel();
         channel.set_draft_guard(true);
@@ -1212,7 +1277,6 @@ fn channel_draft_query_known_and_unknown_project_no_text_or_correlation() {
         assert_eq!(frame.as_object().unwrap().len(), 4);
         let mut receipt = draft_ack_value();
         receipt["empty"] = empty.into();
-        receipt["chars"] = chars.into();
         receipt["hold"] = hold.clone();
         channel
             .draft_ack(serde_json::from_value(receipt).unwrap())
@@ -1221,7 +1285,7 @@ fn channel_draft_query_known_and_unknown_project_no_text_or_correlation() {
             serde_json::from_str(&query.wait().response("caller".into(), false)).unwrap();
         assert_eq!(
             response["result"],
-            serde_json::json!({"status":"known", "empty":empty, "chars":chars, "hold":hold})
+            serde_json::json!({"status":"known", "empty":empty, "hold":hold})
         );
         assert_eq!(receiver.try_iter().count(), 1);
     }
@@ -1241,7 +1305,7 @@ fn channel_draft_query_known_and_unknown_project_no_text_or_correlation() {
 #[test]
 fn channel_draft_query_parser_and_correlation_fail_closed() {
     let base = draft_ack_value();
-    for duplicate in ["\"request_id\":\"q\"", "\"chars\":0"] {
+    for duplicate in ["\"request_id\":\"q\"", "\"empty\":true", "\"hold\":null"] {
         let bytes = format!("{{{},{}", duplicate, &base.to_string()[1..]);
         assert!(
             serde_json::from_str::<DraftStateAck>(&bytes).is_err(),
@@ -1254,7 +1318,6 @@ fn channel_draft_query_parser_and_correlation_fail_closed() {
         "request_id",
         "session_generation",
         "empty",
-        "chars",
         "hold",
     ] {
         let mut absent = base.clone();
@@ -1301,13 +1364,6 @@ fn channel_draft_query_parser_and_correlation_fail_closed() {
             .draft_ack(serde_json::from_value(wrong).unwrap())
             .is_err());
         assert!(query.pending());
-    }
-    for chars in [1, MAX_SAFE_JSON_INTEGER + 1] {
-        let mut wrong = base.clone();
-        wrong["chars"] = chars.into();
-        assert!(channel
-            .draft_ack(serde_json::from_value(wrong).unwrap())
-            .is_err());
     }
     let unknown_false = serde_json::json!({"type":"draft_state", "registration_epoch":"epoch_test", "request_id":"q", "session_generation":"session_test", "unknown":false});
     assert!(channel

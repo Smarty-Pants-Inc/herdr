@@ -348,7 +348,11 @@ fn agent_command() -> Command {
             Command::new("draft-state")
                 .about("Inspect registered Pi editor emptiness and UI holds without exposing draft text")
                 .arg(required("target", "TARGET").allow_hyphen_values(true))
-                .after_help("An unregistered pane, an old extension, or an unavailable reply returns unknown. This snapshot does not authorize a later prompt; use --if-draft-empty for an atomic check."),
+                .arg(
+                    flag("allow-cross-pane")
+                        .help("Deliberately allow an agent-originated query to target another pane"),
+                )
+                .after_help("Queries enforce the same self/cross-pane permission policy as prompts; no override is implicit. Put options before -- when TARGET matches an option. An unregistered pane, an old extension, or an unavailable reply returns unknown. This snapshot does not authorize a later prompt; use --if-draft-empty for an atomic check."),
         )
         .subcommand(
             Command::new("prompt-guarded")
@@ -1299,9 +1303,16 @@ mod tests {
         assert!(has_option(guarded, "timeout-ms"));
         assert!(has_option(guarded, "allow-cross-pane"));
         assert!(has_option(guarded, "if-draft-empty"));
-        assert!(
-            argument(command_path(&cmd, &["agent", "draft-state"]), "target").is_required_set()
-        );
+        let draft = command_path(&cmd, &["agent", "draft-state"]);
+        assert!(argument(draft, "target").is_required_set());
+        assert!(has_option(draft, "allow-cross-pane"));
+        for forbidden in ["if-draft-empty", "wait", "until", "timeout", "timeout-ms"] {
+            assert!(!has_option(draft, forbidden));
+        }
+        let help = long_help(&["agent", "draft-state"]);
+        assert!(help.contains("--allow-cross-pane"));
+        assert!(help.contains("same self/cross-pane permission policy"));
+        assert!(help.contains("no override is implicit"));
         assert!(has_option(
             command_path(&cmd, &["agent", "prompt"]),
             "if-draft-empty"
@@ -1379,6 +1390,49 @@ mod tests {
             assert!(output.is_empty());
             let args = ["herdr", "agent", "channel-info", "--", text].map(str::to_owned);
             assert!(!super::write_requested_help(&args, &mut output, || {}).unwrap());
+        }
+    }
+
+    #[test]
+    fn draft_query_spec_exposes_explicit_override_and_separator_target() {
+        for (leaf_args, target, allowed) in [
+            (vec!["worker"], "worker", false),
+            (vec!["--allow-cross-pane", "worker"], "worker", true),
+            (vec!["worker", "--allow-cross-pane"], "worker", true),
+            (
+                vec!["--", "--allow-cross-pane"],
+                "--allow-cross-pane",
+                false,
+            ),
+            (vec!["--allow-cross-pane", "--", "--help"], "--help", true),
+            (
+                vec!["--allow-cross-pane", "--", "--session=literal"],
+                "--session=literal",
+                true,
+            ),
+        ] {
+            let input = ["herdr", "agent", "draft-state"]
+                .into_iter()
+                .chain(leaf_args.iter().copied());
+            let parsed = super::command().try_get_matches_from(input).unwrap();
+            let leaf = parsed
+                .subcommand_matches("agent")
+                .unwrap()
+                .subcommand_matches("draft-state")
+                .unwrap();
+            assert_eq!(
+                leaf.get_one::<String>("target").map(String::as_str),
+                Some(target)
+            );
+            assert_eq!(leaf.get_flag("allow-cross-pane"), allowed);
+            let input = ["herdr", "agent", "draft-state"]
+                .into_iter()
+                .chain(leaf_args)
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            let mut output = Vec::new();
+            assert!(!super::write_requested_help(&input, &mut output, || {}).unwrap());
+            assert!(output.is_empty());
         }
     }
 

@@ -2022,16 +2022,68 @@ for (const [draft, hold] of [["", undefined], [" \n🐑e\u0301", "dialog"], ["se
     expect(connection.draftStates[0]).toEqual({
       type: "draft_state", registration_epoch: "epoch-1", request_id: "read-only",
       session_generation: "session-1", empty: draft.length === 0,
-      chars: Array.from(draft).length, hold: hold ?? null,
+      hold: hold ?? null,
     });
     expect(typeof connection.draftStates[0].empty).toBe("boolean");
-    expect(Number.isSafeInteger(connection.draftStates[0].chars)).toBe(true);
-    expect(connection.draftStates[0]).not.toHaveProperty("text");
-    expect(connection.draftStates[0]).not.toHaveProperty("draft");
+    expect(Object.keys(connection.draftStates[0]).sort()).toEqual([
+      "empty", "hold", "registration_epoch", "request_id", "session_generation", "type",
+    ]);
+    for (const field of ["chars", "count", "length", "text", "draft"]) {
+      expect(connection.draftStates[0]).not.toHaveProperty(field);
+    }
     expect(JSON.stringify(connection.draftStates)).not.toContain("secret");
     expect(asset.calls).toEqual([]);
     expect(connection.acks).toEqual([]);
     expect(mutations).toBe(0);
+  });
+}
+
+for (const path of ["empty", "draft-present", "hold", "late"] as const) {
+  registeredChannelTest(`Pi draft privacy emits neither count nor text across the ${path} guarded path`, async () => {
+    const { connections, reports } = await startChannelServer();
+    const privateDraft = "private unsent text 👩🏽‍💻 e\u0301\n";
+    const editor = path === "draft-present" || path === "late" ? privateDraft : "";
+    const hold = path === "hold" ? "dialog" : undefined;
+    const asset = await loadChannelAsset(async (request) => ({
+      status: "accepted", sessionGeneration: request.sessionGeneration,
+      text: privateDraft, chars: 999, count: 999, length: 999,
+    }));
+    await asset.handlers.get("session_start")?.({}, draftContext({
+      getEditorText: () => editor, holdState: () => hold,
+    }));
+    await waitFor(() => connections.length === 1);
+    const connection = connections[0];
+    queryDraft(connection, "privacy-query", {
+      text: privateDraft, draft: privateDraft, chars: 999, count: 999, length: 999,
+    });
+    await waitFor(() => connection.draftStates.length === 1);
+    connection.socket.write(`${JSON.stringify({
+      ...delivery(connection, "privacy-delivery"), if_draft_empty: true,
+      deadline_ms: path === "late" ? Date.now() - 1 : Date.now() + 60_000,
+    })}\n`);
+    await waitFor(() => connection.acks.length === 1);
+    expect(connection.draftStates).toEqual([{
+      type: "draft_state", registration_epoch: connection.epoch,
+      request_id: "privacy-query", session_generation: connection.generation,
+      empty: editor.length === 0, hold: hold ?? null,
+    }]);
+    expect(connection.acks).toEqual([{
+      type: "ack", registration_epoch: connection.epoch,
+      request_id: "privacy-delivery", session_generation: connection.generation,
+      ...(path === "empty" ? { status: "accepted" } : {
+        status: "rejected", reason: path === "draft-present" ? "draft_present" : path === "hold" ? "ui_hold" : "expired",
+      }),
+    }]);
+    const emitted = [...connection.draftStates, ...connection.acks, ...reports];
+    for (const frame of emitted) {
+      for (const field of ["chars", "count", "length", "text", "draft"]) {
+        expect(frame).not.toHaveProperty(field);
+      }
+    }
+    expect(JSON.stringify(emitted)).not.toContain(privateDraft);
+    expect(JSON.stringify(emitted)).not.toMatch(/"(?:chars|count|length|text|draft)":/);
+    expect(asset.calls.map((request) => request.text)).toEqual(path === "empty" ? ["hello"] : []);
+    expect(editor).toBe(path === "draft-present" || path === "late" ? privateDraft : "");
   });
 }
 

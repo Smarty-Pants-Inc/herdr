@@ -37,7 +37,7 @@ fn channel_methods_have_distinct_json_shapes_and_no_transport_authority() {
     assert!(matches!(old.method, Method::AgentPrompt(_))); // Methods never reinterpret one another.
 }
 #[test]
-fn channel_draft_guard_json_contract_is_explicit_and_query_is_target_only() {
+fn channel_draft_guard_json_contract_is_explicit_and_query_has_strict_caller_policy() {
     let registration: Request = serde_json::from_value(serde_json::json!({
         "id":"r", "method":"agent.register_self", "params":{
             "session_generation":"session", "draft_guard":true
@@ -88,6 +88,23 @@ fn channel_draft_guard_json_contract_is_explicit_and_query_is_target_only() {
         serde_json::to_value(&query).unwrap()["params"],
         serde_json::json!({"target":"pane"})
     );
+    let Method::AgentDraftState(params) = &query.method else {
+        panic!("draft query");
+    };
+    assert!(!params.allow_cross_pane);
+    let mut allowed = serde_json::to_value(&query).unwrap();
+    allowed["params"]["allow_cross_pane"] = true.into();
+    let Method::AgentDraftState(params) = serde_json::from_value::<Request>(allowed.clone())
+        .unwrap()
+        .method
+    else {
+        panic!("draft query");
+    };
+    assert!(params.allow_cross_pane);
+    for value in [serde_json::Value::Null, "true".into(), 1.into()] {
+        allowed["params"]["allow_cross_pane"] = value;
+        assert!(serde_json::from_value::<Request>(allowed.clone()).is_err());
+    }
     assert!(!crate::api::request_changes_ui(&query));
     assert_eq!(api_method_name(&query.method), "agent.draft_state");
     for field in [
@@ -98,13 +115,13 @@ fn channel_draft_guard_json_contract_is_explicit_and_query_is_target_only() {
         "if_draft_empty",
         "request_id",
         "timeout_ms",
-        "allow_cross_pane",
+        "forged_origin",
     ] {
         let mut invalid = serde_json::to_value(&query).unwrap();
         invalid["params"][field] = true.into();
         assert!(
             serde_json::from_value::<Request>(invalid).is_err(),
-            "query must be target-only: {field}"
+            "query accepts only target and caller policy: {field}"
         );
     }
 }
@@ -114,6 +131,7 @@ fn draft_query_request() -> Request {
         id: "draft-query".into(),
         method: Method::AgentDraftState(crate::api::schema::AgentDraftStateParams {
             target: "pane".into(),
+            allow_cross_pane: false,
         }),
     }
 }
@@ -179,7 +197,7 @@ fn channel_draft_query_app_receiver_and_response_loss_are_unknown() {
 #[test]
 fn channel_draft_query_app_results_and_target_errors_are_preserved() {
     for response in [
-        serde_json::json!({"id":"draft-query", "result":{"status":"known", "empty":false, "chars":4, "hold":"editor"}}),
+        serde_json::json!({"id":"draft-query", "result":{"status":"known", "empty":false, "hold":"editor"}}),
         serde_json::json!({"id":"draft-query", "error":{"code":"agent_not_found", "message":"target missing"}}),
     ] {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ApiRequestMessage>();

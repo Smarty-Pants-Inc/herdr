@@ -19,7 +19,7 @@ const GENERATION: &str = "test-session-1";
 // recorder's control barrier drains stdin before replying, including on a PTY
 // with no newline. A positive control tests this instrumentation separately.
 const PROCESS: &str = r#"
-import json, os, pathlib, select, socket, subprocess, sys, time, tty
+import json, os, pathlib, select, socket, subprocess, sys, threading, time, tty
 
 role = sys.argv[1]
 directory = pathlib.Path(sys.argv[2])
@@ -72,6 +72,17 @@ def register(claim):
     response = read_json(s)
     s.settimeout(None)
     return s, response
+
+def api_request(value):
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+        s.settimeout(10)
+        s.connect(os.environ['CHANNEL_TEST_SOCKET'])
+        send_json(s, value)
+        return read_json(s)
+
+if role == 'request':
+    print(json.dumps(api_request(json.loads(sys.argv[3]))), flush=True)
+    sys.exit(0)
 
 if role == 'probe':
     s, response = register(sys.argv[3])
@@ -154,7 +165,12 @@ while True:
             command = read_json(peer)
             op = command['op']
             result = {'ok': True}
-            if op == 'mode':
+            if op == 'request':
+                # The actual registered agent opens the API socket. A separate
+                # thread lets its receiver event loop answer same-pane queries.
+                threading.Thread(target=lambda value=command['request'], name=command['name']:
+                    publish(name, api_request(value)), daemon=True).start()
+            elif op == 'mode':
                 mode = command['mode']
             elif op in ('disconnect', 'reconnect'):
                 if channel is not None:
@@ -216,14 +232,14 @@ while True:
                 # ingress. The fake peer exercises real server projection/parser.
                 append('queries.jsonl', frame)
                 reply = {key: frame[key] for key in ('registration_epoch', 'request_id', 'session_generation')}
-                reply.update(type='draft_state', empty=True, chars=0, hold=None)
+                reply.update(type='draft_state', empty=True, hold=None)
                 if mode == 'query_timeout':
                     continue
                 if mode == 'query_unknown':
                     reply = {key: reply[key] for key in ('type', 'registration_epoch', 'request_id', 'session_generation')}
                     reply['unknown'] = True
                 elif mode == 'query_nonempty':
-                    reply.update(empty=False, chars=7)
+                    reply.update(empty=False)
                 elif mode in ('query_dialog', 'query_custom', 'query_editor'):
                     reply['hold'] = mode.removeprefix('query_')
                 elif mode == 'query_text':
@@ -234,6 +250,8 @@ while True:
                     reply['session_generation'] = 'wrong'
                 elif mode == 'query_wrong_id':
                     reply['request_id'] = 'wrong'
+                elif mode == 'query_chars':
+                    reply['chars'] = 0
                 elif mode == 'query_bounds':
                     reply['chars'] = 9007199254740992
                 send_json(channel, reply)
@@ -500,6 +518,16 @@ impl TestPane {
 
     fn control(&self, command: Value) -> Value {
         request_control(&self.directory.join("agent.sock"), command)
+    }
+
+    fn agent_request(&self, name: &str, method: &str, params: Value) -> Value {
+        let name = format!("response-{name}.json");
+        assert_eq!(
+            self.control(json!({"op":"request", "name":name,
+            "request":{"id":name, "method":method, "params":params}}))["ok"],
+            true
+        );
+        self.file(&name)
     }
 
     fn exit(&self, number: u32) {
@@ -1092,6 +1120,107 @@ fn guarded_channel_if_draft_empty_typed_refusals_send_no_input_and_do_not_replay
 }
 
 #[test]
+fn guarded_channel_draft_query_uses_real_caller_policy_before_sending_any_frame() {
+    let server = ChannelServer::new();
+    let a = server.pane("query-caller-a", "accepted", "self");
+    a.registration(1);
+    let b = server.pane("query-target-b", "accepted", "self");
+    b.registration(1);
+    // Neither peer reports an agent/detection state. Registration alone must
+    // establish agent-origin policy for the independently running API caller.
+    for (name, params) in [
+        ("cross-default", json!({"target":b.id})),
+        (
+            "cross-false",
+            json!({"target":b.id, "allow_cross_pane":false}),
+        ),
+    ] {
+        let denied = a.agent_request(name, "agent.draft_state", params);
+        assert_refusal(&denied);
+        assert_eq!(
+            denied["error"]["code"], "cross_pane_input_denied",
+            "{denied}"
+        );
+        assert!(
+            b.entries("queries.jsonl").is_empty(),
+            "denial sent a query frame"
+        );
+        assert!(a.entries("queries.jsonl").is_empty());
+    }
+    let known = json!({"status":"known", "empty":true, "hold":null});
+    let own = a.agent_request("same-pane", "agent.draft_state", json!({"target":a.id}));
+    assert_result(&own);
+    assert_eq!(own["result"], known);
+    assert_eq!(a.entries("queries.jsonl").len(), 1);
+    assert!(b.entries("queries.jsonl").is_empty());
+    let allowed = a.agent_request(
+        "cross-opt-in",
+        "agent.draft_state",
+        json!({"target":b.id, "allow_cross_pane":true}),
+    );
+    assert_result(&allowed);
+    assert_eq!(allowed["result"], known);
+    assert_eq!(b.entries("queries.jsonl").len(), 1);
+    // The real, marker-free ordinary test client uses the same default policy as
+    // prompts: explicit opt-in is not required when attribution proves ordinary.
+    let ordinary = server.request("agent.draft_state", json!({"target":b.id}));
+    assert_result(&ordinary);
+    assert_eq!(ordinary["result"], known);
+    assert_eq!(b.entries("queries.jsonl").len(), 2);
+    // A live outside PID with pane launch markers but no native pane relationship
+    // is Unknown, not ordinary or the supplied public pane. Test the socket path.
+    for allow in [false, true] {
+        let mut external = Command::new("python3");
+        crate::test_command::sanitize_command_env(&mut external);
+        let output = external
+            .arg(server.base.join("process.py"))
+            .arg("request")
+            .arg(server.base.join("unknown-query-peer"))
+            .arg(
+                json!({"id":"unknown-query", "method":"agent.draft_state",
+                "params":{"target":b.id, "allow_cross_pane":allow}})
+                .to_string(),
+            )
+            .env("CHANNEL_TEST_SOCKET", &server.socket)
+            .env("HERDR_ENV", "1")
+            .env("HERDR_PANE_ID", &a.id)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+        if allow {
+            assert_result(&response);
+            assert_eq!(response["result"], known);
+            assert_eq!(b.entries("queries.jsonl").len(), 3);
+        } else {
+            assert_refusal(&response);
+            assert_eq!(
+                response["error"]["code"], "input_origin_unknown",
+                "{response}"
+            );
+            assert_eq!(
+                b.entries("queries.jsonl").len(),
+                2,
+                "unknown caller sent a frame"
+            );
+        }
+    }
+    assert!(a.entries("frames.jsonl").is_empty());
+    assert!(b.entries("frames.jsonl").is_empty());
+    assert!(a.entries("admitted.jsonl").is_empty());
+    assert!(b.entries("admitted.jsonl").is_empty());
+    a.exit(1);
+    b.exit(1);
+    a.assert_no_shell_input(1);
+    b.assert_no_shell_input(1);
+}
+
+#[test]
 fn guarded_channel_draft_query_known_unknown_timeout_is_read_only_and_not_authority() {
     let server = ChannelServer::new();
     let pane = server.pane("draft-query", "accepted", "");
@@ -1099,23 +1228,23 @@ fn guarded_channel_draft_query_known_unknown_timeout_is_read_only_and_not_author
     for (mode, expected) in [
         (
             "accepted",
-            json!({"status":"known", "empty":true, "chars":0, "hold":null}),
+            json!({"status":"known", "empty":true, "hold":null}),
         ),
         (
             "query_nonempty",
-            json!({"status":"known", "empty":false, "chars":7, "hold":null}),
+            json!({"status":"known", "empty":false, "hold":null}),
         ),
         (
             "query_dialog",
-            json!({"status":"known", "empty":true, "chars":0, "hold":"dialog"}),
+            json!({"status":"known", "empty":true, "hold":"dialog"}),
         ),
         (
             "query_custom",
-            json!({"status":"known", "empty":true, "chars":0, "hold":"custom"}),
+            json!({"status":"known", "empty":true, "hold":"custom"}),
         ),
         (
             "query_editor",
-            json!({"status":"known", "empty":true, "chars":0, "hold":"editor"}),
+            json!({"status":"known", "empty":true, "hold":"editor"}),
         ),
         (
             "query_unknown",
@@ -1211,6 +1340,7 @@ fn guarded_channel_draft_query_bad_receipt_or_private_text_fails_closed_without_
         "query_wrong_epoch",
         "query_wrong_session",
         "query_wrong_id",
+        "query_chars",
         "query_bounds",
     ] {
         let pane = server.pane(mode, mode, "");

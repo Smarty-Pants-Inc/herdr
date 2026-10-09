@@ -408,7 +408,7 @@ mod tests {
     }
 
     #[test]
-    fn draft_state_endpoint_is_advertised_read_only_and_target_only() {
+    fn draft_state_endpoint_is_read_only_with_explicit_cross_pane_permission() {
         assert!(supported_client_shell_method_names().contains(&"agent.draft_state"));
         assert!(supports_client_shell_method_name("agent.draft_state"));
         let schema = serde_json::to_value(schemars::schema_for!(
@@ -417,7 +417,10 @@ mod tests {
         .unwrap();
         assert_eq!(
             schema["properties"],
-            serde_json::json!({"target": {"type": "string"}})
+            serde_json::json!({
+                "target": {"type": "string"},
+                "allow_cross_pane": {"type": "boolean"}
+            })
         );
         assert_eq!(schema["required"], serde_json::json!(["target"]));
         assert_eq!(schema["additionalProperties"], false);
@@ -432,6 +435,37 @@ mod tests {
             "agent.draft_state"
         );
         assert_eq!(serde_json::to_value(request).unwrap(), wire);
+        assert_eq!(
+            endpoint_method_shape_digests(false)
+                .get("agent.draft_state")
+                .map(String::as_str),
+            Some("d1515e0b0c354a129b2ed2ebc1efcab6da073e109e536cb8ef4fe4e77b3d6c7c")
+        );
+        for allowed in [None, Some(false), Some(true)] {
+            let mut wire = wire.clone();
+            if let Some(allowed) = allowed {
+                wire["params"]["allow_cross_pane"] = allowed.into();
+            }
+            let request: crate::api::schema::Request =
+                serde_json::from_value(wire.clone()).unwrap();
+            assert!(supports_client_shell_method(&request.method));
+            assert!(!crate::api::request_changes_ui(&request));
+            let Method::AgentDraftState(params) = &request.method else {
+                panic!("expected draft-state query");
+            };
+            assert_eq!(params.allow_cross_pane, allowed.unwrap_or(false));
+            let serialized = serde_json::to_value(request).unwrap();
+            if allowed == Some(true) {
+                assert_eq!(serialized, wire);
+            } else {
+                assert_eq!(serialized["params"], serde_json::json!({"target": "pane"}));
+            }
+        }
+        for invalid_value in [serde_json::Value::Null, "true".into(), 1.into()] {
+            let mut invalid = wire.clone();
+            invalid["params"]["allow_cross_pane"] = invalid_value;
+            assert!(serde_json::from_value::<crate::api::schema::Request>(invalid).is_err());
+        }
         for field in [
             "text",
             "empty",

@@ -73,8 +73,9 @@ pub(crate) fn literal_slots(args: &[String]) -> Vec<usize> {
                 slots.push(index + 1);
                 index += 1;
             }
-        } else if command == "prompt-guarded"
-            && matches!(arg.as_str(), "--allow-cross-pane" | "--if-draft-empty")
+        } else if (matches!(command, "prompt-guarded" | "draft-state")
+            && arg == "--allow-cross-pane")
+            || (command == "prompt-guarded" && arg == "--if-draft-empty")
         {
             // These flags have no value.
         } else if positionals < positional_count {
@@ -106,14 +107,44 @@ fn parse_channel_info_args(args: &[String]) -> Result<AgentChannelInfoParams, i3
     parse_terminal_target(args, "channel-info").map(|target| AgentChannelInfoParams { target })
 }
 
+fn parse_draft_state_args(args: &[String]) -> Result<AgentDraftStateParams, i32> {
+    let mut target = None;
+    let mut allow_cross_pane = false;
+    let mut options_ended = false;
+    for arg in args {
+        if !options_ended && arg == "--" {
+            options_ended = true;
+        } else if !options_ended && arg == "--allow-cross-pane" {
+            if allow_cross_pane {
+                eprintln!("--allow-cross-pane may only be specified once");
+                return Err(2);
+            }
+            allow_cross_pane = true;
+        } else if target.is_none() {
+            target = Some(arg.clone());
+        } else {
+            eprintln!("unknown option or extra argument: {arg}");
+            return Err(2);
+        }
+    }
+    let Some(target) = target.filter(|value| !value.is_empty()) else {
+        eprintln!("usage: herdr agent draft-state <target> [--allow-cross-pane]");
+        return Err(2);
+    };
+    Ok(AgentDraftStateParams {
+        target,
+        allow_cross_pane,
+    })
+}
+
 pub(super) fn draft_state(args: &[String]) -> std::io::Result<i32> {
-    let target = match parse_terminal_target(args, "draft-state") {
-        Ok(target) => target,
+    let params = match parse_draft_state_args(args) {
+        Ok(params) => params,
         Err(code) => return Ok(code),
     };
     super::super::print_response(&super::super::send_request(&Request {
         id: "cli:agent:draft-state".into(),
-        method: Method::AgentDraftState(AgentDraftStateParams { target }),
+        method: Method::AgentDraftState(params),
     })?)
 }
 
@@ -677,7 +708,7 @@ mod tests {
     }
 
     #[test]
-    fn draft_state_parser_preserves_literal_target_and_rejects_options() {
+    fn draft_state_parser_preserves_literal_target_and_requires_explicit_override() {
         for target in [
             "terminal",
             "--session=literal",
@@ -685,23 +716,113 @@ mod tests {
             "--help",
         ] {
             assert_eq!(
-                parse_terminal_target(&args(&[target]), "draft-state").unwrap(),
+                parse_draft_state_args(&args(&[target])).unwrap().target,
                 target
             );
-            assert_eq!(
-                parse_terminal_target(&args(&["--", target]), "draft-state").unwrap(),
-                target
-            );
+            let parsed = parse_draft_state_args(&args(&["--", target])).unwrap();
+            assert_eq!(parsed.target, target);
+            assert!(!parsed.allow_cross_pane);
+            for input in [
+                args(&["--allow-cross-pane", target]),
+                args(&[target, "--allow-cross-pane"]),
+                args(&["--allow-cross-pane", "--", target]),
+            ] {
+                let parsed = parse_draft_state_args(&input).unwrap();
+                assert_eq!(parsed.target, target);
+                assert!(parsed.allow_cross_pane);
+            }
         }
+        let parsed = parse_draft_state_args(&args(&["--", "--allow-cross-pane"])).unwrap();
+        assert_eq!(parsed.target, "--allow-cross-pane");
+        assert!(!parsed.allow_cross_pane);
         for input in [
             &[][..],
             &[""][..],
             &["--"][..],
+            &["--allow-cross-pane"][..],
             &["worker", "--wait"][..],
             &["worker", "--timeout", "1"][..],
+            &["worker", "--if-draft-empty"][..],
+            &["worker", "--allow-cross-pane=true"][..],
+            &["worker", "--allow-cross-pane", "--allow-cross-pane"][..],
+            &["worker", "--", "--allow-cross-pane"][..],
         ] {
-            assert!(parse_terminal_target(&args(input), "draft-state").is_err());
+            assert!(parse_draft_state_args(&args(input)).is_err());
         }
+    }
+
+    #[test]
+    fn draft_query_override_preserves_literals_through_global_extractors() {
+        let env = crate::environment::test_env();
+        env.remove(crate::session::SESSION_ENV_VAR);
+        for target in [
+            "worker",
+            "--session=target",
+            "--remote",
+            "--remote-keybindings=server",
+            "--handoff",
+            "--if-draft-empty",
+            "--allow-cross-pane",
+            "--help",
+        ] {
+            for leaf in [
+                args(&["--", target]),
+                args(&["--allow-cross-pane", "--", target]),
+            ] {
+                let explicit = leaf[0] == "--allow-cross-pane";
+                let mut input = args(&["herdr", "agent", "draft-state"]);
+                input.extend(leaf);
+                let cleaned = crate::session::configure_from_args(&input).unwrap();
+                assert_eq!(cleaned, input);
+                let (cleaned, remote) = crate::remote::extract_remote_args(&cleaned).unwrap();
+                assert_eq!(cleaned, input);
+                assert!(remote.is_none());
+                let parsed = parse_draft_state_args(&cleaned[3..]).unwrap();
+                assert_eq!(parsed.target, target);
+                assert_eq!(parsed.allow_cross_pane, explicit);
+                assert_eq!(crate::session::active_name(), None);
+            }
+            if target == "--allow-cross-pane" {
+                continue;
+            }
+            for leaf in [
+                args(&["--allow-cross-pane", target]),
+                args(&[target, "--allow-cross-pane"]),
+            ] {
+                let mut input = args(&["herdr", "agent", "draft-state"]);
+                input.extend(leaf);
+                let target_index = if input[3] == "--allow-cross-pane" {
+                    4
+                } else {
+                    3
+                };
+                assert_eq!(literal_slots(&input), [target_index]);
+                assert_eq!(crate::session::configure_from_args(&input).unwrap(), input);
+                let (cleaned, remote) = crate::remote::extract_remote_args(&input).unwrap();
+                assert_eq!(cleaned, input);
+                assert!(remote.is_none());
+                let parsed = parse_draft_state_args(&cleaned[3..]).unwrap();
+                assert_eq!(parsed.target, target);
+                assert!(parsed.allow_cross_pane);
+            }
+        }
+        let input = args(&[
+            "herdr",
+            "--session",
+            "query-test",
+            "agent",
+            "draft-state",
+            "--allow-cross-pane",
+            "--remote=literal",
+        ]);
+        assert_eq!(literal_slots(&input), [6]);
+        let cleaned = crate::session::configure_from_args(&input).unwrap();
+        assert_eq!(crate::session::active_name().as_deref(), Some("query-test"));
+        let (cleaned, remote) = crate::remote::extract_remote_args(&cleaned).unwrap();
+        assert!(remote.is_none());
+        let parsed = parse_draft_state_args(&cleaned[3..]).unwrap();
+        assert_eq!(parsed.target, "--remote=literal");
+        assert!(parsed.allow_cross_pane);
     }
 
     #[test]
@@ -808,19 +929,35 @@ mod tests {
     }
 
     #[test]
-    fn draft_state_transport_is_read_only_and_target_only() {
-        let (code, requests) = command_with_mock_server(
-            "draft-state",
-            &args(&["--session=undetected-terminal"]),
-            serde_json::json!({"result": {"status": "known", "empty": true, "chars": 0, "hold": null}}),
-        );
-        assert_eq!(code, 0);
-        assert_eq!(requests.len(), 2);
-        assert_eq!(requests[1]["method"], "agent.draft_state");
-        assert_eq!(
-            requests[1]["params"],
-            serde_json::json!({"target": "--session=undetected-terminal"})
-        );
+    fn draft_state_transport_is_read_only_with_no_implicit_override() {
+        for (input, expected) in [
+            (
+                args(&["--session=undetected-terminal"]),
+                serde_json::json!({"target": "--session=undetected-terminal"}),
+            ),
+            (
+                args(&["--allow-cross-pane", "--remote=literal"]),
+                serde_json::json!({"target": "--remote=literal", "allow_cross_pane": true}),
+            ),
+            (
+                args(&["worker", "--allow-cross-pane"]),
+                serde_json::json!({"target": "worker", "allow_cross_pane": true}),
+            ),
+            (
+                args(&["--", "--allow-cross-pane"]),
+                serde_json::json!({"target": "--allow-cross-pane"}),
+            ),
+        ] {
+            let (code, requests) = command_with_mock_server(
+                "draft-state",
+                &input,
+                serde_json::json!({"result": {"status": "known", "empty": true, "hold": null}}),
+            );
+            assert_eq!(code, 0);
+            assert_eq!(requests.len(), 2);
+            assert_eq!(requests[1]["method"], "agent.draft_state");
+            assert_eq!(requests[1]["params"], expected);
+        }
     }
 
     #[test]

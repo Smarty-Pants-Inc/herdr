@@ -37,6 +37,28 @@ pub(crate) const MAX_WAITERS_PER_REQUEST: usize = 8;
 // JSON integers exchanged with JavaScript must be exactly representable.
 const MAX_SAFE_JSON_INTEGER: u64 = 9_007_199_254_740_991;
 
+fn sample_deadlines(
+    timeout: Duration,
+    guarded: bool,
+    wall_now: impl FnOnce() -> std::time::SystemTime,
+    monotonic_now: impl FnOnce() -> Instant,
+) -> Result<(Instant, Option<u64>), Outcome> {
+    // Sample wall time FIRST: descheduling between clocks must shorten receiver
+    // authority, never let wall expiry outlive the server's monotonic expiry.
+    let wall = guarded.then(wall_now);
+    let deadline = monotonic_now() + timeout;
+    let deadline_ms = wall
+        .map(|time| {
+            time.checked_add(timeout)
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+                .filter(|millis| *millis <= MAX_SAFE_JSON_INTEGER)
+                .ok_or_else(|| Outcome::failure("agent_prompt_rejected", "unknown"))
+        })
+        .transpose()?;
+    Ok((deadline, deadline_ms))
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Outcome {
     Receipt(serde_json::Value),
@@ -456,7 +478,14 @@ impl Channel {
                 _ => {}
             }
         }
-        let deadline = Instant::now() + timeout;
+        let (deadline, deadline_ms) = sample_deadlines(
+            timeout,
+            kind == DeliveryKind::Prompt {
+                if_draft_empty: true,
+            },
+            std::time::SystemTime::now,
+            Instant::now,
+        )?;
         let mut frame = serde_json::json!({"registration_epoch":self.epoch,
             "request_id":request_id,"session_generation":self.session_generation});
         match kind {
@@ -464,12 +493,6 @@ impl Channel {
                 frame["type"] = "deliver".into();
                 frame["text"] = text.clone().into();
                 if if_draft_empty {
-                    let deadline_ms = std::time::SystemTime::now()
-                        .checked_add(timeout)
-                        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-                        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
-                        .filter(|millis| *millis <= MAX_SAFE_JSON_INTEGER)
-                        .ok_or_else(|| Outcome::failure("agent_prompt_rejected", "unknown"))?;
                     frame["if_draft_empty"] = true.into();
                     frame["deadline_ms"] = deadline_ms.into();
                 }
@@ -583,22 +606,16 @@ impl Channel {
     }
     fn draft_ack(&self, ack: DraftStateAck) -> io::Result<()> {
         let (kind, epoch, request_id, generation, result) = match ack {
-            DraftStateAck::Known(ack) => {
-                if ack.chars > MAX_SAFE_JSON_INTEGER || ack.empty != (ack.chars == 0) {
-                    return Err(io::Error::other("invalid draft observation bounds"));
-                }
-                (
-                    ack.kind,
-                    ack.registration_epoch,
-                    ack.request_id,
-                    ack.session_generation,
-                    AgentDraftStateResult::Known {
-                        empty: ack.empty,
-                        chars: ack.chars,
-                        hold: ack.hold,
-                    },
-                )
-            }
+            DraftStateAck::Known(ack) => (
+                ack.kind,
+                ack.registration_epoch,
+                ack.request_id,
+                ack.session_generation,
+                AgentDraftStateResult::Known {
+                    empty: ack.empty,
+                    hold: ack.hold,
+                },
+            ),
             DraftStateAck::Unknown(ack) => {
                 if !ack.unknown {
                     return Err(io::Error::other("invalid unknown draft observation"));

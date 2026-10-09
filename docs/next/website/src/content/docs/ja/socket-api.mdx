@@ -137,21 +137,21 @@ ACK は接続、epoch、リクエスト ID、セッション世代と一致す�
 
 #### 本文を返さないドラフト状態の問い合わせ
 
-`agent.draft_state` は `{target}` のみを受け付け、登録済み受信側のエディタと UI hold を変更せずに観測します。既定の問い合わせタイムアウトは 2 秒です。ドラフト本文は返しません。
+`agent.draft_state` は `{target, allow_cross_pane?}` を受け付け、登録済み受信側のエディタと UI hold を変更せずに観測します。任意の boolean `allow_cross_pane` の既定値は `false` です。問い合わせにはプロンプトと同じ自分のペイン/別ペインの権限ポリシーが適用されます。エージェントから別ペインへの問い合わせには明示的な `allow_cross_pane: true` が必要です。許可なしでは、別ペインのエージェントからの呼び出しは `cross_pane_input_denied`、呼び出し元を観測できない場合は `input_origin_unknown` で拒否します。暗黙の許可はなく、このフラグはチャネルやターミナル識別子の検証を回避しません。既定の問い合わせタイムアウトは 2 秒です。ドラフト本文も長さも返しません。
 
 ```json
 {"id":"draft","method":"agent.draft_state","params":{"target":"w1:p1"}}
-{"id":"draft","result":{"status":"known","empty":true,"chars":0,"hold":null}}
+{"id":"draft","result":{"status":"known","empty":true,"hold":null}}
 {"id":"draft","result":{"status":"unknown","reason":"unsupported"}}
 ```
 
-`status: "known"` の `empty` は boolean、`chars` は整数の文字数、`hold` は `null`（hold なし）、`"dialog"`、`"custom"`、`"editor"` のいずれかです。`status: "unknown"` の型付き `reason` は `unregistered`（チャネルなし）、`unsupported`（能力なし）、`timeout`（期限内の応答なし）、`unknown`（観測不能）です。unknown を空と扱わないでください。帰属や接続が不確実なら操作を拒否します。観測は予約でも後のプロンプトの許可でもなく、キャッシュした状態を後の安全な配信の根拠として渡してはいけません。
+`status: "known"` の `empty` は boolean、`hold` は `null`（hold なし）、`"dialog"`、`"custom"`、`"editor"` のいずれかです。`status: "unknown"` の型付き `reason` は `unregistered`（チャネルなし）、`unsupported`（能力なし）、`timeout`（期限内の応答なし）、`unknown`（観測不能）です。unknown を空と扱わないでください。帰属や接続が不確実なら操作を拒否します。観測は予約でも後のプロンプトの許可でもなく、キャッシュした状態を後の安全な配信の根拠として渡してはいけません。
 
 既存の登録ソケット上で、問い合わせと応答は同じ epoch、リクエスト ID、セッション世代を使います。
 
 ```json
 {"type":"draft_state","registration_epoch":"epoch_opaque","request_id":"draft-key","session_generation":"pi-session-token"}
-{"type":"draft_state","registration_epoch":"epoch_opaque","request_id":"draft-key","session_generation":"pi-session-token","empty":true,"chars":0,"hold":null}
+{"type":"draft_state","registration_epoch":"epoch_opaque","request_id":"draft-key","session_generation":"pi-session-token","empty":true,"hold":null}
 {"type":"draft_state","registration_epoch":"epoch_opaque","request_id":"draft-key","session_generation":"pi-session-token","unknown":true}
 ```
 

@@ -155,21 +155,21 @@ Only complete frames are submitted. Frame size, in-flight requests, receipt wait
 
 #### Redacted draft-state queries
 
-`agent.draft_state` accepts only `{target}` and observes the registered receiver's editor and UI hold without changing them. The default query timeout is two seconds. It never returns draft text:
+`agent.draft_state` accepts `{target, allow_cross_pane?}` and observes the registered receiver's editor and UI hold without changing them. The optional boolean `allow_cross_pane` defaults to `false`. The query enforces the same self/cross-pane permission policy as prompts: an agent-originated query to another pane requires explicit `allow_cross_pane: true`. Without the override, a different-pane agent caller receives `cross_pane_input_denied` and an unobservable caller origin receives `input_origin_unknown`. There is no implicit override, and the flag does not bypass channel or terminal identity checks. The default query timeout is two seconds. It returns neither draft text nor draft length:
 
 ```json
 {"id":"draft","method":"agent.draft_state","params":{"target":"w1:p1"}}
-{"id":"draft","result":{"status":"known","empty":true,"chars":0,"hold":null}}
+{"id":"draft","result":{"status":"known","empty":true,"hold":null}}
 {"id":"draft","result":{"status":"unknown","reason":"unsupported"}}
 ```
 
-For `status: "known"`, `empty` is boolean, `chars` is an integer count, and `hold` is `null` (no active hold), `"dialog"`, `"custom"`, or `"editor"`. `status: "unknown"` has a typed `reason`: `unregistered` (no registered channel), `unsupported` (missing draft-guard capability), `timeout` (no timely reply), or `unknown` (unobservable state). Unknown must not be treated as empty. Attribution or connection uncertainty fails closed. This observation is not a reservation or authorization for a later prompt; never supply a cached state as proof that a later delivery is safe.
+For `status: "known"`, `empty` is boolean and `hold` is `null` (no active hold), `"dialog"`, `"custom"`, or `"editor"`. `status: "unknown"` has a typed `reason`: `unregistered` (no registered channel), `unsupported` (missing draft-guard capability), `timeout` (no timely reply), or `unknown` (unobservable state). Unknown must not be treated as empty. Attribution or connection uncertainty fails closed. This observation is not a reservation or authorization for a later prompt; never supply a cached state as proof that a later delivery is safe.
 
 Over the existing registration socket, the query and reply use the same epoch, request ID, and session generation:
 
 ```json
 {"type":"draft_state","registration_epoch":"epoch_opaque","request_id":"draft-key","session_generation":"pi-session-token"}
-{"type":"draft_state","registration_epoch":"epoch_opaque","request_id":"draft-key","session_generation":"pi-session-token","empty":true,"chars":0,"hold":null}
+{"type":"draft_state","registration_epoch":"epoch_opaque","request_id":"draft-key","session_generation":"pi-session-token","empty":true,"hold":null}
 {"type":"draft_state","registration_epoch":"epoch_opaque","request_id":"draft-key","session_generation":"pi-session-token","unknown":true}
 ```
 

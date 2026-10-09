@@ -24,6 +24,8 @@ pub struct AgentChannelInfoParams {
 #[serde(deny_unknown_fields)]
 pub struct AgentDraftStateParams {
     pub target: String,
+    #[serde(default, skip_serializing_if = "super::is_false")]
+    pub allow_cross_pane: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -108,11 +110,10 @@ pub enum DraftStateUnknownReason {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(tag = "status", rename_all = "snake_case")]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AgentDraftStateResult {
     Known {
         empty: bool,
-        chars: u64,
         hold: Option<DraftHold>,
     },
     Unknown {
@@ -138,7 +139,6 @@ pub(crate) struct DraftStateKnownAck {
     pub request_id: String,
     pub session_generation: String,
     pub empty: bool,
-    pub chars: u64,
     #[serde(deserialize_with = "deserialize_hold")]
     pub hold: Option<DraftHold>,
 }

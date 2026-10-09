@@ -13,7 +13,7 @@ impl App {
     ) -> Option<String> {
         // Decide from the method first: attribution walks every agent pane's session in
         // /proc, so doing it for each API request kept the server busy (smarty-dev#931).
-        // Only a content write that does not allow cross-pane input needs it.
+        // Only a content write or protected draft query without cross-pane opt-in needs it.
         if Self::allows_cross_pane(&request.method) {
             return None;
         }
@@ -41,6 +41,7 @@ impl App {
             }
             Method::AgentPrompt(params) => params.allow_cross_pane,
             Method::AgentPromptGuarded(params) => params.allow_cross_pane,
+            Method::AgentDraftState(params) => params.allow_cross_pane,
             Method::AgentSendKeys(params) => params.allow_cross_pane,
             Method::PaneReportAgent(params) => params.allow_cross_pane,
             Method::PaneReportAgentSession(params) => params.allow_cross_pane,
@@ -60,6 +61,7 @@ impl App {
             }
             Method::AgentPrompt(params) => self.resolve_agent_target(&params.target).ok(),
             Method::AgentPromptGuarded(params) => self.resolve_terminal_target(&params.target).ok(),
+            Method::AgentDraftState(params) => self.resolve_terminal_target(&params.target).ok(),
             Method::AgentSendKeys(params) => self.resolve_agent_target(&params.target).ok(),
             Method::PaneSendText(params) => self.pane_target(&params.pane_id),
             Method::PaneSendKeys(params) => self.pane_target(&params.pane_id),

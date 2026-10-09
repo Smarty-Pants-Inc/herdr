@@ -1243,6 +1243,9 @@
           "additionalProperties": false,
           "description": "A read-only observation, never authority for a later prompt.",
           "properties": {
+            "allow_cross_pane": {
+              "type": "boolean"
+            },
             "target": {
               "type": "string"
             }

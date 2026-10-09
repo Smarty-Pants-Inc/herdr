@@ -349,7 +349,7 @@ herdr agent explain --file PATH --agent LABEL [--json|--verbose]
 
 ```bash
 herdr agent channel-info <target>
-herdr agent draft-state <target>
+herdr agent draft-state <target> [--allow-cross-pane]
 herdr agent prompt <target> <text> --if-draft-empty [--allow-cross-pane]
 herdr agent prompt-guarded <target> <text> --expected-terminal TERMINAL_ID --expected-registration-epoch EPOCH --request-id ID [--timeout-ms MS] [--allow-cross-pane] [--if-draft-empty]
 ```
@@ -373,7 +373,7 @@ herdr agent prompt-guarded w1:p1 "Review this change" \
 
 守卫帧带有期限；Pi 在上述检查和调用前同步拒绝已过期帧，原因为 `expired`，不提交提示也不修改编辑器。守卫期限缺失或无效时以 `unknown` 拒绝。在 socket 发送前发生的类型化失败表示没有发送；可能已接纳后的回执丢失仍是 `delivery_unknown`，绝不重放。
 
-`agent draft-state` 通过注册通道执行只读、隐藏文本的观察，默认查询超时为两秒。结果为 `{status: "known", empty, chars, hold}`：`empty` 是布尔值，`chars` 是整数字符数，`hold` 为 `null`（无 hold）、`"dialog"`、`"custom"` 或 `"editor"`。绝不返回草稿文本。否则返回 `{status: "unknown", reason}`，原因为 `unregistered`（无通道）、`unsupported`（无能力）、`timeout`（未及时回复）或 `unknown`（状态不可观察）。unknown 不代表草稿为空。查询不是后续发送的授权；守卫提示会在接纳时重新检查。
+`agent draft-state` 通过注册通道执行只读、隐藏文本的观察，默认查询超时为两秒。结果为 `{status: "known", empty, hold}`：`empty` 是布尔值，`hold` 为 `null`（无 hold）、`"dialog"`、`"custom"` 或 `"editor"`。不返回草稿文本或长度。查询遵循与提示相同的本窗格/跨窗格权限策略：智能体查询其他窗格时需要显式 `--allow-cross-pane`；CLI 不会隐式添加此权限。没有该权限时，其他窗格中的智能体调用方收到 `cross_pane_input_denied`，无法观察调用方来源时收到 `input_origin_unknown`。此标志不绕过通道或终端身份检查。TARGET 按字面值保留；带显式权限查询形如标志的目标可使用 `herdr agent draft-state --allow-cross-pane -- --allow-cross-pane`。否则返回 `{status: "unknown", reason}`，原因为 `unregistered`（无通道）、`unsupported`（无能力）、`timeout`（未及时回复）或 `unknown`（状态不可观察）。unknown 不代表草稿为空。查询不是后续发送的授权；守卫提示会在接纳时重新检查。
 
 成功返回 `status: "accepted"`（已接纳到活动会话的输入）或 `"queued"`（已进入该会话的后续消息队列），以及固定的终端、epoch、请求 ID 和会话代数。两种状态都不保证模型轮次已完成或成功。同一 epoch 中，相同请求 ID、完全相同文本和相同 `if_draft_empty` 值共享首次结果，不会再次提交；改变文本或守卫值返回 `payload_mismatch`。新 ID 表示新请求，不是安全重试。
 

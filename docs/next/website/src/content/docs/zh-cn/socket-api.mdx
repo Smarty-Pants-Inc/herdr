@@ -149,21 +149,21 @@ ACK 必须匹配实时连接、epoch、请求 ID 和会话代数。ACK 的 `stat
 
 #### 隐藏文本的草稿状态查询
 
-`agent.draft_state` 只接受 `{target}`，观察已注册接收端的编辑器和 UI hold，不作修改。默认查询超时为两秒。绝不返回草稿文本：
+`agent.draft_state` 接受 `{target, allow_cross_pane?}`，观察已注册接收端的编辑器和 UI hold，不作修改。可选布尔值 `allow_cross_pane` 默认为 `false`。查询遵循与提示相同的本窗格/跨窗格权限策略：智能体查询其他窗格时需要显式 `allow_cross_pane: true`。没有该权限时，其他窗格中的智能体调用方收到 `cross_pane_input_denied`，无法观察调用方来源时收到 `input_origin_unknown`。没有隐式授权，此标志不绕过通道或终端身份检查。默认查询超时为两秒。不返回草稿文本或长度：
 
 ```json
 {"id":"draft","method":"agent.draft_state","params":{"target":"w1:p1"}}
-{"id":"draft","result":{"status":"known","empty":true,"chars":0,"hold":null}}
+{"id":"draft","result":{"status":"known","empty":true,"hold":null}}
 {"id":"draft","result":{"status":"unknown","reason":"unsupported"}}
 ```
 
-`status: "known"` 中，`empty` 是布尔值，`chars` 是整数字符数，`hold` 为 `null`（无 hold）、`"dialog"`、`"custom"` 或 `"editor"`。`status: "unknown"` 有类型化 `reason`：`unregistered`（无注册通道）、`unsupported`（缺少草稿守卫能力）、`timeout`（未及时回复）或 `unknown`（状态不可观察）。unknown 不能视为空。归属或连接不确定时拒绝操作。这次观察不是预留，也不是后续提示的授权；绝不把缓存状态当作后续安全投递的凭据。
+`status: "known"` 中，`empty` 是布尔值，`hold` 为 `null`（无 hold）、`"dialog"`、`"custom"` 或 `"editor"`。`status: "unknown"` 有类型化 `reason`：`unregistered`（无注册通道）、`unsupported`（缺少草稿守卫能力）、`timeout`（未及时回复）或 `unknown`（状态不可观察）。unknown 不能视为空。归属或连接不确定时拒绝操作。这次观察不是预留，也不是后续提示的授权；绝不把缓存状态当作后续安全投递的凭据。
 
 在已有注册 socket 上，查询和回复使用相同的 epoch、请求 ID 和会话代数：
 
 ```json
 {"type":"draft_state","registration_epoch":"epoch_opaque","request_id":"draft-key","session_generation":"pi-session-token"}
-{"type":"draft_state","registration_epoch":"epoch_opaque","request_id":"draft-key","session_generation":"pi-session-token","empty":true,"chars":0,"hold":null}
+{"type":"draft_state","registration_epoch":"epoch_opaque","request_id":"draft-key","session_generation":"pi-session-token","empty":true,"hold":null}
 {"type":"draft_state","registration_epoch":"epoch_opaque","request_id":"draft-key","session_generation":"pi-session-token","unknown":true}
 ```
 
