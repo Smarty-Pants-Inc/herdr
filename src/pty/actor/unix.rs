@@ -1466,6 +1466,23 @@ fn input_submission_closed_error() -> std::io::Error {
     )
 }
 
+/// A live, no-foreground test channel using the real observer and close gate.
+/// Keep the descriptor owned for the fixture's lifetime; observers remain weak.
+#[cfg(test)]
+pub(crate) struct TestPtyForeground(ActorPtyFile);
+
+#[cfg(test)]
+impl TestPtyForeground {
+    pub(crate) fn new() -> std::io::Result<Self> {
+        // A valid non-TTY makes tcgetpgrp return no foreground, not "closed".
+        std::fs::File::open("/dev/null").map(|file| Self(ActorPtyFile::new(file)))
+    }
+
+    pub(crate) fn observer(&self) -> PtyForegroundObserver {
+        PtyForegroundObserver(Arc::downgrade(&self.0.foreground))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1475,6 +1492,22 @@ mod tests {
         os::unix::net::UnixStream,
         sync::atomic::{AtomicBool, Ordering},
     };
+
+    #[test]
+    fn test_foreground_fixture_observes_live_no_foreground_until_drop() {
+        let fixture = TestPtyForeground::new().expect("live no-foreground fixture");
+        let observer = fixture.observer();
+        assert_eq!(observer.observe(), Some(None));
+        let cloned_observer = observer.clone();
+        drop(fixture);
+        assert_eq!(observer.observe(), None, "observer must not retain the fd");
+        assert_eq!(cloned_observer.observe(), None);
+    }
+
+    #[test]
+    fn default_foreground_observer_is_closed() {
+        assert_eq!(PtyForegroundObserver::default().observe(), None);
+    }
 
     fn test_wake_pair() -> (fd::WakeWriter, OwnedFd) {
         let pipe = fd::create_wake_pipe().expect("wake pipe");

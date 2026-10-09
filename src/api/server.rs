@@ -26,6 +26,7 @@ use crate::ipc::{
     set_local_stream_polling, socket_file_identity, LocalStream, LocalStreamRead,
     SocketFileIdentity,
 };
+use crate::server::shutdown::{ServerStop, ShutdownReason};
 
 #[cfg(test)]
 mod subscription_socket_tests;
@@ -61,13 +62,11 @@ fn is_transient_accept_error(err: &io::Error) -> bool {
 fn handle_fatal_accept_error(
     err: &io::Error,
     running: &AtomicBool,
-    server_stop: Option<&AtomicBool>,
+    server_stop: Option<&ServerStop>,
 ) {
     // The shared stop flag can precede ServerHandle::drop during graceful
     // shutdown. Neither that path nor a retired listener may kill the server.
-    if !running.load(Ordering::Relaxed)
-        || server_stop.is_some_and(|stop| stop.load(Ordering::Acquire))
-    {
+    if !running.load(Ordering::Relaxed) || server_stop.is_some_and(ServerStop::is_requested) {
         return;
     }
     error!(err = %err, "api listener accept failed; exiting for service-manager recovery");
@@ -112,7 +111,7 @@ impl ServerHandle {
 pub(crate) fn start_server_with_stop_control(
     api_tx: ApiRequestSender,
     event_hub: EventHub,
-    server_stop: Arc<AtomicBool>,
+    server_stop: ServerStop,
 ) -> std::io::Result<ServerHandle> {
     start_server_inner(
         socket_path(),
@@ -130,7 +129,7 @@ pub(crate) fn start_server_at_with_stop_control(
     path: PathBuf,
     api_tx: ApiRequestSender,
     event_hub: EventHub,
-    server_stop: Arc<AtomicBool>,
+    server_stop: ServerStop,
 ) -> std::io::Result<ServerHandle> {
     start_server_inner(
         path,
@@ -160,7 +159,7 @@ fn start_server_inner(
     api_tx: ApiRequestSender,
     event_hub: EventHub,
     mut capabilities: Option<ServerCapabilities>,
-    server_stop: Option<Arc<AtomicBool>>,
+    server_stop: Option<ServerStop>,
 ) -> std::io::Result<ServerHandle> {
     use interprocess::local_socket::traits::Listener as _;
 
@@ -201,11 +200,11 @@ fn start_server_inner(
 
     let running = Arc::new(AtomicBool::new(true));
     let listener_running = Arc::clone(&running);
-    let thread = std::thread::spawn(move || {
+    let spawned = crate::thread_spawn::spawn_named("herdr-api-accept", move || {
         run_accept_loop(
             std::iter::from_fn(|| Some(listener.accept())),
             &listener_running,
-            server_stop.as_deref(),
+            server_stop.as_ref(),
             ACCEPT_RETRY_INITIAL_DELAY,
             ACCEPT_RETRY_MAX_DELAY,
             |stream| {
@@ -218,7 +217,7 @@ fn start_server_inner(
                 let connection_running = Arc::clone(&listener_running);
                 #[cfg(unix)]
                 let ssh_agents = ssh_agents.clone();
-                std::thread::spawn(move || {
+                spawn_connection_handler(move || {
                     if let Err(err) = handle_connection_with_stop(
                         stream,
                         context,
@@ -237,6 +236,14 @@ fn start_server_inner(
         );
         debug!("api server thread exiting");
     });
+    let thread = match spawned {
+        Ok(thread) => thread,
+        Err(err) => {
+            // No ServerHandle owns the socket yet, so its Drop cleanup won't run.
+            let _ = remove_socket_file_if_owned(&path, &identity);
+            return Err(err);
+        }
+    };
 
     Ok(ServerHandle {
         _thread: thread,
@@ -246,10 +253,18 @@ fn start_server_inner(
     })
 }
 
+/// Starts one connection's worker. When the OS refuses a thread, only this
+/// connection is dropped; the accept loop keeps serving.
+fn spawn_connection_handler(work: impl FnOnce() + Send + 'static) {
+    if let Err(err) = crate::thread_spawn::spawn_named("herdr-api-conn", work) {
+        warn!(err = %err, "failed to spawn api connection thread; dropping connection");
+    }
+}
+
 fn run_accept_loop<S>(
     incoming: impl IntoIterator<Item = io::Result<S>>,
     running: &AtomicBool,
-    server_stop: Option<&AtomicBool>,
+    server_stop: Option<&ServerStop>,
     initial_delay: Duration,
     max_delay: Duration,
     mut handle: impl FnMut(S),
@@ -320,6 +335,28 @@ mod accept_loop_tests {
         );
 
         assert_eq!(handled, vec![1, 2]);
+    }
+
+    #[test]
+    fn keeps_serving_after_connection_thread_spawn_fails() {
+        let running = AtomicBool::new(true);
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        crate::thread_spawn::test_hook::fail_next_spawns(1);
+        run_accept_loop(
+            [Ok(1), Ok(2)],
+            &running,
+            None,
+            Duration::ZERO,
+            Duration::ZERO,
+            |stream| {
+                let tx = tx.clone();
+                spawn_connection_handler(move || tx.send(stream).unwrap());
+            },
+        );
+        drop(tx);
+
+        assert_eq!(rx.iter().collect::<Vec<_>>(), vec![2]);
     }
 
     #[test]
@@ -452,7 +489,7 @@ fn handle_connection_with_stop(
     event_hub: &EventHub,
     running: &Arc<AtomicBool>,
     capabilities: Option<ServerCapabilities>,
-    server_stop: Option<&Arc<AtomicBool>>,
+    server_stop: Option<&ServerStop>,
     #[cfg(unix)] ssh_agents: Option<&crate::platform::ssh_agent::SshAgentRegistry>,
 ) -> std::io::Result<()> {
     if let Err(err) = stream.set_send_timeout(Some(STREAM_WRITE_TIMEOUT)) {
@@ -528,7 +565,7 @@ fn handle_connection_with_stop(
                             },
                             error.to_string(),
                         ),
-                    )
+                    );
                 }
             };
             write_json_line(
@@ -615,6 +652,9 @@ fn handle_connection_with_stop(
         }
         method_body => {
             let (response_write_tx, response_write_rx) = std::sync::mpsc::channel();
+            let stop_caller = matches!(method_body, Method::ServerStop(_))
+                .then(|| crate::platform::local_stream_peer_description(&stream))
+                .flatten();
             let response = handle_request_with_context(
                 Request {
                     id: request_id.clone(),
@@ -624,6 +664,7 @@ fn handle_connection_with_stop(
                 api_tx,
                 capabilities,
                 server_stop,
+                stop_caller,
                 Some(response_write_rx),
             );
             let result = write_text_line_allow_disconnect(&mut stream, &response);
@@ -678,7 +719,8 @@ fn handle_request(
     request: Request,
     api_tx: &ApiRequestSender,
     capabilities: Option<ServerCapabilities>,
-    server_stop: Option<&Arc<AtomicBool>>,
+    server_stop: Option<&ServerStop>,
+    stop_caller: Option<String>,
     response_write_complete: Option<std::sync::mpsc::Receiver<()>>,
 ) -> String {
     handle_request_with_context(
@@ -687,6 +729,7 @@ fn handle_request(
         api_tx,
         capabilities,
         server_stop,
+        stop_caller,
         response_write_complete,
     )
 }
@@ -696,7 +739,8 @@ fn handle_request_with_context(
     context: ApiRequestContext,
     api_tx: &ApiRequestSender,
     capabilities: Option<ServerCapabilities>,
-    server_stop: Option<&Arc<AtomicBool>>,
+    server_stop: Option<&ServerStop>,
+    stop_caller: Option<String>,
     response_write_complete: Option<std::sync::mpsc::Receiver<()>>,
 ) -> String {
     if matches!(&request.method, Method::Ping(_)) {
@@ -724,13 +768,15 @@ fn handle_request_with_context(
 
     if matches!(&request.method, Method::ServerStop(_)) {
         if let Some(server_stop) = server_stop {
-            server_stop.store(true, Ordering::Release);
+            server_stop.request(ShutdownReason::ApiStop {
+                caller: stop_caller,
+            });
             let response = serde_json::to_string(&SuccessResponse {
                 id: request.id.clone(),
                 result: ResponseResult::Ok {},
             })
             .unwrap_or_else(|_| "{}".to_string());
-            // Changing the flag alone cannot wake an idle, deadline-free App
+            // Recording the stop request alone cannot wake an idle, deadline-free App
             // loop. Enqueue the actual stop request, but never wait for its
             // response: stop control must remain responsive even with a busy
             // App or a receiver that has already shut down.
@@ -743,7 +789,7 @@ fn handle_request_with_context(
             });
             return response;
         }
-    } else if server_stop.is_some_and(|stop| stop.load(Ordering::Acquire)) {
+    } else if server_stop.is_some_and(ServerStop::is_requested) {
         return error_response_json(
             request.id,
             "server_unavailable",
@@ -1492,7 +1538,7 @@ mod tests {
         handle_fatal_accept_error(
             &io::Error::from_raw_os_error(libc::EINVAL),
             &AtomicBool::new(true),
-            Some(&AtomicBool::new(false)),
+            Some(&ServerStop::default()),
         );
     }
 
@@ -1510,10 +1556,12 @@ mod tests {
         handle_fatal_accept_error(
             &error,
             &AtomicBool::new(false),
-            Some(&AtomicBool::new(false)),
+            Some(&ServerStop::default()),
         );
         // should_quit can precede handle drop: running is still true here.
-        handle_fatal_accept_error(&error, &AtomicBool::new(true), Some(&AtomicBool::new(true)));
+        let stop = ServerStop::default();
+        stop.request(ShutdownReason::HostShutdown);
+        handle_fatal_accept_error(&error, &AtomicBool::new(true), Some(&stop));
         assert!(logs.0.lock().unwrap().is_empty(), "shutdown must be quiet");
     }
 
@@ -1675,7 +1723,9 @@ mod tests {
             // Only the listener/its handlers own senders. Disconnection proves their
             // exit, and receiving anything instead catches dispatch of queued work.
             assert_listener_channel_closed(&mut rx);
-            println!("EMFILE observed; handle dropped during backoff; listener exited after pressure released; queued workspace.rename never dispatched on PID {pid}");
+            println!(
+                "EMFILE observed; handle dropped during backoff; listener exited after pressure released; queued workspace.rename never dispatched on PID {pid}"
+            );
             drop(client);
             let _ = fs::remove_dir_all(config_home);
             return;
@@ -1719,7 +1769,9 @@ mod tests {
         assert_eq!(response["result"]["type"], "pong");
         assert_eq!(std::process::id(), pid);
         assert!(!handle._thread.is_finished());
-        println!("EMFILE observed; one warning during repeated retries; fresh correlated pong on the same PID {pid} and live listener (queued pong required except macOS EOF/reset)");
+        println!(
+            "EMFILE observed; one warning during repeated retries; fresh correlated pong on the same PID {pid} and live listener (queued pong required except macOS EOF/reset)"
+        );
         drop(fresh);
         drop(handle);
         let _ = fs::remove_dir_all(config_home);
@@ -1834,6 +1886,28 @@ mod tests {
             }
         });
         (api_tx, responder)
+    }
+
+    #[test]
+    fn api_accept_thread_spawn_failure_removes_bound_socket() {
+        let dir = unique_test_path("api-accept-spawn-failure");
+        let _dirs = crate::config::test_config_dirs(&dir.join("config"), &dir.join("state"));
+        let env = crate::environment::test_env();
+        env.remove("SSH_AUTH_SOCK");
+        env.remove(crate::session::SESSION_ENV_VAR);
+        crate::session::clear_explicit_session_for_test();
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("herdr.sock");
+        // The SSH registry derives its stable address from the API socket path.
+        env.set(crate::api::SOCKET_PATH_ENV_VAR, &path);
+        let (api_tx, _api_rx) = mpsc::unbounded_channel();
+
+        crate::thread_spawn::test_hook::fail_next_spawns(1);
+        let result = start_server_inner(path.clone(), api_tx, EventHub::default(), None, None);
+
+        assert!(result.is_err());
+        assert!(!path.exists(), "bound socket must be removed");
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -2028,6 +2102,7 @@ mod tests {
             }),
             None,
             None,
+            None,
         );
 
         let parsed: SuccessResponse = serde_json::from_str(&response).unwrap();
@@ -2038,7 +2113,7 @@ mod tests {
     #[test]
     fn server_stop_control_wakes_app_without_waiting_for_app_response() {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let stop = Arc::new(AtomicBool::new(false));
+        let stop = ServerStop::default();
         let response = handle_request(
             Request {
                 id: "priority_stop".into(),
@@ -2047,13 +2122,20 @@ mod tests {
             &tx,
             None,
             Some(&stop),
+            Some("pid 42 (herdr)".into()),
             None,
         );
 
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
         assert_eq!(response["id"], "priority_stop");
         assert_eq!(response["result"]["type"], "ok");
-        assert!(stop.load(Ordering::Acquire));
+        assert!(stop.is_requested());
+        assert_eq!(
+            stop.take_reason(),
+            Some(ShutdownReason::ApiStop {
+                caller: Some("pid 42 (herdr)".into())
+            })
+        );
         // No App consumed or answered the request before the immediate reply.
         // The queued request also wakes a receiver parked in the headless select.
         let wake = rx.try_recv().expect("stop must wake the App receiver");
@@ -2070,6 +2152,7 @@ mod tests {
             None,
             Some(&stop),
             None,
+            None,
         );
         let rejected: serde_json::Value = serde_json::from_str(&rejected).unwrap();
         assert_eq!(rejected["error"]["code"], "server_unavailable");
@@ -2080,7 +2163,7 @@ mod tests {
     fn server_stop_control_replies_even_after_app_receiver_closes() {
         let (tx, rx) = mpsc::unbounded_channel();
         drop(rx);
-        let stop = Arc::new(AtomicBool::new(false));
+        let stop = ServerStop::default();
         let response = handle_request(
             Request {
                 id: "closed_app_stop".into(),
@@ -2090,11 +2173,16 @@ mod tests {
             None,
             Some(&stop),
             None,
+            None,
         );
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
         assert_eq!(response["id"], "closed_app_stop");
         assert_eq!(response["result"]["type"], "ok");
-        assert!(stop.load(Ordering::Acquire));
+        assert!(stop.is_requested());
+        assert_eq!(
+            stop.take_reason(),
+            Some(ShutdownReason::ApiStop { caller: None })
+        );
     }
 
     #[test]
@@ -2106,8 +2194,9 @@ mod tests {
         };
 
         let request_for_thread = request.clone();
-        let thread =
-            std::thread::spawn(move || handle_request(request_for_thread, &tx, None, None, None));
+        let thread = std::thread::spawn(move || {
+            handle_request(request_for_thread, &tx, None, None, None, None)
+        });
 
         let msg = rx.blocking_recv().unwrap();
         assert_eq!(msg.request.id, "req_2");
