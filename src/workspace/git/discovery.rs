@@ -201,7 +201,7 @@ pub fn git_branch(cwd: &Path) -> Option<String> {
     parse_git_head_branch(&head)
 }
 
-pub(super) fn git_dir_for_repo_root(repo_root: &Path) -> Option<PathBuf> {
+pub(crate) fn git_dir_for_repo_root(repo_root: &Path) -> Option<PathBuf> {
     let git_path = repo_root.join(".git");
     if git_path.is_dir() {
         return Some(git_path);
