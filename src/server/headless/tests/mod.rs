@@ -4,6 +4,8 @@ use super::*;
 #[path = "client_listener.rs"]
 mod client_listener_tests;
 mod event_fairness;
+#[cfg(unix)]
+mod initial_focus;
 mod input_consumer;
 #[path = "last_input_alt_read.rs"]
 mod last_input_alt_read_tests;

@@ -1599,6 +1599,8 @@ impl AppState {
                     .collect()
                 }
             }
+            // Focus-reporting initialization is runtime-only, never an AppState mutation.
+            AppEvent::TerminalFocusReportingEnabled { .. } => Vec::new(),
             // Host-local effects are intercepted by HeadlessServer and forwarded to the
             // foreground client; they never touch AppState. Kept for AppEvent exhaustiveness.
             AppEvent::TerminalBell { .. } => Vec::new(),
