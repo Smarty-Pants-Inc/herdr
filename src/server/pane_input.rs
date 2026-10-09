@@ -35,6 +35,19 @@ pub(super) fn precheck_client_input(
     }
 }
 
+pub(super) fn classify_client_enqueue_error(
+    runtime: &crate::terminal::TerminalRuntime,
+    message: String,
+) -> ClientInputError {
+    // The actor can poison input after the client's healthy precheck. Classify
+    // a real enqueue failure against current state, not the stale precheck.
+    if runtime.input_is_poisoned() {
+        ClientInputError::PaneInputPoisoned
+    } else {
+        ClientInputError::Failed(message)
+    }
+}
+
 pub(super) fn input_poison_notice(pane_id: &str) -> crate::protocol::ServerMessage {
     crate::protocol::ServerMessage::Notify {
         kind: crate::protocol::NotifyKind::Toast,
@@ -212,7 +225,12 @@ fn apply_scroll(
             };
             runtime
                 .try_send_bytes_with_source(Bytes::from(bytes), input_source)
-                .map_err(|err| format!("terminal attach mouse wheel input failed: {err}"))?;
+                .map_err(|err| {
+                    classify_client_enqueue_error(
+                        runtime,
+                        format!("terminal attach mouse wheel input failed: {err}"),
+                    )
+                })?;
             return Ok(true);
         }
         Some(crate::pane::WheelRouting::AlternateScroll) => {
@@ -225,7 +243,12 @@ fn apply_scroll(
             }
             runtime
                 .try_send_bytes_with_source(Bytes::from(bytes), input_source)
-                .map_err(|err| format!("terminal attach alternate scroll input failed: {err}"))?;
+                .map_err(|err| {
+                    classify_client_enqueue_error(
+                        runtime,
+                        format!("terminal attach alternate scroll input failed: {err}"),
+                    )
+                })?;
             return Ok(true);
         }
         Some(crate::pane::WheelRouting::HostScroll) => {
@@ -255,14 +278,24 @@ pub(super) fn apply_terminal_attach_input(
     if let Some(text) = crate::raw_input::complete_text_bracketed_paste(&data) {
         runtime
             .try_send_paste_with_source(text.to_owned(), input_source)
-            .map_err(|err| ClientInputError::Failed(format!("terminal attach paste failed: {err}")))
+            .map_err(|err| {
+                classify_client_enqueue_error(
+                    runtime,
+                    format!("terminal attach paste failed: {err}"),
+                )
+            })
     } else {
         if data.is_empty() {
             return Ok(false);
         }
         runtime
             .try_send_bytes_with_source(Bytes::from(data), input_source)
-            .map_err(|err| format!("terminal attach input failed: {err}"))?;
+            .map_err(|err| {
+                classify_client_enqueue_error(
+                    runtime,
+                    format!("terminal attach input failed: {err}"),
+                )
+            })?;
         Ok(true)
     }
 }
@@ -357,7 +390,12 @@ fn apply_client_terminal_input_events(
                 }
                 runtime
                     .try_send_bytes_with_source(Bytes::from(bytes), input_source.clone())
-                    .map_err(|err| format!("targeted pane mouse input failed: {err}"))?;
+                    .map_err(|err| {
+                        classify_client_enqueue_error(
+                            runtime,
+                            format!("targeted pane mouse input failed: {err}"),
+                        )
+                    })?;
                 accepted = true;
             }
             continue;
@@ -391,7 +429,12 @@ fn apply_client_terminal_input_events(
                 if !bytes.is_empty() {
                     runtime
                         .try_send_bytes_with_source(Bytes::from(bytes), input_source.clone())
-                        .map_err(|err| format!("targeted pane key input failed: {err}"))?;
+                        .map_err(|err| {
+                            classify_client_enqueue_error(
+                                runtime,
+                                format!("targeted pane key input failed: {err}"),
+                            )
+                        })?;
                     accepted = true;
                 }
             }
@@ -403,14 +446,24 @@ fn apply_client_terminal_input_events(
                 }
                 runtime
                     .try_send_bytes_with_source(Bytes::copy_from_slice(bytes), input_source.clone())
-                    .map_err(|err| format!("targeted pane text input failed: {err}"))?;
+                    .map_err(|err| {
+                        classify_client_enqueue_error(
+                            runtime,
+                            format!("targeted pane text input failed: {err}"),
+                        )
+                    })?;
                 accepted = true;
             }
             crate::raw_input::RawInputEvent::Paste(text) => {
                 runtime.scroll_reset();
                 accepted |= runtime
                     .try_send_paste_with_source(text, input_source.clone())
-                    .map_err(|err| format!("targeted pane paste failed: {err}"))?;
+                    .map_err(|err| {
+                        classify_client_enqueue_error(
+                            runtime,
+                            format!("targeted pane paste failed: {err}"),
+                        )
+                    })?;
             }
             crate::raw_input::RawInputEvent::Mouse(_)
             | crate::raw_input::RawInputEvent::OuterFocusGained
@@ -432,6 +485,51 @@ fn apply_client_terminal_input_events(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn enqueue_error_after_healthy_precheck_preserves_typed_poison() {
+        let (runtime, mut input_rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_capacity(20, 5, 1);
+        assert_eq!(precheck_client_input(&runtime), Ok(()));
+        runtime.test_set_input_poisoned(true);
+        let err = runtime
+            .try_send_bytes_with_source(Bytes::from_static(b"rejected"), InputSource::Unknown)
+            .expect_err("poison set after precheck must reject the real enqueue");
+        assert_eq!(
+            classify_client_enqueue_error(&runtime, format!("terminal attach input failed: {err}")),
+            ClientInputError::PaneInputPoisoned
+        );
+        assert!(input_rx.try_recv().is_err());
+        assert!(
+            runtime.input_is_poisoned(),
+            "classification must not clear poison"
+        );
+    }
+
+    #[tokio::test]
+    async fn healthy_full_or_closed_enqueue_error_remains_failed() {
+        for closed in [false, true] {
+            let (runtime, mut input_rx) =
+                crate::terminal::TerminalRuntime::test_with_channel_capacity(20, 5, 1);
+            if closed {
+                input_rx.close();
+            } else {
+                runtime
+                    .try_send_bytes(Bytes::from_static(b"occupied"))
+                    .expect("fill queue");
+            }
+            assert_eq!(precheck_client_input(&runtime), Ok(()));
+            let err = runtime
+                .try_send_bytes_with_source(Bytes::from_static(b"rejected"), InputSource::Unknown)
+                .expect_err("healthy queue rejection");
+            let message = format!("terminal attach input failed: {err}");
+            assert_eq!(
+                classify_client_enqueue_error(&runtime, message.clone()),
+                ClientInputError::Failed(message)
+            );
+            assert!(!runtime.input_is_poisoned());
+        }
+    }
 
     #[tokio::test]
     async fn poisoned_client_input_rejects_keys_text_paste_and_raw_without_enqueue() {
