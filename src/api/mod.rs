@@ -2,7 +2,7 @@ pub mod client;
 mod event_hub;
 pub mod schema;
 mod server;
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) use server::handle_connection as test_handle_connection;
 mod status;
 mod subscriptions;
