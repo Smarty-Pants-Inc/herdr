@@ -73,10 +73,18 @@ try:
     with open(directory + '/ready', 'w') as f:
         f.write(str(reporter))
     deadline = time.monotonic() + 20
+    pending = b''
     while time.monotonic() < deadline:
-        if not select.select([control], [], [], 0.1)[0]:
-            continue
-        action = os.read(control, 4096).decode().strip()
+        # A FIFO is a byte stream: preserve fragments and process each complete
+        # frame separately, including when several frames share one read.
+        if b'\n' not in pending:
+            if not select.select([control], [], [], 0.1)[0]:
+                continue
+            pending += os.read(control, 4096)
+            if b'\n' not in pending:
+                continue
+        frame, pending = pending.split(b'\n', 1)
+        action = frame.decode().strip()
         if action == 'pause':
             os.kill(reporter, signal.SIGSTOP)
             os.waitpid(reporter, os.WUNTRACED)
@@ -209,7 +217,15 @@ impl NativePty {
             .custom_flags(libc::O_NONBLOCK)
             .open(directory.join("control"))
             .expect("control FIFO");
-        writeln!(fifo, "{action}").expect("native command");
+        // FIFO atomicity applies to one write(2), not to writeln!'s separate
+        // action/newline writes. A split newline was treated as an empty
+        // command, tearing down the reporter or the response reader after ACK.
+        let frame = format!("{action}\n");
+        assert!(frame.len() <= 512, "POSIX minimum PIPE_BUF");
+        assert_eq!(
+            fifo.write(frame.as_bytes()).expect("native command"),
+            frame.len()
+        );
         if action != "stop" {
             let deadline = Instant::now() + Duration::from_secs(3);
             while !std::fs::read_to_string(directory.join("ack")).is_ok_and(|ack| ack == action) {
@@ -673,7 +689,13 @@ fn guarded_native_loss_after_partial_write_discards_staged_bytes_before_fallback
         None
     );
     let accepted = runner.current_write_offset;
-    assert!(accepted > 0 && accepted < length, "real accepted prefix");
+    assert!(
+        accepted > 0 && accepted < length,
+        "real accepted prefix: offset={accepted}, active={}, reporter={:?}, foreground={:?}",
+        runner.active_submission.is_some(),
+        crate::platform::process_identity(fixture.reporter.pid),
+        crate::platform::foreground_process_group_id_for_tty_fd(runner.file.as_raw_fd())
+    );
     assert_eq!(
         runner
             .file
@@ -701,6 +723,55 @@ fn guarded_native_loss_after_partial_write_discards_staged_bytes_before_fallback
         bytes.len()
     );
     fixture.captured(b"");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn guarded_native_one_short_syscall_then_loss_flushes_before_foreground_read() {
+    let fixture = NativePty::new();
+    let mut runner = fixture.runner();
+    fixture.control("pause");
+    let directory = fixture.directory.clone();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&accepted);
+    let mut attempts = 0;
+    runner.file.before_write = Some(Box::new(move |offset| {
+        attempts += 1;
+        assert!(attempts <= 2, "no retry-until-success loop");
+        if attempts == 2 {
+            // Offset is the return count of the FIRST real native write(2),
+            // not a mock or an aggregate accumulated until EAGAIN.
+            observed.store(offset, Ordering::Relaxed);
+            NativePty::control_at(&directory, "park");
+        }
+    }));
+    let length = 4 * 1024 * 1024;
+    let receipt = submit(
+        &mut runner,
+        Bytes::from(vec![b'x'; length]),
+        Bytes::from_static(b"\r"),
+        Duration::ZERO,
+        Some(fixture.guard()),
+    );
+    assert_eq!(
+        runner.flush_pending_writes_once().expect("native flush"),
+        None
+    );
+    let count = accepted.load(Ordering::Relaxed);
+    assert!(
+        count > 0 && count < length,
+        "one native short count: {count}"
+    );
+    lost(receipt, true); // real foreground guard loss invokes slave TCIFLUSH
+    assert!(runner.pending_writes.is_empty());
+    assert!(runner.active_submission.is_none());
+    assert_eq!(runner.current_write_offset, 0);
+    assert_eq!(
+        fixture.probe_bytes(),
+        b"",
+        "foreground nonblocking read after flush"
+    );
+    fixture.captured(b""); // original reporter remained stopped throughout
 }
 
 #[cfg(target_os = "linux")]
