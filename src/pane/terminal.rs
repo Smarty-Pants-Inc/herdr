@@ -166,6 +166,8 @@ pub(crate) struct ProcessBytesResult {
     pub request_render: bool,
     pub render_delay: Option<Duration>,
     pub terminal_title_changed: bool,
+    /// Focus reporting transitioned from disabled to enabled in this PTY write.
+    pub focus_reporting_enabled: bool,
     pub terminal_bells: u16,
     pub clipboard_writes: Vec<Vec<u8>>,
     pub reported_cwd: Option<std::path::PathBuf>,
@@ -1355,6 +1357,7 @@ impl GhosttyPaneTerminal {
                 request_render: false,
                 render_delay: None,
                 terminal_title_changed: false,
+                focus_reporting_enabled: false,
                 terminal_bells: 0,
                 clipboard_writes: Vec::new(),
                 reported_cwd: None,
@@ -1401,6 +1404,10 @@ impl GhosttyPaneTerminal {
             .terminal
             .mode_get(crate::ghostty::MODE_SYNCHRONIZED_OUTPUT)
             .unwrap_or(false);
+        let focus_reporting_before = core
+            .terminal
+            .mode_get(crate::ghostty::MODE_FOCUS_EVENT)
+            .unwrap_or(false);
         let write_started = crate::render_prof::timer();
         self.write_pty_bytes_with_ordered_responses(
             &mut core,
@@ -1410,6 +1417,11 @@ impl GhosttyPaneTerminal {
             c1_xtgettcap_responses,
             &mut terminal_responses,
         );
+        let focus_reporting_enabled = !focus_reporting_before
+            && core
+                .terminal
+                .mode_get(crate::ghostty::MODE_FOCUS_EVENT)
+                .unwrap_or(false);
         let terminal_bells = core.terminal.take_bell_count();
         let clipboard_writes = core.terminal.take_clipboard_writes();
         let reported_cwd = core
@@ -1472,6 +1484,7 @@ impl GhosttyPaneTerminal {
             request_render,
             render_delay,
             terminal_title_changed,
+            focus_reporting_enabled,
             terminal_bells,
             clipboard_writes,
             reported_cwd,
@@ -4127,6 +4140,35 @@ mod tests {
         assert_eq!(
             latest.reported_cwd,
             Some(std::path::PathBuf::from("/tmp/iterm2"))
+        );
+    }
+
+    #[test]
+    fn process_pty_bytes_reports_focus_reporting_enable_transitions() {
+        let (tx, _rx) = mpsc::channel(4);
+        let terminal = crate::ghostty::Terminal::new(80, 24, 100).unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+        let pane_id = PaneId::from_raw(1);
+
+        for (bytes, enabled) in [
+            (b"output".as_slice(), false),
+            (b"\x1b[?100".as_slice(), false),
+            (b"4h".as_slice(), true),
+            (b"\x1b[?1004h".as_slice(), false),
+            (b"\x1b[?1004l".as_slice(), false),
+            (b"\x1b[?1004h".as_slice(), true),
+            (b"\x1bc".as_slice(), false),
+            (b"\x1b[?2026h\x1b[?1004h".as_slice(), true),
+        ] {
+            let result = pane.process_pty_bytes(pane_id, 0, bytes, &tx);
+            assert_eq!(result.focus_reporting_enabled, enabled, "bytes: {bytes:?}");
+        }
+        assert!(pane.focus_reporting_enabled());
+        assert!(
+            !pane
+                .process_pty_bytes(pane_id, 0, b"hidden output", &tx)
+                .request_render,
+            "synchronized output must retain its render suppression"
         );
     }
 

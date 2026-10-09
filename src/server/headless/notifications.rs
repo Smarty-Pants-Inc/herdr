@@ -322,6 +322,10 @@ impl HeadlessServer {
             (original, proxy_rx)
         });
         match &ev {
+            AppEvent::TerminalFocusReportingEnabled { pane_id } => {
+                self.send_current_pane_focus_event(*pane_id);
+                false
+            }
             AppEvent::TerminalBell { pane_id, count } => {
                 if !self.send_to_foreground_client(ServerMessage::TerminalBell { count: *count }) {
                     debug!(

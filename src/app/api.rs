@@ -56,7 +56,8 @@ impl App {
                 self.handle_api_worktree_read_finished(*result);
                 changes_workspace
             }
-            ev @ AppEvent::TerminalBell { .. } => {
+            ev @ (AppEvent::TerminalBell { .. }
+            | AppEvent::TerminalFocusReportingEnabled { .. }) => {
                 self.handle_internal_event(ev);
                 false
             }
@@ -119,6 +120,14 @@ impl App {
             }
             ev => ev,
         };
+        if let AppEvent::TerminalFocusReportingEnabled { pane_id } = &ev {
+            // The legacy app-only path has no shell-client focus evidence.
+            // Do not infer Gained from app navigation or unknown host focus.
+            if let Some((ws_idx, _)) = self.find_pane(*pane_id) {
+                self.send_pane_focus_event(ws_idx, *pane_id, crate::ghostty::FocusEvent::Lost);
+            }
+            return Vec::new();
+        }
         if matches!(
             &ev,
             AppEvent::TerminalBell { .. } | AppEvent::ClipboardWrite { .. }

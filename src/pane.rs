@@ -2179,6 +2179,40 @@ fn usable_reported_cwd(cwd: std::path::PathBuf) -> Option<std::path::PathBuf> {
     (cwd.is_absolute() && cwd.is_dir()).then_some(cwd)
 }
 
+fn publish_focus_reporting_enabled(
+    pane_id: PaneId,
+    enabled: bool,
+    events: &mpsc::Sender<AppEvent>,
+    runtime: &tokio::runtime::Handle,
+) {
+    if !enabled {
+        return;
+    }
+    match events.try_send(AppEvent::TerminalFocusReportingEnabled { pane_id }) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full(event)) => {
+            // Initial focus is not a render hint: retain it under queue pressure.
+            // Never block the PTY actor, which also owns the input response lock.
+            let events = events.clone();
+            runtime.spawn(async move {
+                if let Err(err) = events.send(event).await {
+                    warn!(
+                        pane = pane_id.raw(),
+                        err = %err,
+                        "failed to send terminal focus-reporting enable event"
+                    );
+                }
+            });
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            warn!(
+                pane = pane_id.raw(),
+                "terminal focus-reporting enable event channel closed"
+            );
+        }
+    }
+}
+
 fn publish_terminal_bells(pane_id: PaneId, count: u16, events: &mpsc::Sender<AppEvent>) {
     if count == 0 {
         return;
@@ -2607,6 +2641,12 @@ impl PaneRuntime {
                 content_seq.fetch_add(1, Ordering::Release);
                 drop(_content_write_guard);
                 compression_wake.wake();
+                publish_focus_reporting_enabled(
+                    pane_id,
+                    result.focus_reporting_enabled,
+                    &read_events,
+                    &delay_rt,
+                );
                 publish_terminal_bells(pane_id, result.terminal_bells, &read_events);
                 observe_detection_content_change(bytes, &detection_content_seq);
                 if !bytes.is_empty() {
@@ -2827,6 +2867,12 @@ impl PaneRuntime {
                 content_seq.fetch_add(1, Ordering::Release);
                 drop(_content_write_guard);
                 compression_wake.wake();
+                publish_focus_reporting_enabled(
+                    pane_id,
+                    result.focus_reporting_enabled,
+                    &events,
+                    &rt,
+                );
                 publish_terminal_bells(pane_id, result.terminal_bells, &events);
                 if agent_detection == AgentDetection::Enabled {
                     observe_detection_content_change(bytes, &detection_content_seq);
@@ -4146,6 +4192,30 @@ impl PaneRuntime {
 mod tests {
     use super::*;
     use std::ffi::OsStr;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn focus_reporting_enable_event_survives_full_queue() {
+        let pane_id = PaneId::from_raw(1);
+        let (events, mut receiver) = mpsc::channel(1);
+        events.try_send(AppEvent::GitFilesChanged).unwrap();
+        let runtime = tokio::runtime::Handle::current();
+
+        publish_focus_reporting_enabled(pane_id, true, &events, &runtime);
+        assert!(matches!(
+            receiver.recv().await,
+            Some(AppEvent::GitFilesChanged)
+        ));
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), receiver.recv())
+            .await
+            .expect("initial focus event must survive queue pressure")
+            .expect("event channel stays open");
+        assert!(matches!(
+            event,
+            AppEvent::TerminalFocusReportingEnabled { pane_id: id } if id == pane_id
+        ));
+        publish_focus_reporting_enabled(pane_id, false, &events, &runtime);
+        assert!(receiver.try_recv().is_err());
+    }
 
     #[tokio::test]
     async fn clear_pane_preserves_wrapped_input_and_unfinished_vt_sequence() {
