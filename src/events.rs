@@ -177,6 +177,10 @@ pub enum AppEvent {
         activated: Vec<crate::detect::Agent>,
         status: crate::detect::manifest_update::ManifestUpdateStatus,
     },
+    /// An enabled pane child still needs its initial current-focus report.
+    /// PTY writes repeat this request until focus input is successfully admitted.
+    /// This runtime event is independent of pane visibility and rendering.
+    TerminalFocusReportingEnabled { pane_id: PaneId },
     /// A pane child emitted one or more executable BEL characters.
     /// The host-facing process forwards them to its outer terminal.
     TerminalBell { pane_id: PaneId, count: u16 },

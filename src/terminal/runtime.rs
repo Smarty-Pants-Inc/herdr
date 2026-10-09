@@ -510,6 +510,9 @@ impl TerminalRuntime {
     ) -> Result<bool, mpsc::error::TrySendError<Bytes>> {
         self.0.try_send_paste_with_source(text, source)
     }
+    pub(crate) fn initial_focus_pending(&self) -> bool {
+        self.0.initial_focus_pending()
+    }
     pub(crate) fn try_send_focus_event_with_source(
         &self,
         event: crate::ghostty::FocusEvent,
