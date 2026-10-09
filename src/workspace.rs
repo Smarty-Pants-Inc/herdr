@@ -29,7 +29,10 @@ pub use self::{
     tab::{NewPane, Tab},
 };
 pub(crate) use self::{
-    git::{git_status_snapshot_for_cwd_with_demand, git_worktree_info, GitWorktreeInfo},
+    git::{
+        git_dir_for_repo_root, git_status_snapshot_for_cwd_with_demand, git_worktree_info,
+        GitWorktreeInfo,
+    },
     tab::MovedPane,
 };
 
