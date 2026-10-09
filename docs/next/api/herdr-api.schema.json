@@ -4904,6 +4904,60 @@
           },
           "type": "object"
         },
+        "WorktreeCreateProjectCheckedParams": {
+          "description": "Project-checked creation, separate from the frozen legacy endpoint shape.",
+          "properties": {
+            "allow_project_change": {
+              "default": false,
+              "description": "Explicit permission to change ownership of a surviving agent session.",
+              "type": "boolean"
+            },
+            "base": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "branch": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "cwd": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "focus": {
+              "default": false,
+              "type": "boolean"
+            },
+            "label": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "path": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "trust_repository": {
+              "type": "boolean"
+            },
+            "workspace_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "type": "object"
+        },
         "WorktreeListParams": {
           "properties": {
             "cwd": {
@@ -4926,6 +4980,54 @@
         },
         "WorktreeOpenParams": {
           "properties": {
+            "branch": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "cwd": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "focus": {
+              "default": false,
+              "type": "boolean"
+            },
+            "label": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "path": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "trust_repository": {
+              "type": "boolean"
+            },
+            "workspace_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "type": "object"
+        },
+        "WorktreeOpenProjectCheckedParams": {
+          "description": "Project-checked opening, separate from the frozen legacy endpoint shape.",
+          "properties": {
+            "allow_project_change": {
+              "default": false,
+              "description": "Explicit permission to change ownership of a surviving agent session.",
+              "type": "boolean"
+            },
             "branch": {
               "type": [
                 "string",
@@ -5454,6 +5556,23 @@
           "type": "object"
         },
         {
+          "description": "Project-checked creation; older servers reject instead of ignoring permission.",
+          "properties": {
+            "method": {
+              "const": "worktree.create_project_checked",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/WorktreeCreateProjectCheckedParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
           "properties": {
             "method": {
               "const": "worktree.open",
@@ -5461,6 +5580,23 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/WorktreeOpenParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Project-checked opening; older servers reject instead of ignoring permission.",
+          "properties": {
+            "method": {
+              "const": "worktree.open_project_checked",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/WorktreeOpenProjectCheckedParams"
             }
           },
           "required": [

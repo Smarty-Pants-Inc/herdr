@@ -242,7 +242,9 @@ impl HeadlessServer {
                 | Method::WorkspaceCreate(_)
                 | Method::WorkspaceCreateLinked(_)
                 | Method::WorktreeCreate(_)
+                | Method::WorktreeCreateProjectChecked(_)
                 | Method::WorktreeOpen(_)
+                | Method::WorktreeOpenProjectChecked(_)
                 | Method::WorktreeRemove(_)
         )
     }
@@ -290,7 +292,9 @@ impl HeadlessServer {
                 | Method::WorkspaceMoveBlock(_)
                 | Method::WorkspaceRename(_)
                 | Method::WorktreeCreate(_)
+                | Method::WorktreeCreateProjectChecked(_)
                 | Method::WorktreeOpen(_)
+                | Method::WorktreeOpenProjectChecked(_)
                 | Method::WorktreeRemove(_)
         )
     }
@@ -325,7 +329,9 @@ impl HeadlessServer {
                 | Method::WorkspaceCreateLinked(_)
                 | Method::WorkspaceFocus(_)
                 | Method::WorktreeCreate(_)
+                | Method::WorktreeCreateProjectChecked(_)
                 | Method::WorktreeOpen(_)
+                | Method::WorktreeOpenProjectChecked(_)
                 | Method::WorktreeRemove(_)
         )
     }

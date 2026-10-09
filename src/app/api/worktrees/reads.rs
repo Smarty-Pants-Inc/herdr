@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use crate::api::schema::{Method, Request};
+use crate::api::schema::{Method, Request, WorktreeOpenParams};
 use crate::app::App;
 use crate::events::{AppEvent, WorktreeReadData, WorktreeReadResult};
 use crate::workspace::{GitSpaceMetadata, WorktreeSpaceMembership};
@@ -77,6 +77,14 @@ fn linked_source_error() -> ApiFailure {
     )
 }
 
+fn open_params(method: &Method) -> Option<&WorktreeOpenParams> {
+    match method {
+        Method::WorktreeOpen(params) => Some(params),
+        Method::WorktreeOpenProjectChecked(params) => Some(&params.params),
+        _ => None,
+    }
+}
+
 impl App {
     fn capture_worktree_read_source(
         &self,
@@ -146,7 +154,9 @@ impl App {
                 true,
                 params.trust_repository,
             ),
-            Method::WorktreeOpen(params) => {
+            _ => {
+                let params = open_params(&request.method)
+                    .expect("only worktree list/open use background discovery");
                 if params.path.is_some() == params.branch.is_some() {
                     let _ = respond_to.send(encode_error(
                         request.id,
@@ -162,7 +172,6 @@ impl App {
                     params.trust_repository,
                 )
             }
-            _ => unreachable!("only worktree list/open use background discovery"),
         };
         let input = match self.capture_worktree_read_source(workspace_id, cwd) {
             Ok(input) => input,
@@ -196,7 +205,7 @@ impl App {
                             trust_repository,
                         )
                         .map_err(|err| ApiFailure::new("worktree_list_failed", err))?;
-                        if let Method::WorktreeOpen(params) = &request.method {
+                        if let Some(params) = open_params(&request.method) {
                             entries = vec![find_worktree_entry(
                                 entries,
                                 params.path.clone(),
@@ -282,6 +291,17 @@ impl App {
                     Method::WorktreeOpen(params) => self.finish_worktree_open(
                         result.request.id,
                         params,
+                        false,
+                        source,
+                        data.entries
+                            .into_iter()
+                            .next()
+                            .expect("open discovery selects one worktree"),
+                    ),
+                    Method::WorktreeOpenProjectChecked(params) => self.finish_worktree_open(
+                        result.request.id,
+                        params.params,
+                        params.allow_project_change,
                         source,
                         data.entries
                             .into_iter()
