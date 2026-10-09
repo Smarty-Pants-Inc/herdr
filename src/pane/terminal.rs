@@ -167,7 +167,11 @@ pub(crate) struct ProcessBytesResult {
     pub render_delay: Option<Duration>,
     pub terminal_title_changed: bool,
     /// Focus reporting transitioned from disabled to enabled in this PTY write.
+    /// Retained for transition invariants; callbacks use the pending-report signal.
+    #[cfg(test)]
     pub focus_reporting_enabled: bool,
+    /// Initial focus is still pending and reporting is enabled after this PTY write.
+    pub initial_focus_report_needed: bool,
     pub terminal_bells: u16,
     pub clipboard_writes: Vec<Vec<u8>>,
     pub reported_cwd: Option<std::path::PathBuf>,
@@ -1368,7 +1372,9 @@ impl GhosttyPaneTerminal {
                 request_render: false,
                 render_delay: None,
                 terminal_title_changed: false,
+                #[cfg(test)]
                 focus_reporting_enabled: false,
+                initial_focus_report_needed: false,
                 terminal_bells: 0,
                 clipboard_writes: Vec::new(),
                 reported_cwd: None,
@@ -1428,14 +1434,15 @@ impl GhosttyPaneTerminal {
             c1_xtgettcap_responses,
             &mut terminal_responses,
         );
-        let focus_reporting_enabled = !focus_reporting_before
-            && core
-                .terminal
-                .mode_get(crate::ghostty::MODE_FOCUS_EVENT)
-                .unwrap_or(false);
+        let focus_reporting_after = core
+            .terminal
+            .mode_get(crate::ghostty::MODE_FOCUS_EVENT)
+            .unwrap_or(false);
+        let focus_reporting_enabled = !focus_reporting_before && focus_reporting_after;
         if focus_reporting_enabled {
             core.initial_focus_pending = true;
         }
+        let initial_focus_report_needed = core.initial_focus_pending && focus_reporting_after;
         let terminal_bells = core.terminal.take_bell_count();
         let clipboard_writes = core.terminal.take_clipboard_writes();
         let reported_cwd = core
@@ -1498,7 +1505,9 @@ impl GhosttyPaneTerminal {
             request_render,
             render_delay,
             terminal_title_changed,
+            #[cfg(test)]
             focus_reporting_enabled,
+            initial_focus_report_needed,
             terminal_bells,
             clipboard_writes,
             reported_cwd,
@@ -4218,6 +4227,53 @@ mod tests {
                 .request_render,
             "synchronized output must retain its render suppression"
         );
+    }
+
+    #[test]
+    fn initial_focus_pending_output_requests_report_until_admitted() {
+        let (tx, _rx) = mpsc::channel(4);
+        let terminal = crate::ghostty::Terminal::new(80, 24, 100).unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+        let pane_id = PaneId::from_raw(1);
+
+        // Multiple enables in one processed batch still produce one boolean signal.
+        let enabled = pane.process_pty_bytes(pane_id, 0, b"\x1b[?1004h\x1b[?1004h\x1b[?1004h", &tx);
+        assert!(enabled.focus_reporting_enabled);
+        assert!(enabled.initial_focus_report_needed);
+        assert!(pane.initial_focus_pending());
+        for bytes in [
+            b"ordinary output".as_slice(),
+            b"more output",
+            b"\x1b[?1004h",
+        ] {
+            let retry = pane.process_pty_bytes(pane_id, 0, bytes, &tx);
+            assert!(!retry.focus_reporting_enabled, "no off-to-on transition");
+            assert!(
+                retry.initial_focus_report_needed,
+                "pending initial focus must wake its handler on every later PTY write"
+            );
+        }
+
+        let disabled = pane.process_pty_bytes(pane_id, 0, b"\x1b[?1004l", &tx);
+        assert!(!disabled.focus_reporting_enabled);
+        assert!(!disabled.initial_focus_report_needed);
+        assert!(pane.initial_focus_pending(), "mode-off is not delivery");
+        assert!(
+            !pane
+                .process_pty_bytes(pane_id, 0, b"mode-off output", &tx)
+                .initial_focus_report_needed
+        );
+        assert!(
+            pane.process_pty_bytes(pane_id, 0, b"\x1b[?1004h", &tx)
+                .initial_focus_report_needed
+        );
+        assert!(pane.try_send_focus_event(crate::ghostty::FocusEvent::Lost, |_| true));
+        for bytes in [b"after delivery".as_slice(), b"\x1b[?1004h\x1b[?1004h"] {
+            let result = pane.process_pty_bytes(pane_id, 0, bytes, &tx);
+            assert!(!result.focus_reporting_enabled);
+            assert!(!result.initial_focus_report_needed);
+            assert!(!pane.initial_focus_pending());
+        }
     }
 
     #[test]

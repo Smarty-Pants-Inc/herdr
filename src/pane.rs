@@ -2179,13 +2179,13 @@ fn usable_reported_cwd(cwd: std::path::PathBuf) -> Option<std::path::PathBuf> {
     (cwd.is_absolute() && cwd.is_dir()).then_some(cwd)
 }
 
-fn publish_focus_reporting_enabled(
+fn publish_initial_focus_report_needed(
     pane_id: PaneId,
-    enabled: bool,
+    needed: bool,
     events: &mpsc::Sender<AppEvent>,
     runtime: &tokio::runtime::Handle,
 ) {
-    if !enabled {
+    if !needed {
         return;
     }
     match events.try_send(AppEvent::TerminalFocusReportingEnabled { pane_id }) {
@@ -2199,7 +2199,7 @@ fn publish_focus_reporting_enabled(
                     warn!(
                         pane = pane_id.raw(),
                         err = %err,
-                        "failed to send terminal focus-reporting enable event"
+                        "failed to send initial terminal focus-report request"
                     );
                 }
             });
@@ -2207,7 +2207,7 @@ fn publish_focus_reporting_enabled(
         Err(mpsc::error::TrySendError::Closed(_)) => {
             warn!(
                 pane = pane_id.raw(),
-                "terminal focus-reporting enable event channel closed"
+                "initial terminal focus-report request channel closed"
             );
         }
     }
@@ -2641,9 +2641,9 @@ impl PaneRuntime {
                 content_seq.fetch_add(1, Ordering::Release);
                 drop(_content_write_guard);
                 compression_wake.wake();
-                publish_focus_reporting_enabled(
+                publish_initial_focus_report_needed(
                     pane_id,
-                    result.focus_reporting_enabled,
+                    result.initial_focus_report_needed,
                     &read_events,
                     &delay_rt,
                 );
@@ -2867,9 +2867,9 @@ impl PaneRuntime {
                 content_seq.fetch_add(1, Ordering::Release);
                 drop(_content_write_guard);
                 compression_wake.wake();
-                publish_focus_reporting_enabled(
+                publish_initial_focus_report_needed(
                     pane_id,
-                    result.focus_reporting_enabled,
+                    result.initial_focus_report_needed,
                     &events,
                     &rt,
                 );
@@ -4198,7 +4198,7 @@ mod tests {
         events.try_send(AppEvent::GitFilesChanged).unwrap();
         let runtime = tokio::runtime::Handle::current();
 
-        publish_focus_reporting_enabled(pane_id, true, &events, &runtime);
+        publish_initial_focus_report_needed(pane_id, true, &events, &runtime);
         assert!(matches!(
             receiver.recv().await,
             Some(AppEvent::GitFilesChanged)
@@ -4211,7 +4211,7 @@ mod tests {
             event,
             AppEvent::TerminalFocusReportingEnabled { pane_id: id } if id == pane_id
         ));
-        publish_focus_reporting_enabled(pane_id, false, &events, &runtime);
+        publish_initial_focus_report_needed(pane_id, false, &events, &runtime);
         assert!(receiver.try_recv().is_err());
     }
 
@@ -5618,6 +5618,122 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn initial_focus_full_input_queue_retries_on_processed_output() {
+        let (runtime, mut input) = PaneRuntime::test_with_channel_capacity(80, 24, 1);
+        let PaneRuntimeIo::TestChannel { sender, .. } = &runtime.io else {
+            panic!("expected test input channel");
+        };
+        let (events, mut event_rx) = mpsc::channel(4);
+        let handle = tokio::runtime::Handle::current();
+        runtime
+            .try_send_bytes(Bytes::from_static(b"occupied"))
+            .unwrap();
+
+        // Keep input full while consuming every request: one event per PTY write,
+        // even for ordinary output, repeated enables, and synchronized output.
+        for bytes in [
+            b"\x1b[?1004h\x1b[?1004h\x1b[?1004h".as_slice(),
+            b"ordinary output",
+            b"more output",
+            b"\x1b[?1004h\x1b[?1004h",
+            b"\x1b[?2026hhidden output",
+        ] {
+            let result = runtime
+                .terminal
+                .process_pty_bytes(runtime.pane_id, 0, bytes, sender);
+            publish_initial_focus_report_needed(
+                runtime.pane_id,
+                result.initial_focus_report_needed,
+                &events,
+                &handle,
+            );
+            assert!(matches!(
+                event_rx.try_recv().expect("pending output must request focus"),
+                AppEvent::TerminalFocusReportingEnabled { pane_id } if pane_id == runtime.pane_id
+            ));
+            assert!(
+                event_rx.try_recv().is_err(),
+                "one event per processed batch"
+            );
+            assert!(!runtime.try_send_focus_event(crate::ghostty::FocusEvent::Lost));
+            assert!(runtime.initial_focus_pending());
+        }
+
+        for bytes in [b"\x1b[?1004l".as_slice(), b"mode-off output"] {
+            let result = runtime
+                .terminal
+                .process_pty_bytes(runtime.pane_id, 0, bytes, sender);
+            publish_initial_focus_report_needed(
+                runtime.pane_id,
+                result.initial_focus_report_needed,
+                &events,
+                &handle,
+            );
+            assert!(
+                event_rx.try_recv().is_err(),
+                "mode-off writes must not retry"
+            );
+            assert!(runtime.initial_focus_pending(), "mode-off is not delivery");
+        }
+        // Re-enable while still full, consume that event, then recover queue space.
+        let enabled = runtime.terminal.process_pty_bytes(
+            runtime.pane_id,
+            0,
+            b"\x1b[?1004h\x1b[?2026l",
+            sender,
+        );
+        publish_initial_focus_report_needed(
+            runtime.pane_id,
+            enabled.initial_focus_report_needed,
+            &events,
+            &handle,
+        );
+        assert!(matches!(
+            event_rx.try_recv().unwrap(),
+            AppEvent::TerminalFocusReportingEnabled { pane_id } if pane_id == runtime.pane_id
+        ));
+        assert!(event_rx.try_recv().is_err());
+        assert!(!runtime.try_send_focus_event(crate::ghostty::FocusEvent::Lost));
+        assert_eq!(input.try_recv().unwrap(), Bytes::from_static(b"occupied"));
+
+        let retry = runtime.terminal.process_pty_bytes(
+            runtime.pane_id,
+            0,
+            b"later ordinary output",
+            sender,
+        );
+        publish_initial_focus_report_needed(
+            runtime.pane_id,
+            retry.initial_focus_report_needed,
+            &events,
+            &handle,
+        );
+        assert!(matches!(
+            event_rx.try_recv().expect("later output must retry pending focus"),
+            AppEvent::TerminalFocusReportingEnabled { pane_id } if pane_id == runtime.pane_id
+        ));
+        assert!(event_rx.try_recv().is_err(), "retry publishes exactly once");
+        assert!(runtime.try_send_focus_event(crate::ghostty::FocusEvent::Lost));
+        assert_eq!(input.try_recv().unwrap(), Bytes::from_static(b"\x1b[O"));
+        assert!(!runtime.initial_focus_pending());
+
+        for bytes in [b"future output".as_slice(), b"\x1b[?1004h\x1b[?1004h"] {
+            let result = runtime
+                .terminal
+                .process_pty_bytes(runtime.pane_id, 0, bytes, sender);
+            publish_initial_focus_report_needed(
+                runtime.pane_id,
+                result.initial_focus_report_needed,
+                &events,
+                &handle,
+            );
+            assert!(event_rx.try_recv().is_err(), "admission ends retries");
+            assert!(input.try_recv().is_err());
+            assert!(!runtime.initial_focus_pending());
+        }
     }
 
     #[tokio::test]

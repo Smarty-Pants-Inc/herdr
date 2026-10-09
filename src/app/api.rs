@@ -124,6 +124,17 @@ impl App {
             // The legacy app-only path has no shell-client focus evidence.
             // Do not infer Gained from app navigation or unknown host focus.
             if let Some((ws_idx, _)) = self.find_pane(*pane_id) {
+                let Some(runtime) = self.state.runtime_for_pane_in_workspace(
+                    &self.terminal_runtimes,
+                    ws_idx,
+                    *pane_id,
+                ) else {
+                    return Vec::new();
+                };
+                // A normal focus transition may have satisfied this queued report.
+                if !runtime.initial_focus_pending() {
+                    return Vec::new();
+                }
                 self.send_pane_focus_event(ws_idx, *pane_id, crate::ghostty::FocusEvent::Lost);
             }
             return Vec::new();

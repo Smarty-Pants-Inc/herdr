@@ -396,3 +396,274 @@ fn initial_focus_native_queued_enable_after_gained_transition_reports_once() {
 fn initial_focus_native_queued_enable_after_lost_transition_reports_once() {
     assert_native_initial_focus_transition(false);
 }
+
+// These channel tests isolate the legacy app-only handler. They deliberately
+// inject the initial event: publication by the PTY reader is covered below,
+// and this parser-only helper must not stand in for output-driven retry tests.
+fn assert_app_only_initial_focus_transition(focused: bool, initial_first: bool) {
+    with_terminal_session_test_server(|server, terminal_id, _, _| {
+        let pane_id = server.app.state.workspaces[0].tabs[0].root_pane;
+        let (runtime, mut input_rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        server
+            .app
+            .terminal_runtimes
+            .insert(terminal_id.clone(), runtime);
+        prepare_initial_focus_transition(server, !focused);
+        server
+            .app
+            .terminal_runtimes
+            .get(&terminal_id)
+            .expect("app-only focus runtime")
+            .test_process_pty_bytes(b"\x1b[?1004h");
+
+        if initial_first {
+            server
+                .app
+                .handle_internal_event(AppEvent::TerminalFocusReportingEnabled { pane_id });
+            assert_eq!(
+                input_rx.try_recv().expect("conservative initial report"),
+                Bytes::from_static(b"\x1b[O"),
+                "app navigation is not evidence of outer-terminal focus"
+            );
+            assert!(input_rx.try_recv().is_err(), "duplicate initial report");
+        }
+
+        assert!(server.handle_server_event(ServerEvent::ClientShellFocus {
+            client_id: 1,
+            focused,
+        }));
+        assert!(
+            !server
+                .app
+                .terminal_runtimes
+                .get(&terminal_id)
+                .expect("app-only focus runtime")
+                .initial_focus_pending(),
+            "a successful normal transition must consume initial pending"
+        );
+        if !initial_first {
+            // A successful normal transition overtook the queued enable event.
+            // App-only dispatch must not append a conservative Lost to it.
+            server
+                .app
+                .handle_internal_event(AppEvent::TerminalFocusReportingEnabled { pane_id });
+        }
+        let changed = Bytes::from_static(if focused { b"\x1b[I" } else { b"\x1b[O" });
+        let mut actual = Vec::new();
+        while let Ok(bytes) = input_rx.try_recv() {
+            actual.push(bytes);
+        }
+        assert_eq!(
+            actual,
+            vec![changed],
+            "app-only initialization must neither duplicate nor suppress normal focus changes"
+        );
+    });
+}
+
+#[test]
+fn initial_focus_app_only_queued_enable_after_gained_transition_reports_once() {
+    assert_app_only_initial_focus_transition(true, false);
+}
+
+#[test]
+fn initial_focus_app_only_queued_enable_after_lost_transition_reports_once() {
+    assert_app_only_initial_focus_transition(false, false);
+}
+
+#[test]
+fn initial_focus_app_only_initial_lost_allows_later_gained_transition() {
+    assert_app_only_initial_focus_transition(true, true);
+}
+
+#[test]
+fn initial_focus_app_only_initial_lost_allows_later_lost_transition() {
+    assert_app_only_initial_focus_transition(false, true);
+}
+
+#[test]
+fn initial_focus_app_only_full_input_queue_retains_pending() {
+    with_terminal_session_test_server(|server, terminal_id, _, _| {
+        let pane_id = server.app.state.workspaces[0].tabs[0].root_pane;
+        let (runtime, mut input_rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_capacity(80, 24, 1);
+        server
+            .app
+            .terminal_runtimes
+            .insert(terminal_id.clone(), runtime);
+        prepare_initial_focus_transition(server, true);
+        let runtime = server
+            .app
+            .terminal_runtimes
+            .get(&terminal_id)
+            .expect("backpressured app-only focus runtime");
+        runtime.test_process_pty_bytes(b"\x1b[?1004h");
+        runtime
+            .try_send_bytes(Bytes::from_static(b"occupied"))
+            .expect("fill deterministic input queue");
+
+        server
+            .app
+            .handle_internal_event(AppEvent::TerminalFocusReportingEnabled { pane_id });
+        assert!(
+            server
+                .app
+                .terminal_runtimes
+                .get(&terminal_id)
+                .expect("backpressured app-only focus runtime")
+                .initial_focus_pending(),
+            "failed input admission must retain pending"
+        );
+        assert_eq!(
+            input_rx.try_recv().expect("original filler"),
+            Bytes::from_static(b"occupied")
+        );
+        assert!(input_rx.try_recv().is_err(), "full queue admitted focus");
+        // Admission-only coverage: do not inject a second event and claim it
+        // proves later PTY output publishes a retry. That needs pane internals.
+    });
+}
+
+#[test]
+fn initial_focus_app_only_mode_off_sends_nothing() {
+    with_terminal_session_test_server(|server, terminal_id, _, _| {
+        let pane_id = server.app.state.workspaces[0].tabs[0].root_pane;
+        let (runtime, mut input_rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        server
+            .app
+            .terminal_runtimes
+            .insert(terminal_id.clone(), runtime);
+        prepare_initial_focus_transition(server, true);
+        let runtime = server
+            .app
+            .terminal_runtimes
+            .get(&terminal_id)
+            .expect("mode-off app-only focus runtime");
+        runtime.test_process_pty_bytes(b"\x1b[?1004h\x1b[?1004l");
+        server
+            .app
+            .handle_internal_event(AppEvent::TerminalFocusReportingEnabled { pane_id });
+        assert!(input_rx.try_recv().is_err(), "mode-off admitted focus");
+    });
+}
+
+// Use the actual event published by the native reader, held until a successful
+// normal focus transition, but dispatch through App rather than HeadlessServer.
+// Keep the original server-path native tests unchanged as counterexamples.
+fn assert_native_app_only_initial_focus_transition(focused: bool) {
+    with_terminal_session_test_server(|server, terminal_id, _, _| {
+        let pane_id = server.app.state.workspaces[0].tabs[0].root_pane;
+        prepare_initial_focus_transition(server, !focused);
+        let script = r#"stty raw -echo min 1 time 0 || exit 1
+printf '\033[?1004h'
+first=$(dd bs=1 count=3 2>/dev/null | od -An -tx1 | tr -d ' \n')
+stty min 0 time 10
+extra=$(dd bs=1 count=3 2>/dev/null | od -An -tx1 | tr -d ' \n')
+printf '\r\nAPP_ONLY_FOCUS:%s%s:END\r\n' "$first" "$extra"
+stty min 1 time 0
+dd bs=1 count=1 >/dev/null 2>&1
+"#;
+        let runtime = crate::terminal::TerminalRuntime::spawn_argv_command(
+            pane_id,
+            24,
+            80,
+            std::env::temp_dir(),
+            &["/bin/sh".into(), "-c".into(), script.into()],
+            &crate::pane::PaneLaunchEnv::default(),
+            crate::pane::AgentDetection::Disabled,
+            0,
+            crate::terminal_theme::TerminalTheme::default(),
+            None,
+            server.app.event_tx.clone(),
+            server.app.render_notify.clone(),
+            server.app.render_dirty.clone(),
+        )
+        .expect("spawn app-only ordered focus PTY child");
+        server
+            .app
+            .terminal_runtimes
+            .insert(terminal_id.clone(), runtime);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut held_events = Vec::new();
+        let initial = loop {
+            match server.app.event_rx.try_recv() {
+                Ok(event) => {
+                    if matches!(&event, AppEvent::TerminalFocusReportingEnabled { pane_id: id } if *id == pane_id)
+                    {
+                        break Some(event);
+                    }
+                    held_events.push(event);
+                }
+                Err(_) if Instant::now() >= deadline => break None,
+                Err(_) => std::thread::sleep(Duration::from_millis(5)),
+            }
+        };
+        let captured_enable = initial.is_some();
+        let mut transition_handled = false;
+        if let Some(initial) = initial {
+            transition_handled = server.handle_server_event(ServerEvent::ClientShellFocus {
+                client_id: 1,
+                focused,
+            });
+            server.app.handle_internal_event(initial);
+        }
+        for event in held_events {
+            server.handle_internal_event_with_forwarding(event);
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let (screen, completed) = loop {
+            while let Ok(event) = server.app.event_rx.try_recv() {
+                server.handle_internal_event_with_forwarding(event);
+            }
+            let screen = server
+                .app
+                .terminal_runtimes
+                .get(&terminal_id)
+                .expect("owned app-only ordered focus runtime")
+                .detection_text();
+            let completed = screen
+                .lines()
+                .any(|line| line.contains("APP_ONLY_FOCUS:") && line.contains(":END"));
+            if completed || !captured_enable || Instant::now() >= deadline {
+                break (screen, completed);
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        // Clean up even on current R2's expected red assertions.
+        server
+            .app
+            .terminal_runtimes
+            .remove(&terminal_id)
+            .expect("owned app-only ordered focus runtime")
+            .shutdown();
+        assert!(
+            captured_enable,
+            "native focus enable event timed out; screen: {screen:?}"
+        );
+        assert!(
+            transition_handled,
+            "client focus transition was not handled"
+        );
+        assert!(
+            completed,
+            "app-only focus child timed out; screen: {screen:?}"
+        );
+        let hex = if focused { "1b5b49" } else { "1b5b4f" };
+        let marker = format!("APP_ONLY_FOCUS:{hex}:END");
+        assert!(
+            screen.contains(&marker),
+            "expected exactly one report: {marker}; screen: {screen:?}"
+        );
+    });
+}
+
+#[test]
+fn initial_focus_native_app_only_queued_enable_after_gained_transition_reports_once() {
+    assert_native_app_only_initial_focus_transition(true);
+}
+
+#[test]
+fn initial_focus_native_app_only_queued_enable_after_lost_transition_reports_once() {
+    assert_native_app_only_initial_focus_transition(false);
+}
