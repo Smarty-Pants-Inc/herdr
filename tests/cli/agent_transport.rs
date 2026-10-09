@@ -12,24 +12,10 @@ fn check_expected_status_transport(
     fs::create_dir_all(&base).unwrap();
     let socket_path = base.join("herdr.sock");
     let listener = UnixListener::bind(&socket_path).unwrap();
-    listener.set_nonblocking(true).unwrap();
-    let (done_tx, done_rx) = std::sync::mpsc::channel();
     let server = thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(5);
         let mut operations = Vec::new();
         loop {
-            if done_rx.try_recv().is_ok() || Instant::now() >= deadline {
-                return operations;
-            }
-            let (mut stream, _) = match listener.accept() {
-                Ok(connection) => connection,
-                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(5));
-                    continue;
-                }
-                Err(err) => panic!("fake server accept failed: {err}"),
-            };
-            stream.set_nonblocking(false).unwrap();
+            let (mut stream, _) = listener.accept().unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(1)))
                 .unwrap();
@@ -41,6 +27,9 @@ fn check_expected_status_transport(
                 .read_line(&mut line)
                 .unwrap();
             let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+            if request["method"] == "__test_shutdown" {
+                return operations;
+            }
             let response = if request["method"] == "ping" {
                 serde_json::json!({"id": request["id"], "result": {
                     "type": "pong", "version": "same-protocol", "protocol": CURRENT_PROTOCOL,
@@ -66,7 +55,10 @@ fn check_expected_status_transport(
         args.extend(["--wait", "--until", "done", "--timeout", "1200"]);
     }
     let output = run_cli(&socket_path, &args);
-    let _ = done_tx.send(());
+    let mut shutdown_stream = UnixStream::connect(&socket_path).unwrap();
+    shutdown_stream
+        .write_all(b"{\"method\":\"__test_shutdown\"}\n")
+        .unwrap();
     let operations = server.join().unwrap();
     cleanup_test_base(&base);
     assert_eq!(
