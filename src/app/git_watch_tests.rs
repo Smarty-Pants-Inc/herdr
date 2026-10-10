@@ -1114,3 +1114,106 @@ fn git_watch_retargeted_commondir_keeps_restore_sentinels_bounded() {
         std::fs::remove_dir_all(path).unwrap();
     }
 }
+
+/// #6260 N4-alias: G/commondir names a symlink alias that is retargeted N
+/// times (atomically and through a dangling gap, with the previous common
+/// dir intact or missing its HEAD). Retained sentinels are keyed on the
+/// canonical common dir: at most one Restore per canonical dir, never one for
+/// a retired common, and no growth across retargets.
+#[cfg(unix)]
+#[test]
+fn git_watch_retargeted_commondir_alias_keeps_one_sentinel_per_canonical_dir() {
+    for (dangling_gap, remove_old_head) in
+        [(false, false), (false, true), (true, false), (true, true)]
+    {
+        let root = repository("commondir-alias-retarget");
+        fixture_commit(&root);
+        let linked = root.with_extension("linked");
+        fixture_git(
+            &root,
+            &["worktree", "add", "-b", "linked", linked.to_str().unwrap()],
+        );
+        let git_dir = PathBuf::from(fixture_git(&linked, &["rev-parse", "--absolute-git-dir"]));
+        let store = root.with_extension("store");
+        std::fs::create_dir_all(&store).unwrap();
+        // The raw commondir content never changes; only the alias target does.
+        let alias = store.join(".git");
+        std::os::unix::fs::symlink(root.join(".git"), &alias).unwrap();
+        std::fs::write(git_dir.join("commondir"), format!("{}\n", alias.display())).unwrap();
+        let commons: Vec<_> = (1..=6)
+            .map(|i| {
+                let common = repository(&format!("commondir-alias-target-{i}"));
+                fixture_commit(&common);
+                common
+            })
+            .collect();
+        let (tx, _rx) = mpsc::channel(256);
+        let mut watches = GitWatches::new(tx).unwrap();
+        watches.sync(HashSet::from([linked.clone()]));
+        let mut previous = root.join(".git");
+        let mut baseline = None;
+        let canonical_git_dir = git_dir.canonicalize().unwrap();
+        for (i, common) in commons.iter().enumerate() {
+            let next = common.join(".git");
+            if dangling_gap {
+                std::fs::remove_file(&alias).unwrap();
+                if remove_old_head {
+                    std::fs::remove_file(previous.join("HEAD")).unwrap();
+                }
+                watches.topology_dirty = true;
+                watches.sync(HashSet::from([linked.clone()]));
+                std::os::unix::fs::symlink(&next, &alias).unwrap();
+            } else {
+                let staged = store.join("alias.tmp");
+                std::os::unix::fs::symlink(&next, &staged).unwrap();
+                std::fs::rename(&staged, &alias).unwrap();
+                if remove_old_head {
+                    std::fs::remove_file(previous.join("HEAD")).unwrap();
+                }
+            }
+            watches.topology_dirty = true;
+            watches.sync(HashSet::from([linked.clone()]));
+            let canonical_common = next.canonicalize().unwrap();
+            assert_eq!(
+                crate::workspace::git_worktree_info(&linked)
+                    .unwrap()
+                    .git_common_dir,
+                canonical_common
+            );
+            let sentinels = &watches.root_markers[&linked];
+            let restore_dirs: Vec<_> = sentinels
+                .iter()
+                .filter_map(|target| match target {
+                    WatchTarget::Restore { file, .. } => {
+                        let parent = file.parent().unwrap();
+                        Some(
+                            parent
+                                .canonicalize()
+                                .unwrap_or_else(|_| parent.to_path_buf()),
+                        )
+                    }
+                    _ => None,
+                })
+                .collect();
+            let unique: HashSet<_> = restore_dirs.iter().cloned().collect();
+            let case = format!("gap={dangling_gap} removed={remove_old_head} retarget {i}");
+            assert_eq!(unique.len(), restore_dirs.len(), "{case}: {sentinels:?}");
+            assert_eq!(
+                unique,
+                HashSet::from([canonical_git_dir.clone(), canonical_common.clone()]),
+                "{case}: {sentinels:?}"
+            );
+            let counts = (sentinels.len(), watches.watched.len());
+            assert_eq!(
+                *baseline.get_or_insert(counts),
+                counts,
+                "{case}: {sentinels:?}"
+            );
+            previous = next;
+        }
+        drop(watches);
+        for path in commons.into_iter().chain([root, linked, store]) {
+            std::fs::remove_dir_all(path).unwrap();
+        }
+    }
+}
