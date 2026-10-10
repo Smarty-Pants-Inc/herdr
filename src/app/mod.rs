@@ -157,6 +157,11 @@ pub struct App {
     pub(crate) git_refresh_in_flight: bool,
     pub(crate) git_refresh_due_after_in_flight: bool,
     pub(crate) git_identity_refresh_requested: bool,
+    /// Generation of the most recently started Git refresh worker.
+    pub(crate) git_refresh_generation: u64,
+    /// Oldest worker generation that observed the latest identity request;
+    /// completions from older generations are stale and dropped.
+    pub(crate) git_identity_refresh_floor: u64,
     /// A refresh worker failed to start; retry it even without a client.
     pub(crate) git_refresh_spawn_retry_pending: bool,
     pub(crate) pending_restored_worktree_spaces:
@@ -682,6 +687,8 @@ impl App {
             git_refresh_in_flight: false,
             git_refresh_due_after_in_flight: false,
             git_identity_refresh_requested: false,
+            git_refresh_generation: 0,
+            git_identity_refresh_floor: 0,
             git_refresh_spawn_retry_pending: false,
             pending_restored_worktree_spaces: Vec::new(),
             restored_worktree_validation_retry_at: None,
@@ -1263,6 +1270,7 @@ mod tests {
         app.git_refresh_in_flight = true;
 
         let changed = app.handle_internal_event_with_render_impact(AppEvent::GitStatusRefreshed {
+            generation: 0,
             results: Vec::new(),
             cache_updates: Vec::new(),
         });
@@ -1310,6 +1318,7 @@ mod tests {
         app.last_git_remote_status_refresh = previous_refresh;
 
         app.handle_internal_event(AppEvent::GitStatusRefreshed {
+            generation: 0,
             results: Vec::new(),
             cache_updates: Vec::new(),
         });
@@ -1327,6 +1336,7 @@ mod tests {
         let resolved_identity_cwd = app.state.workspaces[0].resolved_identity_cwd().unwrap();
 
         app.handle_internal_event(AppEvent::GitStatusRefreshed {
+            generation: 0,
             results: vec![crate::workspace::WorkspaceGitStatus {
                 workspace_id,
                 resolved_identity_cwd: resolved_identity_cwd.clone(),
@@ -1483,6 +1493,7 @@ mod tests {
         app.git_refresh_in_flight = true;
         app.event_tx
             .try_send(AppEvent::GitStatusRefreshed {
+                generation: 0,
                 results: Vec::new(),
                 cache_updates: Vec::new(),
             })
