@@ -3206,7 +3206,10 @@ mod tests {
     }
 
     fn test_temp_session_path(name: &str) -> String {
-        std::env::temp_dir().join(name).display().to_string()
+        std::path::absolute(std::env::temp_dir().join(name))
+            .expect("absolute temp session path")
+            .display()
+            .to_string()
     }
 
     fn buffer_pi_report(
