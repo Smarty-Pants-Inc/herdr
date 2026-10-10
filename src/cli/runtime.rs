@@ -3,7 +3,7 @@ use crate::api::schema::{
     PaneRenameParams, PaneResizeParams, PaneSplitParams, PaneSwapParams, PaneTarget,
     PaneZoomParams, Request, TabCreateParams, TabListParams, TabRenameParams, TabTarget,
     WorkspaceCloseParams, WorkspaceCreateParams, WorkspaceRenameParams, WorkspaceTarget,
-    WorktreeCreateParams, WorktreeListParams, WorktreeOpenParams, WorktreeRemoveParams,
+    WorktreeListParams, WorktreeRemoveParams,
 };
 
 fn print_method_response(id: &'static str, method: Method) -> std::io::Result<i32> {
@@ -81,12 +81,25 @@ pub(super) fn worktree_list(params: WorktreeListParams) -> std::io::Result<i32> 
     print_method_response("cli:worktree:list", Method::WorktreeList(params))
 }
 
-pub(super) fn worktree_create(params: WorktreeCreateParams) -> std::io::Result<i32> {
-    print_method_response("cli:worktree:create", Method::WorktreeCreate(params))
+pub(super) fn worktree_create(
+    params: crate::api::schema::WorktreeCreateProjectCheckedParams,
+) -> std::io::Result<i32> {
+    // Always use the checked method, even without opt-in. Never retry legacy
+    // dispatch on an older server that could silently change project ownership.
+    print_method_response(
+        "cli:worktree:create",
+        Method::WorktreeCreateProjectChecked(params),
+    )
 }
 
-pub(super) fn worktree_open(params: WorktreeOpenParams) -> std::io::Result<i32> {
-    print_method_response("cli:worktree:open", Method::WorktreeOpen(params))
+pub(super) fn worktree_open(
+    params: crate::api::schema::WorktreeOpenProjectCheckedParams,
+) -> std::io::Result<i32> {
+    // No unchecked fallback: an older server must reject this operation safely.
+    print_method_response(
+        "cli:worktree:open",
+        Method::WorktreeOpenProjectChecked(params),
+    )
 }
 
 pub(super) fn worktree_remove(params: WorktreeRemoveParams) -> std::io::Result<i32> {

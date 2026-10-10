@@ -18,6 +18,7 @@ BASE_MATRIX = {
         {"os": "windows-latest", "kind": "windows"},
     ]
 }
+UNIX_MATRIX = {"include": [BASE_MATRIX["include"][0]]}
 FULL_MATRIX = {
     "include": [
         BASE_MATRIX["include"][0],
@@ -114,20 +115,20 @@ class CIPlanTests(unittest.TestCase):
         self.assertIn(outputs["conpty"], ("true", "false"))
         return json.loads(outputs["matrix"]), outputs["conpty"] == "true"
 
-    def test_ordinary_pr_keeps_linux_and_windows_even_for_docs_only(self) -> None:
+    def test_ordinary_docs_pr_keeps_only_linux(self) -> None:
         self.write("docs/next/website/page.mdx")
-        matrix, conpty = self.plan(self.event(self.commit()))
-        self.assertEqual(matrix, BASE_MATRIX)
-        self.assertFalse(conpty)
+        event = self.event(self.commit())
+        event["inputs"] = {"hosted_macos": "true"}
+        self.assertEqual(self.plan(event), (UNIX_MATRIX, False))
 
-    def test_push_keeps_linux_and_windows_even_for_docs_only(self) -> None:
+    def test_docs_push_keeps_only_linux(self) -> None:
         self.write("docs/page.md")
         event = self.event(self.commit())
         event["inputs"] = {"hosted_macos": "true"}
         for branch in ("master", "windows", "smarty-preview-source"):
             with self.subTest(branch=branch):
                 event["ref"] = f"refs/heads/{branch}"
-                self.assertEqual(self.plan(event, "push"), (BASE_MATRIX, False))
+                self.assertEqual(self.plan(event, "push"), (UNIX_MATRIX, False))
 
     def test_manual_dispatch_requires_explicit_hosted_macos_opt_in(self) -> None:
         for inputs in (None, {}, {"hosted_macos": False}, {"hosted_macos": "false"}):
@@ -157,6 +158,27 @@ class CIPlanTests(unittest.TestCase):
                         event["pull_request"]["draft"] = draft
                     self.assertEqual(self.plan(event), (BASE_MATRIX, False))
 
+    def test_queue_requires_both_authenticated_identity_and_head_prefix(self) -> None:
+        self.write("docs/page.md")
+        after = self.commit()
+        for user, head in (
+            ({"id": 123}, {"ref": "mergify/merge-queue/master/pr-12"}),
+            ({"id": "37929162"}, {"ref": "mergify/merge-queue/master/pr-12"}),
+            ({"id": 37929162}, {"ref": "feature"}),
+            ({"id": 37929162}, {"ref": "mergify/merge-queue-like/pr-12"}),
+            (None, {"ref": "mergify/merge-queue/master/pr-12"}),
+            ({"id": 37929162}, None),
+            ({"id": 37929162}, {"ref": 12}),
+        ):
+            with self.subTest(user=user, head=head):
+                event = self.event(after, queue=True)
+                event["pull_request"]["user"] = user
+                event["pull_request"]["head"] = {"sha": after, **(head or {})}
+                self.assertEqual(self.plan(event), (UNIX_MATRIX, False))
+        event = self.event(after, queue=True)
+        self.assertEqual(self.plan(event), (BASE_MATRIX, False))
+        self.assertEqual(self.plan(event, "push"), (UNIX_MATRIX, False))
+
     def test_all_build_and_package_inputs_enable_conpty(self) -> None:
         paths = (
             "src/main.rs", "src/integration/assets/claude/herdr-agent-state.ps1",
@@ -181,8 +203,8 @@ class CIPlanTests(unittest.TestCase):
                 event = self.event(after)
                 event["before"] = before
                 event["pull_request"]["base"]["sha"] = before
-                self.assertTrue(self.plan(event)[1])
-                self.assertTrue(self.plan(event, "push")[1])
+                self.assertEqual(self.plan(event), (BASE_MATRIX, True))
+                self.assertEqual(self.plan(event, "push"), (BASE_MATRIX, True))
                 before = after
 
     def test_irrelevant_paths_do_not_match_prefixes_or_script_lookalikes(self) -> None:
@@ -196,7 +218,9 @@ class CIPlanTests(unittest.TestCase):
             "skills/herdr/other.md", "docs/next/api/other.json", ".github/workflows/other.yml",
         ):
             self.write(path)
-        self.assertFalse(self.plan(self.event(self.commit()))[1])
+        event = self.event(self.commit())
+        self.assertEqual(self.plan(event), (UNIX_MATRIX, False))
+        self.assertEqual(self.plan(event, "push"), (UNIX_MATRIX, False))
 
     def test_deleting_source_enables_conpty(self) -> None:
         (self.repo / "src/main.rs").unlink()
@@ -286,9 +310,9 @@ class CIPlanTests(unittest.TestCase):
         head = self.commit()
         event = self.event(head)
         event["pull_request"]["base"]["sha"] = base
-        self.assertTrue(self.plan(event)[1])
+        self.assertEqual(self.plan(event), (BASE_MATRIX, True))
         event["after"] = base
-        self.assertTrue(self.plan(event, "push")[1])
+        self.assertEqual(self.plan(event, "push"), (BASE_MATRIX, True))
 
     def test_uncommitted_files_do_not_change_event_diff(self) -> None:
         self.write("src/main.rs", "uncommitted source\n")
@@ -303,7 +327,7 @@ class CIPlanTests(unittest.TestCase):
                         event[endpoint] = sha
                         section = "base" if endpoint == "before" else "head"
                         event["pull_request"][section]["sha"] = sha
-                        self.assertTrue(self.plan(event, name)[1])
+                        self.assertEqual(self.plan(event, name), (BASE_MATRIX, True))
 
     def test_blob_sha_is_not_complete_commit_evidence(self) -> None:
         event = self.event()
@@ -318,17 +342,17 @@ class CIPlanTests(unittest.TestCase):
         # ponytail: git writes loose objects read-only; Windows refuses to unlink those.
         obj.chmod(0o644)
         obj.unlink()
-        self.assertTrue(self.plan(self.event(after), "push")[1])
+        self.assertEqual(self.plan(self.event(after), "push"), (BASE_MATRIX, True))
 
     def test_not_a_repository_enables_conpty(self) -> None:
-        self.assertTrue(self.plan(self.event(), cwd=self.root)[1])
+        self.assertEqual(self.plan(self.event(), cwd=self.root), (BASE_MATRIX, True))
 
     def test_shallow_checkout_enables_conpty_even_when_endpoints_exist(self) -> None:
         self.write("docs/page.md")
         after = self.commit()
         shallow = self.root / "shallow"
         self.git("clone", "--quiet", "--depth=2", "--no-local", self.repo.as_uri(), str(shallow))
-        self.assertTrue(self.plan(self.event(after), cwd=shallow)[1])
+        self.assertEqual(self.plan(self.event(after), cwd=shallow), (BASE_MATRIX, True))
 
     def test_unrelated_pr_histories_enable_conpty(self) -> None:
         self.git("checkout", "--quiet", "--orphan", "unrelated")
@@ -357,6 +381,33 @@ class CIPlanTests(unittest.TestCase):
         self.commit()
         self.write("docs/page.md")
         self.assertTrue(self.plan(self.event(self.commit()), "push")[1])
+
+    def test_check_matrix_two_argument_callers_reuse_conpty_classifier(self) -> None:
+        event = self.event()
+        for conpty, expected in ((False, UNIX_MATRIX), (True, BASE_MATRIX)):
+            with self.subTest(conpty=conpty), mock.patch.object(
+                ci_plan, "needs_conpty", return_value=conpty,
+            ) as classify:
+                self.assertEqual(ci_plan.check_matrix("pull_request", event), expected)
+                classify.assert_called_once_with("pull_request", event)
+
+    def test_main_classifies_diff_only_once_and_shares_result(self) -> None:
+        event = self.event()
+        event_path = self.root / "event.json"
+        output_path = self.root / "output"
+        event_path.write_text(json.dumps(event), encoding="utf-8")
+        argv = [str(PLANNER), "--event-name", "pull_request", "--event-path", str(event_path),
+                "--github-output", str(output_path)]
+        for conpty, expected in ((False, UNIX_MATRIX), (True, BASE_MATRIX)):
+            with self.subTest(conpty=conpty), mock.patch.object(sys, "argv", argv), mock.patch.object(
+                ci_plan, "needs_conpty", return_value=conpty,
+            ) as classify:
+                output_path.write_text("", encoding="utf-8")
+                self.assertEqual(ci_plan.main(), 0)
+                classify.assert_called_once_with("pull_request", event)
+                outputs = dict(line.split("=", 1) for line in output_path.read_text().splitlines())
+                self.assertEqual(json.loads(outputs["matrix"]), expected)
+                self.assertEqual(outputs["conpty"], str(conpty).lower())
 
     def test_ambiguous_merge_base_cannot_authorize_skip(self) -> None:
         sha = self.before.encode()

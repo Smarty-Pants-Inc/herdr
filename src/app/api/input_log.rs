@@ -18,6 +18,20 @@ pub(crate) fn default_api_input_log_path() -> std::path::PathBuf {
 }
 
 impl App {
+    /// The actor invokes this durable sink before releasing an authoritative cut.
+    /// Only metadata is representable in AuditRecord; capabilities, nonce and raw
+    /// input cannot accidentally enter this log. Failure is handled by the actor
+    /// as unknown(input_log_unavailable) plus epoch poison, not by this transport.
+    pub(super) fn input_consumer_audit_sink(&self) -> crate::pty::input_consumer::AuditSink {
+        let path = self.api_input_log.with_file_name("input-consumer.jsonl");
+        std::sync::Arc::new(move |record| {
+            let line = serde_json::to_string(record).map_err(std::io::Error::other)?;
+            append_line(&path, &line).inspect_err(|err| {
+                tracing::warn!(err = %err, path = %path.display(), "input consumer audit log write failed");
+            })
+        })
+    }
+
     /// Appends the log line for an API write of `bytes` bytes to a pane's input. On error the
     /// caller must not write, and returns the encoded error.
     pub(super) fn log_api_input(
@@ -81,6 +95,24 @@ impl App {
                 caller_fields["unit"] = unit.into();
             }
         }
+        if let Some(peer) = context.local_peer_identity {
+            let herdr_exe = crate::platform::launch_executable()
+                .ok()
+                .and_then(|path| path.file_name()?.to_str().map(str::to_owned));
+            if let Some((exe, pid)) = nearest_non_herdr_ancestor(
+                peer,
+                herdr_exe.as_deref(),
+                crate::platform::process_identity,
+                crate::platform::parent_process_identity,
+                crate::platform::process_caller_metadata,
+            ) {
+                caller_fields["ancestor_exe"] = exe.into();
+                caller_fields["ancestor_pid"] = pid.into();
+            }
+            if let Some(present) = crate::platform::process_initial_pane_env_present(peer) {
+                caller_fields["pane_env_present"] = present.into();
+            }
+        }
         let ts_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|elapsed| elapsed.as_millis())
@@ -99,6 +131,58 @@ impl App {
         })
         .to_string()
     }
+}
+
+/// Best-effort diagnostic ancestry, never authorization. Start at the parent, not
+/// the caller, and omit both fields if the nearest non-Herdr executable is unknown.
+/// The actual server basename also covers renamed Herdr binaries.
+fn nearest_non_herdr_ancestor(
+    peer: crate::platform::ProcessIdentity,
+    herdr_exe: Option<&str>,
+    identity_of: impl Fn(u32) -> Option<crate::platform::ProcessIdentity>,
+    parent_of: impl Fn(crate::platform::ProcessIdentity) -> Option<crate::platform::ProcessIdentity>,
+    metadata_of: impl Fn(crate::platform::ProcessIdentity) -> Option<crate::platform::CallerMetadata>,
+) -> Option<(String, u32)> {
+    const MAX_DEPTH: usize = 32;
+    let mut current = peer;
+    let mut seen = Vec::with_capacity(MAX_DEPTH + 1);
+    seen.push(peer);
+    for _ in 0..MAX_DEPTH {
+        if peer.pid == 0
+            || identity_of(peer.pid) != Some(peer)
+            || identity_of(current.pid) != Some(current)
+        {
+            return None;
+        }
+        let parent = parent_of(current)?;
+        if parent.pid == 0
+            || parent.start_time > current.start_time
+            || seen.contains(&parent)
+            || identity_of(peer.pid) != Some(peer)
+            || identity_of(current.pid) != Some(current)
+            || identity_of(parent.pid) != Some(parent)
+        {
+            return None;
+        }
+        let exe = metadata_of(parent)?.exe?;
+        if identity_of(peer.pid) != Some(peer)
+            || identity_of(current.pid) != Some(current)
+            || identity_of(parent.pid) != Some(parent)
+        {
+            return None;
+        }
+        if Some(exe.as_str()) != herdr_exe
+            && !matches!(
+                exe.as_str(),
+                "herdr" | "herdr-dev" | "herdr.exe" | "herdr-dev.exe"
+            )
+        {
+            return Some((exe, parent.pid));
+        }
+        seen.push(parent);
+        current = parent;
+    }
+    None
 }
 
 /// Appends `line` as one JSONL record and makes it durable before returning.
@@ -185,6 +269,77 @@ mod tests {
         source_pane_id: String,
         target_pane_id: String,
         target_rx: tokio::sync::mpsc::Receiver<bytes::Bytes>,
+    }
+
+    fn audit_record() -> crate::pty::input_consumer::AuditRecord {
+        crate::pty::input_consumer::AuditRecord {
+            epoch: "epoch-id".into(),
+            seq: 1,
+            token: "submission-token".into(),
+            cut: 2,
+            digest: "ab".repeat(32),
+            kind: crate::pty::input_consumer::CutKind::Submit,
+            result: crate::pty::input_consumer::CutResult::Client { principal: None },
+        }
+    }
+
+    #[tokio::test]
+    async fn input_consumer_audit_is_owner_only_metadata_and_durable() {
+        let fixture = fixture();
+        let path = fixture
+            .app
+            .api_input_log
+            .with_file_name("input-consumer.jsonl");
+        let sink = fixture.app.input_consumer_audit_sink();
+        sink(&audit_record()).expect("durable audit");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(raw.lines().count(), 1);
+        let record: serde_json::Value = serde_json::from_str(raw.trim()).unwrap();
+        assert_eq!(record["epoch"], "epoch-id");
+        assert_eq!(record["seq"], 1);
+        assert_eq!(record["token"], "submission-token");
+        assert_eq!(record["cut"], 2);
+        assert_eq!(record["kind"], "submit");
+        assert_eq!(
+            record["result"],
+            serde_json::json!({"result":"client", "principal":null})
+        );
+        assert_eq!(record.as_object().unwrap().len(), 7);
+        for forbidden in ["raw", "epoch_key", "nonce", "text"] {
+            assert!(record.get(forbidden).is_none());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn input_consumer_audit_propagates_append_and_directory_sync_failure() {
+        let fixture = fixture();
+        let path = fixture
+            .app
+            .api_input_log
+            .with_file_name("input-consumer.jsonl");
+        std::fs::create_dir(&path).unwrap();
+        let sink = fixture.app.input_consumer_audit_sink();
+        assert!(
+            sink(&audit_record()).is_err(),
+            "actor must observe append failure"
+        );
+        std::fs::remove_dir(&path).unwrap();
+        super::FAIL_DIRECTORY_SYNCS.set(1);
+        assert!(
+            sink(&audit_record()).is_err(),
+            "actor must observe durability failure"
+        );
+        super::FAIL_DIRECTORY_SYNCS.set(0);
+        std::fs::remove_file(path).unwrap();
     }
 
     /// A caller pane (this test process, an agent named "sender") and a target pane.
@@ -285,6 +440,246 @@ mod tests {
         let _ = std::fs::remove_file(&fixture.app.api_input_log);
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    struct PresencePeer(std::process::Child);
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    impl Drop for PresencePeer {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn assert_logged_pane_env_presence(marker: Option<&str>, expected: Option<bool>) {
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .args(["-c", "read line"])
+            .env_clear()
+            .stdin(std::process::Stdio::piped());
+        if let Some(marker) = marker {
+            command.env("HERDR_PANE_ID", marker);
+        }
+        let mut peer = PresencePeer(command.spawn().expect("live environment peer"));
+        assert!(peer.0.try_wait().expect("peer status").is_none());
+        let context = ApiRequestContext::for_local_peer_pid(Some(peer.0.id()));
+        let identity = context.local_peer_identity.expect("pinned live peer");
+        if expected.is_none() {
+            peer.0.kill().expect("stop peer");
+            peer.0.wait().expect("reap peer");
+            assert_ne!(
+                crate::platform::process_identity(identity.pid),
+                Some(identity)
+            );
+        }
+        let fixture = fixture();
+        let pane = fixture.app.state.workspaces[0].tabs[0].root_pane;
+        let raw = fixture
+            .app
+            .api_input_log_line("pane.send_text", 0, pane, context, 1);
+        let line: serde_json::Value = serde_json::from_str(&raw).expect("actual log line");
+        assert_eq!(line["caller"]["pid"], identity.pid);
+        assert!(!raw.contains("HERDR_PANE_ID"), "{raw}");
+        if let Some(marker) = marker.filter(|value| !value.is_empty()) {
+            assert!(!raw.contains(marker), "marker value leaked: {raw}");
+        }
+        let presence = line["caller"].get("pane_env_present");
+        if let Some(expected) = expected {
+            assert_eq!(presence, Some(&serde_json::json!(expected)), "{raw}");
+        } else {
+            assert!(presence.is_none_or(serde_json::Value::is_null), "{raw}");
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn diagnostic_pane_env_presence_empty_marker_is_true() {
+        assert_logged_pane_env_presence(Some(""), Some(true));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn diagnostic_pane_env_presence_malformed_marker_is_true_and_private() {
+        assert_logged_pane_env_presence(Some("931-private-invalid-pane-marker"), Some(true));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn diagnostic_pane_env_presence_absent_marker_is_false() {
+        assert_logged_pane_env_presence(None, Some(false));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn diagnostic_pane_env_presence_stale_caller_is_unknown_and_private() {
+        assert_logged_pane_env_presence(Some("931-private-stale-pane-marker"), None);
+    }
+
+    fn diagnostic_identity(pid: u32) -> crate::platform::ProcessIdentity {
+        crate::platform::ProcessIdentity { pid, start_time: 1 }
+    }
+
+    fn diagnostic_metadata(exe: Option<&str>) -> crate::platform::CallerMetadata {
+        crate::platform::CallerMetadata {
+            exe: exe.map(str::to_owned),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn diagnostic_ancestor_skips_herdr_wrappers_and_never_inspects_the_caller_exe() {
+        let result = super::nearest_non_herdr_ancestor(
+            diagnostic_identity(6),
+            Some("renamed-herdr"),
+            |pid| Some(diagnostic_identity(pid)),
+            |child| Some(diagnostic_identity(child.pid - 1)),
+            |parent| {
+                Some(diagnostic_metadata(Some(match parent.pid {
+                    5 => "herdr",
+                    4 => "herdr-dev",
+                    3 => "herdr.exe",
+                    2 => "renamed-herdr",
+                    1 => "node",
+                    _ => panic!("must inspect only ancestors"),
+                })))
+            },
+        );
+        assert_eq!(result, Some(("node".into(), 1)));
+    }
+
+    #[test]
+    fn diagnostic_ancestor_is_bounded_and_rejects_cycles() {
+        let reads = std::cell::Cell::new(0);
+        assert!(super::nearest_non_herdr_ancestor(
+            diagnostic_identity(100),
+            Some("herdr"),
+            |pid| Some(diagnostic_identity(pid)),
+            |child| {
+                reads.set(reads.get() + 1);
+                Some(diagnostic_identity(child.pid - 1))
+            },
+            |_| Some(diagnostic_metadata(Some("herdr"))),
+        )
+        .is_none());
+        assert_eq!(reads.get(), 32);
+        assert!(super::nearest_non_herdr_ancestor(
+            diagnostic_identity(2),
+            Some("herdr"),
+            |pid| Some(diagnostic_identity(pid)),
+            |child| Some(diagnostic_identity(if child.pid == 2 { 1 } else { 2 })),
+            |_| Some(diagnostic_metadata(Some("herdr"))),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn diagnostic_ancestor_omits_unknown_exe_parent_and_stale_original() {
+        for metadata in [None, Some(diagnostic_metadata(None))] {
+            assert!(super::nearest_non_herdr_ancestor(
+                diagnostic_identity(2),
+                Some("herdr"),
+                |pid| Some(diagnostic_identity(pid)),
+                |_| Some(diagnostic_identity(1)),
+                |_| metadata
+                    .as_ref()
+                    .map(|value| diagnostic_metadata(value.exe.as_deref())),
+            )
+            .is_none());
+        }
+        assert!(super::nearest_non_herdr_ancestor(
+            diagnostic_identity(2),
+            Some("herdr"),
+            |pid| Some(diagnostic_identity(pid)),
+            |_| None,
+            |_| panic!("no parent to inspect"),
+        )
+        .is_none());
+        assert!(super::nearest_non_herdr_ancestor(
+            diagnostic_identity(2),
+            Some("herdr"),
+            |_| None,
+            |_| panic!("stale caller must stop before parent query"),
+            |_| panic!("stale caller must stop before metadata query"),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn diagnostic_ancestor_revalidates_original_child_and_parent_after_metadata() {
+        for replaced_pid in [3, 2, 1] {
+            let changed = std::cell::Cell::new(false);
+            assert!(
+                super::nearest_non_herdr_ancestor(
+                    diagnostic_identity(3),
+                    Some("herdr"),
+                    |pid| {
+                        let mut identity = diagnostic_identity(pid);
+                        if changed.get() && pid == replaced_pid {
+                            identity.start_time += 1;
+                        }
+                        Some(identity)
+                    },
+                    |child| Some(diagnostic_identity(child.pid - 1)),
+                    |parent| {
+                        if parent.pid == 1 {
+                            changed.set(true);
+                            Some(diagnostic_metadata(Some("node")))
+                        } else {
+                            Some(diagnostic_metadata(Some("herdr")))
+                        }
+                    },
+                )
+                .is_none(),
+                "reused pid {replaced_pid}"
+            );
+        }
+    }
+
+    #[test]
+    fn diagnostic_ancestor_revalidates_original_after_parent_query() {
+        let exited = std::cell::Cell::new(false);
+        assert!(super::nearest_non_herdr_ancestor(
+            diagnostic_identity(2),
+            Some("herdr"),
+            |pid| (!exited.get()).then_some(diagnostic_identity(pid)),
+            |_| {
+                exited.set(true);
+                Some(diagnostic_identity(1))
+            },
+            |_| panic!("exited original must stop before metadata"),
+        )
+        .is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn diagnostic_ancestor_is_the_live_parent_not_the_caller() {
+        let peer = crate::platform::process_identity(std::process::id()).expect("live caller");
+        let Some(parent) = crate::platform::parent_process_identity(peer) else {
+            return; // Unsupported platforms cannot observe ancestry.
+        };
+        let metadata = crate::platform::process_caller_metadata(parent).expect("parent metadata");
+        let expected_exe = metadata.exe.expect("parent executable basename");
+        let caller = crate::platform::process_caller_metadata(peer).expect("caller metadata");
+        let mut fixture = fixture();
+        send_text(&mut fixture, "x");
+        let lines = log_lines(&fixture.app);
+        let _ = std::fs::remove_file(&fixture.app.api_input_log);
+        assert_eq!(lines[0]["caller"]["ancestor_pid"], parent.pid);
+        assert_eq!(lines[0]["caller"]["ancestor_exe"], expected_exe);
+        assert_ne!(lines[0]["caller"]["ancestor_pid"], peer.pid);
+        if let Some(exe) = caller.exe {
+            assert_eq!(lines[0]["caller"]["exe"], exe);
+        }
+        if let Some(ppid) = caller.ppid {
+            assert_eq!(lines[0]["caller"]["ppid"], ppid);
+        }
+        if let Some(unit) = caller.unit {
+            assert_eq!(lines[0]["caller"]["unit"], unit);
+        }
+    }
+
     #[tokio::test]
     async fn an_unattributed_caller_is_logged_without_a_caller_pane() {
         let mut fixture = fixture();
@@ -304,6 +699,8 @@ mod tests {
         assert_eq!(lines[0]["method"], "pane.send_keys");
         assert!(lines[0]["caller"]["pid"].is_null());
         assert!(lines[0]["caller"]["pane"].is_null());
+        assert!(lines[0]["caller"].get("ancestor_pid").is_none());
+        assert!(lines[0]["caller"].get("ancestor_exe").is_none());
         let _ = std::fs::remove_file(&fixture.app.api_input_log);
     }
 

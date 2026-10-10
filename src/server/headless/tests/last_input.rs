@@ -21,6 +21,7 @@ pub(super) fn connect(
         surface_delta: false,
         surface_scroll: false,
         media_capable: true,
+        principal: None,
         writer,
     });
     server.handle_server_event(ServerEvent::ClientUser {

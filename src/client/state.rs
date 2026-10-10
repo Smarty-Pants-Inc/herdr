@@ -51,6 +51,8 @@ pub(super) struct ClientState {
     pub(super) kitty_graphics_enabled: bool,
     pub(super) pixel_geometry_enabled: bool,
     pub(super) pixel_geometry_exact: bool,
+    /// The host's answer to the SGR pixel mouse probe; None when unknown.
+    pub(super) host_sgr_pixel_mouse: Option<bool>,
     #[cfg(unix)]
     pub(super) direct_graphics_response: Arc<Mutex<direct_graphics::ResponseMatcher>>,
     #[cfg(unix)]
@@ -116,6 +118,7 @@ impl ClientState {
             kitty_graphics_enabled: false,
             pixel_geometry_enabled: false,
             pixel_geometry_exact: false,
+            host_sgr_pixel_mouse: None,
             #[cfg(unix)]
             direct_graphics_response: Default::default(),
             #[cfg(unix)]
@@ -570,9 +573,9 @@ impl ClientState {
         self.try_present_frame_to(&mut io::stdout(), frame_data)
     }
 
-    fn try_present_frame_to(
+    pub(super) fn try_present_frame_to(
         &mut self,
-        stdout: &mut impl io::Write,
+        writer: &mut impl io::Write,
         frame_data: impl Into<frame_output::ComposedFrame>,
     ) -> bool {
         let frame_output::ComposedFrame {
@@ -580,7 +583,7 @@ impl ClientState {
             graphics,
             graphics_delivery,
         } = frame_data.into();
-        let presented = self.write_presented_frame(stdout, frame_data, graphics);
+        let presented = self.write_presented_frame(writer, frame_data, graphics);
         if let Some(shell) = self.shell.as_mut() {
             shell.finish_graphics_delivery(graphics_delivery, presented);
         }
@@ -589,12 +592,17 @@ impl ClientState {
 
     fn write_presented_frame(
         &mut self,
-        stdout: &mut impl io::Write,
-        frame_data: crate::protocol::FrameData,
+        writer: &mut impl io::Write,
+        mut frame_data: crate::protocol::FrameData,
         graphics: crate::kitty_graphics::GraphicsOutput,
     ) -> bool {
         if self.presentation_frozen {
             return false;
+        }
+        // With capture enabled, host OSC 8 can intercept Ctrl-click before plugins.
+        // Keep semantic links internally and restore native links when capture is off.
+        if self.shell_mouse_capture_preference {
+            frame_data.hyperlinks.clear();
         }
         let frame_data = if self.draw_host_cursor {
             render_ansi::frame_with_drawn_cursor(frame_data)
@@ -607,7 +615,7 @@ impl ClientState {
         } else {
             self.blit_encoder.encode(&frame_data, self.repaint_pending)
         };
-        if let Err(error) = self.write_composed_output(stdout, &encoded.bytes, graphics) {
+        if let Err(error) = self.write_composed_output(writer, &encoded.bytes, graphics) {
             tracing::warn!(%error, "failed to present client frame");
             self.repaint_pending = true;
             return false;

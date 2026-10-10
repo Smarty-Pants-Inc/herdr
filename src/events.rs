@@ -22,6 +22,9 @@ pub struct ApiWorktreeAddRequest {
     pub repo_name: String,
     pub label: Option<String>,
     pub focus: bool,
+    pub allow_project_change: bool,
+    pub branch: String,
+    pub trust_repository: bool,
     pub respond_to: std::sync::mpsc::Sender<String>,
 }
 
@@ -29,7 +32,8 @@ pub struct ApiWorktreeAddRequest {
 pub struct WorktreeAddResult {
     pub path: std::path::PathBuf,
     pub api_request: Option<ApiWorktreeAddRequest>,
-    pub result: Result<(), String>,
+    /// `Ok(Some(commit))` when the add created its branch at `commit`.
+    pub result: Result<Option<String>, String>,
 }
 
 #[derive(Debug)]
@@ -173,6 +177,10 @@ pub enum AppEvent {
         activated: Vec<crate::detect::Agent>,
         status: crate::detect::manifest_update::ManifestUpdateStatus,
     },
+    /// An enabled pane child still needs its initial current-focus report.
+    /// PTY writes repeat this request until focus input is successfully admitted.
+    /// This runtime event is independent of pane visibility and rendering.
+    TerminalFocusReportingEnabled { pane_id: PaneId },
     /// A pane child emitted one or more executable BEL characters.
     /// The host-facing process forwards them to its outer terminal.
     TerminalBell { pane_id: PaneId, count: u16 },
@@ -191,6 +199,12 @@ pub enum AppEvent {
     GitStatusRefreshed {
         results: Vec<WorkspaceGitStatus>,
         cache_updates: Vec<(std::path::PathBuf, GitStatusCacheEntry)>,
+    },
+    /// Background validation of a saved membership after session restore.
+    RestoredWorktreeSpaceChecked {
+        workspace_id: String,
+        expected: crate::workspace::WorktreeSpaceMembership,
+        valid: bool,
     },
     /// A configured tab bar status command finished.
     TabBarCommandFinished {
