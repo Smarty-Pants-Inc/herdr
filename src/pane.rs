@@ -620,8 +620,8 @@ fn should_probe_foreground_job(input: ProcessProbeInput) -> bool {
     if input.current_agent.is_none() {
         // An exec in place (a launcher that becomes the agent) keeps the PGID,
         // and output that never pauses keeps one acquisition window from
-        // re-arming. Changed output re-probes at the identified-agent safety
-        // cadence; a quiet pane schedules nothing (#3261).
+        // re-arming. Output-event wakes re-probe at most once per 5 s, with
+        // no timer wake; a quiet pane schedules nothing (#3261).
         return !input.has_process_probe
             || foreground_group_changed
             || (input.unidentified_output_since_process_check
@@ -822,7 +822,6 @@ fn detection_deadline(
     pending_release: &Mutex<Option<PendingAgentRelease>>,
     transient_theme: bool,
     acquisition_started_at: Option<std::time::Instant>,
-    last_content_change_at: Option<std::time::Instant>,
     last_process_check: std::time::Instant,
     self_reported_active: bool,
     last_self_reported_check: Option<std::time::Instant>,
@@ -857,10 +856,6 @@ fn detection_deadline(
             };
             include((last_process_check + interval > now).then_some(last_process_check + interval));
         }
-    }
-    if unidentified_output_since(last_content_change_at, last_process_check) {
-        let next = last_process_check + PROCESS_RECHECK_IDENTIFIED;
-        include((next > now).then_some(next));
     }
     if self_reported_active {
         include(Some(
@@ -922,7 +917,6 @@ fn spawn_basic_detection_task(
                 &pending_release_for_task,
                 false,
                 acquisition_started_at,
-                last_content_change_at,
                 last_process_check,
                 child_pid.load(Ordering::Acquire) > 0
                     && self_reported_agent_active.load(Ordering::Acquire),
@@ -2931,7 +2925,6 @@ impl PaneRuntime {
                         &pending_release_for_task,
                         terminal.has_transient_default_color_override(),
                         acquisition_started_at,
-                        last_content_change_at,
                         last_process_check,
                         child_pid.load(Ordering::Acquire) > 0
                             && self_reported_agent_active_for_task.load(Ordering::Acquire),
@@ -6158,31 +6151,46 @@ mod tests {
             ..changed
         }));
 
-        // A silent agent after exec still gets one scheduled probe; a pane
-        // without output since the last probe schedules none.
         let checked = std::time::Instant::now();
-        let deadline = |changed_at| {
+        assert!(unidentified_output_since(Some(checked), checked));
+        assert!(!unidentified_output_since(
+            Some(checked - std::time::Duration::from_millis(1)),
+            checked
+        ));
+        assert!(!unidentified_output_since(None, checked));
+    }
+
+    #[test]
+    fn detection_deadline_unidentified_output_after_acquisition_schedules_no_timer() {
+        let now = std::time::Instant::now();
+        let checked = now - std::time::Duration::from_secs(1);
+        let mut acquisition_started_at =
+            Some(now - PROCESS_ACQUISITION_WINDOW - PROCESS_ACQUISITION_IDLE_RESET);
+        let mut last_content_change_at = Some(now - std::time::Duration::from_millis(200));
+        sync_content_change_acquisition(
+            None,
+            None,
+            false,
+            true,
+            now,
+            &mut acquisition_started_at,
+            &mut last_content_change_at,
+        );
+        assert!(unidentified_output_since(last_content_change_at, checked));
+        assert_eq!(
             detection_deadline(
                 &PendingIdleConfirmation::default(),
                 None,
                 &Mutex::new(None),
                 false,
-                None,
-                changed_at,
+                acquisition_started_at,
                 checked,
                 false,
                 None,
-            )
-        };
-        assert_eq!(
-            deadline(Some(checked)),
-            Some(checked + PROCESS_RECHECK_IDENTIFIED)
+            ),
+            None,
+            "output after acquisition must not arm a process-recheck timer"
         );
-        assert_eq!(
-            deadline(Some(checked - std::time::Duration::from_millis(1))),
-            None
-        );
-        assert_eq!(deadline(None), None);
     }
 
     #[test]

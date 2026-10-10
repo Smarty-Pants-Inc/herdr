@@ -420,7 +420,7 @@ fn detection_events_silent_exec_replacement_rescans_unchanged_idle_buffer() {
 fn detection_events_agent_exec_after_acquisition_window_is_identified() {
     // #3261: a launcher keeps writing output past the acquisition window, then
     // execs the agent in place (same PID and PGID, like a wrapper that becomes
-    // Pi). The agent draws one frame and goes silent.
+    // Pi). The agent keeps rendering changed frames, like a real Pi TUI.
     let base = unique_test_dir();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
@@ -438,7 +438,7 @@ while [ ! -e "$1/go" ]; do
     i=$((i + 1))
     /bin/sleep 0.2
 done
-HERDR_AGENT=pi exec /bin/sh -c 'printf "\033[2J\033[HE2E:READY"; IFS= read -r _'
+HERDR_AGENT=pi exec /bin/sh -c 'i=0; while :; do printf "\033[2J\033[Hagent tick %s\nE2E:READY" "$i"; i=$((i + 1)); /bin/sleep 0.2; done'
 "#,
     )
     .unwrap();
@@ -479,7 +479,7 @@ HERDR_AGENT=pi exec /bin/sh -c 'printf "\033[2J\033[HE2E:READY"; IFS= read -r _'
     }
     fs::write(base.join("go"), "").unwrap();
 
-    // The unidentified-output recheck runs every 5s; allow 3s CI slack.
+    // Rendering wakes the rate-limited 5s recheck; allow 3s CI slack, no timer.
     let mut last = serde_json::Value::Null;
     assert!(
         wait_until(Duration::from_secs(8), Duration::from_millis(50), || {
