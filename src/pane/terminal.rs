@@ -610,6 +610,7 @@ impl PaneTerminal {
         self.ghostty.apply_host_terminal_appearance(appearance)
     }
 
+    #[cfg(all(test, unix))]
     pub fn has_transient_default_color_override(&self) -> bool {
         self.ghostty.has_transient_default_color_override()
     }
@@ -1282,6 +1283,7 @@ impl GhosttyPaneTerminal {
         appearance.map(|appearance| Bytes::from_static(appearance.color_scheme_report()))
     }
 
+    #[cfg(test)]
     pub fn has_transient_default_color_override(&self) -> bool {
         self.core
             .lock()
