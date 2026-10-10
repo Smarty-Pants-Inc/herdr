@@ -200,7 +200,10 @@ impl App {
         ) {
             return encode_error(id, code, message);
         }
-        let context = self.merge_plugin_context(params.context, &id);
+        let context = match self.merge_plugin_context(params.context, &id) {
+            Ok(context) => context,
+            Err((code, message)) => return encode_error(id, code, message),
+        };
         let log = match self.start_plugin_command(
             &plugin,
             Some(action.action_id.clone()),
@@ -226,6 +229,7 @@ impl App {
         &mut self,
         action_id: String,
         selected_text: Option<String>,
+        invoking_pane: Option<(usize, crate::layout::PaneId)>,
     ) -> Result<(), String> {
         self.refresh_installed_plugins()
             .map_err(|err| format!("failed to load plugin registry: {err}"))?;
@@ -240,7 +244,9 @@ impl App {
             &action.qualified_id(),
         )
         .map_err(|(_, message)| message)?;
-        let mut context = self.current_plugin_context("keybinding");
+        // A keybinding pressed in a pane binds to that pane; a global one has
+        // no pane and must not borrow whatever pane holds UI focus.
+        let mut context = self.invoking_plugin_context(invoking_pane, "keybinding");
         context.invocation_source = Some("keybinding".to_string());
         context.selected_text = selected_text;
         self.start_plugin_command(
@@ -387,7 +393,7 @@ impl App {
             &action.id,
         )
         .map_err(|(_, message)| message)?;
-        let Some(ws_idx) = self.state.active else {
+        let Some((ws_idx, _)) = self.find_pane(pane_id) else {
             return Ok(false);
         };
         let mut context = self.plugin_context_for_pane(ws_idx, pane_id, "link_click");
@@ -1846,7 +1852,7 @@ command = ["sh", "-c", '"$HERDR_BIN_PATH" --list >/dev/null; printf "%s\n" "$?" 
 "#,
             );
             link_manifest(&mut app, &plugin_root);
-            app.invoke_plugin_action_from_keybind("example.update.probe".into(), None)
+            app.invoke_plugin_action_from_keybind("example.update.probe".into(), None, None)
                 .unwrap();
             let action_status = read_capture_when_ready(&plugin_root.join("action-status"), || {
                 app.drain_all_internal_events();
@@ -2673,7 +2679,7 @@ command = ["sh", "-c", "printf %s ${{HERDR_PANE_ID-unset}} > '{}'; sleep 1"]
 
         make_stale(&mut app);
         assert!(app
-            .invoke_plugin_action_from_keybind("bootstrap".into(), None)
+            .invoke_plugin_action_from_keybind("bootstrap".into(), None, None)
             .unwrap_err()
             .contains("disabled"));
 
@@ -3514,7 +3520,7 @@ command = ["show-ctx"]
             method: Method::PluginActionInvoke(PluginActionInvokeParams {
                 plugin_id: Some("example.context".into()),
                 action_id: "show".into(),
-                context: None,
+                context: Some(invoking_pane_context(&pane_public)),
             }),
         });
 
@@ -3549,6 +3555,324 @@ command = ["show-ctx"]
         assert!(worktree.is_linked_worktree);
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn invoking_pane_context(pane_id: &str) -> PluginInvocationContext {
+        PluginInvocationContext {
+            workspace_id: None,
+            workspace_label: None,
+            workspace_cwd: None,
+            worktree: None,
+            tab_id: None,
+            tab_label: None,
+            focused_pane_id: Some(pane_id.into()),
+            focused_pane_cwd: None,
+            focused_pane_agent: None,
+            focused_pane_status: None,
+            selected_text: None,
+            invocation_source: None,
+            correlation_id: None,
+            clicked_url: None,
+            link_handler_id: None,
+        }
+    }
+
+    struct PrivacyFixture {
+        app: App,
+        root: std::path::PathBuf,
+        #[cfg(unix)]
+        a_pane: crate::layout::PaneId,
+        a_pane_public: String,
+        a_tab_public: String,
+        a_workspace_public: String,
+    }
+
+    /// Pane A (workspace Alpha, codex) is the invoker; pane B (workspace
+    /// Bravo, claude) holds UI focus. Nothing of B may reach A's invocation.
+    fn privacy_fixture(name: &str) -> PrivacyFixture {
+        let mut app = test_app();
+        app.state.workspaces = vec![
+            crate::workspace::Workspace::test_new("alpha"),
+            crate::workspace::Workspace::test_new("bravo"),
+        ];
+        app.state.workspaces[0].identity_cwd = "/tmp/alpha-cwd".into();
+        app.state.workspaces[0].custom_name = Some("Alpha".into());
+        app.state.workspaces[1].identity_cwd = "/tmp/bravo-cwd".into();
+        app.state.workspaces[1].custom_name = Some("Bravo Secret".into());
+        app.state.ensure_test_terminals();
+        app.state.active = Some(1);
+        app.state.selected = 1;
+        let a_pane = app.state.workspaces[0].tabs[0].root_pane;
+        let b_pane = app.state.workspaces[1].tabs[0].root_pane;
+        let a_pane_public = app.public_pane_id(0, a_pane).unwrap();
+        let b_pane_public = app.public_pane_id(1, b_pane).unwrap();
+        for (pane_id, agent) in [(&a_pane_public, "codex"), (&b_pane_public, "claude")] {
+            let _ = app.handle_pane_report_agent(
+                "report".into(),
+                crate::api::schema::PaneReportAgentParams {
+                    allow_cross_pane: true,
+                    pane_id: pane_id.clone(),
+                    source: "test".into(),
+                    agent: agent.into(),
+                    state: crate::api::schema::PaneAgentState::Working,
+                    message: None,
+                    seq: None,
+                    agent_session_id: None,
+                    agent_session_path: None,
+                    resume_argv: None,
+                },
+            );
+        }
+        let root = unique_temp_path(name);
+        write_manifest_content(
+            &root,
+            r#"
+id = "example.privacy"
+name = "Privacy"
+version = "0.1.0"
+min_herdr_version = "0.6.10"
+platforms = ["linux", "macos"]
+
+[[actions]]
+id = "dump"
+title = "Dump context"
+command = ["sh", "-c", 'printf "%s|%s|%s|%s" "${HERDR_PANE_ID-unset}" "${HERDR_WORKSPACE_ID-unset}" "${HERDR_TAB_ID-unset}" "$HERDR_PLUGIN_CONTEXT_JSON" > dump.tmp && mv dump.tmp dump.txt']
+
+[[startup]]
+command = ["sh", "-c", 'printf "%s|%s|%s|%s" "${HERDR_PANE_ID-unset}" "${HERDR_WORKSPACE_ID-unset}" "${HERDR_TAB_ID-unset}" "$HERDR_PLUGIN_CONTEXT_JSON" > startup.tmp && mv startup.tmp startup.txt']
+"#,
+        );
+        link_manifest(&mut app, &root);
+        let a_tab_public = app.public_tab_id(0, 0).unwrap();
+        let a_workspace_public = app.public_workspace_id(0);
+        PrivacyFixture {
+            app,
+            root,
+            #[cfg(unix)]
+            a_pane,
+            a_pane_public,
+            a_tab_public,
+            a_workspace_public,
+        }
+    }
+
+    fn assert_no_focused_b_fields(text: &str) {
+        for leaked in ["Bravo Secret", "bravo-cwd", "claude"] {
+            assert!(
+                !text.contains(leaked),
+                "focused pane B leaked {leaked}: {text}"
+            );
+        }
+    }
+
+    fn assert_global_context(context: &PluginInvocationContext) {
+        assert_eq!(context.workspace_id, None);
+        assert_eq!(context.workspace_label, None);
+        assert_eq!(context.workspace_cwd, None);
+        assert_eq!(context.worktree, None);
+        assert_eq!(context.tab_id, None);
+        assert_eq!(context.tab_label, None);
+        assert_eq!(context.focused_pane_id, None);
+        assert_eq!(context.focused_pane_cwd, None);
+        assert_eq!(context.focused_pane_agent, None);
+        assert_eq!(context.focused_pane_status, None);
+    }
+
+    #[cfg(unix)]
+    fn take_dump(app: &mut App, path: &std::path::Path) -> (String, String, String, String) {
+        let dump = read_capture_when_ready(path, || {
+            app.drain_all_internal_events();
+        });
+        let _ = std::fs::remove_file(path);
+        let mut parts = dump.splitn(4, '|').map(str::to_owned);
+        (
+            parts.next().unwrap(),
+            parts.next().unwrap(),
+            parts.next().unwrap(),
+            parts.next().unwrap(),
+        )
+    }
+
+    #[test]
+    fn api_action_context_rebuilds_invoking_pane_not_focused_pane() {
+        let mut fixture = privacy_fixture("plugin-privacy-api");
+        let mut provided = invoking_pane_context(&fixture.a_pane_public);
+        // Caller claims about pane-derived fields are ignored, not mixed in.
+        provided.workspace_label = Some("spoofed".into());
+        provided.focused_pane_cwd = Some("/spoofed".into());
+        provided.invocation_source = Some("cli".into());
+        let invoke = fixture.app.handle_api_request(Request {
+            id: "invoke-a".into(),
+            method: Method::PluginActionInvoke(PluginActionInvokeParams {
+                plugin_id: Some("example.privacy".into()),
+                action_id: "dump".into(),
+                context: Some(provided),
+            }),
+        });
+        let ResponseResult::PluginActionInvoked { context, .. } = response_result(&invoke) else {
+            panic!("expected plugin action invocation: {invoke}");
+        };
+        assert_eq!(
+            context.focused_pane_id.as_deref(),
+            Some(fixture.a_pane_public.as_str())
+        );
+        assert_eq!(
+            context.workspace_id.as_deref(),
+            Some(fixture.a_workspace_public.as_str())
+        );
+        assert_eq!(
+            context.tab_id.as_deref(),
+            Some(fixture.a_tab_public.as_str())
+        );
+        assert_eq!(context.workspace_label.as_deref(), Some("Alpha"));
+        assert_eq!(context.focused_pane_cwd.as_deref(), Some("/tmp/alpha-cwd"));
+        assert_eq!(context.workspace_cwd.as_deref(), Some("/tmp/alpha-cwd"));
+        assert_eq!(context.focused_pane_agent.as_deref(), Some("codex"));
+        assert_eq!(context.invocation_source.as_deref(), Some("cli"));
+        assert_no_focused_b_fields(&serde_json::to_string(&context).unwrap());
+
+        #[cfg(unix)]
+        {
+            let (pane, workspace, tab, json) =
+                take_dump(&mut fixture.app, &fixture.root.join("dump.txt"));
+            assert_eq!(pane, fixture.a_pane_public);
+            assert_eq!(workspace, fixture.a_workspace_public);
+            assert_eq!(tab, fixture.a_tab_public);
+            assert_no_focused_b_fields(&json);
+        }
+        let _ = std::fs::remove_dir_all(fixture.root);
+    }
+
+    #[test]
+    fn api_action_without_invoking_pane_is_global() {
+        let mut fixture = privacy_fixture("plugin-privacy-global");
+        let mut cli = invoking_pane_context("unused");
+        cli.focused_pane_id = None;
+        cli.invocation_source = Some("cli".into());
+        for (id, context) in [("global-none", None), ("global-cli", Some(cli))] {
+            let invoke = fixture.app.handle_api_request(Request {
+                id: id.into(),
+                method: Method::PluginActionInvoke(PluginActionInvokeParams {
+                    plugin_id: Some("example.privacy".into()),
+                    action_id: "dump".into(),
+                    context,
+                }),
+            });
+            let ResponseResult::PluginActionInvoked { context, .. } = response_result(&invoke)
+            else {
+                panic!("expected plugin action invocation: {invoke}");
+            };
+            assert_global_context(&context);
+            #[cfg(unix)]
+            {
+                let (pane, workspace, tab, json) =
+                    take_dump(&mut fixture.app, &fixture.root.join("dump.txt"));
+                assert_eq!(
+                    (pane.as_str(), workspace.as_str(), tab.as_str()),
+                    ("unset", "unset", "unset")
+                );
+                assert_no_focused_b_fields(&json);
+            }
+        }
+        let _ = std::fs::remove_dir_all(fixture.root);
+    }
+
+    #[test]
+    fn api_action_rejects_unknown_invoking_pane() {
+        let mut fixture = privacy_fixture("plugin-privacy-invalid");
+        let invoke = fixture.app.handle_api_request(Request {
+            id: "invoke-invalid".into(),
+            method: Method::PluginActionInvoke(PluginActionInvokeParams {
+                plugin_id: Some("example.privacy".into()),
+                action_id: "dump".into(),
+                context: Some(invoking_pane_context("p_999")),
+            }),
+        });
+        let value: serde_json::Value = serde_json::from_str(&invoke).unwrap();
+        assert_eq!(value["error"]["code"], "pane_not_found");
+        assert!(fixture.app.state.plugin_command_logs.is_empty());
+        let _ = std::fs::remove_dir_all(fixture.root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn keybinding_binds_its_pane_and_global_binding_and_startup_bind_none() {
+        let mut fixture = privacy_fixture("plugin-privacy-keybinding");
+        let dump = fixture.root.join("dump.txt");
+
+        // Direct receiver: pane A named while B keeps UI focus.
+        fixture
+            .app
+            .invoke_plugin_action_from_keybind(
+                "example.privacy.dump".into(),
+                None,
+                Some((0, fixture.a_pane)),
+            )
+            .unwrap();
+        assert_eq!(fixture.app.state.active, Some(1));
+        let (pane, workspace, _, json) = take_dump(&mut fixture.app, &dump);
+        assert_eq!(pane, fixture.a_pane_public);
+        assert_eq!(workspace, fixture.a_workspace_public);
+        assert!(
+            json.contains("codex") && json.contains("keybinding"),
+            "{json}"
+        );
+        assert_no_focused_b_fields(&json);
+
+        // Client command path: in-pane binding names A; global names nothing.
+        fixture.app.endpoint_commands =
+            crate::app::custom_commands::EndpointCommandRegistry::new(&[
+                crate::config::CustomCommandKeybind {
+                    bindings: crate::config::ActionKeybinds::prefix("z"),
+                    label: "prefix+z".into(),
+                    command: "example.privacy.dump".into(),
+                    action: crate::config::CustomCommandAction::PluginAction,
+                    description: None,
+                    width: None,
+                    height: None,
+                },
+            ]);
+        let command_id = fixture.app.client_shell_command_manifest()[0]
+            .command_id
+            .clone();
+        let invoke = |app: &mut App, pane_id: Option<String>| {
+            app.handle_command_invoke(
+                "cmd".into(),
+                crate::api::schema::CommandInvokeParams {
+                    command_id: command_id.clone(),
+                    workspace_id: None,
+                    tab_id: None,
+                    pane_id,
+                    selection: None,
+                },
+            )
+        };
+        let response = invoke(&mut fixture.app, Some(fixture.a_pane_public.clone()));
+        assert_eq!(response_result(&response), ResponseResult::Ok {});
+        let (pane, _, _, json) = take_dump(&mut fixture.app, &dump);
+        assert_eq!(pane, fixture.a_pane_public);
+        assert_no_focused_b_fields(&json);
+
+        fixture.app.state.switch_workspace(1);
+        let response = invoke(&mut fixture.app, None);
+        assert_eq!(response_result(&response), ResponseResult::Ok {});
+        let (pane, workspace, tab, json) = take_dump(&mut fixture.app, &dump);
+        assert_eq!(
+            (pane.as_str(), workspace.as_str(), tab.as_str()),
+            ("unset", "unset", "unset")
+        );
+        assert_no_focused_b_fields(&json);
+        assert!(!json.contains("focused_pane_id\":\""), "{json}");
+
+        fixture.app.run_plugin_startup_hooks();
+        let (pane, workspace, tab, json) =
+            take_dump(&mut fixture.app, &fixture.root.join("startup.txt"));
+        assert_eq!(
+            (pane.as_str(), workspace.as_str(), tab.as_str()),
+            ("unset", "unset", "unset")
+        );
+        assert_no_focused_b_fields(&json);
+        let _ = std::fs::remove_dir_all(fixture.root);
     }
 
     #[test]

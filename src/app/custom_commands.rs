@@ -92,9 +92,15 @@ impl App {
         if let Err((code, message)) = self.focus_client_shell_command_target(&params) {
             return crate::app::api::responses::encode_error(id, code, message);
         }
+        // The client names the pane the key was pressed in; a global binding
+        // names none, and its plugin action then has no pane context.
+        let invoking_pane = params
+            .pane_id
+            .as_deref()
+            .and_then(|pane_id| self.parse_pane_id(pane_id));
         let selected_text = if binding.action == crate::config::CustomCommandAction::PluginAction {
             let Some(selection) = params.selection.as_ref() else {
-                return self.execute_custom_command_response(id, &binding, None);
+                return self.execute_custom_command_response(id, &binding, None, invoking_pane);
             };
             if params.pane_id.as_deref() != Some(selection.pane_id.as_str()) {
                 return crate::app::api::responses::encode_error(
@@ -112,7 +118,7 @@ impl App {
         } else {
             None
         };
-        self.execute_custom_command_response(id, &binding, selected_text)
+        self.execute_custom_command_response(id, &binding, selected_text, invoking_pane)
     }
 
     fn execute_custom_command_response(
@@ -120,8 +126,9 @@ impl App {
         id: String,
         binding: &crate::config::CustomCommandKeybind,
         selected_text: Option<String>,
+        invoking_pane: Option<(usize, crate::layout::PaneId)>,
     ) -> String {
-        match self.execute_custom_command_binding(binding, selected_text) {
+        match self.execute_custom_command_binding(binding, selected_text, invoking_pane) {
             Ok(()) => crate::app::api::responses::encode_success(
                 id,
                 crate::api::schema::ResponseResult::Ok {},
@@ -213,6 +220,7 @@ impl App {
         &mut self,
         binding: &crate::config::CustomCommandKeybind,
         selected_text: Option<String>,
+        invoking_pane: Option<(usize, crate::layout::PaneId)>,
     ) -> io::Result<()> {
         match binding.action {
             crate::config::CustomCommandAction::Shell => self.spawn_custom_command(binding),
@@ -221,7 +229,11 @@ impl App {
             }
             crate::config::CustomCommandAction::Popup => self.spawn_custom_popup_command(binding),
             crate::config::CustomCommandAction::PluginAction => self
-                .invoke_plugin_action_from_keybind(binding.command.clone(), selected_text)
+                .invoke_plugin_action_from_keybind(
+                    binding.command.clone(),
+                    selected_text,
+                    invoking_pane,
+                )
                 .map_err(io::Error::other),
         }
     }

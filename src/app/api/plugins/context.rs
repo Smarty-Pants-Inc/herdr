@@ -2,31 +2,60 @@ use crate::api::schema::{EventData, PluginInvocationContext};
 use crate::app::App;
 
 impl App {
+    /// Builds an API invocation context from the caller's invoking pane, never
+    /// from UI focus. A provided `focused_pane_id` names the invoking pane and
+    /// its workspace, tab, cwd and agent are rebuilt from that real pane; caller
+    /// claims about those fields are ignored. Without one the invocation is
+    /// global: no pane fields, and only caller-supplied workspace/tab fields.
     pub(super) fn merge_plugin_context(
         &self,
         provided: Option<PluginInvocationContext>,
         correlation_id: &str,
-    ) -> PluginInvocationContext {
-        let mut context = self.current_plugin_context(correlation_id);
-        if let Some(provided) = provided {
-            context.workspace_id = provided.workspace_id.or(context.workspace_id);
-            context.workspace_label = provided.workspace_label.or(context.workspace_label);
-            context.workspace_cwd = provided.workspace_cwd.or(context.workspace_cwd);
-            context.worktree = provided.worktree.or(context.worktree);
-            context.tab_id = provided.tab_id.or(context.tab_id);
-            context.tab_label = provided.tab_label.or(context.tab_label);
-            context.focused_pane_id = provided.focused_pane_id.or(context.focused_pane_id);
-            context.focused_pane_cwd = provided.focused_pane_cwd.or(context.focused_pane_cwd);
-            context.focused_pane_agent = provided.focused_pane_agent.or(context.focused_pane_agent);
-            context.focused_pane_status =
-                provided.focused_pane_status.or(context.focused_pane_status);
-            context.selected_text = provided.selected_text.or(context.selected_text);
-            context.invocation_source = provided.invocation_source.or(context.invocation_source);
-            context.correlation_id = provided.correlation_id.or(context.correlation_id);
-            context.clicked_url = provided.clicked_url.or(context.clicked_url);
-            context.link_handler_id = provided.link_handler_id.or(context.link_handler_id);
+    ) -> Result<PluginInvocationContext, (&'static str, String)> {
+        let mut context = empty_plugin_context(correlation_id);
+        let Some(provided) = provided else {
+            return Ok(context);
+        };
+        if let Some(pane_id) = provided.focused_pane_id.as_deref() {
+            context = self
+                .plugin_context_for_public_pane_id(pane_id, correlation_id)
+                .ok_or_else(|| ("pane_not_found", format!("pane not found: {pane_id}")))?;
+        } else {
+            context.workspace_id = provided.workspace_id;
+            context.workspace_label = provided.workspace_label;
+            context.workspace_cwd = provided.workspace_cwd;
+            context.worktree = provided.worktree;
+            context.tab_id = provided.tab_id;
+            context.tab_label = provided.tab_label;
         }
-        context
+        context.selected_text = provided.selected_text;
+        context.invocation_source = provided.invocation_source.or(context.invocation_source);
+        context.correlation_id = provided.correlation_id.or(context.correlation_id);
+        context.clicked_url = provided.clicked_url;
+        context.link_handler_id = provided.link_handler_id;
+        Ok(context)
+    }
+
+    /// Context for an invocation that may have no invoking pane (a global
+    /// keybinding, CLI call or startup hook). It never falls back to UI focus.
+    pub(super) fn invoking_plugin_context(
+        &self,
+        invoking_pane: Option<(usize, crate::layout::PaneId)>,
+        correlation_id: &str,
+    ) -> PluginInvocationContext {
+        match invoking_pane {
+            Some((ws_idx, pane_id))
+                if self
+                    .state
+                    .workspaces
+                    .get(ws_idx)
+                    .and_then(|ws| ws.find_tab_index_for_pane(pane_id))
+                    .is_some() =>
+            {
+                self.plugin_context_for_pane(ws_idx, pane_id, correlation_id)
+            }
+            _ => empty_plugin_context(correlation_id),
+        }
     }
 
     pub(super) fn current_plugin_context(&self, correlation_id: &str) -> PluginInvocationContext {
@@ -267,7 +296,7 @@ impl App {
             })
     }
 
-    fn plugin_context_for_public_pane_id(
+    pub(super) fn plugin_context_for_public_pane_id(
         &self,
         pane_id: &str,
         correlation_id: &str,
