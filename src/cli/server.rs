@@ -1,6 +1,11 @@
 use crate::api::schema::{EmptyParams, Method, Request, ServerLiveHandoffParams};
 
 pub(super) fn run_server_command(args: &[String]) -> std::io::Result<Option<i32>> {
+    #[cfg(windows)]
+    if args == ["--allow-unelevated-clients"] {
+        crate::platform::allow_unelevated_clients();
+        return Ok(None);
+    }
     let Some(subcommand) = args.first().map(|arg| arg.as_str()) else {
         return Ok(None);
     };
@@ -280,6 +285,8 @@ pub(crate) fn parse_live_handoff_params(args: &[String]) -> Option<ServerLiveHan
 fn print_server_help() {
     eprintln!("herdr server commands:");
     eprintln!("  herdr server                run as headless server");
+    #[cfg(windows)]
+    eprintln!("  herdr server --allow-unelevated-clients  allow ordinary same-account clients to control an elevated server");
     eprintln!("  herdr server stop           stop the running server via the API socket");
     eprintln!("  herdr server live-handoff   hand off live panes to a new local server");
     eprintln!("  herdr server --import-from-running --expect-source-pid <pid> [--expect-socket-inode <inode>]");

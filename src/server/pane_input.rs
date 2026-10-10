@@ -223,6 +223,22 @@ pub(super) fn apply_terminal_attach_input(
     }
 }
 
+#[cfg(test)]
+pub(crate) fn test_apply_client_pane_input_events(
+    runtime: &crate::terminal::TerminalRuntime,
+    events: &[ClientPaneInputEvent],
+) -> Result<(), String> {
+    apply_client_pane_input_events(
+        runtime,
+        events,
+        InputSource::Client {
+            connection_id: 0,
+            principal: None,
+        },
+    )
+    .map(|_| ())
+}
+
 pub(super) fn apply_client_pane_input_events(
     runtime: &crate::terminal::TerminalRuntime,
     events: &[ClientPaneInputEvent],

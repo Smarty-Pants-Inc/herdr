@@ -253,6 +253,7 @@ mod endpoint_requests;
 mod endpoints;
 mod graphics;
 mod grouped_sidebar;
+mod input_conformance;
 #[path = "input.rs"]
 mod input_domain;
 mod keybindings_settings;
