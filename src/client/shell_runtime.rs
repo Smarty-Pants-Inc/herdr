@@ -17,10 +17,17 @@ pub(super) fn dispatch_client_shell_actions(
                 boot_id,
                 request,
             } => {
-                if let Some(connection) = endpoints.connection(&endpoint_id).filter(|_| {
+                if let Some(connection) = endpoints.connection(&endpoint_id).filter(|connection| {
                     scheduled_activation.is_none()
                         && endpoints.active_id() == &endpoint_id
-                        && endpoints.active_surface_available()
+                        && (endpoints.active_surface_available()
+                            // The coherent target is visible before its input fence opens.
+                            // Retain workspace navigation; sending remains gated below.
+                            || (connection.surface_active
+                                && matches!(
+                                    request.method,
+                                    crate::api::schema::Method::WorkspaceFocus(_)
+                                )))
                 }) {
                     endpoint_commands.enqueue(endpoint_id, connection.generation, boot_id, request);
                 } else if let Some(shell) = shell.as_deref_mut() {
@@ -161,6 +168,9 @@ pub(super) fn sync_client_shell_keyboard_report_all(
     crate::terminal_modes::set_host_kitty_keyboard_report_all(&mut io::stdout(), desired)
         .map_err(ClientError::ConnectionFailed)?;
     state.keyboard_report_all_active = desired;
+    if let Some(shell) = state.shell.as_mut() {
+        shell.set_host_reports_all_keys(desired);
+    }
     Ok(())
 }
 
@@ -176,7 +186,12 @@ pub(super) fn clear_endpoint_host_effects(
     } else {
         state.direct_mouse_capture_preference
     };
-    let sgr_pixels = super::effective_sgr_pixel_mouse(enabled, false, state.pixel_geometry_exact);
+    let sgr_pixels = super::effective_sgr_pixel_mouse(
+        enabled,
+        false,
+        state.pixel_geometry_exact,
+        state.host_sgr_pixel_mouse,
+    );
     if enabled != state.mouse_capture_active
         || sgr_pixels != host_sgr_pixels_active.load(std::sync::atomic::Ordering::Acquire)
     {
@@ -216,10 +231,11 @@ fn install_pending_activation(
     next_surface_serial: &mut u64,
     activation: endpoint::PendingEndpointActivation,
 ) {
-    let retired = activation
-        .source_command_lane()
-        .map(|source| endpoint_commands.retire_lane(source))
-        .unwrap_or_default();
+    // A fresh target epoch must not replay navigation retained by an abandoned handoff.
+    let mut retired = endpoint_commands.retire_lane(activation.target());
+    if let Some(source) = activation.source_command_lane() {
+        retired.extend(endpoint_commands.retire_lane(source));
+    }
     if let Some(shell) = state.shell.as_mut() {
         for request_id in retired {
             shell.cancel_endpoint_request(&request_id);
@@ -277,6 +293,15 @@ pub(super) fn begin_endpoint_activation(
     now: std::time::Instant,
     scheduled_activation: &mut Option<ClientLoopEvent>,
 ) -> Result<(), ClientError> {
+    #[cfg(windows)]
+    if target.as_ref().is_some_and(|target| {
+        !state
+            .shell
+            .as_ref()
+            .is_some_and(|shell| shell.notification_target_is_current(&endpoint_id, target))
+    }) {
+        return Ok(());
+    }
     state.deferred_local_activation = None;
     if endpoint_id.is_local() && !local_activation_metadata_ready(state, endpoints) {
         state.deferred_local_activation = Some(endpoint::EndpointActivationIntent {
@@ -879,6 +904,96 @@ pub(super) fn finish_client_shell_input(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dispatch_retains_fenced_navigation_but_not_post_selection_actions() {
+        struct Capture(std::sync::Arc<std::sync::Mutex<Vec<ClientMessage>>>);
+
+        impl endpoint::EndpointTransport for Capture {
+            fn send(&mut self, message: &ClientMessage) -> std::io::Result<()> {
+                self.0.lock().unwrap().push(message.clone());
+                Ok(())
+            }
+        }
+
+        for selection_intent in [false, true] {
+            for input_frozen in [false, true] {
+                for surface_active in [false, true] {
+                    for workspace_focus in [false, true] {
+                        let local = endpoint::ClientEndpointId::Local;
+                        let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+                        let mut endpoints = endpoint::EndpointRegistry::new(
+                            Capture(sent.clone()),
+                            1,
+                            endpoint::EndpointNegotiation::default(),
+                        );
+                        endpoints.set_surface_active(&local, surface_active);
+                        assert_eq!(
+                            endpoints.connection(&local).unwrap().surface_active,
+                            surface_active
+                        );
+                        if input_frozen {
+                            endpoints.freeze_input();
+                        }
+                        let method = if workspace_focus {
+                            crate::api::schema::Method::WorkspaceFocus(
+                                crate::api::schema::WorkspaceTarget {
+                                    workspace_id: "ws_1".into(),
+                                },
+                            )
+                        } else {
+                            crate::api::schema::Method::WorkspaceList(
+                                crate::api::schema::EmptyParams::default(),
+                            )
+                        };
+                        let mut actions = Vec::new();
+                        if selection_intent {
+                            actions.push(shell::ClientShellAction::ActivateEndpoint {
+                                endpoint_id: local.clone(),
+                                target: None,
+                            });
+                        }
+                        actions.push(shell::ClientShellAction::Endpoint {
+                            endpoint_id: local.clone(),
+                            boot_id: "boot-1".into(),
+                            request: Box::new(crate::api::schema::Request {
+                                id: "navigation".into(),
+                                method,
+                            }),
+                        });
+                        let mut commands = endpoint_commands::EndpointCommands::default();
+                        let mut scheduled = None;
+                        dispatch_client_shell_actions(
+                            actions,
+                            &mut commands,
+                            &mut endpoints,
+                            None,
+                            &mut Vec::new(),
+                            &mut scheduled,
+                        )
+                        .unwrap();
+
+                        let retained = !selection_intent
+                            && surface_active
+                            && (!input_frozen || workspace_focus);
+                        assert_eq!(scheduled.is_some(), selection_intent);
+                        assert_eq!(
+                            sent.lock().unwrap().len(),
+                            usize::from(retained && !input_frozen),
+                            "selection={selection_intent}, frozen={input_frozen}, surface={surface_active}, focus={workspace_focus}"
+                        );
+                        // The queued focus must become sendable only after the fence opens.
+                        if input_frozen {
+                            endpoints.unfreeze_input();
+                            assert!(commands.send_next(&local, &mut endpoints).is_empty());
+                            assert_eq!(sent.lock().unwrap().len(), usize::from(retained));
+                        }
+                        assert_eq!(commands.disconnect(&local).len(), usize::from(retained));
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn host_color_reaches_server_before_first_snapshot() {
