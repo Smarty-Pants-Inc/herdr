@@ -972,22 +972,34 @@ mod tests {
             })
             .collect();
         for (index, method) in methods.into_iter().chain(guarded_methods).enumerate() {
-            let unknown_response = fixture.app.handle_api_request_with_context(
-                Request {
-                    id: format!("unknown-origin-{index}"),
-                    method: method.clone(),
-                },
-                ApiRequestContext::default(),
-            );
-            assert_unknown(&unknown_response);
-            let response = fixture.app.handle_api_request_with_context(
-                Request {
-                    id: format!("cross-pane-{index}"),
-                    method,
-                },
-                attributed_context(),
-            );
-            assert_denied(&response);
+            let unsupported_guard = matches!(&method, Method::AgentPromptStatusChecked(_))
+                && !crate::platform::expected_agent_session_guard_supported();
+            for (context, origin_code) in [
+                (ApiRequestContext::default(), "input_origin_unknown"),
+                (attributed_context(), "cross_pane_input_denied"),
+            ] {
+                let response = fixture.app.handle_api_request_with_context(
+                    Request {
+                        id: format!("denied-{origin_code}-{index}"),
+                        method: method.clone(),
+                    },
+                    context,
+                );
+                let response: ErrorResponse =
+                    serde_json::from_str(&response).expect("denial response");
+                assert_eq!(
+                    response.error.code,
+                    if unsupported_guard {
+                        "expected_agent_session_unsupported"
+                    } else {
+                        origin_code
+                    },
+                    "method {index}: {origin_code}"
+                );
+                assert!(fixture.source_rx.try_recv().is_err());
+                assert!(fixture.target_rx.try_recv().is_err());
+                assert!(fixture.app.accepted_api_inputs.is_empty());
+            }
         }
 
         assert!(fixture.source_rx.try_recv().is_err());
