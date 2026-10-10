@@ -109,6 +109,34 @@ pub(crate) fn input_consumer_supported() -> bool {
     cfg!(target_os = "linux")
 }
 
+/// First call in `main`: the server reads its attestation key, then every mode drops a
+/// setgid group (smarty-dev#2636 r4). Must run before any config or environment path.
+pub(crate) fn acquire_server_key(args: &[std::ffi::OsString]) {
+    #[cfg(target_os = "linux")]
+    linux::server_key::acquire(args);
+    #[cfg(not(target_os = "linux"))]
+    let _ = args;
+}
+
+/// The server holds a usable attestation key; without it enroll is refused.
+pub(crate) fn server_key_available() -> bool {
+    #[cfg(target_os = "linux")]
+    return linux::server_key::available();
+    #[cfg(not(target_os = "linux"))]
+    false
+}
+
+/// Ed25519 signature for an enroll answer only.
+pub(crate) fn server_key_sign(message: &[u8]) -> Option<Vec<u8>> {
+    #[cfg(target_os = "linux")]
+    return linux::server_key::sign(message);
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = message;
+        None
+    }
+}
+
 /// (st_dev, st_ino) of the pane slave, opened from the server's own master (TIOCGPTPEER).
 #[cfg(unix)]
 pub(crate) fn pane_tty_identity(master: std::os::fd::RawFd) -> std::io::Result<(u64, u64)> {
@@ -1596,10 +1624,6 @@ pub(crate) fn begin_cli_output() {}
 
 #[cfg(not(unix))]
 pub(crate) fn end_cli_output() {}
-
-/// Linux drops an inherited set-group-id at startup (herdr#188); elsewhere there is no guard.
-#[cfg(not(target_os = "linux"))]
-pub(crate) fn drop_inherited_group_privilege() {}
 
 #[cfg(target_os = "linux")]
 mod linux;

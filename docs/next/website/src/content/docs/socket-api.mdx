@@ -207,7 +207,7 @@ and client hello names are not substitutes.
 
 | Method | Required params | Purpose |
 | --- | --- | --- |
-| `pane.input_consumer.enroll` | `pane_id`, `challenge` | Admit the local socket peer and issue `epoch`, secret `epoch_key`, `nonce`, and the pane `tty`. |
+| `pane.input_consumer.enroll` | `pane_id`, `challenge` | Admit the local socket peer and issue `epoch`, secret `epoch_key`, `nonce`, the pane `tty`, and the server signature `sig`. |
 | `pane.input_consumer.cut` | `epoch`, `epoch_key`, `seq`, `token`, `cut`, `digest`, `kind` | Close an interval; `kind` is `submit` or `discard`. |
 | `pane.input_consumer.release` | `epoch`, `epoch_key` | End the epoch before exit, suspension, or TTY handover. |
 
@@ -218,7 +218,7 @@ by enrollment privately.
 
 ```json
 {"id":"enroll","method":"pane.input_consumer.enroll","params":{"pane_id":"w1:p1","challenge":"<64 lowercase hex>"}}
-{"id":"enroll","result":{"epoch":"<epoch>","epoch_key":"<epoch_key>","nonce":"<nonce>","tty":{"dev":"<st_dev>","ino":"<st_ino>"}}}
+{"id":"enroll","result":{"epoch":"<epoch>","epoch_key":"<epoch_key>","nonce":"<nonce>","tty":{"dev":"<st_dev>","ino":"<st_ino>"},"sig":"<base64 Ed25519>"}}
 ```
 
 For the first interval containing exactly `a\r` (hex bytes `61 0d`), `cut = 2`
@@ -262,14 +262,39 @@ all be off. Each cut rechecks raw mode and unchanged termios; failure returns
 `ping.result.capabilities.input_consumer == true` first: non-Linux servers
 advertise `false` and refuse all three methods with `unsupported_platform`.
 
-**Server authentication.** This build has none: the enroll answer carries no
-`sig`, so a consumer cannot prove which server answered and must treat its
-answers as unauthenticated terminal input. Check `tty` against `fstat` of your
-own stdin. Each cut answer's `mac` is HMAC-SHA256 under the decoded `epoch_key`
-over `herdr-cut-v1`, `epoch`, `seq`, `token`, `cut`, `digest`, `kind`, `result`,
+**Server authentication.** A consumer must not trust any socket that answers.
+The installed server is `root:herdr` mode `2755` and reads the Ed25519 key
+`/etc/herdr/server.key` (`0640 root:herdr`) once at startup, then drops the
+group, so no pane child runs with it and same-user processes cannot read the
+key from the file or from server memory. The `herdr` group must have no
+members and be nobody's primary group, or the server does not load the key:
+`nsswitch.conf` must map `passwd` and `group` (and `initgroups`, if listed) to
+`files` or `files systemd`, `/etc/group` must hold exactly one entry with the
+group's gid (no second name) and no other entry with its name, `/etc/group` and
+`/etc/passwd` must give the group no member or primary holder, and no systemd
+userdb drop-in (`*.membership`, `*.user` `memberOf`, `*.group` `members` in
+`/etc/userdb`, `/run/userdb`, `/run/host/userdb`, or `/usr/lib/userdb`) may
+name it or define its gid under another name. When NSS lists `systemd`, every
+Varlink userdb service in `/run/systemd/userdb` (homed, machined,
+`DynamicUser=`, third-party services; the multiplexer and the NSS re-export are
+skipped) must answer `GetMemberships` for the group and `GetGroupRecord` for its
+gid with `NoRecordFound`, and its user enumeration (`GetUserRecord` without a
+name) must hold no user whose primary gid is the group or whose `memberOf`
+names it. Only `io.systemd.Machine` may refuse enumeration. All queries share a
+2-second deadline; a membership, an error, a timeout, or a bad reply refuses. The server also refuses when it runs with `herdr` as a
+supplementary group, which a setgid drop cannot shed and which proves a member
+exists. An unreadable or unparseable record also refuses. The key is provisioned only by a reviewed root
+setup step that runs the same checks before it writes the key; the server's
+check is defense in depth. `sig` is Ed25519 over the fields
+`herdr-enroll-v1`, `challenge`, `epoch`, SHA-256 of the decoded `epoch_key` (hex),
+`nonce`, `pane_id`, and the pane slave's `tty.dev` and `tty.ino` (decimal), each
+encoded as a u32 big-endian byte length plus UTF-8 bytes. Verify it with
+`/etc/herdr/server.pub` and check `tty` against `fstat` of your own stdin. Each
+cut answer's `mac` is HMAC-SHA256 under the decoded `epoch_key` over
+`herdr-cut-v1`, `epoch`, `seq`, `token`, `cut`, `digest`, `kind`, `result`,
 `reason`, and the principal's `smarty_id` and `display_name` (empty strings when
-absent), each encoded as a u32 big-endian byte length plus UTF-8 bytes. The
-`challenge` is validated but not yet bound to a signature.
+absent). Without a usable key the server advertises `false` and refuses
+enrollment with `server_key_unavailable`; there is no unsigned mode.
 
 Enrollment and the marker write are one ordered pane-actor operation. The marker
 is `ESC _ herdr-epoch;<nonce> ESC \\`; discard earlier input and strip the expected

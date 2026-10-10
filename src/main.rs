@@ -516,8 +516,10 @@ fn finish_cli(outcome: io::Result<cli::CommandOutcome>) -> io::Result<()> {
 }
 
 fn main() -> io::Result<()> {
-    // Before any file, socket or child (herdr#188).
-    platform::drop_inherited_group_privilege();
+    // Before anything reads config or the environment, or opens a file, socket or child:
+    // the server takes its attestation key, every mode drops a setgid group and refuses to
+    // run with the herdr group (smarty-dev#2636 r4 conditions 1-2, herdr#188).
+    platform::acquire_server_key(&std::env::args_os().collect::<Vec<_>>());
     let raw_args: Vec<String> = match args_as_utf8(std::env::args_os()) {
         Ok(args) => args,
         Err(err) => {
