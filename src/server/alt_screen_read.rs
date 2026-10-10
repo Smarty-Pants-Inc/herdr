@@ -501,7 +501,12 @@ fn send_wheel(
     if bytes.is_empty() {
         return Ok(());
     }
-    runtime.try_send_bytes(Bytes::from(bytes)).map_err(|_| ())?;
+    runtime
+        .try_send_bytes_with_source(
+            Bytes::from(bytes),
+            crate::pty::input_consumer::InputSource::Api,
+        )
+        .map_err(|_| ())?;
     *input_accepted = true;
     Ok(())
 }

@@ -2,6 +2,7 @@ mod agent_options;
 mod agent_transport;
 mod agent_wait;
 mod agents;
+mod detection_events;
 mod expected_terminal;
 #[cfg(target_os = "linux")]
 mod guarded_channel;

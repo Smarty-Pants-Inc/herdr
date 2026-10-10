@@ -333,7 +333,27 @@ mod tests {
             };
             let denial = fixture.app.cross_pane_input_denial(&request, context);
             if expected.is_some() {
-                assert_denied(&denial.expect("imported guard applies"));
+                let denial = denial.expect("imported guard applies");
+                // Name the failing branch under load: capture-time origin,
+                // live root identity, and whether the owned root exited.
+                assert!(
+                    denial.contains("cross_pane_input_denied"),
+                    "case {index}: {denial}; origin={:?}; live={:?}; original={original:?}; root_exit={:?}; recaptured={:?}; environ={:?}",
+                    context.local_peer_pane_origin,
+                    crate::platform::process_identity(pid),
+                    child.try_wait(),
+                    ApiRequestContext::for_local_peer_pid(Some(pid)).local_peer_pane_origin,
+                    std::fs::read(format!("/proc/{pid}/environ")).map(|bytes| (
+                        bytes.len(),
+                        bytes.last().copied(),
+                        bytes
+                            .split(|&byte| byte == 0)
+                            .filter(|record| record.starts_with(b"HERDR") || !record.contains(&b'='))
+                            .map(|record| String::from_utf8_lossy(record).into_owned())
+                            .collect::<Vec<_>>()
+                    )),
+                );
+                assert_denied(&denial);
             } else {
                 assert_unknown(&denial.expect("unprovable import refuses input"));
             }

@@ -20,12 +20,22 @@ impl App {
     ) -> bool {
         match request.method {
             crate::api::schema::Method::WorktreeList(_)
-            | crate::api::schema::Method::WorktreeOpen(_) => {
+            | crate::api::schema::Method::WorktreeOpen(_)
+            | crate::api::schema::Method::WorktreeOpenProjectChecked(_) => {
                 self.start_api_worktree_read(request, respond_to, client_local);
                 true
             }
             crate::api::schema::Method::WorktreeCreate(params) => {
-                self.start_api_worktree_create(request.id, params, respond_to);
+                self.start_api_worktree_create(request.id, params, false, respond_to);
+                true
+            }
+            crate::api::schema::Method::WorktreeCreateProjectChecked(params) => {
+                self.start_api_worktree_create(
+                    request.id,
+                    params.params,
+                    params.allow_project_change,
+                    respond_to,
+                );
                 true
             }
             crate::api::schema::Method::WorktreeRemove(params) => {
@@ -101,6 +111,7 @@ impl App {
         &mut self,
         id: String,
         params: WorktreeCreateParams,
+        allow_project_change: bool,
         respond_to: std::sync::mpsc::Sender<String>,
     ) {
         let branch = params
@@ -143,7 +154,7 @@ impl App {
                 &branch,
             ),
         };
-        let checkout_key = crate::worktree::canonical_or_original(&checkout_path);
+        let checkout_key = crate::worktree::canonical_or_ancestor(&checkout_path);
         if self
             .pending_api_worktree_creates
             .contains_key(&checkout_key)
@@ -158,6 +169,21 @@ impl App {
                     "worktree_operation_in_progress",
                     "worktree operation is already in progress for this checkout",
                 ),
+            );
+            return;
+        }
+        // Reject before the Git worker creates directories, branches or a checkout.
+        // Recheck on completion: panes/metadata/holders can change while Git runs.
+        if let Err(message) = self.precheck_worktree_memberships(
+            &source,
+            self.open_workspace_idx_for_checkout(&checkout_path),
+            &checkout_path,
+            allow_project_change,
+            "worktree.create_project_checked",
+        ) {
+            Self::send_api_response(
+                respond_to,
+                encode_error(id, "project_change_refused", message),
             );
             return;
         }
@@ -188,34 +214,61 @@ impl App {
             repo_name: source.repo_name,
             label: params.label,
             focus: params.focus,
+            allow_project_change,
+            branch: branch.clone(),
+            trust_repository: params.trust_repository,
             respond_to,
         };
-        let path = checkout_path;
         let source_checkout_path = api_request.source_checkout_path.clone();
         let event_tx = self.event_tx.clone();
-        std::thread::spawn(move || {
-            let result = if let Some(parent_dir) = parent_dir {
-                std::fs::create_dir_all(&parent_dir).map_err(|err| err.to_string())
-            } else {
-                Ok(())
+        let finished = crate::events::WorktreeAddResult {
+            path: checkout_path,
+            api_request: Some(api_request),
+            result: Ok(None),
+        };
+        let spawned = crate::thread_spawn::spawn_named_with(
+            "herdr-worktree-add",
+            finished,
+            move |mut finished| {
+                finished.result = if let Some(parent_dir) = parent_dir {
+                    std::fs::create_dir_all(&parent_dir).map_err(|err| err.to_string())
+                } else {
+                    Ok(())
+                }
+                .and_then(|()| {
+                    crate::worktree::run_worktree_add_command(
+                        &source_checkout_path,
+                        &finished.path,
+                        &branch,
+                        &base,
+                        params.trust_repository,
+                    )
+                });
+                let _ = event_tx.blocking_send(AppEvent::WorktreeAddFinished(Box::new(finished)));
+            },
+        );
+        if let Err((mut finished, err)) = spawned {
+            finished.result = Err(format!("could not start worktree creation: {err}"));
+            self.queue_worktree_spawn_failure(AppEvent::WorktreeAddFinished(Box::new(finished)));
+        }
+    }
+
+    /// Reports a worker that never started through the normal completion path,
+    /// so pending-operation and runtime cleanup stay in one place.
+    fn queue_worktree_spawn_failure(&self, finished: AppEvent) {
+        tracing::warn!("failed to spawn worktree operation thread");
+        match self.event_tx.try_send(finished) {
+            Ok(()) => {}
+            // The event loop drains this channel, so wait for room on a task
+            // instead of dropping the only completion for this request.
+            Err(tokio::sync::mpsc::error::TrySendError::Full(finished)) => {
+                let event_tx = self.event_tx.clone();
+                tokio::spawn(async move {
+                    let _ = event_tx.send(finished).await;
+                });
             }
-            .and_then(|()| {
-                crate::worktree::run_worktree_add_command(
-                    &source_checkout_path,
-                    &path,
-                    &branch,
-                    &base,
-                    params.trust_repository,
-                )
-            });
-            let _ = event_tx.blocking_send(AppEvent::WorktreeAddFinished(Box::new(
-                crate::events::WorktreeAddResult {
-                    path,
-                    api_request: Some(api_request),
-                    result,
-                },
-            )));
-        });
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
+        }
     }
 
     fn start_api_worktree_remove(
@@ -235,6 +288,10 @@ impl App {
             );
             return;
         };
+        if let Err(err) = self.require_restored_worktree_ready(ws_idx) {
+            Self::send_api_response(respond_to, encode_error(id, err.code, err.message));
+            return;
+        }
         let Some(space) = self
             .state
             .workspaces
@@ -285,7 +342,7 @@ impl App {
         }
 
         let workspace_internal_id = self.state.workspaces[ws_idx].id.clone();
-        let checkout_key = crate::worktree::canonical_or_original(&space.checkout_path);
+        let checkout_key = crate::worktree::canonical_or_ancestor(&space.checkout_path);
         if self
             .pending_api_worktree_removes
             .contains_key(&workspace_internal_id)
@@ -343,30 +400,36 @@ impl App {
             respond_to,
         };
         let repo_root = space.repo_root;
-        let path = space.checkout_path;
-        let force = params.force;
         let trust_repository = params.trust_repository;
         let event_tx = self.event_tx.clone();
-        std::thread::spawn(move || {
-            let result = crate::worktree::run_worktree_remove_command_with_recovery(
-                &command,
-                &repo_root,
-                &path,
-                force,
-                trust_repository,
-            );
-            let _ = event_tx.blocking_send(AppEvent::WorktreeRemoveFinished(Box::new(
-                crate::events::WorktreeRemoveResult {
-                    workspace_id: workspace_internal_id,
-                    path,
-                    workspace: Some(Box::new(workspace_snapshot)),
-                    worktree: Some(Box::new(worktree)),
-                    forced: force,
-                    api_request: Some(api_request),
-                    result,
-                },
-            )));
-        });
+        let finished = crate::events::WorktreeRemoveResult {
+            workspace_id: workspace_internal_id,
+            path: space.checkout_path,
+            workspace: Some(Box::new(workspace_snapshot)),
+            worktree: Some(Box::new(worktree)),
+            forced: params.force,
+            api_request: Some(api_request),
+            result: Ok(()),
+        };
+        let spawned = crate::thread_spawn::spawn_named_with(
+            "herdr-worktree-remove",
+            finished,
+            move |mut finished| {
+                finished.result = crate::worktree::run_worktree_remove_command_with_recovery(
+                    &command,
+                    &repo_root,
+                    &finished.path,
+                    finished.forced,
+                    trust_repository,
+                );
+                let _ =
+                    event_tx.blocking_send(AppEvent::WorktreeRemoveFinished(Box::new(finished)));
+            },
+        );
+        if let Err((mut finished, err)) = spawned {
+            finished.result = Err(format!("could not start worktree removal: {err}"));
+            self.queue_worktree_spawn_failure(AppEvent::WorktreeRemoveFinished(Box::new(finished)));
+        }
     }
 
     pub(crate) fn handle_api_worktree_add_finished(
@@ -394,13 +457,16 @@ impl App {
         }
         self.pending_api_worktree_creates.remove(&checkout_key);
 
-        if let Err(err) = result.result {
-            Self::send_api_response(
-                api.respond_to,
-                encode_error(api.id, "worktree_create_failed", err),
-            );
-            return;
-        }
+        let created_commit = match result.result {
+            Ok(created_commit) => created_commit,
+            Err(err) => {
+                Self::send_api_response(
+                    api.respond_to,
+                    encode_error(api.id, "worktree_create_failed", err),
+                );
+                return;
+            }
+        };
 
         let source_workspace_idx = self.api_create_source_workspace_idx(&api);
         let mut source = WorktreeSource {
@@ -410,33 +476,91 @@ impl App {
             repo_key: api.repo_key,
             repo_name: api.repo_name,
         };
+        let already_open = self.open_workspace_idx_for_checkout(&result.path);
+        let project_changes = match self.precheck_worktree_memberships(
+            &source,
+            already_open,
+            &result.path,
+            api.allow_project_change,
+            "worktree.create_project_checked",
+        ) {
+            Ok(changes) => changes,
+            Err(message) => {
+                // Topology changed while Git ran. Undo this operation's checkout
+                // and branch so an orphan cannot block a retry. ponytail: run
+                // on the event loop (two Git calls on a rare path) so no other
+                // operation can claim the checkout between refusal and rollback.
+                // A workspace already using the checkout keeps it.
+                let rollback = if already_open.is_some() {
+                    Err(crate::worktree::WorktreeRollbackFailure::CheckoutKept(
+                        "a workspace already uses it".to_string(),
+                    ))
+                } else {
+                    crate::worktree::rollback_worktree_add(
+                        &source.source_checkout_path,
+                        &result.path,
+                        &api.branch,
+                        created_commit.as_deref(),
+                        api.trust_repository,
+                    )
+                };
+                let message = match rollback {
+                    Ok(()) => message,
+                    // A create retry would fail on the kept path: point to open.
+                    Err(crate::worktree::WorktreeRollbackFailure::CheckoutKept(reason)) => {
+                        format!(
+                            "{}\nthe created worktree {} was kept ({reason}); open it with \
+                             `herdr worktree open --allow-project-change`",
+                            message.replace(
+                                "worktree.create_project_checked",
+                                "worktree.open_project_checked"
+                            ),
+                            result.path.display()
+                        )
+                    }
+                    Err(crate::worktree::WorktreeRollbackFailure::BranchKept(err)) => format!(
+                        "{message}\nthe created worktree {} was removed, but branch {} was \
+                         kept ({err}); a create retry reuses it",
+                        result.path.display(),
+                        api.branch
+                    ),
+                };
+                Self::send_api_response(
+                    api.respond_to,
+                    encode_error(api.id, "project_change_refused", message),
+                );
+                return;
+            }
+        };
         if let Err(err) = self.ensure_source_parent_membership(&mut source, true) {
             Self::send_api_response(api.respond_to, encode_error(api.id, err.code, err.message));
             return;
         }
+        // The source repin is written now, so audit it now: a later failure to
+        // open the target workspace does not undo it.
+        Self::log_project_changes_with_context(&project_changes, "worktree.create_project_checked");
 
-        let (ws_idx, created_workspace) =
-            if let Some(ws_idx) = self.open_workspace_idx_for_checkout(&result.path) {
-                if api.focus {
-                    self.state.switch_workspace(ws_idx);
+        let (ws_idx, created_workspace) = if let Some(ws_idx) = already_open {
+            if api.focus {
+                self.state.switch_workspace(ws_idx);
+            }
+            (ws_idx, false)
+        } else {
+            match self.create_workspace_with_options(result.path.clone(), api.focus) {
+                Ok(ws_idx) => (ws_idx, true),
+                Err(err) => {
+                    Self::send_api_response(
+                        api.respond_to,
+                        encode_error(
+                            api.id,
+                            "worktree_open_failed",
+                            format!("created worktree but failed to open workspace: {err}"),
+                        ),
+                    );
+                    return;
                 }
-                (ws_idx, false)
-            } else {
-                match self.create_workspace_with_options(result.path.clone(), api.focus) {
-                    Ok(ws_idx) => (ws_idx, true),
-                    Err(err) => {
-                        Self::send_api_response(
-                            api.respond_to,
-                            encode_error(
-                                api.id,
-                                "worktree_open_failed",
-                                format!("created worktree but failed to open workspace: {err}"),
-                            ),
-                        );
-                        return;
-                    }
-                }
-            };
+            }
+        };
 
         self.mark_worktree_membership(
             &source,

@@ -49,6 +49,7 @@ fn channel_capabilities_are_optional_json_and_windows_policy_is_false() {
         default_capabilities(),
         None,
         None,
+        None,
     );
     let response: serde_json::Value = serde_json::from_str(&response).unwrap();
     let capabilities = &response["result"]["capabilities"];

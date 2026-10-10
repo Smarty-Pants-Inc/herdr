@@ -304,12 +304,13 @@ mod rollover_transport {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let (mut app, pane, input) = super::app();
         app.api_rx = rx;
-        let stop = Arc::new(AtomicBool::new(false));
+        let server_stop = crate::server::shutdown::ServerStop::default();
+        let stop = server_stop.flag().clone();
         let server = crate::api::start_server_at_with_stop_control(
             path.join("s"),
             tx,
             crate::api::EventHub::default(),
-            stop.clone(),
+            server_stop,
         )
         .unwrap();
         let pair = portable_pty::native_pty_system()

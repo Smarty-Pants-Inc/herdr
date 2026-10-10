@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
@@ -7,8 +7,16 @@ use std::sync::{Mutex, Once, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-static PID_REGISTRY: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
-static RUNTIME_DIR_REGISTRY: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+use portable_pty::CommandBuilder;
+
+// Only process identity is used here; snapshot naming helpers belong to diagnostics.
+#[allow(dead_code)]
+#[path = "../../src/platform/diagnostic_owner.rs"]
+mod diagnostic_owner;
+
+// Re-registration transfers cleanup ownership to the latest registering thread.
+static PID_REGISTRY: OnceLock<Mutex<HashMap<u32, thread::ThreadId>>> = OnceLock::new();
+static RUNTIME_DIR_REGISTRY: OnceLock<Mutex<HashMap<PathBuf, thread::ThreadId>>> = OnceLock::new();
 static INIT: Once = Once::new();
 static CLEANUP_GUARD: OnceLock<CleanupGuard> = OnceLock::new();
 const WATCHDOG_SCAN_INTERVAL: Duration = Duration::from_secs(1);
@@ -24,6 +32,11 @@ const CLIENT_MESSAGE_CLIENT_SHELL_PANE_INPUT: u32 = 13;
 const CLIENT_MESSAGE_CLIENT_SHELL_FOCUS: u32 = 18;
 const CLIENT_MESSAGE_ENDPOINT_CONTROL: u32 = 20;
 
+pub fn isolate_herdr_test_process(command: &mut CommandBuilder) {
+    command.env_remove("HERDR_STARTUP_CWD");
+    command.env_remove("HERDR_SESSION");
+}
+
 pub fn register_spawned_herdr_pid(pid: Option<u32>) {
     let Some(pid) = pid else {
         return;
@@ -31,7 +44,20 @@ pub fn register_spawned_herdr_pid(pid: Option<u32>) {
 
     ensure_cleanup_hooks();
     let mut registry = pid_registry_lock();
-    registry.insert(pid);
+    registry.insert(pid, thread::current().id());
+}
+
+/// Asks a spawned herdr process to exit. portable-pty's `kill` sends SIGHUP,
+/// which the server deliberately ignores.
+pub fn stop_spawned_herdr(child: &mut (dyn portable_pty::Child + Send + Sync)) {
+    match child.process_id() {
+        Some(pid) => unsafe {
+            libc::kill(pid as libc::pid_t, libc::SIGTERM);
+        },
+        None => {
+            let _ = child.kill();
+        }
+    }
 }
 
 pub fn unregister_spawned_herdr_pid(pid: Option<u32>) {
@@ -59,7 +85,7 @@ pub fn register_runtime_dir(path: &Path) {
         .and_then(|()| fs::rename(&staged, path.join(RUNTIME_OWNER_MARKER)));
 
     let mut runtime_dirs = runtime_dir_registry_lock();
-    runtime_dirs.insert(path.to_path_buf());
+    runtime_dirs.insert(path.to_path_buf(), thread::current().id());
 }
 
 pub fn unregister_runtime_dir(path: &Path) {
@@ -108,27 +134,46 @@ pub struct ScopedHandoffServer {
 }
 
 fn process_start_identity(pid: u32) -> std::io::Result<Option<String>> {
-    let output = std::process::Command::new("/bin/ps")
-        .args(["-p", &pid.to_string(), "-o", "lstart=", "-o", "stat="])
-        .env("LC_ALL", "C")
-        .output()?;
-    if !output.status.success() && !output.stderr.is_empty() {
-        return Err(std::io::Error::other(format!(
-            "cannot inspect exact PID {pid}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )));
+    diagnostic_owner::diagnostic_owner_identity(pid)
+}
+
+fn owned_process_running(pid: u32, identity: &str) -> std::io::Result<bool> {
+    match process_start_identity(pid)? {
+        None => Ok(false),
+        Some(current) if current == identity => Ok(true),
+        Some(_) => Err(std::io::Error::other(format!(
+            "PID {pid} has a different kernel owner; preserving runtime"
+        ))),
     }
-    let text = String::from_utf8_lossy(&output.stdout);
-    let text = text.trim();
-    if text.is_empty() {
-        return Ok(None);
+}
+
+// Run in the current integration executable, then keep the same PID across exec.
+// Separate environment entries preserve even non-UTF8 arguments without letting
+// libtest interpret Herdr's flags. They are removed from the final environment.
+#[cfg(test)]
+#[test]
+#[ignore = "only invoked by the scoped handoff importer wrapper"]
+fn handoff_importer_exec() {
+    use std::os::unix::process::CommandExt;
+    let record = PathBuf::from(std::env::var_os("H4609_IMPORTER_RECORD").expect("owner record"));
+    let count: usize = std::env::var("H4609_IMPORTER_ARG_COUNT")
+        .expect("argument count")
+        .parse()
+        .expect("numeric argument count");
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_herdr"));
+    command.env_remove("H4609_IMPORTER_RECORD");
+    command.env_remove("H4609_IMPORTER_ARG_COUNT");
+    for index in 0..count {
+        let key = format!("H4609_IMPORTER_ARG_{index}");
+        command.arg(std::env::var_os(&key).expect("importer argument"));
+        command.env_remove(key);
     }
-    let (identity, state) = text
-        .rsplit_once(char::is_whitespace)
-        .ok_or_else(|| std::io::Error::other("ps omitted process state"))?;
-    // Detached children may be zombies until the host reaps them. They have
-    // terminated and cannot own sockets/workloads; kill(pid, 0) alone misreports them.
-    Ok((!state.starts_with('Z')).then(|| identity.trim().to_owned()))
+    let pid = std::process::id();
+    let identity = process_start_identity(pid).unwrap().expect("live importer");
+    let staged = record.with_extension("tmp");
+    fs::write(&staged, format!("{pid}\n{identity}\n")).expect("stage importer identity");
+    fs::rename(staged, record).expect("publish importer identity before exec");
+    panic!("exec importer failed: {}", command.exec());
 }
 
 pub fn test_process_running(pid: u32) -> bool {
@@ -172,9 +217,8 @@ impl ScopedHandoffServer {
         // Register the path before spawning: failure cleanup also reads it.
         self.importer_records.push(record.clone());
         fs::write(&wrapper, format!(
-            "#!/bin/sh\nset -eu\n{{ printf '%s\\n' \"$$\"; LC_ALL=C /bin/ps -p \"$$\" -o lstart=; }} > {}\nmv {} {}\nexec {} \"$@\"\n",
-            quote(&record.with_extension("tmp")), quote(&record.with_extension("tmp")),
-            quote(&record), quote(Path::new(env!("CARGO_BIN_EXE_herdr")))
+            "#!/bin/sh\nset -eu\nexport H4609_IMPORTER_RECORD={}\ni=0\nfor arg do\n  export \"H4609_IMPORTER_ARG_$i=$arg\"\n  i=$((i + 1))\ndone\nexport H4609_IMPORTER_ARG_COUNT=\"$i\"\nexec {} --exact support::handoff_importer_exec --ignored --nocapture\n",
+            quote(&record), quote(&std::env::current_exe().unwrap())
         )).unwrap();
         fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).unwrap();
         wrapper
@@ -182,16 +226,19 @@ impl ScopedHandoffServer {
 
     fn read_importers(&mut self) -> std::io::Result<()> {
         for record in &self.importer_records {
-            let text = match fs::read_to_string(record) {
-                Ok(text) => text,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error),
-            };
+            // A registered importer may be alive before publishing. Absence is
+            // not evidence of termination; leave all owners and paths intact.
+            let text = fs::read_to_string(record)?;
             let (pid, identity) = text
                 .split_once('\n')
                 .ok_or_else(|| std::io::Error::other("incomplete importer identity"))?;
             let pid: u32 = pid.parse().map_err(std::io::Error::other)?;
-            if pid == 0 || pid == std::process::id() || identity.trim().is_empty() {
+            if pid == 0
+                || pid > i32::MAX as u32
+                || pid == std::process::id()
+                || identity.trim().is_empty()
+                || identity.trim().contains(char::is_whitespace)
+            {
                 return Err(std::io::Error::other("invalid importer identity"));
             }
             let owner = (pid, identity.trim().to_owned());
@@ -220,12 +267,18 @@ impl ScopedHandoffServer {
     pub fn stop_and_cleanup(&mut self) -> std::io::Result<()> {
         use std::os::unix::fs::MetadataExt;
         self.read_importers()?;
+        // Validate all owners before socket shutdown as well as before signals.
+        // Unreadable or recycled PIDs cannot authorize removal of their paths.
+        let mut live_owner = false;
+        for (pid, identity) in &self.owners {
+            live_owner |= owned_process_running(*pid, identity)?;
+        }
         // Only address the exact private socket generation observed by this test.
         // On a pre-refresh failure, bounded PID/identity cleanup still works.
         let same_socket = fs::metadata(&self.socket)
             .ok()
             .is_some_and(|m| self.socket_identity == Some((m.dev(), m.ino())));
-        if same_socket {
+        if same_socket && live_owner {
             if let Ok(mut stream) = UnixStream::connect(&self.socket) {
                 stream.set_write_timeout(Some(Duration::from_secs(2)))?;
                 let _ = stream.write_all(
@@ -235,7 +288,7 @@ impl ScopedHandoffServer {
         }
         for (pid, identity) in &self.owners {
             for signal in [libc::SIGTERM, libc::SIGKILL] {
-                if process_start_identity(*pid)?.as_ref() != Some(identity) {
+                if !owned_process_running(*pid, identity)? {
                     break;
                 }
                 unsafe {
@@ -243,13 +296,13 @@ impl ScopedHandoffServer {
                 }
                 let deadline = Instant::now() + Duration::from_secs(5);
                 while Instant::now() < deadline {
-                    if process_start_identity(*pid)?.as_ref() != Some(identity) {
+                    if !owned_process_running(*pid, identity)? {
                         break;
                     }
                     thread::sleep(Duration::from_millis(25));
                 }
             }
-            if process_start_identity(*pid)?.as_ref() == Some(identity) {
+            if owned_process_running(*pid, identity)? {
                 return Err(std::io::Error::other(format!(
                     "owned server {pid} did not terminate; preserving runtime"
                 )));
@@ -706,9 +759,27 @@ pub fn wait_for_disconnect(stream: &mut UnixStream, timeout: Duration) -> Result
 }
 
 pub fn cleanup_registered_herdr_pids() {
+    cleanup_registered_herdr_pids_for_thread(None);
+    let _ = cleanup_servers_with_missing_runtime_dir();
+}
+
+fn cleanup_registered_herdr_pids_for_thread(owner: Option<thread::ThreadId>) {
     let pids: Vec<u32> = {
         let mut registry = pid_registry_lock();
-        registry.drain().collect()
+        if let Some(owner) = owner {
+            let mut pids = Vec::new();
+            registry.retain(|pid, registered_owner| {
+                if *registered_owner == owner {
+                    pids.push(*pid);
+                    false
+                } else {
+                    true
+                }
+            });
+            pids
+        } else {
+            registry.drain().map(|(pid, _)| pid).collect()
+        }
     };
 
     for pid in pids {
@@ -717,11 +788,23 @@ pub fn cleanup_registered_herdr_pids() {
 
     let runtime_dirs: HashSet<PathBuf> = {
         let mut runtime_dirs = runtime_dir_registry_lock();
-        runtime_dirs.drain().collect()
+        if let Some(owner) = owner {
+            let mut owned_dirs = HashSet::new();
+            runtime_dirs.retain(|path, registered_owner| {
+                if *registered_owner == owner {
+                    owned_dirs.insert(path.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            owned_dirs
+        } else {
+            runtime_dirs.drain().map(|(path, _)| path).collect()
+        }
     };
 
     terminate_servers_for_runtime_dirs(&runtime_dirs);
-    let _ = cleanup_servers_with_missing_runtime_dir();
 }
 
 fn ensure_cleanup_hooks() {
@@ -733,7 +816,9 @@ fn ensure_cleanup_hooks() {
 
         let previous_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |panic_info| {
-            cleanup_registered_herdr_pids();
+            // Even a caught panic runs this hook. Clean only this thread's registrations;
+            // other tests may still own live servers. Process-exit hooks still drain all.
+            cleanup_registered_herdr_pids_for_thread(Some(thread::current().id()));
             previous_hook(panic_info);
         }));
 
@@ -748,16 +833,17 @@ fn ensure_cleanup_hooks() {
     });
 }
 
-fn pid_registry_lock() -> std::sync::MutexGuard<'static, HashSet<u32>> {
+fn pid_registry_lock() -> std::sync::MutexGuard<'static, HashMap<u32, thread::ThreadId>> {
     PID_REGISTRY
-        .get_or_init(|| Mutex::new(HashSet::new()))
+        .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn runtime_dir_registry_lock() -> std::sync::MutexGuard<'static, HashSet<PathBuf>> {
+fn runtime_dir_registry_lock() -> std::sync::MutexGuard<'static, HashMap<PathBuf, thread::ThreadId>>
+{
     RUNTIME_DIR_REGISTRY
-        .get_or_init(|| Mutex::new(HashSet::new()))
+        .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
@@ -767,7 +853,9 @@ fn registered_runtime_dirs_snapshot() -> HashSet<PathBuf> {
         runtime_dirs
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
+            .keys()
+            .cloned()
+            .collect()
     } else {
         HashSet::new()
     }
@@ -1027,6 +1115,11 @@ fn process_exists(pid: libc::pid_t) -> bool {
 }
 
 #[cfg(test)]
+mod cleanup_tests;
+#[cfg(test)]
+mod importer_exec_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1062,7 +1155,7 @@ mod tests {
         cleanup
             .owners
             .push((pid, "not this process start identity".to_owned()));
-        cleanup.stop_and_cleanup().unwrap();
+        assert!(cleanup.stop_and_cleanup().is_err());
         assert!(
             test_process_running(pid),
             "cleanup must not signal a reused/unowned PID"

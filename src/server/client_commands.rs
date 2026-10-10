@@ -58,8 +58,10 @@ const CLIENT_SHELL_METHODS: &[&str] = &[
     "workspace.move_block",
     "workspace.rename",
     "worktree.create",
+    "worktree.create_project_checked",
     "worktree.list",
     "worktree.open",
+    "worktree.open_project_checked",
     "worktree.remove",
 ];
 
@@ -323,6 +325,9 @@ mod tests {
         assert!(actual.remove("tab.move_project_checked").is_some());
         assert!(actual.remove("pane.swap_project_checked").is_some());
         assert!(actual.remove("layout.apply_project_checked").is_some());
+        // Only the additive checked worktree names are outside the v1 fixture.
+        assert!(actual.remove("worktree.create_project_checked").is_some());
+        assert!(actual.remove("worktree.open_project_checked").is_some());
 
         assert_eq!(
             actual, expected,
@@ -363,6 +368,44 @@ mod tests {
                 "focus": false, "root": {"type": "pane", "command": ["/absolute/program", "a b"]}
             })
         );
+    }
+
+    #[test]
+    fn worktree_project_checked_methods_are_registered_and_opt_in() {
+        for method in [
+            "worktree.create_project_checked",
+            "worktree.open_project_checked",
+        ] {
+            for permission in [None, Some(false), Some(true)] {
+                let mut params = serde_json::json!({"branch": "worktree/test", "focus": true});
+                if let Some(allow) = permission {
+                    params["allow_project_change"] = serde_json::json!(allow);
+                }
+                let request: crate::api::schema::Request = serde_json::from_value(
+                    serde_json::json!({"id": "checked", "method": method, "params": params}),
+                )
+                .unwrap();
+                assert_eq!(crate::api::api_method_name(&request.method), method);
+                assert!(supports_client_shell_method(&request.method));
+                assert!(crate::api::request_changes_ui(&request));
+                let (allow, branch, focus) = match request.method {
+                    Method::WorktreeCreateProjectChecked(params) => (
+                        params.allow_project_change,
+                        params.params.branch,
+                        params.params.focus,
+                    ),
+                    Method::WorktreeOpenProjectChecked(params) => (
+                        params.allow_project_change,
+                        params.params.branch,
+                        params.params.focus,
+                    ),
+                    _ => panic!("wrong checked method"),
+                };
+                assert_eq!(allow, permission.unwrap_or(false));
+                assert_eq!(branch.as_deref(), Some("worktree/test"));
+                assert!(focus);
+            }
+        }
     }
 
     #[test]
