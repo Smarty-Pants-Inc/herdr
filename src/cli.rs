@@ -163,6 +163,12 @@ fn channel_set(args: &[String]) -> std::io::Result<i32> {
         return Ok(2);
     };
 
+    // A smarty-install binary is updated only by smarty-install; refuse before touching config.
+    if let Some(refusal) = crate::update::smarty_install_refusal() {
+        eprintln!("{refusal}");
+        return Ok(1);
+    }
+
     if let Some(reason) = channel_set_rejection(
         channel,
         crate::update::preview_channel_rejection_for_current_install(),
@@ -1034,7 +1040,9 @@ fn print_session_table(sessions: &[crate::session::SessionInfo]) {
         println!(
             "{:<20} {:<8} {:<48} {}",
             session.name,
-            if session.running {
+            if session.connection_error.is_some() {
+                "unavailable"
+            } else if session.running {
                 "running"
             } else {
                 "stopped"
@@ -1042,6 +1050,9 @@ fn print_session_table(sessions: &[crate::session::SessionInfo]) {
             session.session_dir,
             session.socket_path
         );
+        if let Some(error) = &session.connection_error {
+            println!("  {error}");
+        }
     }
 }
 

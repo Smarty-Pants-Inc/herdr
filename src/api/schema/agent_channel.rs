@@ -19,11 +19,15 @@ pub struct AgentChannelInfoParams {
     pub target: String,
 }
 
-/// A read-only observation, never authority for a later prompt.
+/// A read-only observation, never authority for a later prompt. Callers are
+/// authorized exactly like `agent.prompt`: an attributed agent may observe its own
+/// pane, and another pane only with explicit `allow_cross_pane`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AgentDraftStateParams {
     pub target: String,
+    #[serde(default, skip_serializing_if = "super::is_false")]
+    pub allow_cross_pane: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -112,7 +116,6 @@ pub enum DraftStateUnknownReason {
 pub enum AgentDraftStateResult {
     Known {
         empty: bool,
-        chars: u64,
         hold: Option<DraftHold>,
     },
     Unknown {
@@ -121,7 +124,7 @@ pub enum AgentDraftStateResult {
 }
 
 // Separate closed shapes enforce exact known/unknown fields, including a required
-// (possibly null) hold. No text or arbitrary caller data can enter the result.
+// (possibly null) hold. No text, draft size or arbitrary caller data can enter the result.
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 pub(crate) enum DraftStateAck {
@@ -138,7 +141,6 @@ pub(crate) struct DraftStateKnownAck {
     pub request_id: String,
     pub session_generation: String,
     pub empty: bool,
-    pub chars: u64,
     #[serde(deserialize_with = "deserialize_hold")]
     pub hold: Option<DraftHold>,
 }

@@ -46,6 +46,9 @@ pub(crate) fn accept_pending_client_connections_with(
                 if reject {
                     continue;
                 }
+                // Pin the original accepted process incarnation exactly once,
+                // before scheduling any handshake or reading client data.
+                let peer = crate::ipc::local_stream_peer_identity(&stream);
                 let client_id = *next_client_id;
                 *next_client_id = next_client_id.saturating_add(1);
 
@@ -56,16 +59,20 @@ pub(crate) fn accept_pending_client_connections_with(
 
                 let should_quit = should_quit.clone();
                 let server_event_tx = server_event_tx.clone();
-                std::thread::spawn(move || {
+                let spawned = crate::thread_spawn::spawn_named("herdr-client-conn", move || {
                     if let Err(err) = client_transport::handle_client_handshake(
                         stream,
                         client_id,
+                        peer,
                         &server_event_tx,
                         &should_quit,
                     ) {
                         debug!(client_id, err = %err, "client handshake failed");
                     }
                 });
+                if let Err(err) = spawned {
+                    warn!(client_id, err = %err, "failed to spawn client connection thread; dropping connection");
+                }
             }
             Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => break,
             Err(ref err) if err.kind() == io::ErrorKind::Interrupted => continue,

@@ -73,8 +73,9 @@ pub(crate) fn literal_slots(args: &[String]) -> Vec<usize> {
                 slots.push(index + 1);
                 index += 1;
             }
-        } else if command == "prompt-guarded"
-            && matches!(arg.as_str(), "--allow-cross-pane" | "--if-draft-empty")
+        } else if (command == "prompt-guarded"
+            && matches!(arg.as_str(), "--allow-cross-pane" | "--if-draft-empty"))
+            || (command == "draft-state" && arg == "--allow-cross-pane")
         {
             // These flags have no value.
         } else if positionals < positional_count {
@@ -106,14 +107,52 @@ fn parse_channel_info_args(args: &[String]) -> Result<AgentChannelInfoParams, i3
     parse_terminal_target(args, "channel-info").map(|target| AgentChannelInfoParams { target })
 }
 
+const DRAFT_STATE_USAGE: &str = "usage: herdr agent draft-state <target> [--allow-cross-pane]";
+
+/// TARGET plus the same explicit cross-pane opt-in as `agent prompt`. Any other
+/// flag-shaped argv stays a literal target; use `--` for a literal `--allow-cross-pane`.
+fn parse_draft_state_args(args: &[String]) -> Result<AgentDraftStateParams, i32> {
+    let mut target = None;
+    let mut allow_cross_pane = false;
+    let mut options_ended = false;
+    for arg in args {
+        if !options_ended && target.is_none() && arg == "--" {
+            options_ended = true;
+        } else if !options_ended && arg == "--allow-cross-pane" {
+            if allow_cross_pane {
+                eprintln!("--allow-cross-pane may only be specified once");
+                return Err(2);
+            }
+            allow_cross_pane = true;
+        } else if target.is_none() {
+            target = Some(arg.clone());
+        } else {
+            eprintln!("{DRAFT_STATE_USAGE}");
+            return Err(2);
+        }
+    }
+    let Some(target) = target else {
+        eprintln!("{DRAFT_STATE_USAGE}");
+        return Err(2);
+    };
+    if target.is_empty() {
+        eprintln!("agent draft-state requires a nonempty target");
+        return Err(2);
+    }
+    Ok(AgentDraftStateParams {
+        target,
+        allow_cross_pane,
+    })
+}
+
 pub(super) fn draft_state(args: &[String]) -> std::io::Result<i32> {
-    let target = match parse_terminal_target(args, "draft-state") {
-        Ok(target) => target,
+    let params = match parse_draft_state_args(args) {
+        Ok(params) => params,
         Err(code) => return Ok(code),
     };
     super::super::print_response(&super::super::send_request(&Request {
         id: "cli:agent:draft-state".into(),
-        method: Method::AgentDraftState(AgentDraftStateParams { target }),
+        method: Method::AgentDraftState(params),
     })?)
 }
 
@@ -639,10 +678,26 @@ mod tests {
                 let (cleaned, remote) = crate::remote::extract_remote_args(&input).unwrap();
                 assert_eq!(cleaned, input);
                 assert!(remote.is_none());
-                assert_eq!(
-                    parse_terminal_target(&cleaned[3..], command).unwrap(),
-                    target
-                );
+                let parsed = if command == "draft-state" {
+                    parse_draft_state_args(&cleaned[3..]).unwrap().target
+                } else {
+                    parse_terminal_target(&cleaned[3..], command).unwrap()
+                };
+                assert_eq!(parsed, target);
+            }
+            // The opt-in flag on either side of TARGET is not a literal slot and
+            // leaves a flag-shaped TARGET intact through both global extractors.
+            for flag_first in [true, false] {
+                let mut input = args(&["herdr", "agent", "draft-state", target]);
+                input.insert(if flag_first { 3 } else { 4 }, "--allow-cross-pane".into());
+                assert_eq!(literal_slots(&input), [if flag_first { 4 } else { 3 }]);
+                assert_eq!(crate::session::configure_from_args(&input).unwrap(), input);
+                let (cleaned, remote) = crate::remote::extract_remote_args(&input).unwrap();
+                assert_eq!(cleaned, input);
+                assert!(remote.is_none());
+                let parsed = parse_draft_state_args(&cleaned[3..]).unwrap();
+                assert_eq!(parsed.target, target);
+                assert!(parsed.allow_cross_pane);
             }
         }
     }
@@ -684,23 +739,35 @@ mod tests {
             "--if-draft-empty",
             "--help",
         ] {
-            assert_eq!(
-                parse_terminal_target(&args(&[target]), "draft-state").unwrap(),
-                target
-            );
-            assert_eq!(
-                parse_terminal_target(&args(&["--", target]), "draft-state").unwrap(),
-                target
-            );
+            for input in [vec![target], vec!["--", target]] {
+                let parsed = parse_draft_state_args(&args(&input)).unwrap();
+                assert_eq!(parsed.target, target);
+                assert!(!parsed.allow_cross_pane, "opt-in is never implicit");
+            }
+            for input in [
+                vec![target, "--allow-cross-pane"],
+                vec!["--allow-cross-pane", target],
+                vec!["--allow-cross-pane", "--", target],
+            ] {
+                let parsed = parse_draft_state_args(&args(&input)).unwrap();
+                assert_eq!(parsed.target, target);
+                assert!(parsed.allow_cross_pane);
+            }
         }
+        let literal = parse_draft_state_args(&args(&["--", "--allow-cross-pane"])).unwrap();
+        assert_eq!(literal.target, "--allow-cross-pane");
+        assert!(!literal.allow_cross_pane);
         for input in [
             &[][..],
             &[""][..],
             &["--"][..],
+            &["--allow-cross-pane"][..],
+            &["--allow-cross-pane", "--allow-cross-pane", "worker"][..],
+            &["worker", "--"][..],
             &["worker", "--wait"][..],
             &["worker", "--timeout", "1"][..],
         ] {
-            assert!(parse_terminal_target(&args(input), "draft-state").is_err());
+            assert!(parse_draft_state_args(&args(input)).is_err(), "{input:?}");
         }
     }
 
@@ -809,18 +876,26 @@ mod tests {
 
     #[test]
     fn draft_state_transport_is_read_only_and_target_only() {
-        let (code, requests) = command_with_mock_server(
-            "draft-state",
-            &args(&["--session=undetected-terminal"]),
-            serde_json::json!({"result": {"status": "known", "empty": true, "chars": 0, "hold": null}}),
-        );
-        assert_eq!(code, 0);
-        assert_eq!(requests.len(), 2);
-        assert_eq!(requests[1]["method"], "agent.draft_state");
-        assert_eq!(
-            requests[1]["params"],
-            serde_json::json!({"target": "--session=undetected-terminal"})
-        );
+        for (leaf, expected) in [
+            (
+                vec!["--session=undetected-terminal"],
+                serde_json::json!({"target": "--session=undetected-terminal"}),
+            ),
+            (
+                vec!["--allow-cross-pane", "--session=undetected-terminal"],
+                serde_json::json!({"target": "--session=undetected-terminal", "allow_cross_pane": true}),
+            ),
+        ] {
+            let (code, requests) = command_with_mock_server(
+                "draft-state",
+                &args(&leaf),
+                serde_json::json!({"result": {"status": "known", "empty": true, "hold": null}}),
+            );
+            assert_eq!(code, 0);
+            assert_eq!(requests.len(), 2);
+            assert_eq!(requests[1]["method"], "agent.draft_state");
+            assert_eq!(requests[1]["params"], expected);
+        }
     }
 
     #[test]

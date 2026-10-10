@@ -299,7 +299,7 @@ impl HeadlessServer {
     ///
     /// Returns true if the event changed visual state (requiring a re-render).
     pub(super) fn handle_internal_event_with_forwarding(&mut self, mut ev: AppEvent) -> bool {
-        if self.host_shutdown_requested.load(Ordering::Acquire) {
+        if self.host_shutdown_requested() {
             return false;
         }
         let focus_response = match &mut ev {
@@ -309,8 +309,11 @@ impl HeadlessServer {
                 .filter(|request| request.focus)
                 .map(|request| &mut request.respond_to),
             AppEvent::WorktreeReadFinished(result)
-                if matches!(&result.request.method,
-                api::schema::Method::WorktreeOpen(params) if params.focus) =>
+                if match &result.request.method {
+                    api::schema::Method::WorktreeOpen(params) => params.focus,
+                    api::schema::Method::WorktreeOpenProjectChecked(params) => params.params.focus,
+                    _ => false,
+                } =>
             {
                 Some(&mut result.respond_to)
             }
@@ -322,6 +325,10 @@ impl HeadlessServer {
             (original, proxy_rx)
         });
         match &ev {
+            AppEvent::TerminalFocusReportingEnabled { pane_id } => {
+                self.send_current_pane_focus_event(*pane_id);
+                false
+            }
             AppEvent::TerminalBell { pane_id, count } => {
                 if !self.send_to_foreground_client(ServerMessage::TerminalBell { count: *count }) {
                     debug!(
@@ -734,7 +741,7 @@ impl HeadlessServer {
         let mut had_event = false;
         let mut changed = false;
         for _ in 0..limit {
-            if self.host_shutdown_requested.load(Ordering::Acquire) {
+            if self.host_shutdown_requested() {
                 break;
             }
             let Ok(ev) = self.app.event_rx.try_recv() else {

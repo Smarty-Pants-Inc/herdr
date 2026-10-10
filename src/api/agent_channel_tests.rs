@@ -1094,6 +1094,77 @@ fn channel_draft_guard_identity_deadline_and_retired_duplicate_are_immutable() {
     assert_eq!(receiver.try_iter().count(), 1);
 }
 
+/// End-to-end tests cannot force preemption between the two clock reads, so this
+/// models it deterministically: one simulated real timeline serves both injected
+/// clocks, and every read is followed by a scheduling delay before the next.
+/// Assumption: the wall clock stays in step with the monotonic clock (no wall-clock
+/// adjustment). Under that assumption only, read-order delay cannot let the receiver
+/// deadline outlive Herdr's; a later backward wall-clock step is out of scope here.
+#[test]
+fn channel_guarded_deadline_wall_before_monotonic_bounds_read_delay_on_stable_wall_clock() {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let timeout = Duration::from_millis(1_500);
+    for delay_ms in [0_u64, 1, 250, 5_000] {
+        let real_ms = Cell::new(1_000_000_u64);
+        let reads = std::cell::RefCell::new(Vec::new());
+        let base = Instant::now();
+        let read = |clock: &'static str| {
+            reads.borrow_mut().push(clock);
+            let now = real_ms.get();
+            real_ms.set(now + delay_ms); // Preempted right after this read.
+            now
+        };
+        let (deadline, deadline_ms) = request_deadlines(
+            timeout,
+            true,
+            || UNIX_EPOCH + Duration::from_millis(read("wall")),
+            || base + Duration::from_millis(read("monotonic")),
+        )
+        .unwrap();
+        assert_eq!(*reads.borrow(), ["wall", "monotonic"]);
+        // Wall time equals simulated real time, so deadline_ms names a real instant.
+        // Herdr's own deadline in the same timeline is its monotonic offset.
+        let receiver_deadline = deadline_ms.unwrap();
+        let herdr_deadline = u64::try_from((deadline - base).as_millis()).unwrap();
+        assert_eq!(receiver_deadline, 1_000_000 + 1_500);
+        assert_eq!(herdr_deadline, 1_000_000 + delay_ms + 1_500);
+        assert!(receiver_deadline <= herdr_deadline, "delay {delay_ms}");
+    }
+    // Unguarded prompts and draft queries never read the wall clock, so their
+    // monotonic timeout behaviour is unchanged.
+    let base = Instant::now();
+    assert_eq!(
+        request_deadlines(
+            timeout,
+            false,
+            || panic!("unguarded request read the wall clock"),
+            || base
+        ),
+        Some((base + timeout, None))
+    );
+    // Unrepresentable wall deadlines refuse without sampling Herdr's deadline.
+    let at_limit = UNIX_EPOCH + Duration::from_millis(MAX_SAFE_JSON_INTEGER - 1_500);
+    assert_eq!(
+        request_deadlines(timeout, true, || at_limit, || base).map(|(_, ms)| ms),
+        Some(Some(MAX_SAFE_JSON_INTEGER))
+    );
+    for (wall, timeout) in [
+        (at_limit + Duration::from_millis(1), timeout),
+        (UNIX_EPOCH - Duration::from_secs(10), timeout),
+        (SystemTime::now(), Duration::MAX),
+    ] {
+        assert_eq!(
+            request_deadlines(
+                timeout,
+                true,
+                || wall,
+                || panic!("monotonic deadline sampled after wall refusal")
+            ),
+            None
+        );
+    }
+}
+
 #[test]
 fn channel_draft_guard_expired_before_dispatch_writes_nothing_and_keeps_legacy_frame() {
     let (channel, receiver) = channel();
@@ -1188,16 +1259,16 @@ fn channel_draft_guard_rejection_reasons_remain_typed_and_retained() {
 
 fn draft_ack_value() -> serde_json::Value {
     serde_json::json!({"type":"draft_state", "registration_epoch":"epoch_test", "request_id":"q",
-        "session_generation":"session_test", "empty":true, "chars":0, "hold":null})
+        "session_generation":"session_test", "empty":true, "hold":null})
 }
 
 #[test]
 fn channel_draft_query_known_and_unknown_project_no_text_or_correlation() {
-    for (empty, chars, hold) in [
-        (true, 0, serde_json::Value::Null),
-        (false, 5, "dialog".into()),
-        (true, 0, "custom".into()),
-        (false, 8, "editor".into()),
+    for (empty, hold) in [
+        (true, serde_json::Value::Null),
+        (false, "dialog".into()),
+        (true, "custom".into()),
+        (false, "editor".into()),
     ] {
         let (channel, receiver) = channel();
         channel.set_draft_guard(true);
@@ -1212,7 +1283,6 @@ fn channel_draft_query_known_and_unknown_project_no_text_or_correlation() {
         assert_eq!(frame.as_object().unwrap().len(), 4);
         let mut receipt = draft_ack_value();
         receipt["empty"] = empty.into();
-        receipt["chars"] = chars.into();
         receipt["hold"] = hold.clone();
         channel
             .draft_ack(serde_json::from_value(receipt).unwrap())
@@ -1221,7 +1291,7 @@ fn channel_draft_query_known_and_unknown_project_no_text_or_correlation() {
             serde_json::from_str(&query.wait().response("caller".into(), false)).unwrap();
         assert_eq!(
             response["result"],
-            serde_json::json!({"status":"known", "empty":empty, "chars":chars, "hold":hold})
+            serde_json::json!({"status":"known", "empty":empty, "hold":hold})
         );
         assert_eq!(receiver.try_iter().count(), 1);
     }
@@ -1241,7 +1311,7 @@ fn channel_draft_query_known_and_unknown_project_no_text_or_correlation() {
 #[test]
 fn channel_draft_query_parser_and_correlation_fail_closed() {
     let base = draft_ack_value();
-    for duplicate in ["\"request_id\":\"q\"", "\"chars\":0"] {
+    for duplicate in ["\"request_id\":\"q\"", "\"empty\":true"] {
         let bytes = format!("{{{},{}", duplicate, &base.to_string()[1..]);
         assert!(
             serde_json::from_str::<DraftStateAck>(&bytes).is_err(),
@@ -1254,7 +1324,6 @@ fn channel_draft_query_parser_and_correlation_fail_closed() {
         "request_id",
         "session_generation",
         "empty",
-        "chars",
         "hold",
     ] {
         let mut absent = base.clone();
@@ -1266,9 +1335,10 @@ fn channel_draft_query_parser_and_correlation_fail_closed() {
     }
     for (field, invalid) in [
         ("text", "private draft".into()),
-        ("chars", (-1).into()),
-        ("chars", 1.5.into()),
-        ("chars", "0".into()),
+        // A draft size is private too: even a well-formed count is an unknown field.
+        ("chars", 0.into()),
+        ("chars", 7.into()),
+        ("length", 7.into()),
         ("empty", serde_json::Value::Null),
         ("hold", "unknown".into()),
         ("unknown", true.into()),
@@ -1301,13 +1371,6 @@ fn channel_draft_query_parser_and_correlation_fail_closed() {
             .draft_ack(serde_json::from_value(wrong).unwrap())
             .is_err());
         assert!(query.pending());
-    }
-    for chars in [1, MAX_SAFE_JSON_INTEGER + 1] {
-        let mut wrong = base.clone();
-        wrong["chars"] = chars.into();
-        assert!(channel
-            .draft_ack(serde_json::from_value(wrong).unwrap())
-            .is_err());
     }
     let unknown_false = serde_json::json!({"type":"draft_state", "registration_epoch":"epoch_test", "request_id":"q", "session_generation":"session_test", "unknown":false});
     assert!(channel

@@ -384,7 +384,7 @@ export default function (pi) {
     }
   }
 
-  function readDraftSnapshot(): { empty: boolean; chars: number; hold: unknown } | undefined {
+  function readDraftSnapshot(): { empty: boolean; hold: unknown } | undefined {
     try {
       const ui = currentContext?.ui;
       if (typeof ui?.getEditorText !== "function" || typeof ui?.holdState !== "function") return undefined;
@@ -393,10 +393,8 @@ export default function (pi) {
       const draft = ui.getEditorText();
       if (typeof draft !== "string") return undefined;
       const hold = ui.holdState();
-      let chars = 0;
-      // Count Unicode code points without allocating a second copy of the private draft.
-      for (const _char of draft) chars += 1;
-      return { empty: draft.length === 0, chars, hold };
+      // Emptiness only: no draft size or content ever leaves this function.
+      return { empty: draft.length === 0, hold };
     } catch {
       return undefined;
     }
@@ -424,7 +422,7 @@ export default function (pi) {
       registration_epoch: channelEpoch,
       request_id: frame.request_id,
       session_generation: channelSessionGeneration,
-      ...(known ? { empty: state.empty, chars: state.chars, hold: state.hold ?? null } : { unknown: true }),
+      ...(known ? { empty: state.empty, hold: state.hold ?? null } : { unknown: true }),
     });
   }
 

@@ -5,6 +5,7 @@ pub mod agents;
 pub mod commands;
 pub mod common;
 pub mod events;
+pub mod input_consumer;
 pub mod integrations;
 pub mod media;
 pub mod panes;
@@ -21,6 +22,7 @@ pub use agents::*;
 pub use commands::*;
 pub use common::*;
 pub use events::*;
+pub use input_consumer::*;
 pub use integrations::*;
 pub use media::*;
 pub use panes::*;
@@ -124,8 +126,14 @@ pub enum Method {
     WorktreeList(WorktreeListParams),
     #[serde(rename = "worktree.create")]
     WorktreeCreate(WorktreeCreateParams),
+    /// Project-checked creation; older servers reject instead of ignoring permission.
+    #[serde(rename = "worktree.create_project_checked")]
+    WorktreeCreateProjectChecked(WorktreeCreateProjectCheckedParams),
     #[serde(rename = "worktree.open")]
     WorktreeOpen(WorktreeOpenParams),
+    /// Project-checked opening; older servers reject instead of ignoring permission.
+    #[serde(rename = "worktree.open_project_checked")]
+    WorktreeOpenProjectChecked(WorktreeOpenProjectCheckedParams),
     #[serde(rename = "worktree.remove")]
     WorktreeRemove(WorktreeRemoveParams),
     #[serde(rename = "tab.create")]
@@ -236,6 +244,13 @@ pub enum Method {
     PaneGet(PaneTarget),
     #[serde(rename = "pane.last_input")]
     PaneLastInput(PaneLastInputParams),
+    /// Local API only; the pane actor validates the kernel-pinned socket peer.
+    #[serde(rename = "pane.input_consumer.enroll")]
+    PaneInputConsumerEnroll(PaneInputConsumerEnrollParams),
+    #[serde(rename = "pane.input_consumer.cut")]
+    PaneInputConsumerCut(PaneInputConsumerCutParams),
+    #[serde(rename = "pane.input_consumer.release")]
+    PaneInputConsumerRelease(PaneInputConsumerReleaseParams),
     #[serde(rename = "pane.focus")]
     PaneFocus(PaneTarget),
     #[serde(rename = "pane.input.set")]

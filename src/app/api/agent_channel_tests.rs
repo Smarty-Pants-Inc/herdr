@@ -98,20 +98,34 @@ async fn channel_discovery_undetected_terminal_and_no_transport_have_zero_pty_ef
 }
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[tokio::test]
-async fn channel_draft_query_is_read_only_with_unknown_origin_and_unregistered_guard_is_typed() {
+async fn channel_draft_query_unknown_origin_needs_opt_in_and_unregistered_guard_is_typed() {
     let (mut app, pane, mut input) = app();
     let target = app.public_pane_id(0, pane).unwrap();
     let terminal = app.state.workspaces[0]
         .terminal_id(pane)
         .unwrap()
         .to_string();
-    let query = Request {
+    let mut query = Request {
         id: "query".into(),
         method: Method::AgentDraftState(AgentDraftStateParams {
             target: target.clone(),
+            allow_cross_pane: false,
         }),
     };
     assert!(!crate::api::request_changes_ui(&query));
+    // Unknown origin is refused like agent.prompt, before any typed observation.
+    let (respond_to, response) = std::sync::mpsc::channel();
+    assert!(app.handle_deferred_agent_api_request(
+        query.clone(),
+        crate::api::ApiRequestContext::default(),
+        respond_to
+    ));
+    let response = value(response.recv_timeout(Duration::from_secs(1)).unwrap());
+    assert_eq!(response["error"]["code"], "input_origin_unknown");
+    assert!(response.get("result").is_none());
+    if let Method::AgentDraftState(params) = &mut query.method {
+        params.allow_cross_pane = true;
+    }
     assert!(app
         .cross_pane_input_denial(&query, crate::api::ApiRequestContext::default())
         .is_none());
@@ -361,12 +375,13 @@ mod rollover_transport {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let (mut app, pane, input) = super::app();
         app.api_rx = rx;
-        let stop = Arc::new(AtomicBool::new(false));
+        let server_stop = crate::server::shutdown::ServerStop::default();
+        let stop = server_stop.flag().clone();
         let server = crate::api::start_server_at_with_stop_control(
             path.join("s"),
             tx,
             crate::api::EventHub::default(),
-            stop.clone(),
+            server_stop,
         )
         .unwrap();
         let pair = portable_pty::native_pty_system()

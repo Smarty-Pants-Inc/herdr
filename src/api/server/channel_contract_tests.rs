@@ -98,14 +98,23 @@ fn channel_draft_guard_json_contract_is_explicit_and_query_is_target_only() {
         "if_draft_empty",
         "request_id",
         "timeout_ms",
-        "allow_cross_pane",
     ] {
         let mut invalid = serde_json::to_value(&query).unwrap();
         invalid["params"][field] = true.into();
         assert!(
             serde_json::from_value::<Request>(invalid).is_err(),
-            "query must be target-only: {field}"
+            "query accepts only target and the caller opt-in: {field}"
         );
+    }
+    // The same explicit cross-pane opt-in as agent.prompt; never implied.
+    let mut allowed = serde_json::to_value(&query).unwrap();
+    allowed["params"]["allow_cross_pane"] = true.into();
+    let parsed: Request = serde_json::from_value(allowed.clone()).unwrap();
+    assert!(matches!(&parsed.method, Method::AgentDraftState(params) if params.allow_cross_pane));
+    assert_eq!(serde_json::to_value(&parsed).unwrap(), allowed);
+    for invalid in [serde_json::Value::Null, "true".into(), 1.into()] {
+        allowed["params"]["allow_cross_pane"] = invalid;
+        assert!(serde_json::from_value::<Request>(allowed.clone()).is_err());
     }
 }
 
@@ -114,6 +123,7 @@ fn draft_query_request() -> Request {
         id: "draft-query".into(),
         method: Method::AgentDraftState(crate::api::schema::AgentDraftStateParams {
             target: "pane".into(),
+            allow_cross_pane: false,
         }),
     }
 }
@@ -179,8 +189,11 @@ fn channel_draft_query_app_receiver_and_response_loss_are_unknown() {
 #[test]
 fn channel_draft_query_app_results_and_target_errors_are_preserved() {
     for response in [
-        serde_json::json!({"id":"draft-query", "result":{"status":"known", "empty":false, "chars":4, "hold":"editor"}}),
+        serde_json::json!({"id":"draft-query", "result":{"status":"known", "empty":false, "hold":"editor"}}),
         serde_json::json!({"id":"draft-query", "error":{"code":"agent_not_found", "message":"target missing"}}),
+        // Caller-policy refusals stay errors; they never become an observation.
+        serde_json::json!({"id":"draft-query", "error":{"code":"cross_pane_input_denied", "message":"denied"}}),
+        serde_json::json!({"id":"draft-query", "error":{"code":"input_origin_unknown", "message":"unknown"}}),
     ] {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ApiRequestMessage>();
         let expected = response.to_string();
@@ -213,6 +226,7 @@ fn channel_capabilities_are_optional_json_and_windows_policy_is_false() {
         ApiRequestContext::default(),
         &tx,
         default_capabilities(),
+        None,
         None,
         None,
     );

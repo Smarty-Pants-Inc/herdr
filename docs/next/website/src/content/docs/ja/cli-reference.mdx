@@ -170,12 +170,14 @@ herdr workspace create --cwd ~/project --label api --no-focus
 
 ```bash
 herdr worktree list [--workspace ID | --cwd PATH] [--trust-repository]
-herdr worktree create [--workspace ID | --cwd PATH] [--branch NAME] [--base REF] [--path PATH] [--label TEXT] [--focus] [--no-focus] [--trust-repository]
-herdr worktree open [--workspace ID | --cwd PATH] (--path PATH | --branch NAME) [--label TEXT] [--focus] [--no-focus] [--trust-repository]
+herdr worktree create [--workspace ID | --cwd PATH] [--branch NAME] [--base REF] [--path PATH] [--label TEXT] [--allow-project-change] [--focus] [--no-focus] [--trust-repository]
+herdr worktree open [--workspace ID | --cwd PATH] (--path PATH | --branch NAME) [--label TEXT] [--allow-project-change] [--focus] [--no-focus] [--trust-repository]
 herdr worktree remove --workspace ID [--force] [--trust-repository]
 ```
 
 worktree は、Git チェックアウトの出自情報を持つ通常の Herdr ワークスペースです。`worktree create` は Git worktree のチェックアウトを作成し、ワークスペースとして開き、親リポジトリのワークスペースとグループ化します。`--branch` が既存のローカルブランチを指す場合はそれをチェックアウトし、そうでなければ `--base` または `HEAD` からブランチを作成します。`--path` がない場合、チェックアウトは `<worktrees.directory>/<repo>/<branch-slug>` の下に作成されます。
+
+`worktree create` と `worktree open` は、存続するエージェントセッションのプロジェクト所有関係をデフォルトで保持します。これらのセッションのプロジェクト所有関係を意図的に変更する場合にのみ、`--allow-project-change` を指定してください。この許可は `--trust-repository` とは別です。どちらのコマンドも、許可が false の場合を含め、常に `worktree.create_project_checked` / `worktree.open_project_checked` を使います。古いサーバーはこれらのメソッドを拒否し、CLI は従来のメソッドで再試行しません。
 
 `workspace close` は Herdr の状態だけを閉じます。リンクされた worktree ワークスペースが開いている間に親ワークスペースを閉じるには `--group` が必要です。指定しない場合、グループは開いたままになり `workspace_group_close_required` が返されます。`worktree remove` が明示的なチェックアウト削除の経路です。`git worktree remove` を実行し、ブランチは決して削除せず、Git がダーティなチェックアウトを拒否する場合は `--force` が必要です。
 
@@ -349,7 +351,7 @@ herdr agent explain --file PATH --agent LABEL [--json|--verbose]
 
 ```bash
 herdr agent channel-info <target>
-herdr agent draft-state <target>
+herdr agent draft-state <target> [--allow-cross-pane]
 herdr agent prompt <target> <text> --if-draft-empty [--allow-cross-pane]
 herdr agent prompt-guarded <target> <text> --expected-terminal TERMINAL_ID --expected-registration-epoch EPOCH --request-id ID [--timeout-ms MS] [--allow-cross-pane] [--if-draft-empty]
 ```
@@ -364,7 +366,7 @@ herdr agent prompt-guarded <target> <text> --expected-terminal TERMINAL_ID --exp
 
 ガード付きフレームは期限を持ちます。Pi は上記の確認と submit 呼び出しの前に、期限切れを同期的に `expired` で拒否し、送信もエディタ変更も行いません。期限の欠落・不正は `unknown` で拒否します。ソケット配信前の型付き失敗は未送信を意味しますが、受け入れの可能性がある後の確認喪失は引き続き `delivery_unknown` であり、再送してはいけません。
 
-`agent draft-state` は登録済みチャネルを使う読み取り専用の観測で、既定の問い合わせタイムアウトは 2 秒です。結果は `{status: "known", empty, chars, hold}` で、`empty` は boolean、`chars` は整数の文字数、`hold` は `null`（hold なし）、`"dialog"`、`"custom"`、`"editor"` のいずれかです。ドラフト本文は返しません。取得できない場合は `{status: "unknown", reason}` を返し、理由は `unregistered`（チャネルなし）、`unsupported`（能力なし）、`timeout`（期限内の応答なし）、`unknown`（観測不能）です。unknown は空のドラフトを意味しません。この問い合わせは後の送信を許可するものではなく、ガード付きプロンプトは受け入れ時に再確認します。
+`agent draft-state` は登録済みチャネルを使う読み取り専用の観測で、既定の問い合わせタイムアウトは 2 秒です。known の結果はドラフトが空かどうかと UI hold（`null`、`"dialog"`、`"custom"`、`"editor"`）だけを示します。ドラフト本文や文字数は返しません。取得できない場合は `{status: "unknown", reason}` を返し、理由は `unregistered`（チャネルなし）、`unsupported`（能力なし）、`timeout`（期限内の応答なし）、`unknown`（観測不能）です。unknown は空のドラフトを意味しません。エージェント自身のペインへの問い合わせはデフォルトで許可されます。別のペインへの問い合わせには `--allow-cross-pane` が必要です。通常の外部オペレーターには `agent.prompt` と同じポリシーを適用します。認可は予約またはフレーム送信の前に確認されます。この問い合わせは後の送信を許可するものではなく、ガード付きプロンプトは受け入れ時に再確認します。
 
 成功時は、活動中セッションの入力に受け入れられた `status: "accepted"`、またはそのセッションの後続キューに入った `"queued"` と、固定したターミナル、epoch、リクエスト ID、セッション世代を返します。ターンの完了や成功は保証しません。同じ epoch 内の同じ ID、完全に同じテキスト、同じ `if_draft_empty` 値は、再送せずに最初の結果を共有します。テキストまたはガード値の変更は `payload_mismatch` です。新しい ID は新規リクエストであり、安全な再試行ではありません。
 

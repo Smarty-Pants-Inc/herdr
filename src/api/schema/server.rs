@@ -54,4 +54,7 @@ pub struct ServerCapabilities {
     /// Supports the fail-closed `expected_terminal` guard on `agent.start` and `pane.send_input`.
     #[serde(default)]
     pub expected_terminal_guard: bool,
+    /// Supports the local `pane.input_consumer.*` methods (Linux servers only).
+    #[serde(default)]
+    pub input_consumer: bool,
 }

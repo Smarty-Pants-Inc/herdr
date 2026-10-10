@@ -2019,13 +2019,13 @@ for (const [draft, hold] of [["", undefined], [" \n🐑e\u0301", "dialog"], ["se
     const connection = connections[0];
     queryDraft(connection, "read-only", { text: "caller-supplied secret", empty: true, chars: 0, hold: null });
     await waitFor(() => connection.draftStates.length === 1);
+    // Exact closed shape: no text and no size/count of the private draft.
     expect(connection.draftStates[0]).toEqual({
       type: "draft_state", registration_epoch: "epoch-1", request_id: "read-only",
-      session_generation: "session-1", empty: draft.length === 0,
-      chars: Array.from(draft).length, hold: hold ?? null,
+      session_generation: "session-1", empty: draft.length === 0, hold: hold ?? null,
     });
     expect(typeof connection.draftStates[0].empty).toBe("boolean");
-    expect(Number.isSafeInteger(connection.draftStates[0].chars)).toBe(true);
+    expect(connection.draftStates[0]).not.toHaveProperty("chars");
     expect(connection.draftStates[0]).not.toHaveProperty("text");
     expect(connection.draftStates[0]).not.toHaveProperty("draft");
     expect(JSON.stringify(connection.draftStates)).not.toContain("secret");

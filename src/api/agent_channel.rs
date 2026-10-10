@@ -456,20 +456,20 @@ impl Channel {
                 _ => {}
             }
         }
-        let deadline = Instant::now() + timeout;
+        let guarded = kind
+            == DeliveryKind::Prompt {
+                if_draft_empty: true,
+            };
+        let (deadline, deadline_ms) =
+            request_deadlines(timeout, guarded, std::time::SystemTime::now, Instant::now)
+                .ok_or_else(|| Outcome::failure("agent_prompt_rejected", "unknown"))?;
         let mut frame = serde_json::json!({"registration_epoch":self.epoch,
             "request_id":request_id,"session_generation":self.session_generation});
         match kind {
             DeliveryKind::Prompt { if_draft_empty } => {
                 frame["type"] = "deliver".into();
                 frame["text"] = text.clone().into();
-                if if_draft_empty {
-                    let deadline_ms = std::time::SystemTime::now()
-                        .checked_add(timeout)
-                        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-                        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
-                        .filter(|millis| *millis <= MAX_SAFE_JSON_INTEGER)
-                        .ok_or_else(|| Outcome::failure("agent_prompt_rejected", "unknown"))?;
+                if let (true, Some(deadline_ms)) = (if_draft_empty, deadline_ms) {
                     frame["if_draft_empty"] = true.into();
                     frame["deadline_ms"] = deadline_ms.into();
                 }
@@ -583,22 +583,18 @@ impl Channel {
     }
     fn draft_ack(&self, ack: DraftStateAck) -> io::Result<()> {
         let (kind, epoch, request_id, generation, result) = match ack {
-            DraftStateAck::Known(ack) => {
-                if ack.chars > MAX_SAFE_JSON_INTEGER || ack.empty != (ack.chars == 0) {
-                    return Err(io::Error::other("invalid draft observation bounds"));
-                }
-                (
-                    ack.kind,
-                    ack.registration_epoch,
-                    ack.request_id,
-                    ack.session_generation,
-                    AgentDraftStateResult::Known {
-                        empty: ack.empty,
-                        chars: ack.chars,
-                        hold: ack.hold,
-                    },
-                )
-            }
+            // The closed shape has no size field: a peer that reports a draft count
+            // fails closed instead of having it dropped or projected to the caller.
+            DraftStateAck::Known(ack) => (
+                ack.kind,
+                ack.registration_epoch,
+                ack.request_id,
+                ack.session_generation,
+                AgentDraftStateResult::Known {
+                    empty: ack.empty,
+                    hold: ack.hold,
+                },
+            ),
             DraftStateAck::Unknown(ack) => {
                 if !ack.unknown {
                     return Err(io::Error::other("invalid unknown draft observation"));
@@ -642,6 +638,39 @@ impl Channel {
         delivery.finish(Outcome::Receipt(serde_json::json!(result)));
         Ok(())
     }
+}
+
+/// Herdr's monotonic deadline and, for draft-guarded prompts, the receiver's wall-clock
+/// deadline. The wall clock is sampled strictly BEFORE the monotonic clock, so scheduling
+/// delay between the two reads can only shorten the receiver's window, never extend it
+/// past Herdr's deadline (the other order would). This bound assumes the wall clock keeps
+/// its relation to the monotonic clock until the receiver checks `deadline_ms`; it is not
+/// a guarantee against wall-clock adjustment. If the wall clock steps backward after
+/// sampling, a receiver comparing its own wall clock with `deadline_ms` can still admit
+/// after Herdr's monotonic wait has reported timeout (as `delivery_unknown` once dispatch
+/// was possible). That is the pre-existing limitation of any wall-clock deadline.
+/// Clocks are injected so the read order is unit-testable.
+/// `None` means the wall deadline is unrepresentable (overflow, pre-epoch or above the
+/// JSON safe-integer range); callers refuse before reservation.
+fn request_deadlines(
+    timeout: Duration,
+    guarded: bool,
+    wall_now: impl FnOnce() -> std::time::SystemTime,
+    monotonic_now: impl FnOnce() -> Instant,
+) -> Option<(Instant, Option<u64>)> {
+    let deadline_ms = if guarded {
+        Some(
+            wall_now()
+                .checked_add(timeout)
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+                .filter(|millis| *millis <= MAX_SAFE_JSON_INTEGER)?,
+        )
+    } else {
+        None
+    };
+    // Same monotonic arithmetic as every unguarded request; timeouts are App-bounded.
+    Some((monotonic_now() + timeout, deadline_ms))
 }
 
 /// Single-use connection-local install slot. Caller JSON cannot supply this authority.

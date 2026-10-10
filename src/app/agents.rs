@@ -216,7 +216,10 @@ impl App {
             .get_mut(&terminal_id)
             .ok_or_else(|| AgentStartError::TargetUnavailable(params.pane_id.clone()))?;
         terminal.begin_managed_agent(name.clone(), kind, now, AGENT_START_SETTLE_DELAY, timeout);
-        if let Err(err) = runtime.try_send_bytes(Bytes::from(bytes)) {
+        if let Err(err) = runtime.try_send_bytes_with_source(
+            Bytes::from(bytes),
+            crate::pty::input_consumer::InputSource::Api,
+        ) {
             terminal.clear_agent_name();
             return Err(AgentStartError::InputFailed(err.to_string()));
         }
@@ -377,7 +380,7 @@ impl App {
         if !terminal.is_agent_terminal() {
             return None;
         }
-        let pane = self.pane_info(ws_idx, pane_id)?;
+        let pane = self.pane_metadata(ws_idx, pane_id)?;
         Some(crate::api::schema::AgentInfo {
             terminal_id: pane.terminal_id,
             name: terminal.agent_name.clone(),

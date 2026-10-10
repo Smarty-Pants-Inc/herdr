@@ -1241,8 +1241,11 @@
         },
         "AgentDraftStateParams": {
           "additionalProperties": false,
-          "description": "A read-only observation, never authority for a later prompt.",
+          "description": "A read-only observation, never authority for a later prompt. Callers are\nauthorized exactly like `agent.prompt`: an attributed agent may observe its own\npane, and another pane only with explicit `allow_cross_pane`.",
           "properties": {
+            "allow_cross_pane": {
+              "type": "boolean"
+            },
             "target": {
               "type": "string"
             }
@@ -2249,6 +2252,13 @@
           ],
           "type": "object"
         },
+        "InputConsumerCutKind": {
+          "enum": [
+            "submit",
+            "discard"
+          ],
+          "type": "string"
+        },
         "IntegrationInstallParams": {
           "properties": {
             "target": {
@@ -2773,6 +2783,80 @@
           },
           "required": [
             "direction"
+          ],
+          "type": "object"
+        },
+        "PaneInputConsumerCutParams": {
+          "additionalProperties": false,
+          "properties": {
+            "cut": {
+              "description": "Number of post-marker bytes through the end of this interval.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "digest": {
+              "type": "string"
+            },
+            "epoch": {
+              "type": "string"
+            },
+            "epoch_key": {
+              "type": "string"
+            },
+            "kind": {
+              "$ref": "#/schemas/request/$defs/InputConsumerCutKind"
+            },
+            "seq": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "token": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "epoch",
+            "epoch_key",
+            "seq",
+            "token",
+            "cut",
+            "digest",
+            "kind"
+          ],
+          "type": "object"
+        },
+        "PaneInputConsumerEnrollParams": {
+          "additionalProperties": false,
+          "properties": {
+            "challenge": {
+              "description": "Fresh 256-bit consumer challenge as 64 lowercase hex characters.",
+              "type": "string"
+            },
+            "pane_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pane_id",
+            "challenge"
+          ],
+          "type": "object"
+        },
+        "PaneInputConsumerReleaseParams": {
+          "additionalProperties": false,
+          "properties": {
+            "epoch": {
+              "type": "string"
+            },
+            "epoch_key": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "epoch",
+            "epoch_key"
           ],
           "type": "object"
         },
@@ -4905,6 +4989,60 @@
           },
           "type": "object"
         },
+        "WorktreeCreateProjectCheckedParams": {
+          "description": "Project-checked creation, separate from the frozen legacy endpoint shape.",
+          "properties": {
+            "allow_project_change": {
+              "default": false,
+              "description": "Explicit permission to change ownership of a surviving agent session.",
+              "type": "boolean"
+            },
+            "base": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "branch": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "cwd": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "focus": {
+              "default": false,
+              "type": "boolean"
+            },
+            "label": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "path": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "trust_repository": {
+              "type": "boolean"
+            },
+            "workspace_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "type": "object"
+        },
         "WorktreeListParams": {
           "properties": {
             "cwd": {
@@ -4927,6 +5065,54 @@
         },
         "WorktreeOpenParams": {
           "properties": {
+            "branch": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "cwd": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "focus": {
+              "default": false,
+              "type": "boolean"
+            },
+            "label": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "path": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "trust_repository": {
+              "type": "boolean"
+            },
+            "workspace_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "type": "object"
+        },
+        "WorktreeOpenProjectCheckedParams": {
+          "description": "Project-checked opening, separate from the frozen legacy endpoint shape.",
+          "properties": {
+            "allow_project_change": {
+              "default": false,
+              "description": "Explicit permission to change ownership of a surviving agent session.",
+              "type": "boolean"
+            },
             "branch": {
               "type": [
                 "string",
@@ -5455,6 +5641,23 @@
           "type": "object"
         },
         {
+          "description": "Project-checked creation; older servers reject instead of ignoring permission.",
+          "properties": {
+            "method": {
+              "const": "worktree.create_project_checked",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/WorktreeCreateProjectCheckedParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
           "properties": {
             "method": {
               "const": "worktree.open",
@@ -5462,6 +5665,23 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/WorktreeOpenParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Project-checked opening; older servers reject instead of ignoring permission.",
+          "properties": {
+            "method": {
+              "const": "worktree.open_project_checked",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/WorktreeOpenProjectCheckedParams"
             }
           },
           "required": [
@@ -6314,6 +6534,55 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/PaneLastInputParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Local API only; the pane actor validates the kernel-pinned socket peer.",
+          "properties": {
+            "method": {
+              "const": "pane.input_consumer.enroll",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneInputConsumerEnrollParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "pane.input_consumer.cut",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneInputConsumerCutParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "pane.input_consumer.release",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneInputConsumerReleaseParams"
             }
           },
           "required": [
@@ -11197,6 +11466,11 @@
             "health_check": {
               "default": false,
               "description": "Whether this server supports endpoint health probes.",
+              "type": "boolean"
+            },
+            "input_consumer": {
+              "default": false,
+              "description": "Supports the local `pane.input_consumer.*` methods (Linux servers only).",
               "type": "boolean"
             },
             "live_handoff": {

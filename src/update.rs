@@ -2113,7 +2113,41 @@ fn homebrew_cellar_keg_root(path: &Path) -> Option<PathBuf> {
 // ---------------------------------------------------------------------------
 
 /// Manual self-update command (`herdr update`).
+/// Exact refusal for a smarty-install install (herdr-lead ruling, smarty-dev#2636).
+pub(crate) const SMARTY_INSTALL_REFUSAL: &str = "this herdr is installed by smarty-install (setgid herdr for the server key); update it with smarty-install herdr <sha>";
+
+/// A setgid binary (any group) belongs to smarty-install: replacing it here would drop
+/// the `root:herdr 2755` mode that smarty-install sets (smarty-dev#2636). A plain
+/// root-owned binary is an ordinary system install and takes the normal update path.
+#[cfg(unix)]
+fn is_smarty_install_managed_exe(exe: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(exe).is_ok_and(|m| m.permissions().mode() & 0o2000 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_smarty_install_managed_exe(_exe: &Path) -> bool {
+    false
+}
+
+/// The refusal for a smarty-install binary, if this process is one. On Linux it checks the
+/// running inode (`/proc/self/exe`, still valid after an unlink) and fails closed when that
+/// cannot be read; it also checks the installed path. Call before any config read or write.
+pub(crate) fn smarty_install_refusal() -> Option<&'static str> {
+    #[cfg(target_os = "linux")]
+    let running = std::fs::metadata("/proc/self/exe").is_err()
+        || is_smarty_install_managed_exe(Path::new("/proc/self/exe"));
+    #[cfg(not(target_os = "linux"))]
+    let running = false;
+    let installed = env::current_exe().is_ok_and(|exe| is_smarty_install_managed_exe(&exe));
+    (running || installed).then_some(SMARTY_INSTALL_REFUSAL)
+}
+
 pub fn self_update(options: SelfUpdateOptions) -> Result<Version, String> {
+    // Before any config read, download or write.
+    if let Some(refusal) = smarty_install_refusal() {
+        return Err(refusal.into());
+    }
     let channel = UpdateChannel::configured();
 
     if is_homebrew_managed_install() {
@@ -2990,6 +3024,35 @@ mod tests {
         assert!(!running_inside_herdr_env(Some("0")));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn smarty_install_managed_exe_is_setgid_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("herdr-upd-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("herdr");
+        std::fs::write(&exe, b"").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            !is_smarty_install_managed_exe(&exe),
+            "a user's own 0755 binary updates"
+        );
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o2755)).unwrap();
+        assert!(
+            is_smarty_install_managed_exe(&exe),
+            "setgid binary is refused"
+        );
+        use std::os::unix::fs::MetadataExt;
+        let sh = std::fs::metadata("/bin/sh").unwrap();
+        assert_eq!(sh.uid(), 0, "fixture: /bin/sh is root-owned");
+        assert_eq!(sh.mode() & 0o2000, 0, "fixture: /bin/sh is not setgid");
+        assert!(
+            !is_smarty_install_managed_exe(Path::new("/bin/sh")),
+            "a plain root-owned binary takes the normal update path"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn self_update_args_gate_live_handoff() {
         assert_eq!(
@@ -3049,6 +3112,7 @@ mod tests {
                 ssh_agent_registration: false,
                 guarded_live_handoff: true,
                 expected_terminal_guard: true,
+                input_consumer: false,
             }),
         };
         let missing_baseline = crate::api::RuntimeStatus {
@@ -3126,6 +3190,7 @@ mod tests {
                     health_check: true,
                     ssh_agent_registration: false,
                     guarded_live_handoff: true,
+                    input_consumer: false,
                 }),
             },
         };
@@ -3379,6 +3444,7 @@ mod tests {
                     health_check: true,
                     ssh_agent_registration: false,
                     guarded_live_handoff: true,
+                    input_consumer: false,
                 }),
             },
         };

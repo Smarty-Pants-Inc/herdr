@@ -59,8 +59,10 @@ const CLIENT_SHELL_METHODS: &[&str] = &[
     "workspace.move_block",
     "workspace.rename",
     "worktree.create",
+    "worktree.create_project_checked",
     "worktree.list",
     "worktree.open",
+    "worktree.open_project_checked",
     "worktree.remove",
 ];
 
@@ -349,6 +351,9 @@ mod tests {
         assert!(actual.remove("tab.move_project_checked").is_some());
         assert!(actual.remove("pane.swap_project_checked").is_some());
         assert!(actual.remove("layout.apply_project_checked").is_some());
+        // Only the additive checked worktree names are outside the v1 fixture.
+        assert!(actual.remove("worktree.create_project_checked").is_some());
+        assert!(actual.remove("worktree.open_project_checked").is_some());
 
         assert_eq!(
             actual, expected,
@@ -408,17 +413,21 @@ mod tests {
     }
 
     #[test]
-    fn draft_state_endpoint_is_advertised_read_only_and_target_only() {
+    fn draft_state_endpoint_is_advertised_read_only_with_caller_cross_pane_opt_in() {
         assert!(supported_client_shell_method_names().contains(&"agent.draft_state"));
         assert!(supports_client_shell_method_name("agent.draft_state"));
         let schema = serde_json::to_value(schemars::schema_for!(
             crate::api::schema::AgentDraftStateParams
         ))
         .unwrap();
-        assert_eq!(
-            schema["properties"],
-            serde_json::json!({"target": {"type": "string"}})
-        );
+        let properties = schema["properties"]
+            .as_object()
+            .expect("draft state params properties");
+        let mut property_names: Vec<&str> = properties.keys().map(String::as_str).collect();
+        property_names.sort_unstable();
+        assert_eq!(property_names, ["allow_cross_pane", "target"]);
+        assert_eq!(properties["target"]["type"], "string");
+        assert_eq!(properties["allow_cross_pane"]["type"], "boolean");
         assert_eq!(schema["required"], serde_json::json!(["target"]));
         assert_eq!(schema["additionalProperties"], false);
         let wire = serde_json::json!({
@@ -432,6 +441,36 @@ mod tests {
             "agent.draft_state"
         );
         assert_eq!(serde_json::to_value(request).unwrap(), wire);
+        let omitted: crate::api::schema::AgentDraftStateParams =
+            serde_json::from_value(serde_json::json!({"target": "pane"})).unwrap();
+        assert!(!omitted.allow_cross_pane);
+        let explicit_false: crate::api::schema::AgentDraftStateParams = serde_json::from_value(
+            serde_json::json!({"target": "pane", "allow_cross_pane": false}),
+        )
+        .unwrap();
+        assert_eq!(explicit_false, omitted);
+        assert_eq!(
+            serde_json::to_value(&explicit_false).unwrap(),
+            serde_json::json!({"target": "pane"})
+        );
+        let mut opted_in = wire.clone();
+        opted_in["params"]["allow_cross_pane"] = true.into();
+        let request: crate::api::schema::Request =
+            serde_json::from_value(opted_in.clone()).unwrap();
+        assert!(supports_client_shell_method(&request.method));
+        assert!(!crate::api::request_changes_ui(&request));
+        assert_eq!(serde_json::to_value(request).unwrap(), opted_in);
+        for invalid_allow in [
+            serde_json::Value::Null,
+            "false".into(),
+            "true".into(),
+            0.into(),
+            1.into(),
+        ] {
+            let mut invalid = wire.clone();
+            invalid["params"]["allow_cross_pane"] = invalid_allow;
+            assert!(serde_json::from_value::<crate::api::schema::Request>(invalid).is_err());
+        }
         for field in [
             "text",
             "empty",
@@ -484,6 +523,44 @@ mod tests {
                 "focus": false, "root": {"type": "pane", "command": ["/absolute/program", "a b"]}
             })
         );
+    }
+
+    #[test]
+    fn worktree_project_checked_methods_are_registered_and_opt_in() {
+        for method in [
+            "worktree.create_project_checked",
+            "worktree.open_project_checked",
+        ] {
+            for permission in [None, Some(false), Some(true)] {
+                let mut params = serde_json::json!({"branch": "worktree/test", "focus": true});
+                if let Some(allow) = permission {
+                    params["allow_project_change"] = serde_json::json!(allow);
+                }
+                let request: crate::api::schema::Request = serde_json::from_value(
+                    serde_json::json!({"id": "checked", "method": method, "params": params}),
+                )
+                .unwrap();
+                assert_eq!(crate::api::api_method_name(&request.method), method);
+                assert!(supports_client_shell_method(&request.method));
+                assert!(crate::api::request_changes_ui(&request));
+                let (allow, branch, focus) = match request.method {
+                    Method::WorktreeCreateProjectChecked(params) => (
+                        params.allow_project_change,
+                        params.params.branch,
+                        params.params.focus,
+                    ),
+                    Method::WorktreeOpenProjectChecked(params) => (
+                        params.allow_project_change,
+                        params.params.branch,
+                        params.params.focus,
+                    ),
+                    _ => panic!("wrong checked method"),
+                };
+                assert_eq!(allow, permission.unwrap_or(false));
+                assert_eq!(branch.as_deref(), Some("worktree/test"));
+                assert!(focus);
+            }
+        }
     }
 
     #[test]

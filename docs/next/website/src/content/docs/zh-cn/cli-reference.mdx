@@ -170,12 +170,14 @@ herdr workspace create --cwd ~/project --label api --no-focus
 
 ```bash
 herdr worktree list [--workspace ID | --cwd PATH] [--trust-repository]
-herdr worktree create [--workspace ID | --cwd PATH] [--branch NAME] [--base REF] [--path PATH] [--label TEXT] [--focus] [--no-focus] [--trust-repository]
-herdr worktree open [--workspace ID | --cwd PATH] (--path PATH | --branch NAME) [--label TEXT] [--focus] [--no-focus] [--trust-repository]
+herdr worktree create [--workspace ID | --cwd PATH] [--branch NAME] [--base REF] [--path PATH] [--label TEXT] [--allow-project-change] [--focus] [--no-focus] [--trust-repository]
+herdr worktree open [--workspace ID | --cwd PATH] (--path PATH | --branch NAME) [--label TEXT] [--allow-project-change] [--focus] [--no-focus] [--trust-repository]
 herdr worktree remove --workspace ID [--force] [--trust-repository]
 ```
 
 worktree 是带有 Git 检出来源信息的普通 Herdr 工作区。`worktree create` 创建一个 Git worktree 检出,作为工作区打开,并与父仓库工作区分到一组。如果 `--branch` 指向已有的本地分支,Herdr 检出它;否则从 `--base` 或 `HEAD` 创建分支。没有 `--path` 时,Herdr 在 `<worktrees.directory>/<repo>/<branch-slug>` 下创建检出。
+
+`worktree create` 和 `worktree open` 默认保留仍存续的代理会话的项目归属。只有在你有意允许这些会话改变项目归属时，才传入 `--allow-project-change`。此权限与 `--trust-repository` 分开。两个命令始终使用 `worktree.create_project_checked` / `worktree.open_project_checked`，包括许可为 false 时。旧服务器会拒绝这些方法；CLI 绝不使用旧方法重试。
 
 `workspace close` 只关闭 Herdr 状态。当关联的 worktree 工作区仍然打开时，关闭父工作区需要 `--group`；否则命令会保留整个组并返回 `workspace_group_close_required`。`worktree remove` 是显式的检出删除路径;它运行 `git worktree remove`,从不删除分支,并在 Git 拒绝脏检出时要求 `--force`。
 
@@ -349,7 +351,7 @@ herdr agent explain --file PATH --agent LABEL [--json|--verbose]
 
 ```bash
 herdr agent channel-info <target>
-herdr agent draft-state <target>
+herdr agent draft-state <target> [--allow-cross-pane]
 herdr agent prompt <target> <text> --if-draft-empty [--allow-cross-pane]
 herdr agent prompt-guarded <target> <text> --expected-terminal TERMINAL_ID --expected-registration-epoch EPOCH --request-id ID [--timeout-ms MS] [--allow-cross-pane] [--if-draft-empty]
 ```
@@ -373,7 +375,7 @@ herdr agent prompt-guarded w1:p1 "Review this change" \
 
 守卫帧带有期限；Pi 在上述检查和调用前同步拒绝已过期帧，原因为 `expired`，不提交提示也不修改编辑器。守卫期限缺失或无效时以 `unknown` 拒绝。在 socket 发送前发生的类型化失败表示没有发送；可能已接纳后的回执丢失仍是 `delivery_unknown`，绝不重放。
 
-`agent draft-state` 通过注册通道执行只读、隐藏文本的观察，默认查询超时为两秒。结果为 `{status: "known", empty, chars, hold}`：`empty` 是布尔值，`chars` 是整数字符数，`hold` 为 `null`（无 hold）、`"dialog"`、`"custom"` 或 `"editor"`。绝不返回草稿文本。否则返回 `{status: "unknown", reason}`，原因为 `unregistered`（无通道）、`unsupported`（无能力）、`timeout`（未及时回复）或 `unknown`（状态不可观察）。unknown 不代表草稿为空。查询不是后续发送的授权；守卫提示会在接纳时重新检查。
+`agent draft-state` 通过注册通道执行只读、隐藏文本的观察，默认查询超时为两秒。known 结果只报告草稿是否为空以及 UI hold（`null`、`"dialog"`、`"custom"` 或 `"editor"`）；绝不返回草稿文本或字符数。否则返回 `{status: "unknown", reason}`，原因为 `unregistered`（无通道）、`unsupported`（无能力）、`timeout`（未及时回复）或 `unknown`（状态不可观察）。unknown 不代表草稿为空。智能体默认可查询自己的窗格；查询其他窗格需要 `--allow-cross-pane`。普通外部操作员遵循与 `agent.prompt` 相同的策略。授权在预留或发送帧之前检查。查询不是后续发送的授权；守卫提示会在接纳时重新检查。
 
 成功返回 `status: "accepted"`（已接纳到活动会话的输入）或 `"queued"`（已进入该会话的后续消息队列），以及固定的终端、epoch、请求 ID 和会话代数。两种状态都不保证模型轮次已完成或成功。同一 epoch 中，相同请求 ID、完全相同文本和相同 `if_draft_empty` 值共享首次结果，不会再次提交；改变文本或守卫值返回 `payload_mismatch`。新 ID 表示新请求，不是安全重试。
 

@@ -614,8 +614,11 @@ fn direct_attach_mouse_capture_combines_local_preference_with_child_demand() {
     assert!(effective_mouse_capture(false, true));
     assert!(effective_mouse_capture(true, false));
     assert!(!effective_mouse_capture(false, false));
-    assert!(effective_sgr_pixel_mouse(true, true, true));
-    assert!(!effective_sgr_pixel_mouse(true, true, false));
+    assert!(effective_sgr_pixel_mouse(true, true, true, None));
+    assert!(effective_sgr_pixel_mouse(true, true, true, Some(true)));
+    assert!(!effective_sgr_pixel_mouse(true, true, false, None));
+    // A host that reports 1016 unsupported keeps sending cell reports.
+    assert!(!effective_sgr_pixel_mouse(true, true, true, Some(false)));
 }
 
 #[test]
@@ -1076,9 +1079,9 @@ fn terminal_control_scroll_command_maps_to_attach_scroll() {
 }
 
 #[test]
-fn forward_clipboard_uses_local_clipboard_path() {
-    let env = crate::environment::test_env();
-    env.set("SSH_CONNECTION", "1 2 3 4");
-    assert!(forward_clipboard("dGVzdA=="));
+fn forward_clipboard_validates_payload_without_assuming_a_write() {
+    // Valid payloads may be duplicate writes or encounter unavailable output.
+    // Check decoding without mutating the host clipboard, and reject invalid input.
+    assert_eq!(decode_clipboard_payload("dGVzdA=="), Some(b"test".to_vec()));
     assert!(!forward_clipboard("not base64"));
 }

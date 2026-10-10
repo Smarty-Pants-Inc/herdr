@@ -979,7 +979,7 @@ fn print_agent_help() {
     eprintln!("  herdr agent list");
     eprintln!("  herdr agent get <target>");
     eprintln!("  herdr agent channel-info <target>");
-    eprintln!("  herdr agent draft-state <target>");
+    eprintln!("  herdr agent draft-state <target> [--allow-cross-pane]");
     eprintln!(
         "  herdr agent prompt-guarded <target> <text> --expected-terminal TERMINAL_ID --expected-registration-epoch EPOCH --request-id ID [--timeout-ms MS] [--allow-cross-pane] [--if-draft-empty]"
     );

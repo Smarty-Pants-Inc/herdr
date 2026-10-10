@@ -317,8 +317,13 @@ impl App {
         respond_to: std::sync::mpsc::Sender<String>,
     ) -> bool {
         if let Method::AgentDraftState(params) = &request.method {
-            // A read-only socket query bypasses input policy and never acquires a
-            // PTY writer, focus, or stale caller observation as submission authority.
+            // Same caller policy as agent.prompt, decided BEFORE any ledger reservation
+            // or frame: a denied caller learns nothing and the receiver sees nothing.
+            // The query never acquires a PTY writer, focus, or submission authority.
+            if let Some(response) = self.cross_pane_input_denial(&request, context) {
+                let _ = respond_to.send(response);
+                return true;
+            }
             let reservation = self.reserve_draft_state(params);
             Self::respond_channel_reservation(request.id, reservation, respond_to);
             return true;
