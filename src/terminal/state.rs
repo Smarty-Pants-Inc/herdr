@@ -3112,6 +3112,10 @@ mod tests {
         assert_eq!(terminal.reported_agent_session_reporter(), None);
     }
 
+    fn test_temp_session_path(name: &str) -> String {
+        std::env::temp_dir().join(name).display().to_string()
+    }
+
     fn buffer_pi_report(
         terminal: &mut TerminalState,
         hook: bool,
@@ -3119,7 +3123,8 @@ mod tests {
         id: Option<&str>,
         reporter: Option<crate::platform::ProcessIdentity>,
     ) {
-        let reference = crate::agent_resume::AgentSessionRef::path("/tmp/buffered.jsonl");
+        let reference =
+            crate::agent_resume::AgentSessionRef::path(test_temp_session_path("buffered.jsonl"));
         let marker = terminal.session_report_marker();
         if hook {
             terminal.set_hook_authority_with_session_ref(
@@ -3249,7 +3254,7 @@ mod tests {
                             source: "herdr:pi".into(),
                             agent: "pi".into(),
                             session_ref: crate::agent_resume::AgentSessionRef::path(
-                                "/tmp/restored.jsonl",
+                                test_temp_session_path("restored.jsonl"),
                             )
                             .expect("path"),
                         }
@@ -3345,7 +3350,8 @@ mod tests {
         let (mut terminal, reporter) = current_pi_binding();
         let original = terminal.reported_agent_session_validity().expect("binding");
         let original_cell = original.upgrade().expect("owned current cell");
-        let reference = crate::agent_resume::AgentSessionRef::path("/tmp/pending.jsonl");
+        let reference =
+            crate::agent_resume::AgentSessionRef::path(test_temp_session_path("pending.jsonl"));
         let marker = terminal.session_report_marker();
         assert!(terminal
             .set_hook_authority_with_session_ref(
@@ -3423,7 +3429,8 @@ mod tests {
     fn reported_session_validity_same_native_id_path_change_keeps_cell() {
         let (mut terminal, reporter) = current_pi_binding();
         let original = terminal.reported_agent_session_validity().expect("binding");
-        let reference = crate::agent_resume::AgentSessionRef::path("/tmp/moved.jsonl");
+        let reference =
+            crate::agent_resume::AgentSessionRef::path(test_temp_session_path("moved.jsonl"));
         let marker = terminal.session_report_marker();
         terminal
             .set_agent_session_ref_for_session_start(
@@ -3542,17 +3549,19 @@ mod tests {
             start_time: 11,
         };
         for (source, agent, path, seq) in [
-            ("herdr:omp", "pi", "/tmp/buffered.jsonl", 1),
-            ("herdr:pi", "omp", "/tmp/buffered.jsonl", 1),
-            ("herdr:pi", "pi", "/tmp/other.jsonl", 1),
-            ("herdr:pi", "pi", "/tmp/buffered.jsonl", 2),
+            ("herdr:omp", "pi", "buffered.jsonl", 1),
+            ("herdr:pi", "omp", "buffered.jsonl", 1),
+            ("herdr:pi", "pi", "other.jsonl", 1),
+            ("herdr:pi", "pi", "buffered.jsonl", 2),
         ] {
             let mut terminal = test_terminal();
             let marker = terminal.session_report_marker();
             terminal.set_agent_session_ref_for_session_start(
                 "herdr:pi".into(),
                 "pi".into(),
-                crate::agent_resume::AgentSessionRef::path("/tmp/buffered.jsonl"),
+                crate::agent_resume::AgentSessionRef::path(test_temp_session_path(
+                    "buffered.jsonl",
+                )),
                 Some(1),
                 Some("startup".into()),
             );
@@ -3560,7 +3569,7 @@ mod tests {
                 (marker, Some(seq)),
                 source,
                 agent,
-                crate::agent_resume::AgentSessionRef::path(path).as_ref(),
+                crate::agent_resume::AgentSessionRef::path(test_temp_session_path(path)).as_ref(),
                 Some("wrong-receipt".into()),
                 Some(reporter),
             );
@@ -3599,7 +3608,7 @@ mod tests {
                             source: "herdr:pi".into(),
                             agent: "pi".into(),
                             session_ref: crate::agent_resume::AgentSessionRef::path(
-                                "/tmp/buffered.jsonl",
+                                test_temp_session_path("buffered.jsonl"),
                             )
                             .expect("path"),
                         },
