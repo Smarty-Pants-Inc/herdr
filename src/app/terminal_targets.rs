@@ -34,6 +34,8 @@ pub(crate) enum TerminalTargetError {
 pub(crate) enum InputOrigin {
     Ordinary,
     Agent(TerminalTarget),
+    /// A live, server-minted plugin action grant: user-initiated input.
+    PluginAction(crate::plugin_action_origin::PluginActionGrant),
     Unknown,
 }
 
@@ -208,7 +210,7 @@ impl App {
     ) -> Option<TerminalTarget> {
         match self.input_origin_for_peer_identity(peer_identity) {
             InputOrigin::Agent(target) => Some(target),
-            InputOrigin::Ordinary | InputOrigin::Unknown => None,
+            InputOrigin::Ordinary | InputOrigin::PluginAction(_) | InputOrigin::Unknown => None,
         }
     }
 
@@ -230,6 +232,14 @@ impl App {
         &self,
         context: crate::api::ApiRequestContext,
     ) -> InputOrigin {
+        // A presented grant decides alone: valid is a user-initiated plugin
+        // action; any invalid claim is unknown and never falls through to the
+        // peer's ordinary or agent attribution.
+        match self.plugin_action_grants.resolve(context.plugin_action) {
+            Ok(Some(grant)) => return InputOrigin::PluginAction(grant),
+            Ok(None) => {}
+            Err(()) => return InputOrigin::Unknown,
+        }
         let Some(peer) = context.local_peer_identity else {
             return InputOrigin::Unknown;
         };
@@ -530,6 +540,7 @@ mod tests {
         crate::api::ApiRequestContext {
             local_peer_identity: Some(peer),
             local_peer_pane_origin: crate::platform::PeerPaneOrigin::Absent,
+            ..Default::default()
         }
     }
 

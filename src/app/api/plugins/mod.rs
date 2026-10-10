@@ -4536,4 +4536,101 @@ command = ["act.exe"]
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(registry_dir);
     }
+
+    /// herdr-8592: only a user action child receives a grant; hooks never do.
+    /// The grant binds plugin/action/invoking pane and the log id, and is
+    /// revoked when the recorded child exits even while a descendant still
+    /// holds its stdout/stderr pipes open.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn action_grant_is_bound_and_revoked_at_child_exit_but_hooks_get_none() {
+        use crate::plugin_action_origin::{PluginActionClaim, PluginActionToken};
+        let mut fixture = privacy_fixture("plugin-grant");
+        let root = fixture.root.join("grant");
+        write_manifest_content(
+            &root,
+            r#"
+id = "example.grant"
+name = "Grant"
+version = "0.1.0"
+min_herdr_version = "0.6.10"
+platforms = ["linux", "macos"]
+
+[[actions]]
+id = "hold"
+title = "Hold"
+command = ["sh", "-c", 'printf %s "${HERDR_PLUGIN_ACTION_TOKEN-none}" > tok.tmp && mv tok.tmp tok.txt; sleep 4 & while [ ! -e release ]; do sleep 0.02; done']
+
+[[startup]]
+command = ["sh", "-c", 'printf %s "${HERDR_PLUGIN_ACTION_TOKEN-none}" > hook.tmp && mv hook.tmp hook.txt']
+"#,
+        );
+        link_manifest(&mut fixture.app, &root);
+        fixture.app.run_plugin_startup_hooks();
+        let app = &mut fixture.app;
+        let hook = read_capture_when_ready(&root.join("hook.txt"), || {
+            app.drain_all_internal_events();
+        });
+        assert_eq!(hook, "none", "startup hooks never receive a grant");
+
+        let invoke = fixture.app.handle_api_request(Request {
+            id: "invoke-hold".into(),
+            method: Method::PluginActionInvoke(PluginActionInvokeParams {
+                plugin_id: Some("example.grant".into()),
+                action_id: "hold".into(),
+                context: Some(invoking_pane_context(&fixture.a_pane_public)),
+            }),
+        });
+        let ResponseResult::PluginActionInvoked { log, .. } = response_result(&invoke) else {
+            panic!("expected plugin action invocation: {invoke}");
+        };
+        assert!(!invoke.contains("plugin_action_token"));
+        let app = &mut fixture.app;
+        let hex = read_capture_when_ready(&root.join("tok.txt"), || {
+            app.drain_all_internal_events();
+        });
+        let token = PluginActionToken::parse(&hex).expect("action child received a token");
+        // The child may present it immediately; a pending grant waits for the pin.
+        let claim = PluginActionClaim::Presented(token);
+        let grant = fixture
+            .app
+            .plugin_action_grants
+            .resolve(claim)
+            .expect("live grant")
+            .expect("granted");
+        assert_eq!(grant.plugin_id, "example.grant");
+        assert_eq!(grant.action_id, "hold");
+        assert_eq!(
+            grant.invoking_pane.as_deref(),
+            Some(fixture.a_pane_public.as_str())
+        );
+        assert_eq!(grant.grant_id, log.log_id);
+        assert!(!format!("{grant:?}").contains(&hex));
+        let logs = serde_json::to_string(&fixture.app.state.plugin_command_logs).unwrap();
+        assert!(!logs.contains(&hex), "command log never records the token");
+
+        let released = std::time::Instant::now();
+        std::fs::write(root.join("release"), b"").unwrap();
+        while fixture.app.plugin_action_grants.resolve(claim).is_ok() {
+            assert!(
+                released.elapsed() < std::time::Duration::from_secs(3),
+                "grant outlived the action child"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // Revoked while `sleep 4` still holds the output pipes: the command
+        // has not finished from the log's point of view yet.
+        assert!(released.elapsed() < std::time::Duration::from_secs(3));
+        fixture.app.drain_all_internal_events();
+        let still_running = fixture
+            .app
+            .state
+            .plugin_command_logs
+            .iter()
+            .find(|entry| entry.log_id == log.log_id)
+            .map(|entry| entry.status);
+        assert_eq!(still_running, Some(PluginCommandStatus::Running));
+        assert_eq!(fixture.app.plugin_action_grants.resolve(claim), Err(()));
+        let _ = std::fs::remove_dir_all(fixture.root);
+    }
 }

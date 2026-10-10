@@ -3705,6 +3705,40 @@ impl Drop for InputSourceRestore {
     }
 }
 
+/// OS CSPRNG through bcryptprimitives!ProcessPrng (what std uses on Windows 10+).
+/// Loaded from System32 only; any failure grants nothing (herdr-8592).
+pub(crate) fn secure_random_platform(bytes: &mut [u8]) -> std::io::Result<()> {
+    use windows_sys::Win32::System::LibraryLoader::{
+        GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32,
+    };
+    type ProcessPrng = unsafe extern "system" fn(*mut u8, usize) -> i32;
+    let name = widestring::U16CString::from_str("bcryptprimitives.dll")
+        .map_err(|_| std::io::Error::other("invalid random library name"))?;
+    // SAFETY: NUL-terminated wide name; System32-only search; null file handle.
+    let module = unsafe { LoadLibraryExW(name.as_ptr(), null_mut(), LOAD_LIBRARY_SEARCH_SYSTEM32) };
+    if module.is_null() {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: NUL-terminated ANSI export name on a loaded module.
+    let result = match unsafe { GetProcAddress(module, c"ProcessPrng".as_ptr().cast()) } {
+        None => Err(std::io::Error::last_os_error()),
+        Some(proc) => {
+            // SAFETY: ProcessPrng's documented signature is BOOL ProcessPrng(PBYTE, SIZE_T).
+            let prng: ProcessPrng = unsafe { std::mem::transmute(proc) };
+            // SAFETY: the buffer is valid for writes of its full length.
+            if unsafe { prng(bytes.as_mut_ptr(), bytes.len()) } == 0 {
+                Err(std::io::Error::other("ProcessPrng failed"))
+            } else {
+                Ok(())
+            }
+        }
+    };
+    // Balance LoadLibraryExW; the function pointer is not used afterwards.
+    // SAFETY: module came from the successful LoadLibraryExW above.
+    unsafe { windows_sys::Win32::Foundation::FreeLibrary(module) };
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use std::{

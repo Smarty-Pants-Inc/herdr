@@ -624,6 +624,17 @@ action = "bootstrap"
 
 Herdr は `HERDR_SOCKET_PATH`、`HERDR_BIN_PATH`、`HERDR_ENV=1`、`HERDR_PLUGIN_ID`、`HERDR_PLUGIN_ROOT`、`HERDR_PLUGIN_CONFIG_DIR`、`HERDR_PLUGIN_STATE_DIR`、`HERDR_PLUGIN_CONTEXT_JSON`、そして利用可能な `HERDR_WORKSPACE_ID`、`HERDR_TAB_ID`、`HERDR_PANE_ID` の値を注入します。アクションコマンドは加えて `HERDR_PLUGIN_ACTION_ID` を受け取ります。イベントフックは `HERDR_PLUGIN_EVENT` と `HERDR_PLUGIN_EVENT_JSON` を、ペインコマンドは `HERDR_PLUGIN_ENTRYPOINT_ID` を受け取ります。
 
+プラグインのアクションコマンドは秘密の `HERDR_PLUGIN_ACTION_TOKEN` も受け取ります。
+ローカル CLI は入力の書き込みリクエストに自動で付けます。生の API クライアントは、
+`id`、`method`、`params` と同じ階層の省略可能な `plugin_action_token` フィールドに
+指定できます。有効なトークンは `allow_cross_pane` なしで書き込みをプラグインの
+アクションに帰属させます。発行元サーバー上で、アクションのプロセスが生存している
+間だけ、最長 10 分有効です。不正・期限切れ・失効済みのトークンは、呼び出し側が
+`allow_cross_pane` を明示的に有効にしない限り `input_origin_unknown` を返します。
+スタートアップフックとイベントフックには渡されません。ログに含めないでください。
+同じ OS ユーザーのプロセスは互いの環境を読み取れる場合があるため、プロセス間の
+隔離境界ではありません。
+
 直近のアクションおよびイベントコマンドのログを一覧する:
 
 ```json

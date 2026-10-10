@@ -100,6 +100,39 @@ impl App {
             self.push_plugin_command_log(log);
             return Err(("plugin_command_limit_reached", message));
         }
+        // Only user-invoked actions get an input grant; startup and event
+        // hooks never do (herdr-8592). Minted before spawn so the child can
+        // never present it before it is registered.
+        let action_grant = match (action_id.as_ref(), event.is_none()) {
+            (Some(action_id), true) => match self.plugin_action_grants.mint(
+                crate::plugin_action_origin::PluginActionGrant {
+                    plugin_id: plugin.plugin_id.clone(),
+                    action_id: action_id.clone(),
+                    invoking_pane: context.focused_pane_id.clone(),
+                    grant_id: log_id.clone(),
+                },
+            ) {
+                Ok((token, key)) => {
+                    env.push((
+                        crate::plugin_action_origin::TOKEN_ENV_VAR.to_string(),
+                        token.expose_hex(),
+                    ));
+                    Some(ActionGrantLease {
+                        grants: self.plugin_action_grants.clone(),
+                        key,
+                    })
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        err = %err,
+                        plugin_id = %plugin.plugin_id,
+                        "plugin action input grant unavailable; running without one"
+                    );
+                    None
+                }
+            },
+            _ => None,
+        };
         let plugin_root = std::path::PathBuf::from(&plugin.plugin_root);
         let log = PluginCommandLogInfo {
             log_id: log_id.clone(),
@@ -130,7 +163,23 @@ impl App {
                 .stderr(Stdio::piped())
                 .spawn();
             let finished = match child {
-                Ok(child) => finish_plugin_child(log_id, child),
+                Ok(mut child) => match pin_action_child(&mut child, action_grant.as_ref()) {
+                    Ok(()) => finish_plugin_child(log_id, child, action_grant),
+                    Err(error) => {
+                        // Stop only our own unreaped child; never signal by PID.
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        drop(action_grant);
+                        crate::events::AppEvent::PluginCommandFinished {
+                            log_id,
+                            finished_unix_ms: current_unix_ms(),
+                            exit_code: None,
+                            stdout: String::new(),
+                            stderr: String::new(),
+                            error: Some(error),
+                        }
+                    }
+                },
                 Err(err) => crate::events::AppEvent::PluginCommandFinished {
                     log_id,
                     finished_unix_ms: current_unix_ms(),
@@ -143,6 +192,8 @@ impl App {
             let _ = event_tx.blocking_send(finished);
         });
         if let Err(err) = spawned {
+            // The closure (and its grant lease) was dropped unrun, which
+            // already revoked the grant.
             tracing::warn!(err = %err, "failed to spawn plugin command thread");
             let log = PluginCommandLogInfo {
                 status: PluginCommandStatus::Failed,
@@ -276,6 +327,7 @@ fn scrub_inherited_invocation_env(
         "HERDR_ACTIVE_TAB_ID",
         "HERDR_ACTIVE_PANE_ID",
         "HERDR_ACTIVE_PANE_CWD",
+        crate::plugin_action_origin::TOKEN_ENV_VAR,
     ] {
         command.env_remove(key);
     }
@@ -286,9 +338,52 @@ fn scrub_inherited_invocation_env(
     }
 }
 
+/// Owns one action's input grant. Dropping it revokes the grant, so every
+/// worker path (exit, spawn failure, pin failure, unwinding) revokes.
+struct ActionGrantLease {
+    grants: crate::plugin_action_origin::PluginActionGrants,
+    key: crate::plugin_action_origin::GrantKey,
+}
+
+impl Drop for ActionGrantLease {
+    fn drop(&mut self) {
+        self.grants.revoke(self.key);
+    }
+}
+
+/// Binds the grant to the exact spawned child. A child that already exited
+/// simply never gets a live grant; any other pin failure is an error and the
+/// caller stops the child rather than trusting an unpinned PID.
+fn pin_action_child(
+    child: &mut std::process::Child,
+    lease: Option<&ActionGrantLease>,
+) -> Result<(), String> {
+    let Some(lease) = lease else {
+        return Ok(());
+    };
+    match crate::platform::pin_owned_child(child) {
+        Ok(pin) => {
+            tracing::debug!(pid = pin.identity().pid, "plugin action input grant pinned");
+            lease.grants.activate(lease.key, pin);
+            Ok(())
+        }
+        Err(err) => {
+            lease.grants.revoke(lease.key);
+            match child.try_wait() {
+                Ok(Some(_)) => Ok(()),
+                _ => Err(format!("could not pin plugin action process: {err}")),
+            }
+        }
+    }
+}
+
 type PluginOutputReader = std::thread::JoinHandle<String>;
 
-fn finish_plugin_child(log_id: String, mut child: std::process::Child) -> crate::events::AppEvent {
+fn finish_plugin_child(
+    log_id: String,
+    mut child: std::process::Child,
+    action_grant: Option<ActionGrantLease>,
+) -> crate::events::AppEvent {
     let (stdout_reader, stderr_reader) =
         match spawn_plugin_output_readers(child.stdout.take(), child.stderr.take()) {
             Ok(readers) => readers,
@@ -309,6 +404,9 @@ fn finish_plugin_child(log_id: String, mut child: std::process::Child) -> crate:
             }
         };
     let wait = child.wait();
+    // The grant ends with the recorded action child, before output readers
+    // join: descendants holding the pipes do not extend it.
+    drop(action_grant);
     // Descendants can hold the pipes open after the command exits; the run
     // ends when the command does, not when its output closes.
     let finished_unix_ms = current_unix_ms();
@@ -415,6 +513,8 @@ mod tests {
             "HERDR_ACTIVE_PANE_ID",
             "HERDR_PLUGIN_CLICKED_URL",
             "HERDR_PLUGIN_ACTION_ID",
+            // Always scrubbed, even when absent from the server's own env.
+            "HERDR_PLUGIN_ACTION_TOKEN",
         ] {
             assert!(removed.contains(key), "{key} not scrubbed");
         }
@@ -438,7 +538,7 @@ mod tests {
         let started = std::time::Instant::now();
 
         crate::thread_spawn::test_hook::fail_next_spawns(1);
-        let finished = finish_plugin_child("log".into(), child);
+        let finished = finish_plugin_child("log".into(), child, None);
 
         let crate::events::AppEvent::PluginCommandFinished {
             exit_code, error, ..
@@ -462,7 +562,7 @@ mod tests {
         let started = std::time::Instant::now();
 
         crate::thread_spawn::test_hook::fail_spawns_after(1, 1);
-        let finished = finish_plugin_child("log".into(), child);
+        let finished = finish_plugin_child("log".into(), child, None);
 
         let crate::events::AppEvent::PluginCommandFinished {
             exit_code, error, ..
@@ -506,7 +606,7 @@ mod tests {
             released_unix_ms
         });
 
-        let finished = finish_plugin_child("log".into(), child);
+        let finished = finish_plugin_child("log".into(), child, None);
         let released_unix_ms = releaser.join().unwrap();
 
         let crate::events::AppEvent::PluginCommandFinished {

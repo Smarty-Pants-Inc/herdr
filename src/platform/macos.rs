@@ -1434,6 +1434,17 @@ pub fn process_exists(pid: u32) -> bool {
     }
 }
 
+/// OS CSPRNG via getentropy(2), at most 256 bytes per call (herdr-8592).
+pub(crate) fn secure_random_platform(bytes: &mut [u8]) -> std::io::Result<()> {
+    for chunk in bytes.chunks_mut(256) {
+        // SAFETY: the chunk is valid for writes of its (<= 256 byte) length.
+        if unsafe { libc::getentropy(chunk.as_mut_ptr().cast(), chunk.len()) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

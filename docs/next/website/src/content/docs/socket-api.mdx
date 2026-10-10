@@ -815,6 +815,17 @@ commands also receive `HERDR_PLUGIN_ACTION_ID`; event hooks receive
 `HERDR_PLUGIN_EVENT` and `HERDR_PLUGIN_EVENT_JSON`; pane commands receive
 `HERDR_PLUGIN_ENTRYPOINT_ID`.
 
+Plugin action commands also receive a secret `HERDR_PLUGIN_ACTION_TOKEN`.
+The local CLI automatically attaches it to content-write requests. Raw API
+clients can supply it in the optional top-level `plugin_action_token` field,
+alongside `id`, `method`, and `params`. A valid token attributes a write to its
+plugin action without requiring `allow_cross_pane`. It is valid only on the
+issuing server, while the action process is alive, and for at most ten minutes.
+Invalid, expired, or revoked claims return `input_origin_unknown` unless the
+caller explicitly enables `allow_cross_pane`. Startup and event hooks receive
+no action token. Never log the token. Same-user processes may read each other's
+environment, so it does not isolate processes running as the same OS user.
+
 List recent action and event command logs:
 
 ```json

@@ -213,6 +213,9 @@ pub struct App {
     // False when startup could not pin every installation; cleanup could
     // otherwise reclaim files a restored consumer still uses.
     pub(crate) plugin_installation_cleanup_allowed: bool,
+    // Runtime-only, server-local plugin action input grants (herdr-8592).
+    // Shared with plugin command workers, which pin and revoke them.
+    pub(crate) plugin_action_grants: crate::plugin_action_origin::PluginActionGrants,
 }
 
 pub(crate) const APP_EVENT_CHANNEL_CAPACITY: usize = 256;
@@ -669,6 +672,7 @@ impl App {
             },
             plugin_installation_leases,
             plugin_installation_cleanup_allowed,
+            plugin_action_grants: Default::default(),
             config_diagnostic_deadline: None,
             toast_deadline: None,
             last_api_notification_at: None,

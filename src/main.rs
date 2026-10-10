@@ -38,6 +38,7 @@ mod pane;
 use ghostty_vt::pane_graphics_files;
 mod persist;
 mod platform;
+mod plugin_action_origin;
 mod plugin_command;
 mod plugin_installations;
 mod plugin_paths;

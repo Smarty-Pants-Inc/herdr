@@ -621,6 +621,14 @@ action = "bootstrap"
 
 Herdr 注入 `HERDR_SOCKET_PATH`、`HERDR_BIN_PATH`、`HERDR_ENV=1`、`HERDR_PLUGIN_ID`、`HERDR_PLUGIN_ROOT`、`HERDR_PLUGIN_CONFIG_DIR`、`HERDR_PLUGIN_STATE_DIR`、`HERDR_PLUGIN_CONTEXT_JSON`,以及可用的 `HERDR_WORKSPACE_ID`、`HERDR_TAB_ID` 和 `HERDR_PANE_ID` 值。动作命令还收到 `HERDR_PLUGIN_ACTION_ID`;事件钩子收到 `HERDR_PLUGIN_EVENT` 和 `HERDR_PLUGIN_EVENT_JSON`;窗格命令收到 `HERDR_PLUGIN_ENTRYPOINT_ID`。
 
+插件动作命令还会收到秘密的 `HERDR_PLUGIN_ACTION_TOKEN`。本地 CLI 会自动
+在内容写入请求中携带它。原始 API 客户端可在与 `id`、`method`、`params` 同级的
+可选 `plugin_action_token` 字段中提供它。有效令牌将写入归属于插件动作,无需
+`allow_cross_pane`。它只在发放它的服务器上、动作进程存活期间有效,最长十分钟。
+无效、过期或撤销的令牌返回 `input_origin_unknown`,除非调用者显式启用
+`allow_cross_pane`。启动钩子和事件钩子不会收到动作令牌。不要将令牌写入日志。
+同一 OS 用户的进程可能读取彼此的环境,因此它不是这些进程之间的隔离边界。
+
 列出最近的动作和事件命令日志:
 
 ```json

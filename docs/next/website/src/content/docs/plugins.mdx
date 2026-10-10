@@ -274,6 +274,15 @@ receive `HERDR_PLUGIN_ACTION_ID`; startup and event hooks receive
 receive `HERDR_PLUGIN_EVENT_JSON`, and pane commands receive
 `HERDR_PLUGIN_ENTRYPOINT_ID`.
 
+Action commands also receive `HERDR_PLUGIN_ACTION_TOKEN`. Local Herdr CLI
+content writes pass this token automatically, so an action can launch a CLI
+subprocess without `--allow-cross-pane`. It is bound to one action on one
+server, expires after at most ten minutes, and stops authorizing input when the
+action process exits. Startup and event hooks receive no action token. Treat
+it as a secret: do not print it or include it in logs. Processes running as the
+same operating-system user may read each other's environment; this token is
+not an isolation boundary between those processes.
+
 `HERDR_PLUGIN_ROOT` is the installed or linked plugin directory. Do not store
 user credentials or durable state there, because GitHub-installed plugin roots
 are managed source checkouts. Put user-editable config such as `.env` files

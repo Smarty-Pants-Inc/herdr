@@ -539,6 +539,11 @@ fn handle_connection_with_stop(
     if !running.load(Ordering::Relaxed) {
         return Ok(());
     }
+    // Plugin action grants travel on the request line itself, never with the
+    // connection, so every queued request carries only its own claim.
+    let context = context.with_plugin_action(
+        crate::plugin_action_origin::PluginActionClaim::from_request_line(line),
+    );
 
     let request_id = request.id.clone();
     let method = api_method_name(&request.method);

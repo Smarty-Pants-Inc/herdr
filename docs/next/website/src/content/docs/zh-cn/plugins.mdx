@@ -235,6 +235,13 @@ Herdr 恢复会话且 API socket 就绪后,会为每个已启用插件运行一�
 （启动钩子中的值为 `startup`）,事件钩子还会收到
 `HERDR_PLUGIN_EVENT_JSON`;窗格命令收到 `HERDR_PLUGIN_ENTRYPOINT_ID`。
 
+动作命令还会收到 `HERDR_PLUGIN_ACTION_TOKEN`。本地 Herdr CLI 会自动在
+内容写入请求中携带此令牌,因此动作启动 CLI 子进程时无需 `--allow-cross-pane`。
+令牌只绑定到一个服务器上的一次动作,最长十分钟后失效,动作进程退出后即不再
+授权输入。启动钩子和事件钩子不会收到动作令牌。请将它视为秘密,不要打印或
+写入日志。同一操作系统用户的进程可能读取彼此的环境,所以此令牌不是这些
+进程之间的隔离边界。
+
 `HERDR_PLUGIN_ROOT` 是已安装或已链接的插件目录。不要把用户凭据或持久
 状态放在那里,因为 GitHub 安装的插件根目录是托管的源码检出。把 `.env`
 这类用户可编辑的配置放在 `HERDR_PLUGIN_CONFIG_DIR` 下,把本地运行时

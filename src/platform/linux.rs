@@ -194,6 +194,56 @@ pub(super) fn local_socket_peer_process_platform(fd: RawFd) -> Option<LocalSocke
     Some(LocalSocketPeerProcess { pid, pidfd })
 }
 
+/// pidfd plus start-time pin of a child this server spawned and still owns
+/// unreaped (herdr-8592). The pidfd reports exit before the owner reaps it and
+/// can never refer to a later process that reuses the PID.
+#[derive(Debug)]
+pub(crate) struct OwnedChildPin {
+    identity: super::ProcessIdentity,
+    pidfd: std::os::fd::OwnedFd,
+}
+
+impl OwnedChildPin {
+    pub(crate) fn identity(&self) -> super::ProcessIdentity {
+        self.identity
+    }
+
+    pub(crate) fn is_alive(&self) -> bool {
+        use std::os::fd::AsRawFd;
+        let mut event = libc::pollfd {
+            fd: self.pidfd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: zero-time poll borrows this owned, initialized pidfd.
+        (unsafe { libc::poll(&mut event, 1, 0) } == 0)
+            && process_identity(self.identity.pid) == Some(self.identity)
+    }
+}
+
+/// No unpinned fallback: without pidfd_open the pin fails and the caller stops
+/// its own child instead of trusting a numeric PID.
+pub(crate) fn pin_owned_child(child: &std::process::Child) -> std::io::Result<OwnedChildPin> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    let pid = child.id();
+    // SAFETY: pidfd_open takes a PID and flags and returns a new descriptor.
+    let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
+    if raw < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: pidfd_open returned a new descriptor that nothing else owns.
+    let pidfd = unsafe { OwnedFd::from_raw_fd(raw as RawFd) };
+    let identity = process_identity(pid)
+        .ok_or_else(|| std::io::Error::other("spawned process exited before it was pinned"))?;
+    let pin = OwnedChildPin { identity, pidfd };
+    if !pin.is_alive() {
+        return Err(std::io::Error::other(
+            "spawned process exited before it was pinned",
+        ));
+    }
+    Ok(pin)
+}
+
 const WSL_MARKER_ENV_VARS: &[&str] = &["WSL_DISTRO_NAME", "WSL_INTEROP"];
 const PROCESS_DETECTION_ENV_VAR: &str = "HERDR_PROCESS_DETECTION";
 const CHILD_GROUPS_SCAN_LIMIT: usize = 64;
