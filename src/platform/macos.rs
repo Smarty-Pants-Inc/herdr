@@ -1040,6 +1040,21 @@ fn process_identity_from_bsdinfo(
     Some(crate::platform::ProcessIdentity { pid, start_time })
 }
 
+/// Darwin's live generation checks and getpgid supply native job-control proof.
+/// A stopped/background reporter is not ownership evidence unless its group is
+/// still the foreground group read from this pane's master.
+pub(super) fn session_reporter_process_group_id(reporter: super::ProcessIdentity) -> Option<u32> {
+    let pid = libc::pid_t::try_from(reporter.pid)
+        .ok()
+        .filter(|pid| *pid > 0)?;
+    if process_identity(reporter.pid) != Some(reporter) {
+        return None;
+    }
+    // SAFETY: getpgid queries one positive PID and has no pointer arguments.
+    let group = unsafe { libc::getpgid(pid) };
+    (group > 0 && process_identity(reporter.pid) == Some(reporter)).then_some(group as u32)
+}
+
 pub(crate) fn process_caller_metadata_platform(
     peer: super::ProcessIdentity,
 ) -> Option<super::CallerMetadata> {

@@ -2,6 +2,8 @@ pub mod client;
 mod event_hub;
 pub mod schema;
 mod server;
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use server::handle_connection as test_handle_connection;
 mod status;
 mod subscriptions;
 mod wait;
@@ -60,6 +62,7 @@ pub(crate) fn request_changes_ui(request: &Request) -> bool {
             | Method::AgentStart(_)
             | Method::AgentStartGuarded(_)
             | Method::AgentPrompt(_)
+            | Method::AgentPromptSessionChecked(_)
             | Method::AgentSendKeys(_)
             | Method::PaneSplit(_)
             | Method::PaneSwap(_)

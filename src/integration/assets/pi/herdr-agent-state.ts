@@ -2,7 +2,7 @@
 // managed by herdr; reinstalling or updating the integration overwrites this file.
 // add custom hooks/plugins beside this file instead of editing it.
 // HERDR_INTEGRATION_ID=pi
-// HERDR_INTEGRATION_VERSION=10
+// HERDR_INTEGRATION_VERSION=11
 // @ts-nocheck
 
 import net from "node:net";
@@ -95,23 +95,18 @@ function updateSessionRef(ctx: any): void {
 }
 
 function withSessionRef(params: Record<string, unknown>): Record<string, unknown> {
-  if (currentAgentSessionPath) {
-    return { ...params, agent_session_path: currentAgentSessionPath };
-  }
-  if (currentAgentSessionId) {
-    return { ...params, agent_session_id: currentAgentSessionId };
-  }
-  return params;
+  const sessionRef = currentSessionRef();
+  return sessionRef ? { ...params, ...sessionRef } : params;
 }
 
 function currentSessionRef(): Record<string, unknown> | undefined {
-  if (currentAgentSessionPath) {
-    return { agent_session_path: currentAgentSessionPath };
+  if (!currentAgentSessionId && !currentAgentSessionPath) {
+    return undefined;
   }
-  if (currentAgentSessionId) {
-    return { agent_session_id: currentAgentSessionId };
-  }
-  return undefined;
+  return {
+    ...(currentAgentSessionId ? { agent_session_id: currentAgentSessionId } : {}),
+    ...(currentAgentSessionPath ? { agent_session_path: currentAgentSessionPath } : {}),
+  };
 }
 
 function reportSession(sessionStartSource?: string): Promise<void> {

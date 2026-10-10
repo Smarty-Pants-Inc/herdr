@@ -61,6 +61,98 @@ impl App {
         })
     }
 
+    /// Compatibility check for tests that do not enqueue input. Production input
+    /// callers must carry the captured evidence to the actual PTY writer.
+    #[cfg(test)]
+    pub(super) fn check_expected_agent_session(
+        &self,
+        expected: Option<&str>,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+    ) -> Result<(), crate::api::schema::ErrorBody> {
+        self.capture_expected_agent_session(expected, ws_idx, pane_id)
+            .map(|_| ())
+    }
+
+    /// Capture the accepted sidecar's reporter incarnation and opaque session ID
+    /// in the same App step as the initial comparison. The actor must freshly
+    /// prove this reporter owns its master before every syscall, including Enter.
+    /// Neither cached detection nor an unreported internal session is proof.
+    pub(super) fn capture_expected_agent_session(
+        &self,
+        expected: Option<&str>,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+    ) -> Result<Option<crate::pty::actor::SessionInputGuard>, crate::api::schema::ErrorBody> {
+        let Some(expected) = expected else {
+            return Ok(None);
+        };
+        if !crate::platform::expected_agent_session_guard_supported() {
+            return Err(crate::api::schema::ErrorBody {
+                code: "expected_agent_session_unsupported".into(),
+                message: "expected agent session guards are supported only on Linux".into(),
+            });
+        }
+        let actual = self
+            .state
+            .terminal_id_for_pane(ws_idx, pane_id)
+            .and_then(|id| self.state.terminals.get(&id))
+            .and_then(|terminal| {
+                let reporter = terminal.reported_agent_session_reporter()?;
+                let runtime = self.state.runtime_for_pane_in_workspace(
+                    &self.terminal_runtimes,
+                    ws_idx,
+                    pane_id,
+                )?;
+                if !runtime.session_reporter_is_foreground(reporter) {
+                    return None;
+                }
+                Some((
+                    terminal.reported_agent_session_id()?,
+                    reporter,
+                    terminal.reported_agent_session_validity()?,
+                ))
+            });
+        match actual {
+            Some((actual, reporter, binding_validity)) if actual == expected => {
+                Ok(Some(crate::pty::actor::SessionInputGuard {
+                    reporter,
+                    expected_agent_session_id: actual.to_owned(),
+                    binding_validity,
+                }))
+            }
+            Some(_) => Err(crate::api::schema::ErrorBody {
+                code: "agent_session_mismatch".into(),
+                message: format!(
+                    "the target's reported agent session does not match expected {expected:?}"
+                ),
+            }),
+            None => Err(crate::api::schema::ErrorBody {
+                code: "agent_session_unknown".into(),
+                message: format!(
+                    "the target has no accepted current agent session ID for expected {expected:?}"
+                ),
+            }),
+        }
+    }
+
+    pub(super) fn check_expected_pane(
+        &self,
+        expected: Option<&str>,
+        target: &TerminalTarget,
+    ) -> Result<(), crate::api::schema::ErrorBody> {
+        let Some(expected) = expected else {
+            return Ok(());
+        };
+        if self.parse_pane_id(expected) == Some((target.ws_idx, target.pane_id)) {
+            return Ok(());
+        }
+        Err(crate::api::schema::ErrorBody {
+            code: "expected_pane_mismatch".into(),
+            message: "the agent target no longer resolves to the expected pane".into(),
+        })
+    }
+
     pub(crate) fn resolve_terminal_target(
         &self,
         target: &str,
@@ -606,6 +698,7 @@ mod tests {
                     Request {
                         id: "logged".into(),
                         method: Method::PaneSendText(PaneSendTextParams {
+                            expected_agent_session_id: None,
                             pane_id: target_id.clone(),
                             text: "private prompt".into(),
                             allow_cross_pane: false,

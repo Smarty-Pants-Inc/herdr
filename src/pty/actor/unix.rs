@@ -2,14 +2,18 @@ use std::{
     collections::VecDeque,
     io::{Read, Write},
     os::fd::{AsRawFd, OwnedFd, RawFd},
-    sync::{mpsc as std_mpsc, Arc, Mutex, Weak},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc as std_mpsc, Arc, Mutex, Weak,
+    },
     time::{Duration, Instant},
 };
 
 use bytes::Bytes;
 use tokio::sync::mpsc::{self, error::TryRecvError as DataTryRecvError};
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
+use super::SessionInputGuard;
 use crate::pty::fd;
 use crate::pty::input_consumer::{
     classify_replies, AuditSink, ConsumerOperation, ConsumerResponse, InputSource, Ledger,
@@ -83,6 +87,7 @@ enum PtyIoDataCommand {
         reply: std_mpsc::Sender<ConsumerResponse>,
     },
     SubmitUserInput {
+        guard: Option<SessionInputGuard>,
         source: InputSource,
         text: Bytes,
         enter: Bytes,
@@ -92,6 +97,12 @@ enum PtyIoDataCommand {
 }
 
 enum PtyIoControlCommand {
+    ClearInputPoison(std_mpsc::Sender<std::io::Result<()>>),
+    #[cfg(test)]
+    SetBeforeWrite {
+        callback: Box<dyn FnMut(usize) + Send>,
+        reply: std_mpsc::Sender<()>,
+    },
     BeginHandoff(std_mpsc::Sender<std::io::Result<()>>),
     DuplicateForHandoff(std_mpsc::Sender<std::io::Result<RawFd>>),
     ForegroundProcessGroup(std_mpsc::Sender<Option<u32>>),
@@ -102,6 +113,7 @@ enum PtyIoControlCommand {
 
 #[derive(Clone)]
 pub(crate) struct PtyIoActorHandle {
+    input_poisoned: Arc<AtomicBool>,
     data_tx: mpsc::Sender<PtyIoDataCommand>,
     control_tx: std_mpsc::Sender<PtyIoControlCommand>,
     wake: fd::WakeWriter,
@@ -118,6 +130,48 @@ struct UserWriteGate {
 }
 
 impl PtyIoActorHandle {
+    pub(crate) fn input_is_poisoned(&self) -> bool {
+        self.input_poisoned.load(Ordering::Acquire)
+    }
+    pub(crate) fn clear_input_poison(&self) -> std::io::Result<()> {
+        let (reply, receipt) = std_mpsc::channel();
+        self.control_tx
+            .send(PtyIoControlCommand::ClearInputPoison(reply))
+            .map_err(|_| input_submission_closed_error())?;
+        self.wake_actor();
+        receipt
+            .recv_timeout(Duration::from_secs(2))
+            .map_err(|_| input_submission_closed_error())?
+    }
+    #[cfg(test)]
+    pub(crate) fn test_set_input_poisoned(&self, poisoned: bool) {
+        self.input_poisoned.store(poisoned, Ordering::Release);
+    }
+    /// Installs a bounded native-test barrier before each write's proof. The
+    /// callback receives a 1-based attempt count since installation. Runner-
+    /// local hooks and full native chunk sizes are preserved.
+    /// Acknowledgment ensures no test races callback installation with enqueue.
+    #[cfg(test)]
+    pub(crate) fn test_set_before_write(
+        &self,
+        callback: Box<dyn FnMut(usize) + Send>,
+    ) -> std::io::Result<()> {
+        let (reply, installed) = std_mpsc::channel();
+        self.control_tx
+            .send(PtyIoControlCommand::SetBeforeWrite { callback, reply })
+            .map_err(|_| input_submission_closed_error())?;
+        self.wake_actor();
+        installed
+            .recv_timeout(Duration::from_secs(2))
+            .map_err(|error| match error {
+                std_mpsc::RecvTimeoutError::Timeout => std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "timed out installing native PTY write barrier",
+                ),
+                std_mpsc::RecvTimeoutError::Disconnected => input_submission_closed_error(),
+            })
+    }
+
     pub(crate) fn queue_input_consumer_operation(
         &self,
         operation: ConsumerOperation,
@@ -151,7 +205,7 @@ impl PtyIoActorHandle {
             .user_writes
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if !user_writes.accepting {
+        if !user_writes.accepting || self.input_is_poisoned() {
             return Err(mpsc::error::TrySendError::Closed(bytes));
         }
         match self
@@ -206,10 +260,35 @@ impl PtyIoActorHandle {
         delay: Duration,
         source: InputSource,
     ) -> std::io::Result<std_mpsc::Receiver<std::io::Result<()>>> {
+        self.queue_submission(text, enter, delay, None, source)
+    }
+
+    pub(crate) fn queue_guarded_user_input_submission_with_source(
+        &self,
+        text: Bytes,
+        enter: Bytes,
+        delay: Duration,
+        guard: SessionInputGuard,
+        source: InputSource,
+    ) -> std::io::Result<std_mpsc::Receiver<std::io::Result<()>>> {
+        self.queue_submission(text, enter, delay, Some(guard), source)
+    }
+
+    fn queue_submission(
+        &self,
+        text: Bytes,
+        enter: Bytes,
+        delay: Duration,
+        guard: Option<SessionInputGuard>,
+        source: InputSource,
+    ) -> std::io::Result<std_mpsc::Receiver<std::io::Result<()>>> {
         let user_writes = self
             .user_writes
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.input_is_poisoned() {
+            return Err(super::pane_input_poisoned());
+        }
         if !user_writes.accepting {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
@@ -219,6 +298,7 @@ impl PtyIoActorHandle {
         let (reply_tx, reply_rx) = std_mpsc::channel();
         self.data_tx
             .try_send(PtyIoDataCommand::SubmitUserInput {
+                guard,
                 source: source.user(),
                 text,
                 enter,
@@ -461,7 +541,9 @@ impl PtyIoActor {
         let controls = Arc::new(Mutex::new(SharedPtyControls::default()));
         let response_order = Arc::new(Mutex::new(()));
         let file = ActorPtyFile::new(std::fs::File::from(config.master_fd));
+        let input_poisoned = Arc::new(AtomicBool::new(false));
         let handle = PtyIoActorHandle {
+            input_poisoned: Arc::clone(&input_poisoned),
             data_tx,
             control_tx,
             wake: wake_pipe.writer,
@@ -473,6 +555,8 @@ impl PtyIoActor {
         };
 
         let mut runner = PtyIoActorRunner {
+            user_writes: Arc::clone(&handle.user_writes),
+            input_poisoned,
             pane_id: config.pane_id,
             consumer_epoch: Arc::clone(&handle.consumer_epoch),
             consumer: None,
@@ -536,6 +620,19 @@ impl PtyForegroundObserver {
 struct ActorPtyFile {
     file: Option<std::fs::File>,
     foreground: Arc<Mutex<Option<RawFd>>>,
+    /// Native tests pause immediately before the proof, not after it. No hook
+    /// or branch exists in production, and the underlying write remains real.
+    #[cfg(test)]
+    before_write: Option<Box<dyn FnMut(usize) + Send>>,
+    /// Separately installed barriers must not replace runner-local hooks.
+    #[cfg(test)]
+    installed_before_write: Option<Box<dyn FnMut(usize) + Send>>,
+    /// Lets native tests invalidate/drop the binding root during the actual
+    /// native proof. No replacement process or foreground answers are mocked.
+    #[cfg(test)]
+    during_guard_proof: Option<Box<dyn FnMut() + Send>>,
+    #[cfg(test)]
+    force_flush_failure: bool,
 }
 
 impl ActorPtyFile {
@@ -544,6 +641,14 @@ impl ActorPtyFile {
         Self {
             file: Some(file),
             foreground,
+            #[cfg(test)]
+            before_write: None,
+            #[cfg(test)]
+            installed_before_write: None,
+            #[cfg(test)]
+            during_guard_proof: None,
+            #[cfg(test)]
+            force_flush_failure: false,
         }
     }
 
@@ -593,6 +698,8 @@ impl Write for ActorPtyFile {
 }
 
 struct PtyIoActorRunner {
+    user_writes: Arc<Mutex<UserWriteGate>>,
+    input_poisoned: Arc<AtomicBool>,
     pane_id: u32,
     consumer_epoch: Arc<Mutex<Option<String>>>,
     consumer: Option<(crate::platform::InputConsumerSnapshot, Ledger)>,
@@ -626,10 +733,14 @@ struct PtyIoActorRunner {
 }
 
 struct ActiveSubmission {
+    guard: Option<SessionInputGuard>,
     source: InputSource,
     enter: Bytes,
     delay: Duration,
     phase: SubmissionPhase,
+    /// Submission text reached the PTY. This remains true after the text
+    /// boundary completes so delayed-Enter loss reports truthful partial input.
+    text_bytes_written: bool,
     reply: std_mpsc::Sender<std::io::Result<()>>,
 }
 
@@ -654,6 +765,29 @@ enum SubmissionPhase {
 }
 
 impl PtyIoActorRunner {
+    fn refuse_queued_poisoned_input(&mut self) {
+        self.pending_writes.clear();
+        self.current_write_offset = 0;
+        self.fail_active_submission(super::pane_input_poisoned());
+        while let Ok(command) = self.data_rx.try_recv() {
+            match command {
+                PtyIoDataCommand::SubmitUserInput { reply, .. } => {
+                    let _ = reply.send(Err(super::pane_input_poisoned()));
+                }
+                PtyIoDataCommand::Consumer { reply, .. } => {
+                    let _ = reply.send(ConsumerResponse::Refused {
+                        reason: "pane_input_poisoned".into(),
+                    });
+                }
+                PtyIoDataCommand::WriteUserInput(..) => {}
+            }
+        }
+        let mut controls = self.controls.lock().unwrap_or_else(|p| p.into_inner());
+        controls.terminal_responses.clear();
+        if let Some(resize) = controls.resize.as_mut() {
+            resize.terminal_responses.clear();
+        }
+    }
     fn end_consumer(&mut self) {
         self.consumer = None;
         *self
@@ -995,6 +1129,20 @@ impl PtyIoActorRunner {
     }
 
     fn handle_data_command(&mut self, command: PtyIoDataCommand) -> bool {
+        if self.input_poisoned.load(Ordering::Acquire) {
+            match command {
+                PtyIoDataCommand::SubmitUserInput { reply, .. } => {
+                    let _ = reply.send(Err(super::pane_input_poisoned()));
+                }
+                PtyIoDataCommand::Consumer { reply, .. } => {
+                    let _ = reply.send(ConsumerResponse::Refused {
+                        reason: "pane_input_poisoned".into(),
+                    });
+                }
+                PtyIoDataCommand::WriteUserInput(..) => {}
+            }
+            return false;
+        }
         match command {
             PtyIoDataCommand::Consumer {
                 operation,
@@ -1015,12 +1163,19 @@ impl PtyIoActorRunner {
                 }
             }
             PtyIoDataCommand::SubmitUserInput {
+                guard,
                 source,
                 text,
                 enter,
                 delay,
                 reply,
             } => {
+                if !crate::platform::expected_agent_session_guard_supported() {
+                    if let Some(guard) = guard.as_ref() {
+                        let _ = reply.send(Err(super::agent_session_lost(guard, false)));
+                        return false;
+                    }
+                }
                 if self.state == ActorState::Running {
                     let phase = if text.is_empty() {
                         SubmissionPhase::WaitingUntil(Instant::now() + delay)
@@ -1033,10 +1188,12 @@ impl PtyIoActorRunner {
                         SubmissionPhase::WritingText
                     };
                     self.active_submission = Some(ActiveSubmission {
+                        guard,
                         source,
                         enter,
                         delay,
                         phase,
+                        text_bytes_written: false,
                         reply,
                     });
                 } else {
@@ -1052,6 +1209,28 @@ impl PtyIoActorRunner {
 
     fn handle_control_command(&mut self, command: PtyIoControlCommand) -> bool {
         match command {
+            PtyIoControlCommand::ClearInputPoison(reply) => {
+                let gate = Arc::clone(&self.user_writes);
+                let _gate = gate.lock().unwrap_or_else(|p| p.into_inner());
+                if self.input_poisoned.load(Ordering::Acquire) {
+                    self.refuse_queued_poisoned_input();
+                    self.sanitizer.reset();
+                    self.input_poisoned.store(false, Ordering::Release);
+                }
+                let _ = reply.send(Ok(()));
+            }
+            #[cfg(test)]
+            PtyIoControlCommand::SetBeforeWrite {
+                mut callback,
+                reply,
+            } => {
+                let mut attempts = 0usize;
+                self.file.installed_before_write = Some(Box::new(move |_| {
+                    attempts += 1;
+                    callback(attempts);
+                }));
+                let _ = reply.send(());
+            }
             PtyIoControlCommand::BeginHandoff(reply) => {
                 self.defer_or_begin_handoff(reply);
             }
@@ -1109,6 +1288,11 @@ impl PtyIoActorRunner {
     }
 
     fn begin_handoff(&mut self) -> std::io::Result<()> {
+        // Poison is live runtime safety state, not a field in a frozen handoff
+        // codec. Refuse transfer instead of silently clearing it in a new actor.
+        if self.input_poisoned.load(Ordering::Acquire) {
+            return Err(super::pane_input_poisoned());
+        }
         self.drain_pre_quiesce_commands();
         if self.active_submission.is_some() {
             return Err(std::io::Error::new(
@@ -1359,7 +1543,91 @@ impl PtyIoActorRunner {
 
     fn flush_pending_writes_once(&mut self) -> std::io::Result<Option<SubmissionBoundary>> {
         self.check_consumer();
+        if self.input_poisoned.load(Ordering::Acquire) {
+            self.refuse_queued_poisoned_input();
+            return Ok(None);
+        }
         while let Some(write) = self.pending_writes.front() {
+            #[cfg(test)]
+            if let Some(before_write) = self.file.before_write.as_mut() {
+                before_write(self.current_write_offset);
+            }
+            #[cfg(test)]
+            if let Some(installed) = self.file.installed_before_write.as_mut() {
+                installed(self.current_write_offset);
+            }
+            // Only Text/Enter belong to the one active submission. Ordinary
+            // writes, terminal replies and consumer markers never inherit its
+            // guard, even when interleaved with its delayed Enter.
+            if matches!(
+                write.boundary,
+                Some(SubmissionBoundary::Text | SubmissionBoundary::Enter)
+            ) {
+                if let Some(guard) = self
+                    .active_submission
+                    .as_ref()
+                    .and_then(|submission| submission.guard.as_ref())
+                {
+                    // Re-prove at EVERY syscall, including the next partial
+                    // chunk and retries after WouldBlock or Interrupted. This
+                    // reads this actor's master directly, without a cached
+                    // observer, process-tree scan, or actor request roundtrip.
+                    // Scalar-only weak-root checks bracket the native proof.
+                    // Each upgrade temporary is dropped within the helper: no
+                    // strong Arc survives across native evidence or write(2).
+                    if !guard.binding_is_current()
+                        || !crate::platform::session_reporter_is_foreground(guard.reporter, || {
+                            #[cfg(test)]
+                            if let Some(during_proof) = self.file.during_guard_proof.as_mut() {
+                                during_proof();
+                            }
+                            crate::platform::foreground_process_group_id_for_tty_fd(
+                                self.file.as_raw_fd(),
+                            )
+                        })
+                        || !guard.binding_is_current()
+                    {
+                        let partial_text_consumed = self
+                            .active_submission
+                            .as_ref()
+                            .is_some_and(|submission| submission.text_bytes_written);
+                        let mut error = super::agent_session_lost(guard, partial_text_consumed);
+                        // Single active submission means no request IDs are
+                        // needed. Drop only its remaining parts, preserving
+                        // unrelated FIFO work and ordered consumer markers.
+                        self.pending_writes.retain(|pending| {
+                            !matches!(
+                                pending.boundary,
+                                Some(SubmissionBoundary::Text | SubmissionBoundary::Enter)
+                            )
+                        });
+                        self.current_write_offset = 0;
+                        if partial_text_consumed {
+                            #[cfg(test)]
+                            let flushed = if self.file.force_flush_failure {
+                                Err(std::io::Error::other("forced slave input flush failure"))
+                            } else {
+                                crate::platform::flush_pty_input(self.file.as_raw_fd())
+                            };
+                            #[cfg(not(test))]
+                            let flushed = crate::platform::flush_pty_input(self.file.as_raw_fd());
+                            if let Err(flush_error) = flushed {
+                                error!(pane = self.pane_id, err = %flush_error,
+                                    "guarded PTY flush failed; all pane input is poisoned until explicit operator clear");
+                                error = super::agent_session_flush_failed(guard);
+                                self.input_poisoned.store(true, Ordering::Release);
+                            }
+                        }
+                        self.fail_active_submission(error);
+                        if self.input_poisoned.load(Ordering::Acquire) {
+                            self.end_consumer();
+                            self.refuse_queued_poisoned_input();
+                            return Ok(None);
+                        }
+                        continue;
+                    }
+                }
+            }
             let chunk = &write.bytes[self.current_write_offset..];
             match self.file.write(chunk) {
                 Ok(0) => {
@@ -1371,6 +1639,11 @@ impl PtyIoActorRunner {
                 Ok(written) => {
                     if let (Some(source), Some((_, ledger))) = (&write.source, &mut self.consumer) {
                         ledger.record(&chunk[..written], source, Instant::now());
+                    }
+                    if written > 0 && write.boundary == Some(SubmissionBoundary::Text) {
+                        if let Some(submission) = self.active_submission.as_mut() {
+                            submission.text_bytes_written = true;
+                        }
                     }
                     self.current_write_offset += written;
                     if self.current_write_offset >= write.bytes.len() {
@@ -1466,6 +1739,9 @@ fn input_submission_closed_error() -> std::io::Error {
     )
 }
 
+#[cfg(all(test, target_os = "linux"))]
+mod guard_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1520,7 +1796,7 @@ mod tests {
         (handle, peer, read_rx)
     }
 
-    fn actor_runner_for_unit_test() -> (PtyIoActorRunner, UnixStream) {
+    pub(super) fn actor_runner_for_unit_test() -> (PtyIoActorRunner, UnixStream) {
         let (actor_socket, peer) = UnixStream::pair().expect("socket pair");
         actor_socket
             .set_nonblocking(true)
@@ -1530,6 +1806,8 @@ mod tests {
         let (_control_tx, control_rx) = std_mpsc::channel();
         let wake_pipe = fd::create_wake_pipe().expect("wake pipe");
         let runner = PtyIoActorRunner {
+            user_writes: Arc::new(Mutex::new(UserWriteGate { accepting: true })),
+            input_poisoned: Arc::new(AtomicBool::new(false)),
             pane_id: 1,
             consumer_epoch: Arc::new(Mutex::new(None)),
             consumer: None,
@@ -1553,6 +1831,70 @@ mod tests {
             poll_observer: None,
         };
         (runner, peer)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn guarded_submission_fails_closed_without_linux_slave_flush_proof() {
+        let (mut runner, mut peer) = actor_runner_for_unit_test();
+        peer.set_nonblocking(true).expect("nonblocking peer");
+        let (reply, receipt) = std_mpsc::channel();
+        runner.handle_data_command(PtyIoDataCommand::SubmitUserInput {
+            guard: Some(SessionInputGuard {
+                reporter: crate::platform::ProcessIdentity {
+                    pid: std::process::id(),
+                    start_time: 0,
+                },
+                expected_agent_session_id: "unsupported-session".into(),
+                binding_validity: Weak::new(),
+            }),
+            source: InputSource::Api,
+            text: Bytes::from_static(b"forbidden"),
+            enter: Bytes::from_static(b"\r"),
+            delay: Duration::ZERO,
+            reply,
+        });
+        let error = receipt
+            .recv()
+            .expect("completion")
+            .expect_err("unsupported");
+        assert_eq!(
+            super::super::agent_session_loss_partial_text_consumed(&error),
+            Some(false)
+        );
+        assert!(runner.active_submission.is_none());
+        assert!(runner.pending_writes.is_empty());
+        let mut bytes = [0; 32];
+        assert_eq!(
+            peer.read(&mut bytes).expect_err("nothing written").kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        runner.enqueue_write(Bytes::from_static(b"legacy"));
+        runner.flush_pending_writes_once().expect("legacy write");
+        assert_eq!(peer.read(&mut bytes).expect("legacy input"), 6);
+        assert_eq!(&bytes[..6], b"legacy");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn session_reporter_foreground_rejects_non_tty_and_closed_master() {
+        let (mut runner, _peer) = actor_runner_for_unit_test();
+        let reporter =
+            crate::platform::process_identity(std::process::id()).expect("live reporter pin");
+        let observer = PtyForegroundObserver(Arc::downgrade(&runner.file.foreground));
+        // A live non-terminal fd has no kernel foreground group; a cached
+        // process-group answer cannot turn that into ownership evidence.
+        assert_eq!(observer.observe(), Some(None));
+        assert!(!crate::platform::session_reporter_is_foreground(
+            reporter,
+            || { observer.observe().flatten() }
+        ));
+        runner.file.close();
+        assert_eq!(observer.observe(), None);
+        assert!(!crate::platform::session_reporter_is_foreground(
+            reporter,
+            || { observer.observe().flatten() }
+        ));
     }
 
     #[test]
@@ -2086,6 +2428,7 @@ mod tests {
         let controls = Arc::new(Mutex::new(SharedPtyControls::default()));
         let (wake, _wake_read_fd) = test_wake_pair();
         let handle = PtyIoActorHandle {
+            input_poisoned: Arc::new(AtomicBool::new(false)),
             data_tx,
             control_tx,
             wake,
@@ -2144,6 +2487,8 @@ mod tests {
         let light = Arc::new(AtomicBool::new(false));
         let query_light = Arc::clone(&light);
         let runner = PtyIoActorRunner {
+            user_writes: Arc::new(Mutex::new(UserWriteGate { accepting: true })),
+            input_poisoned: Arc::new(AtomicBool::new(false)),
             pane_id: 1,
             consumer_epoch: Arc::new(Mutex::new(None)),
             consumer: None,
@@ -2173,6 +2518,7 @@ mod tests {
             poll_observer: None,
         };
         let handle = PtyIoActorHandle {
+            input_poisoned: Arc::clone(&runner.input_poisoned),
             data_tx,
             control_tx,
             wake: wake_pipe.writer,
@@ -2247,6 +2593,7 @@ mod tests {
             .expect("fill data queue");
         let (wake, _wake_read_fd) = test_wake_pair();
         let handle = PtyIoActorHandle {
+            input_poisoned: Arc::new(AtomicBool::new(false)),
             data_tx,
             control_tx,
             wake,
@@ -2291,6 +2638,8 @@ mod tests {
             ))
             .expect("queued write");
         let mut runner = PtyIoActorRunner {
+            user_writes: Arc::new(Mutex::new(UserWriteGate { accepting: true })),
+            input_poisoned: Arc::new(AtomicBool::new(false)),
             pane_id: 1,
             consumer_epoch: Arc::new(Mutex::new(None)),
             consumer: None,

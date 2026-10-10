@@ -1,3 +1,112 @@
+/// Pinned admission evidence carried to the actual PTY writer. Native session
+/// identifiers are opaque to the actor; the reporter is a process incarnation,
+/// not a PID-only or cached foreground observation.
+#[derive(Debug, Clone)]
+pub(crate) struct SessionInputGuard {
+    pub(crate) reporter: crate::platform::ProcessIdentity,
+    pub(crate) expected_agent_session_id: String,
+    /// The accepted binding owns the strong root. Queued input must neither
+    /// extend that binding's lifetime nor retain a strong root during proof.
+    pub binding_validity: std::sync::Weak<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(unix)]
+impl SessionInputGuard {
+    fn binding_is_current(&self) -> bool {
+        self.binding_validity
+            .upgrade()
+            .is_some_and(|validity| validity.load(std::sync::atomic::Ordering::Acquire))
+    }
+}
+
+#[derive(Debug)]
+struct AgentSessionLost {
+    expected_agent_session_id: String,
+    /// True means submission text reached the PTY and may have been consumed;
+    /// it does not claim that a reader consumed every byte.
+    partial_text_consumed: Option<bool>,
+    flush_failed: bool,
+}
+
+impl std::fmt::Display for AgentSessionLost {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "agent session ownership was lost: {}; partial_text_consumed={}; flush_failed={}",
+            self.expected_agent_session_id,
+            self.partial_text_consumed
+                .map_or("unknown", |partial| if partial { "true" } else { "false" }),
+            self.flush_failed
+        )
+    }
+}
+
+impl std::error::Error for AgentSessionLost {}
+
+/// Only ownership loss has this payload. Never classify generic permission or
+/// PTY failures as session loss. Some text may already have reached the PTY.
+pub(crate) fn is_agent_session_lost(error: &std::io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|cause| cause.is::<AgentSessionLost>())
+}
+
+pub(crate) fn agent_session_loss_details(error: &std::io::Error) -> Option<(Option<bool>, bool)> {
+    error
+        .get_ref()
+        .and_then(|cause| cause.downcast_ref::<AgentSessionLost>())
+        .map(|loss| (loss.partial_text_consumed, loss.flush_failed))
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn agent_session_loss_partial_text_consumed(error: &std::io::Error) -> Option<bool> {
+    agent_session_loss_details(error).and_then(|(partial, _)| partial)
+}
+
+#[derive(Debug)]
+struct PaneInputPoisoned;
+impl std::fmt::Display for PaneInputPoisoned {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("pane_input_poisoned: input blocked after a failed flush; staged text may remain on the line; inspect or discard it before explicitly clearing input poison")
+    }
+}
+impl std::error::Error for PaneInputPoisoned {}
+#[cfg(unix)]
+pub(crate) fn pane_input_poisoned() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::PermissionDenied, PaneInputPoisoned)
+}
+pub(crate) fn is_pane_input_poisoned(error: &std::io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|cause| cause.is::<PaneInputPoisoned>())
+}
+
+pub(crate) fn agent_session_lost(
+    guard: &SessionInputGuard,
+    partial_text_consumed: bool,
+) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        AgentSessionLost {
+            expected_agent_session_id: guard.expected_agent_session_id.clone(),
+            partial_text_consumed: Some(partial_text_consumed),
+            flush_failed: false,
+        },
+    )
+}
+
+#[cfg(unix)]
+pub(crate) fn agent_session_flush_failed(guard: &SessionInputGuard) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        AgentSessionLost {
+            expected_agent_session_id: guard.expected_agent_session_id.clone(),
+            partial_text_consumed: None,
+            flush_failed: true,
+        },
+    )
+}
+
 #[cfg(unix)]
 mod unix;
 
@@ -78,6 +187,30 @@ mod windows {
     }
 
     impl PtyIoActorHandle {
+        pub(crate) fn input_is_poisoned(&self) -> bool {
+            false
+        }
+        pub(crate) fn clear_input_poison(&self) -> std::io::Result<()> {
+            Ok(())
+        }
+        #[cfg(test)]
+        pub(crate) fn test_set_input_poisoned(&self, _poisoned: bool) {}
+        /// ConPTY has no equivalent native foreground reporter proof. Never
+        /// enqueue guarded input on this unsupported platform.
+        pub(crate) fn queue_guarded_user_input_submission_with_source(
+            &self,
+            _text: Bytes,
+            _enter: Bytes,
+            _delay: Duration,
+            guard: super::SessionInputGuard,
+            _source: crate::pty::input_consumer::InputSource,
+        ) -> std::io::Result<std_mpsc::Receiver<std::io::Result<()>>> {
+            // The pin is carried by the common interface, but cannot be proved
+            // against ConPTY. Do not substitute process existence for ownership.
+            let _ = (guard.reporter, &guard.binding_validity);
+            Err(super::agent_session_lost(&guard, false))
+        }
+
         pub(crate) fn input_consumer_epoch_matches(&self, _epoch: &str) -> bool {
             false
         }
@@ -445,6 +578,48 @@ mod windows {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn guarded_submission_fails_closed_without_enqueuing_on_windows() {
+            let (data_tx, mut data_rx) = mpsc::channel(2);
+            let (control_tx, _control_rx) = std_mpsc::channel();
+            let (write_tx, write_rx) = std_mpsc::channel();
+            let handle = PtyIoActorHandle {
+                data_tx,
+                control_tx,
+                write_tx,
+                response_order: Arc::new(Mutex::new(())),
+                accepting: Arc::new(Mutex::new(true)),
+            };
+            let guard = super::super::SessionInputGuard {
+                reporter: crate::platform::ProcessIdentity {
+                    pid: std::process::id(),
+                    start_time: 0,
+                },
+                expected_agent_session_id: "unsupported-session".into(),
+                binding_validity: std::sync::Weak::new(),
+            };
+            let error = handle
+                .queue_guarded_user_input_submission_with_source(
+                    Bytes::from_static(b"forbidden"),
+                    Bytes::from_static(b"\r"),
+                    Duration::ZERO,
+                    guard,
+                    crate::pty::input_consumer::InputSource::Api,
+                )
+                .expect_err("ConPTY has no native proof");
+            assert!(super::super::is_agent_session_lost(&error));
+            assert!(data_rx.try_recv().is_err());
+            assert!(write_rx.try_recv().is_err());
+            // Ordinary legacy input still uses the original path.
+            handle
+                .try_write_user_input(Bytes::from_static(b"legacy"))
+                .expect("legacy queues");
+            assert!(
+                matches!(data_rx.try_recv(), Ok(PtyIoDataCommand::WriteUserInput(bytes)) if bytes == b"legacy"[..])
+            );
+        }
+
         struct RecordingWriter {
             writes: Vec<(Vec<u8>, Instant)>,
             flushes: Vec<Instant>,

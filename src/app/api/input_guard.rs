@@ -4,7 +4,39 @@ use crate::api::schema::{Method, Request};
 use crate::api::ApiRequestContext;
 use crate::app::terminal_targets::{InputOrigin, TerminalTarget};
 
+fn session_checked_guard_error(
+    supported: bool,
+    method: &Method,
+) -> Option<(&'static str, &'static str)> {
+    let missing = match method {
+        Method::AgentPromptSessionChecked(params) => {
+            params.expected_agent_session_id.is_none() && params.expected_pane_id.is_none()
+        }
+        Method::PaneSendTextSessionChecked(params) => params.expected_agent_session_id.is_none(),
+        Method::PaneSendKeysSessionChecked(params) => params.expected_agent_session_id.is_none(),
+        _ => return None,
+    };
+    if !supported {
+        return Some((
+            "expected_agent_session_unsupported",
+            "expected agent session guards are supported only on Linux",
+        ));
+    }
+    missing.then_some((
+        "invalid_request",
+        "session-checked method requires an identity expectation",
+    ))
+}
+
 impl App {
+    pub(super) fn session_checked_guard_denial(&self, request: &Request) -> Option<String> {
+        session_checked_guard_error(
+            crate::platform::expected_agent_session_guard_supported(),
+            &request.method,
+        )
+        .map(|(code, message)| encode_error(request.id.clone(), code, message))
+    }
+
     // This is a policy guard, not caller authentication.
     pub(super) fn cross_pane_input_denial(
         &self,
@@ -39,12 +71,18 @@ impl App {
             Method::AgentStart(params) | Method::AgentStartGuarded(params) => {
                 params.allow_cross_pane
             }
-            Method::AgentPrompt(params) => params.allow_cross_pane,
+            Method::AgentPrompt(params) | Method::AgentPromptSessionChecked(params) => {
+                params.allow_cross_pane
+            }
             Method::AgentSendKeys(params) => params.allow_cross_pane,
             Method::PaneReportAgent(params) => params.allow_cross_pane,
             Method::PaneReportAgentSession(params) => params.allow_cross_pane,
-            Method::PaneSendText(params) => params.allow_cross_pane,
-            Method::PaneSendKeys(params) => params.allow_cross_pane,
+            Method::PaneSendText(params) | Method::PaneSendTextSessionChecked(params) => {
+                params.allow_cross_pane
+            }
+            Method::PaneSendKeys(params) | Method::PaneSendKeysSessionChecked(params) => {
+                params.allow_cross_pane
+            }
             Method::PaneSendInput(params) | Method::PaneSendInputGuarded(params) => {
                 params.allow_cross_pane
             }
@@ -57,10 +95,16 @@ impl App {
             Method::AgentStart(params) | Method::AgentStartGuarded(params) => {
                 self.pane_target(&params.pane_id)
             }
-            Method::AgentPrompt(params) => self.resolve_agent_target(&params.target).ok(),
+            Method::AgentPrompt(params) | Method::AgentPromptSessionChecked(params) => {
+                self.resolve_agent_target(&params.target).ok()
+            }
             Method::AgentSendKeys(params) => self.resolve_agent_target(&params.target).ok(),
-            Method::PaneSendText(params) => self.pane_target(&params.pane_id),
-            Method::PaneSendKeys(params) => self.pane_target(&params.pane_id),
+            Method::PaneSendText(params) | Method::PaneSendTextSessionChecked(params) => {
+                self.pane_target(&params.pane_id)
+            }
+            Method::PaneSendKeys(params) | Method::PaneSendKeysSessionChecked(params) => {
+                self.pane_target(&params.pane_id)
+            }
             Method::PaneSendInput(params) | Method::PaneSendInputGuarded(params) => {
                 self.pane_target(&params.pane_id)
             }
@@ -94,6 +138,94 @@ mod tests {
     use crate::workspace::Workspace;
     use bytes::Bytes;
     use tokio::sync::mpsc::Receiver;
+
+    #[test]
+    fn session_checked_prompt_support_is_required_regardless_of_expectations() {
+        for (session, pane) in [
+            (None, None),
+            (None, Some("w1:p1")),
+            (Some("session"), None),
+            (Some("session"), Some("w1:p1")),
+        ] {
+            let method = Method::AgentPromptSessionChecked(AgentPromptParams {
+                expected_agent_session_id: session.map(str::to_owned),
+                expected_pane_id: pane.map(str::to_owned),
+                target: "agent".into(),
+                text: "prompt".into(),
+                wait: None,
+                allow_cross_pane: true,
+            });
+            assert_eq!(
+                session_checked_guard_error(false, &method).map(|(code, _)| code),
+                Some("expected_agent_session_unsupported")
+            );
+            assert_eq!(
+                session_checked_guard_error(true, &method).map(|(code, _)| code),
+                (session.is_none() && pane.is_none()).then_some("invalid_request")
+            );
+        }
+    }
+
+    #[test]
+    fn session_checked_pane_send_support_is_required_regardless_of_expectations() {
+        for session in [None, Some("session")] {
+            let methods = [
+                Method::PaneSendTextSessionChecked(PaneSendTextParams {
+                    expected_agent_session_id: session.map(str::to_owned),
+                    pane_id: "w1:p1".into(),
+                    text: "text".into(),
+                    allow_cross_pane: true,
+                }),
+                Method::PaneSendKeysSessionChecked(PaneSendKeysParams {
+                    expected_agent_session_id: session.map(str::to_owned),
+                    pane_id: "w1:p1".into(),
+                    keys: vec!["enter".into()],
+                    allow_cross_pane: true,
+                }),
+            ];
+            for method in methods {
+                assert_eq!(
+                    session_checked_guard_error(false, &method).map(|(code, _)| code),
+                    Some("expected_agent_session_unsupported")
+                );
+                assert_eq!(
+                    session_checked_guard_error(true, &method).map(|(code, _)| code),
+                    session.is_none().then_some("invalid_request")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn session_checked_guard_does_not_change_unchecked_methods() {
+        let methods = [
+            Method::AgentPrompt(AgentPromptParams {
+                expected_agent_session_id: Some("session".into()),
+                expected_pane_id: Some("w1:p1".into()),
+                target: "agent".into(),
+                text: "prompt".into(),
+                wait: None,
+                allow_cross_pane: true,
+            }),
+            Method::PaneSendText(PaneSendTextParams {
+                expected_agent_session_id: Some("session".into()),
+                pane_id: "w1:p1".into(),
+                text: "text".into(),
+                allow_cross_pane: true,
+            }),
+            Method::PaneSendKeys(PaneSendKeysParams {
+                expected_agent_session_id: Some("session".into()),
+                pane_id: "w1:p1".into(),
+                keys: vec!["enter".into()],
+                allow_cross_pane: true,
+            }),
+        ];
+        for method in methods {
+            for supported in [false, true] {
+                assert_eq!(session_checked_guard_error(supported, &method), None);
+            }
+        }
+    }
 
     struct Fixture {
         app: App,
@@ -324,6 +456,7 @@ mod tests {
             let mut request = Request {
                 id: format!("import-{index}"),
                 method: Method::PaneSendText(PaneSendTextParams {
+                    expected_agent_session_id: None,
                     pane_id: fixture.target_pane_id.clone(),
                     text: "foreign".into(),
                     allow_cross_pane: false,
@@ -363,6 +496,7 @@ mod tests {
                 let repeated_request = Request {
                     id: format!("reimport-{index}"),
                     method: Method::PaneSendText(PaneSendTextParams {
+                        expected_agent_session_id: None,
                         pane_id: fixture.target_pane_id.clone(),
                         text: "foreign-again".into(),
                         allow_cross_pane: false,
@@ -385,6 +519,8 @@ mod tests {
                 assert_unknown(&own_denial.expect("unproven own pane is also protected"));
             }
             request.method = Method::AgentPrompt(AgentPromptParams {
+                expected_agent_session_id: None,
+                expected_pane_id: None,
                 target: "target-agent".into(),
                 text: "explicit".into(),
                 wait: None,
@@ -489,6 +625,7 @@ mod tests {
             Request {
                 id: "setsid-cross-pane".into(),
                 method: Method::PaneSendText(PaneSendTextParams {
+                    expected_agent_session_id: None,
                     pane_id: fixture.target_pane_id.clone(),
                     text: "setsid child".into(),
                     allow_cross_pane: false,
@@ -510,6 +647,8 @@ mod tests {
         let mut request = Request {
             id: "setsid-allow-cross-pane-check".into(),
             method: Method::AgentPrompt(AgentPromptParams {
+                expected_agent_session_id: None,
+                expected_pane_id: None,
                 target: "target-agent".into(),
                 text: "explicitly allowed".into(),
                 wait: None,
@@ -536,6 +675,7 @@ mod tests {
             Request {
                 id: "setsid-allow-cross-pane-text".into(),
                 method: Method::PaneSendText(PaneSendTextParams {
+                    expected_agent_session_id: None,
                     pane_id: fixture.target_pane_id.clone(),
                     text: "explicitly allowed".into(),
                     allow_cross_pane: true,
@@ -562,6 +702,7 @@ mod tests {
             Request {
                 id: "setsid-same-pane".into(),
                 method: Method::PaneSendText(PaneSendTextParams {
+                    expected_agent_session_id: None,
                     pane_id: fixture.source_pane_id.clone(),
                     text: "setsid own pane".into(),
                     allow_cross_pane: false,
@@ -592,6 +733,8 @@ mod tests {
                 allow_cross_pane: false,
             }),
             Method::AgentPrompt(AgentPromptParams {
+                expected_agent_session_id: None,
+                expected_pane_id: None,
                 target: "target-agent".into(),
                 text: "prompt".into(),
                 wait: None,
@@ -603,11 +746,13 @@ mod tests {
                 allow_cross_pane: false,
             }),
             Method::PaneSendText(PaneSendTextParams {
+                expected_agent_session_id: None,
                 pane_id: fixture.target_pane_id.clone(),
                 text: "text".into(),
                 allow_cross_pane: false,
             }),
             Method::PaneSendKeys(PaneSendKeysParams {
+                expected_agent_session_id: None,
                 pane_id: fixture.target_pane_id.clone(),
                 keys: vec!["enter".into()],
                 allow_cross_pane: false,
@@ -689,6 +834,7 @@ mod tests {
             Request {
                 id: "allowed-cross-pane".into(),
                 method: Method::PaneSendText(PaneSendTextParams {
+                    expected_agent_session_id: None,
                     pane_id: fixture.target_pane_id.clone(),
                     text: "deliberate".into(),
                     allow_cross_pane: true,
@@ -764,6 +910,7 @@ mod tests {
             Request {
                 id: "same-pane".into(),
                 method: Method::PaneSendText(PaneSendTextParams {
+                    expected_agent_session_id: None,
                     pane_id: fixture.source_pane_id.clone(),
                     text: "same pane".into(),
                     allow_cross_pane: false,
@@ -797,6 +944,7 @@ mod tests {
             Request {
                 id: "stale-peer".into(),
                 method: Method::PaneSendText(PaneSendTextParams {
+                    expected_agent_session_id: None,
                     pane_id: fixture.target_pane_id.clone(),
                     text: "unattributed".into(),
                     allow_cross_pane: false,
@@ -823,6 +971,7 @@ mod tests {
                 Request {
                     id: id.into(),
                     method: Method::PaneSendText(PaneSendTextParams {
+                        expected_agent_session_id: None,
                         pane_id: fixture.target_pane_id.clone(),
                         text: id.into(),
                         allow_cross_pane: false,
@@ -856,6 +1005,7 @@ mod tests {
             Request {
                 id: "non-agent".into(),
                 method: Method::PaneSendText(PaneSendTextParams {
+                    expected_agent_session_id: None,
                     pane_id: fixture.target_pane_id.clone(),
                     text: "non-agent".into(),
                     allow_cross_pane: false,
@@ -876,6 +1026,7 @@ mod tests {
         let request = Request {
             id: "invalid-membership".into(),
             method: Method::PaneSendText(PaneSendTextParams {
+                expected_agent_session_id: None,
                 pane_id: fixture.target_pane_id.clone(),
                 text: "refused".into(),
                 allow_cross_pane: false,
@@ -907,6 +1058,7 @@ mod tests {
         let request = Request {
             id: "complete-ancestry-outside".into(),
             method: Method::PaneSendText(PaneSendTextParams {
+                expected_agent_session_id: None,
                 pane_id: fixture.target_pane_id.clone(),
                 text: "ordinary".into(),
                 allow_cross_pane: false,
@@ -1025,6 +1177,7 @@ mod tests {
                 let request = Request {
                     id: "unlinked-marker".into(),
                     method: Method::PaneSendText(PaneSendTextParams {
+                        expected_agent_session_id: None,
                         pane_id: fixture.target_pane_id.clone(),
                         text: "blocked".into(),
                         allow_cross_pane: false,
@@ -1040,6 +1193,8 @@ mod tests {
                     Request {
                         id: "deferred-unlinked-marker".into(),
                         method: Method::AgentPrompt(AgentPromptParams {
+                            expected_agent_session_id: None,
+                            expected_pane_id: None,
                             target: "target-agent".into(),
                             text: "blocked".into(),
                             wait: None,
@@ -1145,6 +1300,7 @@ mod tests {
                     Request {
                         id: "server-ancestry-sequence".into(),
                         method: Method::PaneSendText(PaneSendTextParams {
+                            expected_agent_session_id: None,
                             pane_id,
                             text: "sequence".into(),
                             allow_cross_pane: opt_in,
@@ -1179,6 +1335,8 @@ mod tests {
                 Request {
                     id: "deferred-server-ancestry-sequence".into(),
                     method: Method::AgentPrompt(AgentPromptParams {
+                        expected_agent_session_id: None,
+                        expected_pane_id: None,
                         target: fixture.target_pane_id.clone(),
                         text: "deferred".into(),
                         wait: None,
@@ -1244,6 +1402,7 @@ mod tests {
         let request = Request {
             id: "outside-missing-roots".into(),
             method: Method::PaneSendText(PaneSendTextParams {
+                expected_agent_session_id: None,
                 pane_id: fixture.target_pane_id.clone(),
                 text: "ordinary outside".into(),
                 allow_cross_pane: false,
@@ -1393,6 +1552,7 @@ mod tests {
         let request = |id: &str, pane_id: String, text: &str| Request {
             id: id.into(),
             method: Method::PaneSendText(PaneSendTextParams {
+                expected_agent_session_id: None,
                 pane_id,
                 text: text.into(),
                 allow_cross_pane: false,
@@ -1513,6 +1673,7 @@ mod tests {
                 Request {
                     id: "stale-outside-proof".into(),
                     method: Method::PaneSendText(PaneSendTextParams {
+                        expected_agent_session_id: None,
                         pane_id: fixture.target_pane_id.clone(),
                         text: "blocked".into(),
                         allow_cross_pane: false,
@@ -1597,6 +1758,7 @@ mod tests {
         let request = Request {
             id: "darwin-real-accepted-caller".into(),
             method: Method::PaneSendText(PaneSendTextParams {
+                expected_agent_session_id: None,
                 pane_id: fixture.target_pane_id.clone(),
                 text: "native ordinary".into(),
                 allow_cross_pane: false,
@@ -1806,6 +1968,7 @@ mod tests {
         let request = Request {
             id: "windows-real-non-pane-child".into(),
             method: Method::PaneSendText(PaneSendTextParams {
+                expected_agent_session_id: None,
                 pane_id: fixture.target_pane_id.clone(),
                 text: "windows real child".into(),
                 allow_cross_pane: false,
@@ -1927,6 +2090,7 @@ mod tests {
                 Request {
                     id: "windows-two-live-roots".into(),
                     method: Method::PaneSendText(PaneSendTextParams {
+                        expected_agent_session_id: None,
                         pane_id: if own {
                             fixture.source_pane_id.clone()
                         } else {
@@ -1960,6 +2124,8 @@ mod tests {
             Request {
                 id: "windows-two-live-roots-deferred".into(),
                 method: Method::AgentPrompt(AgentPromptParams {
+                    expected_agent_session_id: None,
+                    expected_pane_id: None,
                     target: "target-agent".into(),
                     text: "blocked".into(),
                     wait: None,
@@ -1982,6 +2148,7 @@ mod tests {
         let request = Request {
             id: "reused-windows-parent".into(),
             method: Method::PaneSendText(PaneSendTextParams {
+                expected_agent_session_id: None,
                 pane_id: fixture.target_pane_id.clone(),
                 text: "refused".into(),
                 allow_cross_pane: false,
@@ -2021,6 +2188,7 @@ mod tests {
                 Request {
                     id: "fallback".into(),
                     method: Method::PaneSendText(PaneSendTextParams {
+                        expected_agent_session_id: None,
                         pane_id: pane.clone(),
                         text: "fallback".into(),
                         allow_cross_pane: opt_in,
@@ -2074,6 +2242,7 @@ mod tests {
             Request {
                 id: "unsupported-and-disconnected".into(),
                 method: Method::PaneSendText(PaneSendTextParams {
+                    expected_agent_session_id: None,
                     pane_id: fixture.target_pane_id.clone(),
                     text: "refused".into(),
                     allow_cross_pane: false,
@@ -2098,6 +2267,7 @@ mod tests {
             request: Request {
                 id: "queued-peer-exit".into(),
                 method: Method::PaneSendText(PaneSendTextParams {
+                    expected_agent_session_id: None,
                     pane_id: fixture.target_pane_id.clone(),
                     text: "refused".into(),
                     allow_cross_pane: false,
@@ -2289,6 +2459,7 @@ finally:
         let own = Request {
             id: "marked-own-before-orphan".into(),
             method: Method::PaneSendText(PaneSendTextParams {
+                expected_agent_session_id: None,
                 pane_id: fixture.source_pane_id.clone(),
                 text: "own".into(),
                 allow_cross_pane: false,
@@ -2302,6 +2473,7 @@ finally:
         let request = Request {
             id: "queued-marked-orphan".into(),
             method: Method::PaneSendText(PaneSendTextParams {
+                expected_agent_session_id: None,
                 pane_id: fixture.target_pane_id.clone(),
                 text: "orphan".into(),
                 allow_cross_pane: false,
@@ -2347,6 +2519,8 @@ finally:
                 Request {
                     id: "deferred-marked-orphan".into(),
                     method: Method::AgentPrompt(AgentPromptParams {
+                        expected_agent_session_id: None,
+                        expected_pane_id: None,
                         target: "target-agent".into(),
                         text: "orphan".into(),
                         wait: None,
@@ -2446,6 +2620,7 @@ finally:
         let request = Request {
             id: "outside".into(),
             method: Method::PaneSendText(PaneSendTextParams {
+                expected_agent_session_id: None,
                 pane_id: fixture.target_pane_id.clone(),
                 text: "ordinary".into(),
                 allow_cross_pane: false,

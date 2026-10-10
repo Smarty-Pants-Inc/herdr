@@ -1404,6 +1404,20 @@ pub(crate) fn process_identity(pid: u32) -> Option<crate::platform::ProcessIdent
     })
 }
 
+/// Read the current POSIX group only while the original reporter is live.
+/// Numeric PID queries are bracketed so zombies and PID reuse cannot prove ownership.
+pub(super) fn session_reporter_process_group_id(reporter: super::ProcessIdentity) -> Option<u32> {
+    let pid = libc::pid_t::try_from(reporter.pid)
+        .ok()
+        .filter(|pid| *pid > 0)?;
+    if process_identity(reporter.pid) != Some(reporter) {
+        return None;
+    }
+    // SAFETY: getpgid queries one positive PID and has no pointer arguments.
+    let group = unsafe { libc::getpgid(pid) };
+    (group > 0 && process_identity(reporter.pid) == Some(reporter)).then_some(group as u32)
+}
+
 pub(crate) fn process_caller_metadata_platform(
     peer: super::ProcessIdentity,
 ) -> Option<super::CallerMetadata> {
@@ -1483,6 +1497,63 @@ fn process_session_id(pid: u32) -> Option<i32> {
 mod tests {
     use super::*;
     use std::{cell::RefCell, collections::HashMap};
+
+    #[test]
+    fn session_reporter_foreground_rejects_zombie_and_reaped_process() {
+        struct Child(std::process::Child);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut child = Child(
+            std::process::Command::new("sh")
+                .args(["-c", "read line"])
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn reporter"),
+        );
+        let reporter = process_identity(child.0.id()).expect("live reporter pin");
+        let group = session_reporter_process_group_id(reporter).expect("live reporter group");
+        assert!(super::super::session_reporter_is_foreground(
+            reporter,
+            || { Some(group) }
+        ));
+        drop(child.0.stdin.take());
+        let mut status = std::mem::MaybeUninit::<libc::siginfo_t>::uninit();
+        loop {
+            // SAFETY: waitid receives this owned child's PID and a writable
+            // siginfo buffer. WNOWAIT preserves the zombie for the proof check.
+            let result = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    reporter.pid,
+                    status.as_mut_ptr(),
+                    libc::WEXITED | libc::WNOWAIT,
+                )
+            };
+            if result == 0 {
+                break;
+            }
+            assert_eq!(
+                std::io::Error::last_os_error().kind(),
+                std::io::ErrorKind::Interrupted,
+                "wait for zombie without reaping",
+            );
+        }
+        assert!(process_identity(reporter.pid).is_none());
+        assert!(session_reporter_process_group_id(reporter).is_none());
+        assert!(!super::super::session_reporter_is_foreground(
+            reporter,
+            || { Some(group) }
+        ));
+        child.0.wait().expect("reap reporter");
+        assert!(!super::super::session_reporter_is_foreground(
+            reporter,
+            || { Some(group) }
+        ));
+    }
 
     #[test]
     fn initial_environment_parser_distinguishes_absence_and_malformed_data() {

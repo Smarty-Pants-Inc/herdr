@@ -99,11 +99,11 @@ herdr pane read w1:p2 --source recent --lines 50
 | 工作区 | `workspace.create`、`workspace.list`、`workspace.get`、`workspace.focus`、`workspace.rename`、`workspace.move`、`workspace.move_block`、`workspace.report_metadata`、`workspace.close` |
 | Worktree | `worktree.list`、`worktree.create`、`worktree.create_project_checked`、`worktree.open`、`worktree.open_project_checked`、`worktree.remove` |
 | 标签页 | `tab.create`、`tab.list`、`tab.get`、`tab.focus`、`tab.rename`、`tab.move`、`tab.close` |
-| 窗格 | `pane.split`、`pane.swap`、`pane.move`、`pane.zoom`、`pane.layout`、`pane.process_info`、`pane.neighbor`、`pane.edges`、`pane.focus_direction`、`pane.resize`、`pane.list`、`pane.current`、`pane.get`、`pane.last_input`、`pane.rename`、`pane.send_text`、`pane.send_keys`、`pane.send_input`、`pane.send_input_guarded`、`pane.read`、`pane.report_agent`、`pane.report_agent_session`、`pane.report_metadata`、`pane.clear_agent_authority`、`pane.release_agent`、`pane.close`、`pane.wait_for_output` |
+| 窗格 | `pane.split`、`pane.swap`、`pane.move`、`pane.zoom`、`pane.layout`、`pane.process_info`、`pane.neighbor`、`pane.edges`、`pane.focus_direction`、`pane.resize`、`pane.list`、`pane.current`、`pane.get`、`pane.last_input`、`pane.rename`、`pane.send_text`、`pane.send_text_session_checked`、`pane.send_keys`、`pane.send_keys_session_checked`、`pane.send_input`、`pane.send_input_guarded`、`pane.read`、`pane.report_agent`、`pane.report_agent_session`、`pane.report_metadata`、`pane.clear_agent_authority`、`pane.release_agent`、`pane.close`、`pane.wait_for_output` |
 | 输入消费者（仅本地 JSON） | `pane.input_consumer.enroll`、`pane.input_consumer.cut`、`pane.input_consumer.release` |
 | 弹窗 | `popup.close` |
 | 布局 | `layout.export`、`layout.apply`、`layout.apply_restorable`、`layout.set_split_ratio` |
-| 智能体 | `agent.list`、`agent.get`、`agent.read`、`agent.explain`、`agent.send_keys`、`agent.prompt`、`agent.wait`、`agent.rename`、`agent.focus`、`agent.start`、`agent.start_guarded` |
+| 智能体 | `agent.list`、`agent.get`、`agent.read`、`agent.explain`、`agent.send_keys`、`agent.prompt`、`agent.prompt_session_checked`、`agent.wait`、`agent.rename`、`agent.focus`、`agent.start`、`agent.start_guarded` |
 | 事件 | `events.subscribe`、`events.wait` |
 | 集成 | `integration.install`、`integration.uninstall` |
 | 插件 | `plugin.link`、`plugin.list`、`plugin.unlink`、`plugin.enable`、`plugin.disable`、`plugin.action.list`、`plugin.action.invoke`、`plugin.log.list`、`plugin.pane.open`、`plugin.pane.focus`、`plugin.pane.close` |
@@ -278,6 +278,36 @@ principal 由服务器解析，每个客户端连接只绑定一次。在 Linux 
 ```
 
 该守卫标识的是终端，而不是终端内的智能体名称、进程或原生智能体会话。它不会改变单独的跨窗格输入策略。
+
+### 预期智能体会话守卫
+
+`agent.prompt`、`pane.send_text` 和 `pane.send_keys` 接受可选的 `expected_agent_session_id` 字符串。请从当前的 `pane.get` 或 `agent.get` 记录复制 `agent_session_id`，不要使用 `agent_session.value`。对于 Pi，后者可以是恢复路径；服务器会单独保留上报的原生 ID。没有上报 ID 时返回 `agent_session_unknown`；ID 不同时返回 `agent_session_mismatch`。这些初始拒绝不会写入任何输入字节，也绝不包含实际 ID。
+
+服务器将已接受的会话上报绑定到本地套接字连接方的进程 ID 和启动时间。接受请求时，它会用实时原生检查，而不是缓存的智能体检测结果，确认同一个进程仍存活，并属于该窗格 PTY 当前的前台进程组。上报进程已退出、已暂停、转入后台、未绑定或被替换时，即使退出检测尚未更新窗格，也会初始拒绝并返回 `agent_session_unknown`，不写入任何输入字节。此检查仅支持 Linux；macOS、Windows 和未支持的平台在无法确认安全时会以 `expected_agent_session_unsupported` 拒绝。macOS 的原生证明尚待实现。短生命周期的钩子上报进程退出后，不能授权之后的守卫发送。省略会话预期值时，不应用此进程检查。
+
+固定的上报者和预期 ID 随请求传入 PTY actor。在每次 `write(2)` 前，actor 都针对自身的 PTY master 重新执行实时原生检查，包括部分写入、重试、任何焦点前缀、文本和延迟 300 ms 的 Enter。接受后若失去所有权，会返回 `agent_session_lost`，丢弃剩余输入和 Enter。可能已经写入部分文本或前缀。如果已写入文本阶段的字节，Linux 会从 actor 的 PTY master 打开其对应的确切 slave，并在返回完成结果前调用 `tcflush(slave, TCIFLUSH)`，丢弃已暂存但尚未读取的输入。此刷新作用于整个 tty，也可能丢弃其他已经暂存的未读输入。它无法撤回读取方已经消费的字节；同一个 Pi 草稿可能仍然保留。此错误不保证总写入或总消费字节数为零。
+
+`agent_session_lost` 的 `error.partial_text_consumed` 为布尔值或 `null`，`error.flush_failed` 表示打开确切 slave 或执行 `TCIFLUSH` 是否失败。刷新成功时（或未写入文本阶段的字节、无需刷新时），`flush_failed` 为 `false`：当且仅当文本阶段的字节已到达 PTY、可能已被消费时，`partial_text_consumed` 为 `true`；当且仅当没有写入任何文本阶段的字节时，为 `false`。这不是读取方的接收确认。如果打开确切 slave 或执行 `TCIFLUSH` 失败，错误返回 `partial_text_consumed: null`（未知）和 `flush_failed: true`。会话守卫下的文本和按键发送会等待 actor 的类型化完成结果，而非在入队时返回成功。完成确认的是 PTY 写入，而不是接收方智能体的确认。丢失错误只会显示预期 ID，绝不显示实际 ID；出错后不要自动重试或降级为 unchecked 操作。
+
+如果打开确切 slave 或执行 `TCIFLUSH` 失败，Herdr 不会关闭 PTY master，也不会终止用户进程。它会丢弃剩余请求、不发送 Enter，并将窗格输入标记为 **POISONED**。所有 PTY 写入都会被服务器以类型化错误 `pane_input_poisoned` 拒绝，包括客户端按键和无守卫的 API 发送；服务器还会发送 `Notify`。操作员须显式执行 `herdr pane clear-input-poison <pane>` 才能清除；在已连接客户端中显示该通知的功能仍待 [smarty-dev#7908](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/7908) 实现。之后刷新成功也绝不会自动清除此状态。
+
+只有操作员显式调用 `pane.clear_input_poison`（指定 `pane_id`），或执行 CLI `herdr pane clear-input-poison <pane>` 才能清除。**警告：** 暂存文本可能仍留在输入行上。清除前请检查并丢弃；清除不证明输入行为空，之后的 Enter 可能提交读取方已缓冲的文本。不要自动清除，也不要将清除作为重试策略。
+
+```json
+{"id":"clear_input_poison","method":"pane.clear_input_poison","params":{"pane_id":"w1:p1"}}
+```
+
+内置的 Pi 集成版本 11 和 OMP 集成版本 12 会上报原生 ID 和未改变的恢复路径。旧的仅上报路径的集成会返回 `agent_session_unknown`；请运行 `herdr integration install pi` 或 `herdr integration install omp` 重新安装更新后的集成，再在安全的停顿点重启或重新加载该智能体，以加载更新的钩子并上报 ID。这一步加载钩子并不等于从暂停中恢复：恢复或重新加载同一个原生会话不会恢复带守卫发送的资格。请开启新会话（`/new`）或重启智能体；参见[后续问题](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/7577)。
+
+`agent.prompt` 还接受 `expected_pane_id`，要求其目标（包括别名）解析到该精确窗格。解析到不同窗格时初始拒绝并返回 `expected_pane_mismatch`，不写入任何输入字节。这些预期条件可以单独或一起使用，也可与可选的 `wait` 对象一起使用。窗格发送操作已指定精确的 `pane_id`，没有 `expected_pane_id` 字段。初始检查与接受请求时 Herdr 的已上报窗格状态是原子的，但不是与智能体尚未上报的内部会话变化保持原子性。仍有两类残余竞态：最后一次实时进程／前台原生检查与 `write(2)` 之间的检查／写入间隙，以及所有权丢失／刷新／读取方之间的竞态；读取方可能在刷新前消费已暂存的字节。完成结果和刷新都不保证总写入或总消费字节数为零。App 到 actor 的队列和延迟 Enter 的等待受守卫保护，但不能消除这些原生竞态。省略预期条件会保留现有行为，不改变跨窗格输入策略。
+
+请检查 `ping.result.capabilities.expected_agent_session_guard == true`（仅 Linux 支持并通告 `true`；macOS 和 Windows 通告 `false`，在无法确认安全时拒绝操作，macOS 的原生证明尚待实现）。带守卫的操作使用 `agent.prompt_session_checked`、`pane.send_text_session_checked` 和 `pane.send_keys_session_checked`。checked prompt 方法要求至少一个预期条件；checked 窗格发送方法要求 `expected_agent_session_id`。旧服务器会以 `invalid_request` 拒绝这些名称，而不是静默忽略守卫；即使在 ping 和操作之间被替换也是如此。拒绝后不要回退到 unchecked 方法。CLI 在使用 `--expected-session` 或 `agent prompt --expected-pane` 时使用这些别名；缺少该能力时，它返回 `expected_agent_session_unsupported`，不发送操作。
+
+```json
+{"id":"checked_prompt","method":"agent.prompt_session_checked","params":{"target":"worker","text":"review this change","expected_agent_session_id":"reported_id_from_agent_get","expected_pane_id":"w1:p1","wait":{"until":["idle"],"timeout_ms":30000}}}
+{"id":"checked_text","method":"pane.send_text_session_checked","params":{"pane_id":"w1:p1","text":"hello","expected_agent_session_id":"reported_id_from_pane_get"}}
+{"id":"checked_keys","method":"pane.send_keys_session_checked","params":{"pane_id":"w1:p1","keys":["Enter"],"expected_agent_session_id":"reported_id_from_pane_get"}}
+```
 
 `pane.send_keys` 和 `pane.send_input.keys` 接受 Herdr 组合键字符串: 普通可打印键、`enter` 和 `esc` 这类特殊键、`ctrl+h`、`control+j`、`alt+x`、`shift+tab` 这类修饰组合键、`f1` 这类功能键,以及 `minus` 和 `plus` 这类命名标点。它们不接受 `prefix+` 绑定字符串。
 
