@@ -308,6 +308,20 @@ principal の解決はサーバーが行い、クライアント接続ごとに�
 {"id":"checked_keys","method":"pane.send_keys_session_checked","params":{"pane_id":"w1:p1","keys":["Enter"],"expected_agent_session_id":"reported_id_from_pane_get"}}
 ```
 
+### 検出されたエージェント状態の期待値ガード
+
+エージェントプロンプトの params は、省略可能な `expected_agent_status` フィールドを受け付けますが、**`expected_agent_session_id` が必須**です。状態だけのガードは未対応で、セッション期待値なしの状態期待値は `invalid_request` になります。状態に `"idle"` を指定すると、受理時に Herdr が**検出した**エージェント状態が idle であることを要求します。初期不一致では入力バイトを書き込む前に `expected_status_mismatch` を返します。省略すると既存のプロンプト動作を維持します。明示的な `null`、文字列以外、または未知の状態は `invalid_request` となり、ガードなしのプロンプトにはなりません。
+
+`ping.result.capabilities.expected_agent_status_guard == true` を確認し、状態ガード付きプロンプトには `agent.prompt_status_checked` を使ってください。このメソッドには `expected_agent_status` と `expected_agent_session_id` の両方が必要です。セッションガードのみをサポートするものを含め、古いサーバーは状態フィールドを黙って無視せず、未知のメソッドを拒否します。CLI は `--expected-status` が指定されるとこのメソッドを使い、未対応サーバーを `expected_agent_status_unsupported` で拒否します。旧メソッドでの再試行はありません。期待値を黙って外したり、拒否後に別のプロンプトメソッドへフォールバックしたりしないでください。対応サーバーは `agent.prompt` と `agent.prompt_session_checked` に指定されたフィールドも強制しますが、これらの名前だけでは古いサーバーでの強制を保証できません。
+
+```json
+{"id":"status_checked_prompt","method":"agent.prompt_status_checked","params":{"target":"worker","text":"review this change","expected_agent_session_id":"reported_id_from_agent_get","expected_agent_status":"idle"}}
+```
+
+比較にはフックとスクリーン検出から得た有効な検出状態を使い、ペインの既読状態や `done` 表示は使いません。`done` と表示される idle エージェントも `"idle"` を満たします。必須のセッション期待値に加え、`expected_pane_id` と省略可能な `wait` オブジェクトも指定できます。検出状態の条件は既存のセッション／報告元ガードに付随し、受理時と PTY 書き込み前に確認します。受理後に検出状態が不一致となった場合も `expected_status_mismatch` を返し、リクエストの残りのバイトを停止して、それ以降の Enter を送りません。入力の一部がすでに書き込まれている可能性があり、この後段のエラーは総書き込みバイト数がゼロであることを保証しません。セッション所有権の喪失は引き続き別の `agent_session_lost` エラーです。
+
+検出された idle は**最後に観測した状態**であり、実際のエージェントが busy ではないことのトランザクション的な証明ではありません。フックとスクリーンの観測には遅延があり、確認後に busy になることもあります。破壊的なコマンドには引き続きエージェント側の busy チェックが必要です。idle になるまで待つ操作ではなく、`wait` は引き続き送信後の活動と安定状態を観測します。
+
 `pane.send_keys` と `pane.send_input.keys` は Herdr のキーコンボ文字列を受け付けます: 通常の印字可能キー、`enter` や `esc` のような特殊キー、`ctrl+h`、`control+j`、`alt+x`、`shift+tab` のような修飾キーコード、`f1` のようなファンクションキー、`minus` や `plus` のような名前付き記号です。`prefix+` のバインド文字列は受け付けません。
 
 ```json

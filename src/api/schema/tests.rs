@@ -294,6 +294,7 @@ fn agent_start_and_prompt_requests_round_trip() {
         method: Method::AgentPrompt(AgentPromptParams {
             expected_agent_session_id: None,
             expected_pane_id: None,
+            expected_agent_status: None,
             target: "reviewer".into(),
             text: "review this".into(),
             wait: None,
@@ -312,6 +313,7 @@ fn agent_start_and_prompt_requests_round_trip() {
         method: Method::AgentPrompt(AgentPromptParams {
             expected_agent_session_id: None,
             expected_pane_id: None,
+            expected_agent_status: None,
             target: "reviewer".into(),
             text: "review this".into(),
             wait: Some(AgentPromptWaitOptions {
@@ -652,11 +654,68 @@ fn expected_terminal_guard_is_optional_but_present_values_must_be_strings() {
 }
 
 #[test]
+fn expected_agent_status_guard_is_optional_but_present_values_are_strict() {
+    for method in [
+        "agent.prompt",
+        "agent.prompt_session_checked",
+        "agent.prompt_status_checked",
+    ] {
+        let mut value = serde_json::json!({
+            "id": "status-guard", "method": method,
+            "params": {"target": "reviewer", "text": "hello", "expected_agent_session_id": "session=a"},
+        });
+        let request: Request = serde_json::from_value(value.clone()).unwrap();
+        assert!(serde_json::to_value(request).unwrap()["params"]
+            .get("expected_agent_status")
+            .is_none());
+        if method == "agent.prompt_status_checked" {
+            assert!(!crate::server::client_commands::supports_client_shell_method_name(method));
+        }
+        for status in ["idle", "working", "blocked", "done", "unknown"] {
+            value["params"]["expected_agent_status"] = status.into();
+            let request: Request = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(serde_json::to_value(&request).unwrap(), value);
+            assert_eq!(crate::api::api_method_name(&request.method), method);
+        }
+        for invalid in [
+            serde_json::Value::Null,
+            serde_json::json!("future_status"),
+            serde_json::json!("Idle"),
+            serde_json::json!(""),
+            serde_json::json!(1),
+            serde_json::json!(false),
+            serde_json::json!({}),
+            serde_json::json!(["idle"]),
+        ] {
+            value["params"]["expected_agent_status"] = invalid;
+            assert!(
+                serde_json::from_value::<Request>(value.clone()).is_err(),
+                "{value}"
+            );
+        }
+    }
+}
+
+#[test]
+fn expected_agent_status_guard_schema_is_optional_but_not_nullable() {
+    let schema = serde_json::to_value(schemars::schema_for!(AgentPromptParams)).unwrap();
+    assert_eq!(
+        schema["properties"]["expected_agent_status"]["$ref"],
+        "#/$defs/AgentStatus"
+    );
+    assert!(!schema["required"]
+        .as_array()
+        .unwrap()
+        .contains(&serde_json::json!("expected_agent_status")));
+}
+
+#[test]
 fn old_server_capabilities_do_not_advertise_expected_terminal_guard() {
     let caps: ServerCapabilities =
         serde_json::from_value(serde_json::json!({"live_handoff": false})).unwrap();
     assert!(!caps.expected_terminal_guard);
     assert!(!caps.expected_agent_session_guard);
+    assert!(!caps.expected_agent_status_guard);
     assert!(!caps.input_consumer);
 }
 
@@ -1061,6 +1120,7 @@ fn success_response_round_trips() {
                 guarded_live_handoff: true,
                 expected_terminal_guard: true,
                 expected_agent_session_guard: true,
+                expected_agent_status_guard: true,
                 input_consumer: false,
             }),
         },

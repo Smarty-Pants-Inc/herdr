@@ -239,6 +239,9 @@ impl NativePty {
         SessionInputGuard {
             reporter: self.reporter,
             expected_agent_session_id: "native-session".into(),
+            expected_agent_status: None,
+            agent_status: std::sync::Weak::new(),
+            status_mismatch: Arc::new(AtomicBool::new(false)),
             binding_validity: Arc::downgrade(&self.binding_validity),
         }
     }
@@ -995,6 +998,410 @@ fn guarded_native_binding_invalidated_during_enter_delay_never_enters() {
     pump(&mut runner);
     lost(receipt, true);
     fixture.captured(b"prompt");
+}
+
+fn status_guard(fixture: &NativePty) -> (SessionInputGuard, crate::terminal::TerminalState) {
+    let mut terminal =
+        crate::terminal::TerminalState::new(crate::terminal::TerminalId::alloc(), "/tmp".into());
+    terminal.set_detected_state(
+        Some(crate::detect::Agent::Pi),
+        crate::detect::AgentState::Idle,
+    );
+    let mut guard = fixture.guard();
+    guard.expected_agent_status = Some(crate::api::schema::AgentStatus::Idle);
+    guard.agent_status = terminal.agent_status_cell();
+    (guard, terminal)
+}
+
+fn status_mismatch(
+    receipt: std_mpsc::Receiver<std::io::Result<()>>,
+    partial_text_consumed: Option<bool>,
+    flush_failed: bool,
+) {
+    let error = receipt
+        .recv_timeout(Duration::from_secs(1))
+        .expect("completion")
+        .expect_err("status guard refuses changed status");
+    assert!(
+        !super::super::is_agent_session_lost(&error),
+        "status refusal must not be reported as session loss: {error}"
+    );
+    assert!(super::super::is_expected_status_mismatch(&error));
+    assert!(error.to_string().contains("detected agent status"));
+    assert_eq!(
+        super::super::agent_session_loss_details(&error),
+        Some((partial_text_consumed, flush_failed)),
+        "status refusal must preserve the shared flush metadata"
+    );
+}
+
+#[test]
+fn guarded_native_status_latch_preserves_error_type_after_change_back() {
+    let fixture = NativePty::new();
+    let (guard, mut terminal) = status_guard(&fixture);
+    let clone = guard.clone();
+    assert!(guard.status_is_current());
+    terminal.set_detected_state(
+        Some(crate::detect::Agent::Pi),
+        crate::detect::AgentState::Working,
+    );
+    assert!(!guard.status_is_current());
+    terminal.set_detected_state(
+        Some(crate::detect::Agent::Pi),
+        crate::detect::AgentState::Idle,
+    );
+    assert!(
+        !clone.status_is_current(),
+        "refusal is sticky across clones"
+    );
+    for partial in [false, true] {
+        let error = super::super::agent_session_lost(&clone, partial);
+        assert!(super::super::is_expected_status_mismatch(&error));
+        assert!(!super::super::is_agent_session_lost(&error));
+        assert_eq!(
+            super::super::agent_session_loss_details(&error),
+            Some((Some(partial), false))
+        );
+    }
+    let error = super::super::agent_session_flush_failed(&clone);
+    assert!(super::super::is_expected_status_mismatch(&error));
+    assert!(!super::super::is_agent_session_lost(&error));
+    assert_eq!(
+        super::super::agent_session_loss_details(&error),
+        Some((None, true))
+    );
+    let (matching, _terminal) = status_guard(&fixture);
+    for partial in [false, true] {
+        let error = super::super::agent_session_lost(&matching, partial);
+        assert!(super::super::is_agent_session_lost(&error));
+        assert!(!super::super::is_expected_status_mismatch(&error));
+        assert_eq!(
+            super::super::agent_session_loss_details(&error),
+            Some((Some(partial), false))
+        );
+    }
+    let error = super::super::agent_session_flush_failed(&matching);
+    assert!(super::super::is_agent_session_lost(&error));
+    assert!(!super::super::is_expected_status_mismatch(&error));
+    assert_eq!(
+        super::super::agent_session_loss_details(&error),
+        Some((None, true))
+    );
+    let generic = std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        "expected_status_mismatch",
+    );
+    assert!(!super::super::is_expected_status_mismatch(&generic));
+    assert!(!super::super::is_agent_session_lost(&generic));
+    assert_eq!(super::super::agent_session_loss_details(&generic), None);
+}
+
+#[test]
+fn guarded_native_matching_status_delivers_once_and_omitted_status_is_unchanged() {
+    use crate::api::schema::AgentStatus;
+    use crate::detect::{Agent, AgentState};
+    let fixture = NativePty::new();
+    let mut runner = fixture.runner();
+    let (guard, mut terminal) = status_guard(&fixture);
+    let mut expected = Vec::new();
+    for (state, status, text) in [
+        (AgentState::Idle, AgentStatus::Idle, "idle"),
+        (AgentState::Working, AgentStatus::Working, "working"),
+        (AgentState::Blocked, AgentStatus::Blocked, "blocked"),
+        (AgentState::Unknown, AgentStatus::Unknown, "unknown"),
+    ] {
+        terminal.set_detected_state(Some(Agent::Pi), state);
+        let mut guard = guard.clone();
+        guard.expected_agent_status = Some(status);
+        let receipt = submit(
+            &mut runner,
+            Bytes::from(text),
+            Bytes::from_static(b"\r"),
+            Duration::ZERO,
+            Some(guard),
+        );
+        pump(&mut runner);
+        receipt
+            .recv_timeout(Duration::from_secs(1))
+            .expect("completion")
+            .expect("matching status");
+        expected.extend_from_slice(text.as_bytes());
+        expected.push(b'\r');
+        fixture.captured(&expected);
+    }
+    let mut guard = guard;
+    guard.expected_agent_status = None;
+    drop(terminal); // A status-less guard must not require a live status cell.
+    let receipt = submit(
+        &mut runner,
+        Bytes::from_static(b"legacy"),
+        Bytes::from_static(b"\r"),
+        Duration::ZERO,
+        Some(guard),
+    );
+    pump(&mut runner);
+    receipt
+        .recv_timeout(Duration::from_secs(1))
+        .expect("completion")
+        .expect("session-only unchanged");
+    expected.extend_from_slice(b"legacy\r");
+    fixture.captured(&expected);
+}
+
+#[test]
+fn guarded_native_status_flip_before_write_preserves_unrelated_fifo() {
+    let fixture = NativePty::new();
+    let mut runner = fixture.runner();
+    let (guard, mut terminal) = status_guard(&fixture);
+    runner.enqueue_write(Bytes::from_static(b"before"));
+    let receipt = submit(
+        &mut runner,
+        Bytes::from_static(b"\x1b[Iforbidden\x1b_he"),
+        Bytes::from_static(b"\r"),
+        Duration::ZERO,
+        Some(guard),
+    );
+    runner.enqueue_terminal_responses(vec![Bytes::from_static(b"response")]);
+    runner.pending_writes.push_back(PendingWrite {
+        source: None,
+        bytes: Bytes::from_static(b"marker"),
+        boundary: Some(SubmissionBoundary::Marker),
+    });
+    terminal.set_detected_state(
+        Some(crate::detect::Agent::Pi),
+        crate::detect::AgentState::Working,
+    );
+    pump(&mut runner);
+    status_mismatch(receipt, Some(false), false);
+    fixture.captured(b"beforeresponsemarker");
+    assert_eq!(runner.state, ActorState::Running);
+    runner.enqueue_write(Bytes::from_static(b"after"));
+    pump(&mut runner);
+    fixture.captured(b"beforeresponsemarkerafter");
+    assert!(fixture.binding_validity.load(Ordering::Acquire));
+}
+
+#[test]
+fn guarded_native_status_rechecked_after_proof_without_retaining_root() {
+    let fixture = NativePty::new();
+    let mut runner = fixture.runner();
+    let (guard, terminal) = status_guard(&fixture);
+    let terminal = Arc::new(Mutex::new(terminal));
+    let during_proof = Arc::clone(&terminal);
+    runner.file.during_guard_proof = Some(Box::new(move || {
+        during_proof.lock().expect("terminal").set_detected_state(
+            Some(crate::detect::Agent::Pi),
+            crate::detect::AgentState::Blocked,
+        );
+    }));
+    let receipt = submit(
+        &mut runner,
+        Bytes::from_static(b"forbidden"),
+        Bytes::from_static(b"\r"),
+        Duration::ZERO,
+        Some(guard),
+    );
+    pump(&mut runner);
+    status_mismatch(receipt, Some(false), false);
+    fixture.captured(b"");
+
+    let (guard, terminal) = status_guard(&fixture);
+    let weak = guard.agent_status.clone();
+    let mut sole_root = Some(terminal);
+    runner.file.during_guard_proof = Some(Box::new(move || {
+        drop(sole_root.take());
+    }));
+    let receipt = submit(
+        &mut runner,
+        Bytes::from_static(b"forbidden"),
+        Bytes::new(),
+        Duration::ZERO,
+        Some(guard),
+    );
+    pump(&mut runner);
+    status_mismatch(receipt, Some(false), false);
+    assert!(
+        weak.upgrade().is_none(),
+        "no status root crosses native proof"
+    );
+    fixture.captured(b"");
+}
+
+#[test]
+fn guarded_native_status_flip_during_enter_delay_never_enters() {
+    let fixture = NativePty::new();
+    let mut runner = fixture.runner();
+    let (guard, mut terminal) = status_guard(&fixture);
+    let receipt = submit(
+        &mut runner,
+        Bytes::from_static(b"prompt"),
+        Bytes::from_static(b"\r"),
+        Duration::from_millis(300),
+        Some(guard),
+    );
+    let boundary = runner
+        .flush_pending_writes_once()
+        .expect("text write")
+        .expect("text boundary");
+    runner.complete_submission_boundary(boundary);
+    fixture.captured(b"prompt");
+    terminal.set_detected_state(
+        Some(crate::detect::Agent::Pi),
+        crate::detect::AgentState::Working,
+    );
+    pump(&mut runner);
+    status_mismatch(receipt, Some(true), false);
+    fixture.captured(b"prompt");
+}
+
+#[test]
+fn guarded_native_status_flip_before_enter_discards_staged_text() {
+    let fixture = NativePty::new();
+    let mut runner = fixture.runner();
+    fixture.control("pause");
+    let (guard, mut terminal) = status_guard(&fixture);
+    let receipt = submit(
+        &mut runner,
+        Bytes::from_static(b"staged prompt"),
+        Bytes::from_static(b"\r"),
+        Duration::from_millis(300),
+        Some(guard),
+    );
+    let boundary = runner
+        .flush_pending_writes_once()
+        .expect("text write")
+        .expect("text boundary");
+    runner.complete_submission_boundary(boundary);
+    fixture.captured(b"");
+    terminal.set_detected_state(
+        Some(crate::detect::Agent::Pi),
+        crate::detect::AgentState::Working,
+    );
+    pump(&mut runner);
+    status_mismatch(receipt, Some(true), false);
+    assert!(runner.pending_writes.is_empty());
+    assert!(runner.active_submission.is_none());
+    assert!(
+        fixture.probe_bytes().is_empty(),
+        "no staged text or Enter remains"
+    );
+    fixture.captured(b"");
+}
+
+#[test]
+fn guarded_native_status_flush_failure_stays_typed_and_poisons_input() {
+    let fixture = NativePty::new();
+    let mut runner = fixture.runner();
+    let handle = fixture.queue_handle(&mut runner);
+    fixture.control("pause");
+    let (guard, mut terminal) = status_guard(&fixture);
+    let receipt = submit(
+        &mut runner,
+        Bytes::from_static(b"staged"),
+        Bytes::from_static(b"\r"),
+        Duration::ZERO,
+        Some(guard),
+    );
+    let boundary = runner
+        .flush_pending_writes_once()
+        .expect("text write")
+        .expect("text boundary");
+    runner.complete_submission_boundary(boundary);
+    runner.file.force_flush_failure = true;
+    terminal.set_detected_state(
+        Some(crate::detect::Agent::Pi),
+        crate::detect::AgentState::Working,
+    );
+    pump(&mut runner);
+    status_mismatch(receipt, None, true);
+    assert!(handle.input_is_poisoned());
+    assert!(runner.pending_writes.is_empty());
+    assert!(runner.active_submission.is_none());
+    let refused = handle
+        .queue_user_input_submission(
+            Bytes::from_static(b"forbidden"),
+            Bytes::from_static(b"\r"),
+            Duration::ZERO,
+        )
+        .expect_err("poison blocks later submissions");
+    assert!(super::super::is_pane_input_poisoned(&refused));
+    assert!(handle
+        .try_write_user_input(Bytes::from_static(b"\r"))
+        .is_err());
+    runner.enqueue_terminal_responses(vec![Bytes::from_static(b"response")]);
+    runner
+        .flush_pending_writes_once()
+        .expect("poison refuses writes");
+    assert!(runner.pending_writes.is_empty());
+    runner.file.force_flush_failure = false;
+    crate::platform::flush_pty_input(runner.file.as_raw_fd()).expect("operator discards text");
+    assert!(
+        handle.input_is_poisoned(),
+        "successful flush alone never clears poison"
+    );
+    let (reply, cleared) = std_mpsc::channel();
+    runner.handle_control_command(PtyIoControlCommand::ClearInputPoison(reply));
+    cleared
+        .recv()
+        .expect("clear receipt")
+        .expect("operator clear");
+    assert!(!handle.input_is_poisoned());
+    handle
+        .try_write_user_input(Bytes::from_static(b"healthy"))
+        .expect("explicit clear restores input");
+    runner.drain_data_commands();
+    pump(&mut runner);
+    assert_eq!(fixture.probe_bytes(), b"healthy");
+}
+
+#[test]
+fn guarded_native_status_rechecked_between_partial_syscalls() {
+    let fixture = NativePty::new();
+    let mut runner = fixture.runner();
+    fixture.control("pause");
+    let (guard, terminal) = status_guard(&fixture);
+    let terminal = Arc::new(Mutex::new(terminal));
+    let during_write = Arc::clone(&terminal);
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&accepted);
+    let mut attempts = 0;
+    runner.file.before_write = Some(Box::new(move |offset| {
+        attempts += 1;
+        if attempts == 2 {
+            observed.store(offset, Ordering::Relaxed);
+            during_write.lock().expect("terminal").set_detected_state(
+                Some(crate::detect::Agent::Pi),
+                crate::detect::AgentState::Working,
+            );
+        }
+    }));
+    let length = 4 * 1024 * 1024;
+    let receipt = submit(
+        &mut runner,
+        Bytes::from(vec![b'x'; length]),
+        Bytes::from_static(b"\r"),
+        Duration::ZERO,
+        Some(guard),
+    );
+    assert_eq!(
+        runner.flush_pending_writes_once().expect("single flush"),
+        None
+    );
+    status_mismatch(receipt, Some(true), false);
+    let accepted = accepted.load(Ordering::Relaxed);
+    assert!(accepted > 0 && accepted < length);
+    assert!(runner.pending_writes.is_empty());
+    assert!(runner.active_submission.is_none());
+    assert_eq!(runner.current_write_offset, 0);
+    assert!(crate::platform::session_reporter_is_foreground(
+        fixture.reporter,
+        || crate::platform::foreground_process_group_id_for_tty_fd(runner.file.as_raw_fd())
+    ));
+    assert!(
+        fixture.probe_bytes().is_empty(),
+        "TCIFLUSH discards staged text"
+    );
+    fixture.captured(b"");
 }
 
 #[test]

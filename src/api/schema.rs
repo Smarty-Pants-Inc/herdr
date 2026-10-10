@@ -48,6 +48,15 @@ where
     String::deserialize(deserializer).map(Some)
 }
 
+fn deserialize_expected_agent_status<'de, D>(
+    deserializer: D,
+) -> Result<Option<AgentStatus>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    AgentStatus::deserialize(deserializer).map(Some)
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Request {
     pub id: String,
@@ -182,6 +191,10 @@ pub enum Method {
     /// Local JSON only; older servers reject instead of ignoring identity guards.
     #[serde(rename = "agent.prompt_session_checked")]
     AgentPromptSessionChecked(AgentPromptParams),
+    /// Local JSON only; requires status and session expectations. Older servers
+    /// reject instead of silently ignoring the detected-status guard.
+    #[serde(rename = "agent.prompt_status_checked")]
+    AgentPromptStatusChecked(AgentPromptParams),
     #[serde(rename = "agent.wait")]
     AgentWait(AgentWaitParams),
     #[serde(rename = "pane.split")]

@@ -1245,6 +1245,10 @@
               "description": "Refuse input unless the resolved agent still reports this session ID.",
               "type": "string"
             },
+            "expected_agent_status": {
+              "$ref": "#/schemas/request/$defs/AgentStatus",
+              "description": "Refuse input unless the pane's detected agent status still matches.\nRequires `expected_agent_session_id`. Detection uses hooks and screen\nsignals; idle is the last observed state, not a readiness reservation."
+            },
             "expected_pane_id": {
               "description": "Refuse input unless the target alias resolves to this pane.",
               "type": "string"
@@ -5968,6 +5972,23 @@
           "properties": {
             "method": {
               "const": "agent.prompt_session_checked",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentPromptParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Local JSON only; requires status and session expectations. Older servers\nreject instead of silently ignoring the detected-status guard.",
+          "properties": {
+            "method": {
+              "const": "agent.prompt_status_checked",
               "type": "string"
             },
             "params": {
@@ -11407,6 +11428,11 @@
             "expected_agent_session_guard": {
               "default": false,
               "description": "Supports the local JSON session-checked prompt, text and key methods.",
+              "type": "boolean"
+            },
+            "expected_agent_status_guard": {
+              "default": false,
+              "description": "Supports the detected-agent-status guard on local JSON prompts.",
               "type": "boolean"
             },
             "expected_terminal_guard": {

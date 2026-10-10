@@ -8,7 +8,25 @@ fn session_checked_guard_error(
     supported: bool,
     method: &Method,
 ) -> Option<(&'static str, &'static str)> {
+    let prompt_params = match method {
+        Method::AgentPrompt(params)
+        | Method::AgentPromptSessionChecked(params)
+        | Method::AgentPromptStatusChecked(params) => Some(params),
+        _ => None,
+    };
+    // Invalid status/session pairing takes precedence on every platform.
+    if prompt_params.is_some_and(|params| {
+        params.expected_agent_status.is_some() && params.expected_agent_session_id.is_none()
+    }) {
+        return Some((
+            "invalid_request",
+            "expected_agent_status requires expected_agent_session_id",
+        ));
+    }
     let missing = match method {
+        Method::AgentPromptStatusChecked(params) => {
+            params.expected_agent_session_id.is_none() || params.expected_agent_status.is_none()
+        }
         Method::AgentPromptSessionChecked(params) => {
             params.expected_agent_session_id.is_none() && params.expected_pane_id.is_none()
         }
@@ -24,7 +42,7 @@ fn session_checked_guard_error(
     }
     missing.then_some((
         "invalid_request",
-        "session-checked method requires an identity expectation",
+        "checked method requires its input guard expectations",
     ))
 }
 
@@ -71,9 +89,9 @@ impl App {
             Method::AgentStart(params) | Method::AgentStartGuarded(params) => {
                 params.allow_cross_pane
             }
-            Method::AgentPrompt(params) | Method::AgentPromptSessionChecked(params) => {
-                params.allow_cross_pane
-            }
+            Method::AgentPrompt(params)
+            | Method::AgentPromptSessionChecked(params)
+            | Method::AgentPromptStatusChecked(params) => params.allow_cross_pane,
             Method::AgentSendKeys(params) => params.allow_cross_pane,
             Method::PaneReportAgent(params) => params.allow_cross_pane,
             Method::PaneReportAgentSession(params) => params.allow_cross_pane,
@@ -95,7 +113,9 @@ impl App {
             Method::AgentStart(params) | Method::AgentStartGuarded(params) => {
                 self.pane_target(&params.pane_id)
             }
-            Method::AgentPrompt(params) | Method::AgentPromptSessionChecked(params) => {
+            Method::AgentPrompt(params)
+            | Method::AgentPromptSessionChecked(params)
+            | Method::AgentPromptStatusChecked(params) => {
                 self.resolve_agent_target(&params.target).ok()
             }
             Method::AgentSendKeys(params) => self.resolve_agent_target(&params.target).ok(),
@@ -147,22 +167,54 @@ mod tests {
             (Some("session"), None),
             (Some("session"), Some("w1:p1")),
         ] {
-            let method = Method::AgentPromptSessionChecked(AgentPromptParams {
-                expected_agent_session_id: session.map(str::to_owned),
-                expected_pane_id: pane.map(str::to_owned),
-                target: "agent".into(),
-                text: "prompt".into(),
-                wait: None,
-                allow_cross_pane: true,
-            });
-            assert_eq!(
-                session_checked_guard_error(false, &method).map(|(code, _)| code),
-                Some("expected_agent_session_unsupported")
-            );
-            assert_eq!(
-                session_checked_guard_error(true, &method).map(|(code, _)| code),
-                (session.is_none() && pane.is_none()).then_some("invalid_request")
-            );
+            for status in [None, Some(crate::api::schema::AgentStatus::Idle)] {
+                let params = AgentPromptParams {
+                    expected_agent_session_id: session.map(str::to_owned),
+                    expected_pane_id: pane.map(str::to_owned),
+                    expected_agent_status: status,
+                    target: "agent".into(),
+                    text: "prompt".into(),
+                    wait: None,
+                    allow_cross_pane: true,
+                };
+                let methods = [
+                    Method::AgentPromptSessionChecked(params.clone()),
+                    Method::AgentPromptStatusChecked(params),
+                ];
+                for method in methods {
+                    if status.is_some() && session.is_none() {
+                        for supported in [false, true] {
+                            assert_eq!(
+                                session_checked_guard_error(supported, &method),
+                                Some((
+                                    "invalid_request",
+                                    "expected_agent_status requires expected_agent_session_id",
+                                ))
+                            );
+                        }
+                        continue;
+                    }
+                    assert_eq!(
+                        session_checked_guard_error(false, &method),
+                        Some((
+                            "expected_agent_session_unsupported",
+                            "expected agent session guards are supported only on Linux",
+                        ))
+                    );
+                    let missing = if matches!(method, Method::AgentPromptStatusChecked(_)) {
+                        session.is_none() || status.is_none()
+                    } else {
+                        session.is_none() && pane.is_none()
+                    };
+                    assert_eq!(
+                        session_checked_guard_error(true, &method),
+                        missing.then_some((
+                            "invalid_request",
+                            "checked method requires its input guard expectations",
+                        ))
+                    );
+                }
+            }
         }
     }
 
@@ -189,8 +241,11 @@ mod tests {
                     Some("expected_agent_session_unsupported")
                 );
                 assert_eq!(
-                    session_checked_guard_error(true, &method).map(|(code, _)| code),
-                    session.is_none().then_some("invalid_request")
+                    session_checked_guard_error(true, &method),
+                    session.is_none().then_some((
+                        "invalid_request",
+                        "checked method requires its input guard expectations",
+                    ))
                 );
             }
         }
@@ -202,6 +257,7 @@ mod tests {
             Method::AgentPrompt(AgentPromptParams {
                 expected_agent_session_id: Some("session".into()),
                 expected_pane_id: Some("w1:p1".into()),
+                expected_agent_status: Some(crate::api::schema::AgentStatus::Idle),
                 target: "agent".into(),
                 text: "prompt".into(),
                 wait: None,
@@ -223,6 +279,30 @@ mod tests {
         for method in methods {
             for supported in [false, true] {
                 assert_eq!(session_checked_guard_error(supported, &method), None);
+            }
+        }
+    }
+
+    #[test]
+    fn unchecked_prompt_status_requires_session_on_every_platform() {
+        for pane in [None, Some("w1:p1")] {
+            let method = Method::AgentPrompt(AgentPromptParams {
+                expected_agent_session_id: None,
+                expected_pane_id: pane.map(str::to_owned),
+                expected_agent_status: Some(crate::api::schema::AgentStatus::Idle),
+                target: "agent".into(),
+                text: "prompt".into(),
+                wait: None,
+                allow_cross_pane: true,
+            });
+            for supported in [false, true] {
+                assert_eq!(
+                    session_checked_guard_error(supported, &method),
+                    Some((
+                        "invalid_request",
+                        "expected_agent_status requires expected_agent_session_id",
+                    ))
+                );
             }
         }
     }
@@ -310,6 +390,103 @@ mod tests {
     fn assert_ok(response: &str) {
         let response: SuccessResponse = serde_json::from_str(response).expect("success response");
         assert!(matches!(response.result, ResponseResult::Ok {}));
+    }
+
+    #[tokio::test]
+    async fn expected_agent_status_admission_requires_session_and_checked_alias_requires_status() {
+        let mut fixture = attributed_agent_fixture();
+        for method in [
+            "agent.prompt",
+            "agent.prompt_session_checked",
+            "agent.prompt_status_checked",
+        ] {
+            for (session, status, pane) in [
+                (false, false, false),
+                (false, false, true),
+                (false, true, false),
+                (false, true, true),
+                (true, false, false),
+                (true, true, false),
+            ] {
+                let mut params = serde_json::json!({
+                    "target": fixture.target_pane_id, "text": "bad", "allow_cross_pane": true,
+                });
+                if session {
+                    params["expected_agent_session_id"] = "opaque-session".into();
+                }
+                if status {
+                    params["expected_agent_status"] = "idle".into();
+                }
+                if pane {
+                    params["expected_pane_id"] = fixture.target_pane_id.clone().into();
+                }
+                let request: Request = serde_json::from_value(serde_json::json!({
+                    "id": "admission", "method": method, "params": params,
+                }))
+                .expect("prompt request");
+                assert!(
+                    App::api_request_requires_deferred_input(&request),
+                    "{method}"
+                );
+                let expected_error = if status && !session {
+                    Some((
+                        "invalid_request",
+                        "expected_agent_status requires expected_agent_session_id",
+                    ))
+                } else if method != "agent.prompt"
+                    && !crate::platform::expected_agent_session_guard_supported()
+                {
+                    Some((
+                        "expected_agent_session_unsupported",
+                        "expected agent session guards are supported only on Linux",
+                    ))
+                } else {
+                    let missing = match method {
+                        "agent.prompt_status_checked" => !status || !session,
+                        "agent.prompt_session_checked" => !session && !pane,
+                        _ => false,
+                    };
+                    missing.then_some((
+                        "invalid_request",
+                        "checked method requires its input guard expectations",
+                    ))
+                };
+                let denial = fixture.app.session_checked_guard_denial(&request);
+                assert_eq!(
+                    denial.is_some(),
+                    expected_error.is_some(),
+                    "{method}: session={session}, status={status}, pane={pane}"
+                );
+                if let Some((code, message)) = expected_error {
+                    let assert_error = |response: &str| {
+                        let error: ErrorResponse =
+                            serde_json::from_str(response).expect("denial response");
+                        assert_eq!(error.error.code, code);
+                        assert_eq!(error.error.message, message);
+                    };
+                    assert_error(&denial.expect("denial"));
+                    // Both direct and deferred app admission reject before lookup or input attribution.
+                    assert_error(
+                        &fixture
+                            .app
+                            .handle_api_request_with_context(request.clone(), Default::default()),
+                    );
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    assert!(fixture.app.handle_deferred_agent_api_request(
+                        request,
+                        Default::default(),
+                        tx
+                    ));
+                    assert_error(
+                        &rx.recv_timeout(std::time::Duration::from_secs(1))
+                            .expect("denial deferred response"),
+                    );
+                    assert!(fixture.app.accepted_api_inputs.is_empty());
+                    assert!(fixture.source_rx.try_recv().is_err());
+                    assert!(fixture.target_rx.try_recv().is_err());
+                }
+            }
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -521,6 +698,7 @@ mod tests {
             request.method = Method::AgentPrompt(AgentPromptParams {
                 expected_agent_session_id: None,
                 expected_pane_id: None,
+                expected_agent_status: None,
                 target: "target-agent".into(),
                 text: "explicit".into(),
                 wait: None,
@@ -649,6 +827,7 @@ mod tests {
             method: Method::AgentPrompt(AgentPromptParams {
                 expected_agent_session_id: None,
                 expected_pane_id: None,
+                expected_agent_status: None,
                 target: "target-agent".into(),
                 text: "explicitly allowed".into(),
                 wait: None,
@@ -735,8 +914,18 @@ mod tests {
             Method::AgentPrompt(AgentPromptParams {
                 expected_agent_session_id: None,
                 expected_pane_id: None,
+                expected_agent_status: None,
                 target: "target-agent".into(),
                 text: "prompt".into(),
+                wait: None,
+                allow_cross_pane: false,
+            }),
+            Method::AgentPromptStatusChecked(AgentPromptParams {
+                expected_agent_session_id: Some("opaque-session".into()),
+                expected_pane_id: None,
+                expected_agent_status: Some(crate::api::schema::AgentStatus::Idle),
+                target: "target-agent".into(),
+                text: "guarded prompt".into(),
                 wait: None,
                 allow_cross_pane: false,
             }),
@@ -783,22 +972,34 @@ mod tests {
             })
             .collect();
         for (index, method) in methods.into_iter().chain(guarded_methods).enumerate() {
-            let unknown_response = fixture.app.handle_api_request_with_context(
-                Request {
-                    id: format!("unknown-origin-{index}"),
-                    method: method.clone(),
-                },
-                ApiRequestContext::default(),
-            );
-            assert_unknown(&unknown_response);
-            let response = fixture.app.handle_api_request_with_context(
-                Request {
-                    id: format!("cross-pane-{index}"),
-                    method,
-                },
-                attributed_context(),
-            );
-            assert_denied(&response);
+            let unsupported_guard = matches!(&method, Method::AgentPromptStatusChecked(_))
+                && !crate::platform::expected_agent_session_guard_supported();
+            for (context, origin_code) in [
+                (ApiRequestContext::default(), "input_origin_unknown"),
+                (attributed_context(), "cross_pane_input_denied"),
+            ] {
+                let response = fixture.app.handle_api_request_with_context(
+                    Request {
+                        id: format!("denied-{origin_code}-{index}"),
+                        method: method.clone(),
+                    },
+                    context,
+                );
+                let response: ErrorResponse =
+                    serde_json::from_str(&response).expect("denial response");
+                assert_eq!(
+                    response.error.code,
+                    if unsupported_guard {
+                        "expected_agent_session_unsupported"
+                    } else {
+                        origin_code
+                    },
+                    "method {index}: {origin_code}"
+                );
+                assert!(fixture.source_rx.try_recv().is_err());
+                assert!(fixture.target_rx.try_recv().is_err());
+                assert!(fixture.app.accepted_api_inputs.is_empty());
+            }
         }
 
         assert!(fixture.source_rx.try_recv().is_err());
@@ -1195,6 +1396,7 @@ mod tests {
                         method: Method::AgentPrompt(AgentPromptParams {
                             expected_agent_session_id: None,
                             expected_pane_id: None,
+                            expected_agent_status: None,
                             target: "target-agent".into(),
                             text: "blocked".into(),
                             wait: None,
@@ -1337,6 +1539,7 @@ mod tests {
                     method: Method::AgentPrompt(AgentPromptParams {
                         expected_agent_session_id: None,
                         expected_pane_id: None,
+                        expected_agent_status: None,
                         target: fixture.target_pane_id.clone(),
                         text: "deferred".into(),
                         wait: None,
@@ -2126,6 +2329,7 @@ mod tests {
                 method: Method::AgentPrompt(AgentPromptParams {
                     expected_agent_session_id: None,
                     expected_pane_id: None,
+                    expected_agent_status: None,
                     target: "target-agent".into(),
                     text: "blocked".into(),
                     wait: None,
@@ -2521,6 +2725,7 @@ finally:
                     method: Method::AgentPrompt(AgentPromptParams {
                         expected_agent_session_id: None,
                         expected_pane_id: None,
+                        expected_agent_status: None,
                         target: "target-agent".into(),
                         text: "orphan".into(),
                         wait: None,

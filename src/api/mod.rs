@@ -63,6 +63,7 @@ pub(crate) fn request_changes_ui(request: &Request) -> bool {
             | Method::AgentStartGuarded(_)
             | Method::AgentPrompt(_)
             | Method::AgentPromptSessionChecked(_)
+            | Method::AgentPromptStatusChecked(_)
             | Method::AgentSendKeys(_)
             | Method::PaneSplit(_)
             | Method::PaneSwap(_)

@@ -8656,6 +8656,7 @@ async fn headless_deferred_agent_prompt_enforces_cross_pane_guard() {
         api::schema::Method::AgentPrompt(api::schema::AgentPromptParams {
             expected_agent_session_id: None,
             expected_pane_id: None,
+            expected_agent_status: None,
             target: target.into(),
             text: "hello".into(),
             wait: None,

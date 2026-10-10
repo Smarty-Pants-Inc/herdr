@@ -5,18 +5,82 @@
 pub(crate) struct SessionInputGuard {
     pub(crate) reporter: crate::platform::ProcessIdentity,
     pub(crate) expected_agent_session_id: String,
+    pub(crate) expected_agent_status: Option<crate::api::schema::AgentStatus>,
+    pub(crate) agent_status: std::sync::Weak<std::sync::atomic::AtomicU8>,
+    /// Shared across guard clones so a refused status stays typed even if it changes back.
+    pub(crate) status_mismatch: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// The accepted binding owns the strong root. Queued input must neither
     /// extend that binding's lifetime nor retain a strong root during proof.
     pub binding_validity: std::sync::Weak<std::sync::atomic::AtomicBool>,
 }
 
-#[cfg(unix)]
 impl SessionInputGuard {
+    #[cfg(unix)]
     fn binding_is_current(&self) -> bool {
         self.binding_validity
             .upgrade()
             .is_some_and(|validity| validity.load(std::sync::atomic::Ordering::Acquire))
     }
+
+    fn status_is_current(&self) -> bool {
+        let Some(expected) = self.expected_agent_status else {
+            return true;
+        };
+        if self
+            .status_mismatch
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return false;
+        }
+        let expected = match expected {
+            crate::api::schema::AgentStatus::Idle => Some(crate::detect::AgentState::Idle),
+            crate::api::schema::AgentStatus::Working => Some(crate::detect::AgentState::Working),
+            crate::api::schema::AgentStatus::Blocked => Some(crate::detect::AgentState::Blocked),
+            crate::api::schema::AgentStatus::Unknown => Some(crate::detect::AgentState::Unknown),
+            crate::api::schema::AgentStatus::Done => None,
+        };
+        let current = expected.is_some_and(|expected| {
+            let expected = crate::terminal::state::agent_state_guard_code(expected);
+            self.agent_status
+                .upgrade()
+                .is_some_and(|status| status.load(std::sync::atomic::Ordering::Acquire) == expected)
+        });
+        if !current {
+            self.status_mismatch
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        current
+    }
+}
+
+#[derive(Debug)]
+struct ExpectedStatusMismatch {
+    expected: crate::api::schema::AgentStatus,
+    /// Submission text may have reached the PTY, as for session loss.
+    partial_text_consumed: Option<bool>,
+    flush_failed: bool,
+}
+
+impl std::fmt::Display for ExpectedStatusMismatch {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "the target's detected agent status no longer matches expected {:?}; partial_text_consumed={}; flush_failed={}",
+            self.expected,
+            self.partial_text_consumed
+                .map_or("unknown", |partial| if partial { "true" } else { "false" }),
+            self.flush_failed
+        )
+    }
+}
+
+impl std::error::Error for ExpectedStatusMismatch {}
+
+/// Classify only the guard's typed status refusal, not arbitrary permission errors.
+pub(crate) fn is_expected_status_mismatch(error: &std::io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|cause| cause.is::<ExpectedStatusMismatch>())
 }
 
 #[derive(Debug)]
@@ -43,19 +107,25 @@ impl std::fmt::Display for AgentSessionLost {
 
 impl std::error::Error for AgentSessionLost {}
 
-/// Only ownership loss has this payload. Never classify generic permission or
-/// PTY failures as session loss. Some text may already have reached the PTY.
+/// Only ownership loss has this payload. A detected-status refusal has its own
+/// type. Never classify generic permission or PTY failures as session loss.
+/// Some text may already have reached the PTY.
 pub(crate) fn is_agent_session_lost(error: &std::io::Error) -> bool {
     error
         .get_ref()
         .is_some_and(|cause| cause.is::<AgentSessionLost>())
 }
 
+/// Shared cleanup metadata for either typed guard refusal. Classification stays
+/// separate so a status mismatch never becomes an agent-session-loss response.
 pub(crate) fn agent_session_loss_details(error: &std::io::Error) -> Option<(Option<bool>, bool)> {
-    error
-        .get_ref()
-        .and_then(|cause| cause.downcast_ref::<AgentSessionLost>())
-        .map(|loss| (loss.partial_text_consumed, loss.flush_failed))
+    let cause = error.get_ref()?;
+    if let Some(loss) = cause.downcast_ref::<AgentSessionLost>() {
+        return Some((loss.partial_text_consumed, loss.flush_failed));
+    }
+    cause
+        .downcast_ref::<ExpectedStatusMismatch>()
+        .map(|mismatch| (mismatch.partial_text_consumed, mismatch.flush_failed))
 }
 
 #[cfg(all(test, unix))]
@@ -81,10 +151,23 @@ pub(crate) fn is_pane_input_poisoned(error: &std::io::Error) -> bool {
         .is_some_and(|cause| cause.is::<PaneInputPoisoned>())
 }
 
+/// Keep status refusal distinct, including when it changed back after the check.
 pub(crate) fn agent_session_lost(
     guard: &SessionInputGuard,
     partial_text_consumed: bool,
 ) -> std::io::Error {
+    if let Some(expected) = guard.expected_agent_status {
+        if !guard.status_is_current() {
+            return std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                ExpectedStatusMismatch {
+                    expected,
+                    partial_text_consumed: Some(partial_text_consumed),
+                    flush_failed: false,
+                },
+            );
+        }
+    }
     std::io::Error::new(
         std::io::ErrorKind::PermissionDenied,
         AgentSessionLost {
@@ -97,6 +180,18 @@ pub(crate) fn agent_session_lost(
 
 #[cfg(unix)]
 pub(crate) fn agent_session_flush_failed(guard: &SessionInputGuard) -> std::io::Error {
+    if let Some(expected) = guard.expected_agent_status {
+        if !guard.status_is_current() {
+            return std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                ExpectedStatusMismatch {
+                    expected,
+                    partial_text_consumed: None,
+                    flush_failed: true,
+                },
+            );
+        }
+    }
     std::io::Error::new(
         std::io::ErrorKind::PermissionDenied,
         AgentSessionLost {
@@ -597,6 +692,9 @@ mod windows {
                     start_time: 0,
                 },
                 expected_agent_session_id: "unsupported-session".into(),
+                expected_agent_status: None,
+                agent_status: std::sync::Weak::new(),
+                status_mismatch: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 binding_validity: std::sync::Weak::new(),
             };
             let error = handle

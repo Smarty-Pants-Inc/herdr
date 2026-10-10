@@ -1168,7 +1168,9 @@ impl App {
                     "input consumer operations require the asynchronous local API route",
                 );
             }
-            Method::AgentPrompt(_) | Method::AgentPromptSessionChecked(_) => {
+            Method::AgentPrompt(_)
+            | Method::AgentPromptSessionChecked(_)
+            | Method::AgentPromptStatusChecked(_) => {
                 return responses::encode_error(
                     request.id,
                     "invalid_request",

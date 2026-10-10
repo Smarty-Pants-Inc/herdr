@@ -338,7 +338,7 @@ herdr agent list
 herdr agent get <target>
 herdr agent read <target> [--source visible|recent|recent-unwrapped|detection] [--lines N] [--format text|ansi] [--ansi]
 herdr agent send-keys <target> <key> [key ...]
-herdr agent prompt <target> <text> [--expected-session ID] [--expected-pane ID] [--wait] [--until STATUS]... [--timeout MS]
+herdr agent prompt <target> <text> [--expected-session ID] [--expected-pane ID] [--expected-status STATUS] [--wait] [--until STATUS]... [--timeout MS]
 herdr agent rename <target> <name>|--clear
 herdr agent focus <target>
 herdr agent wait <target> [--until STATUS]... [--timeout MS]
@@ -355,6 +355,18 @@ herdr agent explain --file PATH --agent LABEL [--json|--verbose]
 成功した start は、期待したエージェントが同じターミナルを所有し、対話入力の準備ができてから返ります。起動中の検出状態が `blocked` の場合、コマンドは直ちに `agent_not_ready` を返します。名前は `agent read` と `agent send-keys` で引き続き使用でき、検出状態が `idle` になるとプロンプトを送信できるようになります。デフォルトの起動タイムアウトは 30000 ミリ秒で、明示する値は 3000 より大きく 300000 以下でなければなりません。
 
 `agent prompt` は現在の bracketed paste モードを尊重し、working 中でもテキストと遅延した Enter を順序付きの 1 回の送信として書き込みます。`--wait` なしの成功は書き込みの完了を示し、ターンの開始を保証しません。Windows の Codex では Enter の前にペースト境界が送られるため、送信はプロンプトのサイズに依存しません。呼び出し側のタイムアウトには送信時間も含まれます。エージェントがすでに `blocked` の場合は、入力を送信せずに `agent_blocked` を返します。`--wait` を使う場合、別の non-working 状態から受け付けたプロンプトでは、送信後の最大 5 秒間に `working` または `blocked` が観測される必要があります。観測できなければ Herdr は `agent_prompt_stalled` を返し、呼び出し側のタイムアウトが先に切れた場合は通常の `timeout` エラーを返します。これにより、無関係な `idle`、`done`、またはセッションの変化によって待機が誤って完了することを防ぎます。活動を観測した後、要求された最初の安定状態を待ちます。個々のターンは追跡しません。すでに working の場合、進行中ターンの完了が待機を満たすことがあります。`--until` は一致状態を絞り込み、`--wait` なしでは拒否されます。単独の `agent wait` は現在の状態が一致すれば即座に返ります。どちらもデフォルトは `idle`、`done`、`blocked` です。
+
+`agent prompt` に `--expected-status idle` を追加すると、受理時に Herdr が**検出した**エージェント状態が idle でない限り送信を拒否します。初期不一致では `expected_status_mismatch` を返し、入力バイトは一切書き込みません。フックとスクリーン検出から得た有効状態を比較し、ペインの既読状態には依存しません。そのため、`done` と表示される idle エージェントも idle の期待値を満たします。フラグを省略すると、working 中のエージェントへの送信を含む既存の動作を維持します。
+
+```bash
+herdr agent prompt reviewer "Review the current diff" --expected-session "$session_id" --expected-status idle
+```
+
+`--expected-status` には **`--expected-session` が必須**です。上の例では、`agent get` で報告された `agent_session_id` を `session_id` にコピーしてください。状態だけのガードは未対応です。このフラグは API の省略可能な `expected_agent_status` フィールドに対応し、`expected_agent_status_guard` のサポートが必要です。未対応なら CLI はプロンプトを送らずに `expected_agent_status_unsupported` を返します。`--expected-status` を指定すると、CLI は常に `agent.prompt_status_checked` を使います。古いサーバーは状態フィールドを黙って無視せず、このメソッドを拒否します。旧メソッドでの再試行はありません。期待値を外して自動再試行しないでください。`--expected-pane` と `--wait` も併用できます。
+
+検出状態の条件は、受理時と PTY 書き込み前に既存のセッション／報告元ガードとともに確認します。受理後に検出状態が不一致となった場合も `expected_status_mismatch` を返し、リクエストの残りのバイトを停止して、それ以降の Enter を送りません。入力の一部がすでに書き込まれている可能性があり、この後段のエラーは総書き込みバイト数がゼロであることを保証しません。idle になるまで待つ操作ではありません。
+
+検出された idle は**最後に観測した状態**であり、実際のエージェントが busy ではないことのトランザクション的な証明ではありません。フックとスクリーン検出には遅延があり、確認後に busy になることもあります。破壊的なコマンドには引き続きエージェント側の busy チェックが必要で、このフラグはそれを提供しません。`--wait` は送信後の活動と安定状態を観測するもので、受理時の確認を強化するものではありません。
 
 `idle` と `done` はどちらも入力可能な状態です。CLI/API はサーバーの既読状態を使い、未確認の idle を `done` とします。明示的な `pane focus` / `agent focus` は対象を既読にしますが、読み取りでは変わりません。各 TUI クライアントは表示済みの完了を独立して管理するため、Done バッジが CLI やほかのクライアントと異なる場合があります。`blocked` は承認または質問 UI を Herdr が認識した状態です。`unknown` はエージェントが存在するものの確実に分類できない状態で、作業の成功を意味しません。
 

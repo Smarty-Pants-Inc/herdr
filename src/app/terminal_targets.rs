@@ -84,7 +84,25 @@ impl App {
         ws_idx: usize,
         pane_id: crate::layout::PaneId,
     ) -> Result<Option<crate::pty::actor::SessionInputGuard>, crate::api::schema::ErrorBody> {
-        let Some(expected) = expected else {
+        self.capture_expected_agent_input_guard(None, expected, ws_idx, pane_id)
+    }
+
+    /// Compare the detected status and session/foreground evidence together before enqueue.
+    /// The status cell is carried to the native writer when the session guard is present.
+    pub(super) fn capture_expected_agent_input_guard(
+        &self,
+        expected_agent_status: Option<crate::api::schema::AgentStatus>,
+        expected_agent_session_id: Option<&str>,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+    ) -> Result<Option<crate::pty::actor::SessionInputGuard>, crate::api::schema::ErrorBody> {
+        if expected_agent_status.is_some() && expected_agent_session_id.is_none() {
+            return Err(crate::api::schema::ErrorBody {
+                code: "invalid_request".into(),
+                message: "expected_agent_status requires expected_agent_session_id".into(),
+            });
+        }
+        let Some(expected) = expected_agent_session_id else {
             return Ok(None);
         };
         if !crate::platform::expected_agent_session_guard_supported() {
@@ -93,31 +111,52 @@ impl App {
                 message: "expected agent session guards are supported only on Linux".into(),
             });
         }
-        let actual = self
+        let terminal = self
             .state
             .terminal_id_for_pane(ws_idx, pane_id)
-            .and_then(|id| self.state.terminals.get(&id))
-            .and_then(|terminal| {
-                let reporter = terminal.reported_agent_session_reporter()?;
-                let runtime = self.state.runtime_for_pane_in_workspace(
-                    &self.terminal_runtimes,
-                    ws_idx,
-                    pane_id,
-                )?;
-                if !runtime.session_reporter_is_foreground(reporter) {
-                    return None;
-                }
-                Some((
-                    terminal.reported_agent_session_id()?,
-                    reporter,
-                    terminal.reported_agent_session_validity()?,
-                ))
+            .and_then(|id| self.state.terminals.get(&id));
+        if let (Some(expected), Some(terminal)) = (expected_agent_status, terminal) {
+            let actual = terminal.detected_agent_status();
+            if actual != expected {
+                return Err(crate::api::schema::ErrorBody {
+                    code: "expected_status_mismatch".into(),
+                    message: format!(
+                        "the target's detected agent status is {actual:?}, not expected {expected:?}"
+                    ),
+                });
+            }
+        } else if expected_agent_status.is_some() {
+            return Err(crate::api::schema::ErrorBody {
+                code: "expected_status_mismatch".into(),
+                message: "the target has no detected agent status".into(),
             });
+        }
+
+        let actual = terminal.and_then(|terminal| {
+            let reporter = terminal.reported_agent_session_reporter()?;
+            let runtime = self.state.runtime_for_pane_in_workspace(
+                &self.terminal_runtimes,
+                ws_idx,
+                pane_id,
+            )?;
+            if !runtime.session_reporter_is_foreground(reporter) {
+                return None;
+            }
+            Some((
+                terminal.reported_agent_session_id()?,
+                reporter,
+                terminal.reported_agent_session_validity()?,
+                terminal.agent_status_cell(),
+            ))
+        });
         match actual {
-            Some((actual, reporter, binding_validity)) if actual == expected => {
+            Some((actual, reporter, binding_validity, agent_status)) if actual == expected => {
                 Ok(Some(crate::pty::actor::SessionInputGuard {
                     reporter,
                     expected_agent_session_id: actual.to_owned(),
+                    expected_agent_status,
+                    agent_status,
+                    status_mismatch: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                     binding_validity,
                 }))
             }
@@ -596,6 +635,85 @@ mod tests {
             api_rx,
             crate::api::EventHub::default(),
         )
+    }
+
+    #[tokio::test]
+    async fn expected_status_admission_requires_session_even_for_matching_status() {
+        let mut app = test_app();
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("status")];
+        app.state.ensure_test_terminals();
+        let target = app.terminal_targets().pop().expect("one pane");
+        let terminal = app
+            .state
+            .terminals
+            .get_mut(target.terminal_id.as_str())
+            .expect("terminal");
+        terminal.set_detected_state(
+            Some(crate::detect::Agent::Pi),
+            crate::detect::AgentState::Idle,
+        );
+        for expected in [
+            crate::api::schema::AgentStatus::Idle,
+            crate::api::schema::AgentStatus::Working,
+        ] {
+            let error = app
+                .capture_expected_agent_input_guard(
+                    Some(expected),
+                    None,
+                    target.ws_idx,
+                    target.pane_id,
+                )
+                .expect_err("status-only admission is unsupported");
+            assert_eq!(error.code, "invalid_request");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn expected_status_admission_uses_detected_state_not_seen() {
+        use crate::api::schema::AgentStatus;
+        use crate::detect::{Agent, AgentState};
+        let mut app = test_app();
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("status")];
+        app.state.ensure_test_terminals();
+        let target = app.terminal_targets().pop().expect("one pane");
+        for seen in [true, false] {
+            app.state.workspaces[target.ws_idx].tabs[target.tab_idx]
+                .panes
+                .get_mut(&target.pane_id)
+                .expect("pane")
+                .seen = seen;
+            for (state, status) in [
+                (AgentState::Idle, AgentStatus::Idle),
+                (AgentState::Working, AgentStatus::Working),
+                (AgentState::Blocked, AgentStatus::Blocked),
+                (AgentState::Unknown, AgentStatus::Unknown),
+            ] {
+                app.state
+                    .terminals
+                    .get_mut(target.terminal_id.as_str())
+                    .expect("terminal")
+                    .set_detected_state(Some(Agent::Pi), state);
+                let matching = app
+                    .capture_expected_agent_input_guard(
+                        Some(status),
+                        Some("no-session"),
+                        target.ws_idx,
+                        target.pane_id,
+                    )
+                    .expect_err("matching status proceeds to session admission");
+                assert_eq!(matching.code, "agent_session_unknown");
+                let mismatch = app
+                    .capture_expected_agent_input_guard(
+                        Some(AgentStatus::Done),
+                        Some("no-session"),
+                        target.ws_idx,
+                        target.pane_id,
+                    )
+                    .expect_err("presentation-only Done is never detected state");
+                assert_eq!(mismatch.code, "expected_status_mismatch");
+            }
+        }
     }
 
     fn attribution_app(root: crate::platform::ProcessIdentity) -> (App, TerminalTarget) {

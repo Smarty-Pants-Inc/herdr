@@ -207,6 +207,16 @@ pub struct AgentPromptParams {
     )]
     #[schemars(with = "String")]
     pub expected_pane_id: Option<String>,
+    /// Refuse input unless the pane's detected agent status still matches.
+    /// Requires `expected_agent_session_id`. Detection uses hooks and screen
+    /// signals; idle is the last observed state, not a readiness reservation.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "super::deserialize_expected_agent_status"
+    )]
+    #[schemars(with = "AgentStatus")]
+    pub expected_agent_status: Option<AgentStatus>,
     pub target: String,
     pub text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
