@@ -279,6 +279,8 @@ mod tests {
         app: App,
         source_pane_id: String,
         target_pane_id: String,
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        source_rx: tokio::sync::mpsc::Receiver<bytes::Bytes>,
         target_rx: tokio::sync::mpsc::Receiver<bytes::Bytes>,
     }
 
@@ -393,6 +395,8 @@ mod tests {
             source_pane_id: app.public_pane_id(0, source_pane).expect("source pane id"),
             target_pane_id: app.public_pane_id(0, target_pane).expect("target pane id"),
             app,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            source_rx: _source_rx,
             target_rx,
         }
     }
@@ -468,6 +472,18 @@ mod tests {
                 grant_id: "plugin-log-9".into(),
             })
             .expect("mint");
+        let (ws_idx, pane_id) = fixture
+            .app
+            .parse_pane_id(&fixture.source_pane_id)
+            .expect("invoking pane");
+        let target = fixture
+            .app
+            .terminal_target_for_pane(ws_idx, pane_id)
+            .expect("invoking terminal");
+        assert!(fixture
+            .app
+            .plugin_action_grants
+            .bind_target(key, &target.terminal_id));
         let mut child = std::process::Command::new("sleep")
             .arg("30")
             .spawn()
@@ -480,7 +496,7 @@ mod tests {
             Request {
                 id: "granted".into(),
                 method: Method::PaneSendText(PaneSendTextParams {
-                    pane_id: fixture.target_pane_id.clone(),
+                    pane_id: fixture.source_pane_id.clone(),
                     text: "open".into(),
                     allow_cross_pane: false,
                 }),
@@ -488,6 +504,8 @@ mod tests {
             ApiRequestContext::default().with_plugin_action(PluginActionClaim::Presented(token)),
         );
         assert!(response.contains("\"ok\""), "{response}");
+        assert_eq!(fixture.source_rx.try_recv().expect("input"), "open");
+        assert!(fixture.target_rx.try_recv().is_err());
         let lines = log_lines(&fixture.app);
         assert_eq!(lines.len(), 1, "{lines:?}");
         let action = &lines[0]["caller"]["plugin_action"];
@@ -515,7 +533,7 @@ mod tests {
         let grant = PluginActionGrant {
             plugin_id: "example.explorr".into(),
             action_id: "open".into(),
-            invoking_pane: None,
+            invoking_pane: Some(fixture.source_pane_id.clone()),
             grant_id: "plugin-log-10".into(),
         };
         let (token, key) = fixture
@@ -523,6 +541,26 @@ mod tests {
             .plugin_action_grants
             .mint(grant.clone())
             .expect("mint");
+        let (ws_idx, pane_id) = fixture
+            .app
+            .parse_pane_id(&fixture.source_pane_id)
+            .expect("invoking pane");
+        let target = fixture
+            .app
+            .terminal_target_for_pane(ws_idx, pane_id)
+            .expect("invoking terminal");
+        assert!(fixture
+            .app
+            .plugin_action_grants
+            .bind_target(key, &target.terminal_id));
+        let request = Request {
+            id: "late".into(),
+            method: Method::PaneSendText(PaneSendTextParams {
+                pane_id: fixture.source_pane_id.clone(),
+                text: "open".into(),
+                allow_cross_pane: false,
+            }),
+        };
         let context =
             ApiRequestContext::default().with_plugin_action(PluginActionClaim::Presented(token));
         let mut child = std::process::Command::new("sleep")
@@ -536,8 +574,12 @@ mod tests {
         assert_eq!(
             fixture.app.input_origin_for_context(context),
             InputOrigin::PluginAction(grant),
-            "guard admission"
+            "live plugin attribution"
         );
+        assert!(fixture
+            .app
+            .cross_pane_input_denial(&request, context)
+            .is_none());
         // The child exits and the worker revokes before the log line.
         child.kill().expect("stop own child");
         child.wait().expect("reap");
@@ -547,10 +589,11 @@ mod tests {
             InputOrigin::Unknown,
             "a request after exit is refused"
         );
-        let (ws_idx, pane_id) = fixture
+        let denied = fixture
             .app
-            .parse_pane_id(&fixture.target_pane_id)
-            .expect("target");
+            .cross_pane_input_denial(&request, context)
+            .expect("a later write is refused");
+        assert!(denied.contains("input_origin_unknown"), "{denied}");
         fixture
             .app
             .log_api_input("late", "pane.send_text", ws_idx, pane_id, context, 4)
@@ -559,6 +602,7 @@ mod tests {
         let action = &lines.last().expect("line")["caller"]["plugin_action"];
         assert_eq!(action["plugin_id"], "example.explorr");
         assert_eq!(action["grant"], "plugin-log-10");
+        assert_eq!(action["invoking_pane"], fixture.source_pane_id.as_str());
         let raw = std::fs::read_to_string(&fixture.app.api_input_log).unwrap();
         assert!(!raw.contains(&token.expose_hex()));
         let _ = std::fs::remove_file(&fixture.app.api_input_log);

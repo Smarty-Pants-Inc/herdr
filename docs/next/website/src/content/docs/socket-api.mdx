@@ -818,15 +818,27 @@ commands also receive `HERDR_PLUGIN_ACTION_ID`; event hooks receive
 `HERDR_PLUGIN_EVENT` and `HERDR_PLUGIN_EVENT_JSON`; pane commands receive
 `HERDR_PLUGIN_ENTRYPOINT_ID`.
 
-Plugin action commands also receive a secret `HERDR_PLUGIN_ACTION_TOKEN`.
-The local CLI automatically attaches it to content-write requests. Raw API
-clients can supply it in the optional top-level `plugin_action_token` field,
-alongside `id`, `method`, and `params`. A valid token attributes a write to its
-plugin action without requiring `allow_cross_pane`. It is valid only on the
-issuing server, while the action process is alive, and for at most ten minutes.
-Invalid, expired, or revoked claims return `input_origin_unknown` unless the
-caller explicitly enables `allow_cross_pane`. Startup and event hooks receive
-no action token. Never log the token. Same-user processes may read each other's
+Plugin action commands normally also receive a secret
+`HERDR_PLUGIN_ACTION_TOKEN`. The local CLI automatically attaches it to
+content-write requests and to `pane.split`, `tab.create`, `workspace.create`,
+and `workspace.create_linked`. Raw API clients can supply it in the optional
+top-level `plugin_action_token` field, alongside `id`, `method`, and `params`;
+request parameters are unchanged. Without `allow_cross_pane`, a valid token
+authorizes writes only to the action's invoking terminal and to terminals
+created by requests carrying the same token. These rights follow the stable
+terminal identity across moves and renames, but never extend to another
+existing terminal, a reused public ID, or a terminal created under another
+grant. A global action has no invoking terminal and can write only to terminals
+it created. A valid token aimed at any other existing terminal returns
+`cross_pane_input_denied`. Invalid, expired, revoked, foreign, or malformed
+tokens return `input_origin_unknown`. Explicit `allow_cross_pane` remains a
+separate override. A token is valid only on the issuing server, while the action
+process is alive, and for at most ten minutes. The server keeps at most 256
+grants, including revoked ones; when live or pending grants fill it, the action runs
+without a token under the ordinary input rules. No new grant is issued. On cap
+exhaustion, a global action runs as an ordinary client, as before action tokens
+were introduced; those rules allow writes to existing panes. Startup and event
+hooks receive no action token. Never log the token. Same-user processes may read each other's
 environment, so it does not isolate processes running as the same OS user.
 
 List recent action and event command logs:

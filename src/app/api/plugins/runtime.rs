@@ -112,6 +112,16 @@ impl App {
                     grant_id: log_id.clone(),
                 },
             ) {
+                Ok((_, key)) if !self.bind_plugin_action_invoking_terminal(key, context) => {
+                    // The server-resolved invoking pane has no terminal or
+                    // the grant refused it: fail closed, run without a token.
+                    self.plugin_action_grants.revoke(key);
+                    tracing::warn!(
+                        plugin_id = %plugin.plugin_id,
+                        "plugin action invoking terminal unavailable; running without an input grant"
+                    );
+                    None
+                }
                 Ok((token, key)) => {
                     env.push((
                         crate::plugin_action_origin::TOKEN_ENV_VAR.to_string(),
@@ -302,6 +312,27 @@ impl App {
                 );
             }
         }
+    }
+
+    /// herdr#223: a grant may write to its invoking terminal, bound by stable
+    /// terminal ID (never the public pane ID, which can be renumbered or
+    /// reused). The pane comes from the server-built invocation context; a
+    /// global invocation binds nothing. False only when an invoking pane is
+    /// named but cannot be bound.
+    fn bind_plugin_action_invoking_terminal(
+        &self,
+        key: crate::plugin_action_origin::GrantKey,
+        context: &PluginInvocationContext,
+    ) -> bool {
+        let Some(pane_id) = context.focused_pane_id.as_deref() else {
+            return true;
+        };
+        self.parse_pane_id(pane_id)
+            .and_then(|(ws_idx, pane_id)| self.terminal_target_for_pane(ws_idx, pane_id))
+            .is_some_and(|target| {
+                self.plugin_action_grants
+                    .bind_target(key, &target.terminal_id)
+            })
     }
 
     fn push_plugin_command_log(&mut self, log: PluginCommandLogInfo) {

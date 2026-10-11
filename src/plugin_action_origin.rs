@@ -13,7 +13,7 @@
 //! This is not same-UID authentication: any same-user process that can read the
 //! child's environment can copy the token (existing #8151 class).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -26,6 +26,10 @@ pub(crate) const MAX_GRANT_AGE: Duration = Duration::from_secs(10 * 60);
 /// Bound on how long a request presented between spawn and pin may wait.
 const ACTIVATION_WAIT: Duration = Duration::from_secs(5);
 const TOKEN_BYTES: usize = 32;
+/// Hard cap on TOTAL registry entries: pending, live and revoked tombstones.
+pub(crate) const MAX_ENTRIES: usize = 256;
+/// Hard cap on stable terminal IDs one grant may target.
+pub(crate) const MAX_TARGETS_PER_GRANT: usize = 256;
 
 /// A presented or minted secret. Copy, fixed-size, and redacted in Debug.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -80,6 +84,14 @@ pub(crate) fn method_carries_grant(method: &crate::api::schema::Method) -> bool 
         | Method::PaneSendKeys(_)
         | Method::PaneSendInput(_)
         | Method::PaneSendInputGuarded(_) => true,
+        // Pane creation the CLI performs, so the server can attribute the
+        // created terminals to the grant (herdr#223). Carrying a claim never
+        // awards rights by itself; the server registers only actually
+        // created stable terminal IDs for a valid grant.
+        Method::PaneSplit(_)
+        | Method::TabCreate(_)
+        | Method::WorkspaceCreate(_)
+        | Method::WorkspaceCreateLinked(_) => true,
         Method::PaneReportAgent(params) => params.resume_argv.is_some(),
         Method::PaneReportAgentSession(params) => params.resume_argv.is_some(),
         _ => false,
@@ -185,6 +197,43 @@ struct Entry {
     grant: PluginActionGrant,
     minted: Instant,
     state: GrantState,
+    /// Stable terminal IDs (never public pane IDs) this grant may target.
+    /// Starts empty: the runtime binds the trusted invoking terminal and the
+    /// server adds terminals the grant actually created. Nothing is derived
+    /// from `grant.invoking_pane`.
+    allowed_terminal_ids: HashSet<String>,
+}
+
+impl Entry {
+    fn is_expired(&self) -> bool {
+        self.minted.elapsed() > MAX_GRANT_AGE
+    }
+
+    /// Lazily revoke an expired or dead grant; true if it is now Revoked.
+    fn revoke_if_invalid(&mut self) -> bool {
+        let invalid = match &self.state {
+            GrantState::Revoked => true,
+            GrantState::Live(pin) => !pin.is_alive() || self.is_expired(),
+            GrantState::Pending => self.is_expired(),
+        };
+        if invalid {
+            self.state = GrantState::Revoked;
+        }
+        invalid
+    }
+
+    fn allow_target(&mut self, target: &str) -> bool {
+        if target.is_empty() {
+            return false;
+        }
+        if self.allowed_terminal_ids.contains(target) {
+            return true;
+        }
+        if self.allowed_terminal_ids.len() >= MAX_TARGETS_PER_GRANT {
+            return false;
+        }
+        self.allowed_terminal_ids.insert(target.to_owned())
+    }
 }
 
 /// Per-App (therefore per-server) registry.
@@ -209,6 +258,13 @@ impl PluginActionGrants {
 
     /// Mint a pending grant before the child exists, so a request the child
     /// sends immediately after exec can never precede registration.
+    ///
+    /// The registry holds at most [`MAX_ENTRIES`] entries in total. Before
+    /// inserting, entries past attribution retention are dropped, expired or
+    /// dead grants become tombstones, and, only when still full, the oldest
+    /// tombstones are evicted (their attribution is then lost). If pending and
+    /// live grants alone fill the cap this fails closed with an error that
+    /// carries no secret; the caller runs the action without a token.
     pub(crate) fn mint(
         &self,
         grant: PluginActionGrant,
@@ -218,15 +274,76 @@ impl PluginActionGrants {
         let mut entries = self.lock();
         let now = Instant::now();
         entries.retain(|_, entry| now.duration_since(entry.minted) <= ATTRIBUTION_RETENTION);
+        for entry in entries.values_mut() {
+            entry.revoke_if_invalid();
+        }
+        while entries.len() >= MAX_ENTRIES {
+            let oldest_tombstone = entries
+                .iter()
+                .filter(|(_, entry)| matches!(entry.state, GrantState::Revoked))
+                .min_by_key(|(_, entry)| entry.minted)
+                .map(|(key, _)| *key);
+            match oldest_tombstone {
+                Some(evict) => {
+                    entries.remove(&evict);
+                }
+                None => {
+                    drop(entries);
+                    // Lazy revocations above may wake resolvers.
+                    self.inner.1.notify_all();
+                    return Err(std::io::Error::other(
+                        "plugin action grant registry is full",
+                    ));
+                }
+            }
+        }
         entries.insert(
             key,
             Entry {
                 grant,
                 minted: now,
                 state: GrantState::Pending,
+                allowed_terminal_ids: HashSet::new(),
             },
         );
+        drop(entries);
+        self.inner.1.notify_all();
         Ok((token, key))
+    }
+
+    /// Record the trusted initial terminal (stable terminal ID, never a public
+    /// pane ID) before the child spawns. Pending or live grants only; false
+    /// for unknown, revoked, expired or dead grants and for an empty target.
+    pub(crate) fn bind_target(&self, key: GrantKey, target: &str) -> bool {
+        let bound = match self.lock().get_mut(&key) {
+            Some(entry) => !entry.revoke_if_invalid() && entry.allow_target(target),
+            None => false,
+        };
+        self.inner.1.notify_all();
+        bound
+    }
+
+    /// Add a stable terminal ID the server actually created for a request that
+    /// carried this claim. Only a currently valid grant gains the target;
+    /// absent, malformed, unknown, expired or revoked claims change nothing.
+    pub(crate) fn register_created_target(&self, claim: PluginActionClaim, target: &str) -> bool {
+        matches!(
+            self.with_valid_entry(claim, |entry| entry.allow_target(target)),
+            Ok(Some(true))
+        )
+    }
+
+    /// Validate the grant (pin and lifetime) like [`Self::resolve`], then
+    /// check `target` against its allowed set. `Ok(false)`: valid grant, target
+    /// not allowed (also for `Absent`, which carries no grant authority).
+    /// `Err(())`: the claim is invalid. Never an Ordinary fallback.
+    pub(crate) fn permits_target(
+        &self,
+        claim: PluginActionClaim,
+        target: &str,
+    ) -> Result<bool, ()> {
+        self.with_valid_entry(claim, |entry| entry.allowed_terminal_ids.contains(target))
+            .map(|allowed| allowed.unwrap_or(false))
     }
 
     /// Bind the grant to the exact spawned child. False if already revoked.
@@ -269,6 +386,16 @@ impl PluginActionGrants {
         &self,
         claim: PluginActionClaim,
     ) -> Result<Option<PluginActionGrant>, ()> {
+        self.with_valid_entry(claim, |entry| entry.grant.clone())
+    }
+
+    /// Shared validation: `Ok(None)` for no claim, `Ok(Some(f(entry)))` for a
+    /// valid grant (waiting boundedly while it is pending), `Err(())` otherwise.
+    fn with_valid_entry<R>(
+        &self,
+        claim: PluginActionClaim,
+        f: impl FnOnce(&mut Entry) -> R,
+    ) -> Result<Option<R>, ()> {
         let token = match claim {
             PluginActionClaim::Absent => return Ok(None),
             PluginActionClaim::Malformed => return Err(()),
@@ -284,7 +411,7 @@ impl PluginActionGrants {
                 return Err(());
             }
             match &entry.state {
-                GrantState::Live(pin) if pin.is_alive() => return Ok(Some(entry.grant.clone())),
+                GrantState::Live(pin) if pin.is_alive() => return Ok(Some(f(entry))),
                 GrantState::Live(_) | GrantState::Revoked => {
                     entry.state = GrantState::Revoked;
                     return Err(());
@@ -521,6 +648,238 @@ mod tests {
         worker.join().expect("worker");
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    fn live_child() -> std::process::Child {
+        #[cfg(unix)]
+        let child = std::process::Command::new("sleep").arg("30").spawn();
+        #[cfg(windows)]
+        let child = std::process::Command::new("cmd")
+            .args(["/C", "ping -n 30 127.0.0.1 >NUL"])
+            .spawn();
+        child.expect("child")
+    }
+
+    fn reap(mut child: std::process::Child) {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn creation_methods_carry_the_claim_and_reads_do_not() {
+        use crate::api::schema::Method;
+        let split: Method = serde_json::from_value(serde_json::json!({
+            "method": "pane.split",
+            "params": {"target_pane_id": "w1:p1", "direction": "right"}
+        }))
+        .expect("pane.split params");
+        assert!(matches!(split, Method::PaneSplit(_)));
+        assert!(method_carries_grant(&split));
+        for name in ["tab.create", "workspace.create", "workspace.create_linked"] {
+            let method: Method = serde_json::from_value(serde_json::json!({
+                "method": name,
+                "params": {}
+            }))
+            .expect(name);
+            assert!(method_carries_grant(&method), "{name}");
+        }
+        let list: Method = serde_json::from_value(serde_json::json!({
+            "method": "workspace.list",
+            "params": {}
+        }))
+        .expect("workspace.list");
+        assert!(!method_carries_grant(&list));
+    }
+
+    #[test]
+    fn plugin_action_origin_targets_start_empty_and_follow_bindings() {
+        let grants = PluginActionGrants::default();
+        let (token, key) = grants.mint(grant()).expect("mint");
+        let claim = PluginActionClaim::Presented(token);
+        let child = live_child();
+        // Pending: binding the trusted initial terminal is allowed pre-spawn.
+        assert!(grants.bind_target(key, "term-A"));
+        assert!(!grants.bind_target(key, ""), "empty target never binds");
+        assert!(grants.activate(key, crate::platform::pin_owned_child(&child).expect("pin")));
+        assert_eq!(grants.permits_target(claim, "term-A"), Ok(true));
+        assert_eq!(grants.permits_target(claim, "term-B"), Ok(false));
+        // The public invoking pane string is never authority.
+        assert_eq!(grants.permits_target(claim, "w1:p1"), Ok(false));
+        assert!(grants.register_created_target(claim, "term-C"));
+        assert_eq!(grants.permits_target(claim, "term-C"), Ok(true));
+        assert_eq!(grants.permits_target(claim, "term-B"), Ok(false));
+        // Absent carries no grant authority; malformed/forged/foreign is Err.
+        assert_eq!(
+            grants.permits_target(PluginActionClaim::Absent, "term-A"),
+            Ok(false)
+        );
+        assert_eq!(
+            grants.permits_target(PluginActionClaim::Malformed, "term-A"),
+            Err(())
+        );
+        let forged = PluginActionClaim::Presented(PluginActionToken([3; 32]));
+        assert_eq!(grants.permits_target(forged, "term-A"), Err(()));
+        let other_server = PluginActionGrants::default();
+        assert_eq!(other_server.permits_target(claim, "term-A"), Err(()));
+        assert!(!other_server.register_created_target(claim, "term-D"));
+        assert!(!grants.register_created_target(PluginActionClaim::Absent, "term-D"));
+        assert!(!grants.register_created_target(PluginActionClaim::Malformed, "term-D"));
+        assert!(!grants.register_created_target(forged, "term-D"));
+        assert_eq!(grants.permits_target(claim, "term-D"), Ok(false));
+        // Resolve is still attribution only.
+        assert_eq!(grants.resolve(claim), Ok(Some(grant())));
+
+        // Revoked: no registration, no binding, every target check is Err.
+        grants.revoke(key);
+        assert!(!grants.register_created_target(claim, "term-E"));
+        assert!(!grants.bind_target(key, "term-E"));
+        assert_eq!(grants.permits_target(claim, "term-A"), Err(()));
+        assert_eq!(grants.attribution(claim), Some(grant()));
+        reap(child);
+    }
+
+    #[test]
+    fn plugin_action_origin_global_grant_targets_only_created_terminals() {
+        let grants = PluginActionGrants::default();
+        let (token, key) = grants.mint(grant()).expect("mint");
+        let claim = PluginActionClaim::Presented(token);
+        let child = live_child();
+        assert!(grants.activate(key, crate::platform::pin_owned_child(&child).expect("pin")));
+        assert_eq!(grants.permits_target(claim, "term-A"), Ok(false));
+        assert!(grants.register_created_target(claim, "term-C"));
+        assert_eq!(grants.permits_target(claim, "term-C"), Ok(true));
+        assert_eq!(grants.permits_target(claim, "term-A"), Ok(false));
+        reap(child);
+    }
+
+    #[test]
+    fn plugin_action_origin_dead_or_pending_grant_cannot_register() {
+        let grants = PluginActionGrants::default();
+        let (token, key) = grants.mint(grant()).expect("mint");
+        let claim = PluginActionClaim::Presented(token);
+        // Dead pinned child: invalid even before the owner revokes.
+        assert!(grants.activate(key, own_pin()));
+        assert!(!grants.register_created_target(claim, "term-C"));
+        assert!(!grants.bind_target(key, "term-C"));
+        assert_eq!(grants.permits_target(claim, "term-C"), Err(()));
+        // Pending that is revoked while a registration waits.
+        let (token, key) = grants.mint(grant()).expect("mint");
+        let worker = {
+            let grants = grants.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(50));
+                grants.revoke(key);
+            })
+        };
+        assert!(!grants.register_created_target(PluginActionClaim::Presented(token), "term-C"));
+        worker.join().expect("worker");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn plugin_action_origin_expired_grant_cannot_bind_or_register() {
+        let grants = PluginActionGrants::default();
+        let (token, key) = grants.mint(grant()).expect("mint");
+        let claim = PluginActionClaim::Presented(token);
+        let child = live_child();
+        assert!(grants.activate(key, crate::platform::pin_owned_child(&child).expect("pin")));
+        assert!(grants.bind_target(key, "term-A"));
+        grants.backdate_for_test(key, MAX_GRANT_AGE + Duration::from_secs(1));
+        assert!(!grants.bind_target(key, "term-B"));
+        assert!(!grants.register_created_target(claim, "term-C"));
+        assert_eq!(grants.permits_target(claim, "term-A"), Err(()));
+        assert!(grants.is_revoked_for_test(key));
+        reap(child);
+    }
+
+    #[test]
+    fn plugin_action_origin_per_grant_targets_are_capped() {
+        let grants = PluginActionGrants::default();
+        let (_, key) = grants.mint(grant()).expect("mint");
+        for index in 0..MAX_TARGETS_PER_GRANT {
+            assert!(grants.bind_target(key, &format!("term-{index}")));
+        }
+        assert!(
+            grants.bind_target(key, "term-0"),
+            "existing target idempotent"
+        );
+        assert!(!grants.bind_target(key, "term-over"));
+    }
+
+    #[test]
+    fn plugin_action_origin_cap_refuses_when_pending_and_live_fill_it() {
+        let grants = PluginActionGrants::default();
+        for _ in 0..MAX_ENTRIES {
+            grants.mint(grant()).expect("mint under cap");
+        }
+        let error = grants
+            .mint(grant())
+            .expect_err("full registry fails closed");
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert_eq!(error.to_string(), "plugin action grant registry is full");
+        assert_eq!(grants.lock().len(), MAX_ENTRIES);
+    }
+
+    #[test]
+    fn plugin_action_origin_tombstones_count_and_evict_oldest_first() {
+        let grants = PluginActionGrants::default();
+        let mut tombstones = Vec::new();
+        for _ in 0..MAX_ENTRIES {
+            let (token, key) = grants.mint(grant()).expect("mint");
+            grants.revoke(key);
+            tombstones.push(PluginActionClaim::Presented(token));
+        }
+        // Under normal load tombstones keep attribution.
+        assert_eq!(grants.lock().len(), MAX_ENTRIES);
+        assert!(tombstones
+            .iter()
+            .all(|claim| grants.attribution(*claim).is_some()));
+        // At the cap a mint evicts exactly the oldest tombstone.
+        let (fresh, _) = grants.mint(grant()).expect("evicts a tombstone");
+        assert_eq!(grants.lock().len(), MAX_ENTRIES);
+        assert_eq!(grants.attribution(tombstones[0]), None);
+        assert!(tombstones[1..]
+            .iter()
+            .all(|claim| grants.attribution(*claim).is_some()));
+        assert_eq!(
+            grants.attribution(PluginActionClaim::Presented(fresh)),
+            Some(grant())
+        );
+    }
+
+    #[test]
+    fn plugin_action_origin_dead_live_is_pruned_before_refusing() {
+        let grants = PluginActionGrants::default();
+        let (_, dead) = grants.mint(grant()).expect("mint");
+        assert!(grants.activate(dead, own_pin()));
+        for _ in 1..MAX_ENTRIES {
+            grants.mint(grant()).expect("mint");
+        }
+        // The dead live grant becomes a tombstone and is evicted.
+        grants.mint(grant()).expect("dead grant pruned first");
+        assert!(!grants.lock().contains_key(&dead));
+        assert!(grants.mint(grant()).is_err(), "then pending fills it");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn plugin_action_origin_expired_and_retained_out_entries_are_pruned_first() {
+        let grants = PluginActionGrants::default();
+        let (_, expired) = grants.mint(grant()).expect("mint");
+        let (_, stale) = grants.mint(grant()).expect("mint");
+        for _ in 2..MAX_ENTRIES {
+            grants.mint(grant()).expect("mint");
+        }
+        grants.backdate_for_test(expired, MAX_GRANT_AGE + Duration::from_secs(1));
+        grants.backdate_for_test(stale, ATTRIBUTION_RETENTION + Duration::from_secs(1));
+        // Retention drop frees one slot; the expired pending grant becomes a
+        // tombstone and is evicted for the second.
+        grants.mint(grant()).expect("retention prune");
+        assert!(!grants.lock().contains_key(&stale));
+        assert!(grants.lock().contains_key(&expired));
+        grants.mint(grant()).expect("expired prune");
+        assert!(!grants.lock().contains_key(&expired));
+        assert!(grants.mint(grant()).is_err());
     }
 
     fn own_pin() -> crate::platform::OwnedChildPin {

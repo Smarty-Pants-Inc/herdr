@@ -4,6 +4,8 @@ use crate::api::schema::{Method, Request};
 use crate::api::ApiRequestContext;
 use crate::app::terminal_targets::{InputOrigin, TerminalTarget};
 
+const INPUT_ORIGIN_UNKNOWN_MESSAGE: &str = "cannot validate input origin; retry from a live attributable caller or explicitly opt in with CLI --allow-cross-pane (API allow_cross_pane: true)";
+
 impl App {
     // This is a policy guard, not caller authentication.
     pub(super) fn cross_pane_input_denial(
@@ -21,27 +23,36 @@ impl App {
         let origin = self.input_origin_for_context(context);
         let (code, message) = match origin {
             InputOrigin::Ordinary => return None,
-            // A user click or keybinding may target any pane (herdr-8592).
-            InputOrigin::PluginAction(grant) => {
-                tracing::info!(
-                    plugin_id = %grant.plugin_id,
-                    action_id = %grant.action_id,
-                    invoking_pane = grant.invoking_pane.as_deref().unwrap_or(""),
-                    grant = %grant.grant_id,
-                    target_terminal = %target.terminal_id,
-                    "plugin action input allowed"
-                );
-                return None;
-            }
+            // A user click or keybinding may target only its invoking terminal
+            // and terminals the same grant created (herdr-8592, herdr#223),
+            // by stable terminal ID. Never a fallback to ordinary or agent.
+            InputOrigin::PluginAction(grant) => match self
+                .plugin_action_grants
+                .permits_target(context.plugin_action, &target.terminal_id)
+            {
+                Ok(true) => {
+                    tracing::info!(
+                        plugin_id = %grant.plugin_id,
+                        action_id = %grant.action_id,
+                        invoking_pane = grant.invoking_pane.as_deref().unwrap_or(""),
+                        grant = %grant.grant_id,
+                        target_terminal = %target.terminal_id,
+                        "plugin action input allowed"
+                    );
+                    return None;
+                }
+                Ok(false) => (
+                    "cross_pane_input_denied",
+                    "plugin action input may target only its invoking pane and panes it created",
+                ),
+                Err(()) => ("input_origin_unknown", INPUT_ORIGIN_UNKNOWN_MESSAGE),
+            },
             InputOrigin::Agent(source) if source.terminal_id == target.terminal_id => return None,
             InputOrigin::Agent(_) => (
                 "cross_pane_input_denied",
                 "agent-originated input cannot target a different pane",
             ),
-            InputOrigin::Unknown => (
-                "input_origin_unknown",
-                "cannot validate input origin; retry from a live attributable caller or explicitly opt in with CLI --allow-cross-pane (API allow_cross_pane: true)",
-            ),
+            InputOrigin::Unknown => ("input_origin_unknown", INPUT_ORIGIN_UNKNOWN_MESSAGE),
         };
         Some(encode_error(request.id.clone(), code, message))
     }
@@ -2644,7 +2655,8 @@ finally:
 
     /// herdr-8592: Explorr shape. The server-spawned action child (`sh`) forks a
     /// grandchild that inherited the invoking pane's HERDR_PANE_ID marker and the
-    /// grant. Only the grant, while the recorded child lives, admits any pane.
+    /// grant. Only the grant, while the recorded child lives, admits its bound
+    /// invoking terminal; a pre-existing other pane is refused (herdr#223).
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
     async fn plugin_action_grant_admits_grandchild_and_invalid_claims_never_fall_through() {
@@ -2664,6 +2676,16 @@ finally:
             .plugin_action_grants
             .mint(grant.clone())
             .expect("mint");
+        // The production runtime binds the invoking terminal before spawn.
+        let source_terminal = fixture
+            .app
+            .pane_target(&fixture.source_pane_id)
+            .expect("source")
+            .terminal_id;
+        assert!(fixture
+            .app
+            .plugin_action_grants
+            .bind_target(key, &source_terminal));
         let mut action = GuardTestChild(
             std::process::Command::new("sh")
                 .args(["-c", "sleep 30 & echo $!; wait"])
@@ -2711,24 +2733,29 @@ finally:
         ));
         assert!(fixture.target_rx.try_recv().is_err());
 
-        // The grandchild with the grant reaches any pane, no opt-in needed.
+        // The grandchild with the grant reaches its invoking terminal, no
+        // opt-in needed, but not the pre-existing other pane (herdr#223).
         let granted = copied_marker.with_plugin_action(PluginActionClaim::Presented(token));
         assert_eq!(
             fixture.app.input_origin_for_context(granted),
             InputOrigin::PluginAction(grant.clone())
         );
-        for pane in [
-            fixture.target_pane_id.clone(),
-            fixture.source_pane_id.clone(),
-        ] {
-            assert_ok(
-                &fixture
-                    .app
-                    .handle_api_request_with_context(send("granted", &pane, false), granted),
-            );
-        }
+        assert_denied(&fixture.app.handle_api_request_with_context(
+            send("granted-cross", &fixture.target_pane_id, false),
+            granted,
+        ));
+        assert!(fixture.target_rx.try_recv().is_err());
+        assert_ok(&fixture.app.handle_api_request_with_context(
+            send("granted", &fixture.source_pane_id, false),
+            granted,
+        ));
+        // The explicit opt-in remains a separate escape hatch.
+        assert_ok(&fixture.app.handle_api_request_with_context(
+            send("granted-opt-in", &fixture.target_pane_id, true),
+            granted,
+        ));
         assert_eq!(
-            fixture.target_rx.try_recv().expect("target"),
+            fixture.target_rx.try_recv().expect("target opt-in"),
             Bytes::from_static(b"open")
         );
         assert_eq!(
@@ -2780,10 +2807,14 @@ finally:
             Some(grandchild),
             "descendant still alive"
         );
-        assert_unknown(&fixture.app.handle_api_request_with_context(
-            send("replay", &fixture.target_pane_id, false),
-            granted,
-        ));
+        for pane in [&fixture.target_pane_id, &fixture.source_pane_id] {
+            assert_unknown(
+                &fixture
+                    .app
+                    .handle_api_request_with_context(send("replay", pane, false), granted),
+            );
+        }
+        assert!(fixture.source_rx.try_recv().is_err());
         assert!(fixture.target_rx.try_recv().is_err());
         // SAFETY: signal the exact grandchild PID this test started and still
         // observes alive (its parent was reaped above, so it is reparented, not
@@ -2812,6 +2843,16 @@ finally:
             .app
             .plugin_action_grants
             .activate(key, crate::platform::pin_owned_child(&action).expect("pin")));
+        // A global grant starts empty; give it one target to observe expiry.
+        let target_terminal = fixture
+            .app
+            .pane_target(&fixture.target_pane_id)
+            .expect("target")
+            .terminal_id;
+        assert!(fixture
+            .app
+            .plugin_action_grants
+            .bind_target(key, &target_terminal));
         let context =
             ApiRequestContext::default().with_plugin_action(PluginActionClaim::Presented(token));
         let request = || Request {
@@ -2935,5 +2976,276 @@ finally:
                 }
             }
         });
+    }
+
+    /// herdr#223: a grant writes only to its bound invoking terminal and to
+    /// terminals the server actually created for a request carrying that same
+    /// grant, by stable terminal ID, through actual App dispatch.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn plugin_action_grant_targets_only_invoking_and_own_created_terminals() {
+        use crate::api::schema::{
+            PaneMoveDestination, PaneMoveParams, PaneSplitParams, PaneTarget, SplitDirection,
+            TabCreateParams, WorkspaceCreateParams,
+        };
+        use crate::plugin_action_origin::{
+            PluginActionClaim, PluginActionGrant, PluginActionToken,
+        };
+        let env = crate::environment::test_env();
+        env.set("SHELL", super::super::test_support::exiting_test_command());
+        let mut fixture = attributed_agent_fixture();
+        let mint = |fixture: &Fixture, invoking: Option<&str>, log: &str| {
+            let (token, key) = fixture
+                .app
+                .plugin_action_grants
+                .mint(PluginActionGrant {
+                    plugin_id: "example.explorr".into(),
+                    action_id: "open".into(),
+                    invoking_pane: invoking.map(str::to_owned),
+                    grant_id: log.into(),
+                })
+                .expect("mint");
+            (token, key)
+        };
+        let source_terminal = fixture
+            .app
+            .pane_target(&fixture.source_pane_id)
+            .expect("source")
+            .terminal_id;
+        let (token_a, key_a) = mint(&fixture, Some(&fixture.source_pane_id), "plugin-log-a");
+        assert!(fixture
+            .app
+            .plugin_action_grants
+            .bind_target(key_a, &source_terminal));
+        let (token_g, key_g) = mint(&fixture, None, "plugin-log-g");
+        let child_a = detached_sleep_child();
+        let child_g = detached_sleep_child();
+        for (key, child) in [(key_a, &child_a), (key_g, &child_g)] {
+            assert!(fixture
+                .app
+                .plugin_action_grants
+                .activate(key, crate::platform::pin_owned_child(child).expect("pin")));
+        }
+        let ctx = |token: PluginActionToken| {
+            ApiRequestContext::default().with_plugin_action(PluginActionClaim::Presented(token))
+        };
+        let (a, g) = (ctx(token_a), ctx(token_g));
+        let send = |pane: &str| Request {
+            id: "write".into(),
+            method: Method::PaneSendText(PaneSendTextParams {
+                pane_id: pane.into(),
+                text: "open".into(),
+                allow_cross_pane: false,
+            }),
+        };
+        // None: admitted; Some(code): refused with that error code.
+        let decide = |fixture: &Fixture, pane: &str, context: ApiRequestContext| {
+            fixture
+                .app
+                .cross_pane_input_denial(&send(pane), context)
+                .map(|denial| {
+                    serde_json::from_str::<ErrorResponse>(&denial)
+                        .expect("error")
+                        .error
+                        .code
+                })
+        };
+        let denied = Some("cross_pane_input_denied".to_string());
+        let unknown = Some("input_origin_unknown".to_string());
+        let created_pane = |response: &str, kind: &str| -> (String, String) {
+            let value: serde_json::Value = serde_json::from_str(response).expect("json");
+            let pane = match kind {
+                "split" => &value["result"]["pane"],
+                _ => &value["result"]["root_pane"],
+            };
+            (
+                pane["pane_id"].as_str().expect(response).to_owned(),
+                pane["terminal_id"].as_str().expect(response).to_owned(),
+            )
+        };
+        let split = |pane: &str| Request {
+            id: "split".into(),
+            method: Method::PaneSplit(PaneSplitParams {
+                workspace_id: None,
+                target_pane_id: Some(pane.into()),
+                direction: SplitDirection::Right,
+                ratio: None,
+                cwd: None,
+                focus: false,
+                right_click: Default::default(),
+                env: Default::default(),
+            }),
+        };
+
+        // Token A: pre-existing B refused, own invoking A admitted (real write).
+        assert_eq!(decide(&fixture, &fixture.target_pane_id, a), denied);
+        assert_denied(
+            &fixture
+                .app
+                .handle_api_request_with_context(send(&fixture.target_pane_id), a),
+        );
+        assert!(fixture.target_rx.try_recv().is_err());
+        assert_ok(
+            &fixture
+                .app
+                .handle_api_request_with_context(send(&fixture.source_pane_id), a),
+        );
+        assert!(fixture.source_rx.try_recv().is_ok());
+        // The global grant starts empty: neither pre-existing pane.
+        for pane in [&fixture.source_pane_id, &fixture.target_pane_id] {
+            assert_eq!(decide(&fixture, pane, g), denied);
+        }
+
+        // A failed creation (missing target) grants nothing.
+        let failed = fixture
+            .app
+            .handle_api_request_with_context(split("w999:p999"), a);
+        assert!(
+            serde_json::from_str::<ErrorResponse>(&failed).is_ok(),
+            "{failed}"
+        );
+        assert_eq!(decide(&fixture, &fixture.target_pane_id, a), denied);
+
+        // A's own actual split (of the pre-existing other pane) is admitted
+        // for A only; the split target stays refused.
+        let response = fixture
+            .app
+            .handle_api_request_with_context(split(&fixture.target_pane_id), a);
+        let (split_pane, split_terminal) = created_pane(&response, "split");
+        assert_ne!(split_terminal, source_terminal);
+        assert_eq!(decide(&fixture, &split_pane, a), None);
+        assert_eq!(decide(&fixture, &split_pane, g), denied);
+        assert_eq!(decide(&fixture, &fixture.target_pane_id, a), denied);
+
+        // Tab and workspace creation by the global grant: only its own.
+        let response = fixture.app.handle_api_request_with_context(
+            Request {
+                id: "tab".into(),
+                method: Method::TabCreate(TabCreateParams {
+                    workspace_id: None,
+                    cwd: None,
+                    focus: false,
+                    label: None,
+                    env: Default::default(),
+                }),
+            },
+            g,
+        );
+        let (tab_pane, _) = created_pane(&response, "tab");
+        let response = fixture.app.handle_api_request_with_context(
+            Request {
+                id: "workspace".into(),
+                method: Method::WorkspaceCreate(WorkspaceCreateParams {
+                    source_workspace_id: None,
+                    cwd: None,
+                    focus: false,
+                    label: None,
+                    env: Default::default(),
+                }),
+            },
+            g,
+        );
+        let (workspace_pane, _) = created_pane(&response, "workspace");
+        for pane in [&tab_pane, &workspace_pane] {
+            assert_eq!(decide(&fixture, pane, g), None, "{pane}");
+            assert_eq!(decide(&fixture, pane, a), denied, "{pane}");
+        }
+        assert_eq!(decide(&fixture, &split_pane, g), denied);
+        assert_eq!(decide(&fixture, &fixture.source_pane_id, g), denied);
+
+        // Malformed, forged and no-token creations still create under the
+        // existing API but award no rights; forged/malformed writes are
+        // unknown, and no valid grant may adopt the created terminal.
+        let forged =
+            PluginActionClaim::Presented(PluginActionToken::parse(&"0".repeat(64)).expect("hex"));
+        for claim in [
+            PluginActionClaim::Malformed,
+            forged,
+            PluginActionClaim::Absent,
+        ] {
+            let context = ApiRequestContext::default().with_plugin_action(claim);
+            let response = fixture
+                .app
+                .handle_api_request_with_context(split(&fixture.source_pane_id), context);
+            let (pane, _) = created_pane(&response, "split");
+            assert_eq!(decide(&fixture, &pane, a), denied, "{claim:?}");
+            assert_eq!(decide(&fixture, &pane, g), denied, "{claim:?}");
+            if claim != PluginActionClaim::Absent {
+                assert_eq!(decide(&fixture, &pane, context), unknown, "{claim:?}");
+            }
+        }
+
+        // Moving A's created pane changes its public pane ID but keeps its
+        // stable terminal, which stays admitted under the new ID.
+        let moved = fixture.app.handle_api_request_with_context(
+            Request {
+                id: "move".into(),
+                method: Method::PaneMove(PaneMoveParams {
+                    pane_id: split_pane.clone(),
+                    destination: PaneMoveDestination::NewWorkspace {
+                        label: None,
+                        tab_label: None,
+                    },
+                    focus: false,
+                    allow_project_change: false,
+                }),
+            },
+            ApiRequestContext::default(),
+        );
+        assert!(
+            serde_json::from_str::<SuccessResponse>(&moved).is_ok(),
+            "{moved}"
+        );
+        let moved_target = fixture
+            .app
+            .terminal_targets()
+            .into_iter()
+            .find(|target| target.terminal_id == split_terminal)
+            .expect("moved terminal survives");
+        let moved_pane = fixture
+            .app
+            .public_pane_id(moved_target.ws_idx, moved_target.pane_id)
+            .expect("moved pane id");
+        assert_ne!(moved_pane, split_pane, "public pane ID changed");
+        assert_eq!(decide(&fixture, &moved_pane, a), None);
+
+        // Closing it, then a new terminal at a (possibly reused) public pane
+        // ID created without A's grant, is refused for A.
+        let closed = fixture.app.handle_api_request_with_context(
+            Request {
+                id: "close".into(),
+                method: Method::PaneClose(PaneTarget {
+                    pane_id: moved_pane.clone(),
+                }),
+            },
+            ApiRequestContext::default(),
+        );
+        assert!(
+            serde_json::from_str::<SuccessResponse>(&closed).is_ok(),
+            "{closed}"
+        );
+        let response = fixture.app.handle_api_request_with_context(
+            split(&fixture.target_pane_id),
+            ApiRequestContext::default(),
+        );
+        let (new_pane, new_terminal) = created_pane(&response, "split");
+        assert_ne!(new_terminal, split_terminal);
+        assert_eq!(decide(&fixture, &new_pane, a), denied);
+
+        // Revocation stops writes and later registration alike.
+        fixture.app.plugin_action_grants.revoke(key_a);
+        assert_eq!(decide(&fixture, &fixture.source_pane_id, a), unknown);
+        let response = fixture
+            .app
+            .handle_api_request_with_context(split(&fixture.source_pane_id), a);
+        let (late_pane, _) = created_pane(&response, "split");
+        assert_eq!(decide(&fixture, &late_pane, a), unknown);
+        assert_eq!(decide(&fixture, &late_pane, g), denied);
+
+        let runtimes: Vec<_> = fixture.app.terminal_runtimes.drain().collect();
+        for (_terminal_id, runtime) in runtimes {
+            runtime.shutdown();
+        }
+        drop((child_a, child_g));
     }
 }
