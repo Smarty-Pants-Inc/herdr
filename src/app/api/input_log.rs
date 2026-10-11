@@ -8,7 +8,8 @@
 //! write is refused.
 //!
 //! Retention is bounded: a log that has reached `MAX_LOG_BYTES` is renamed to `<log>.1`
-//! (replacing the previous generation) before the next record is appended.
+//! (replacing the previous generation) before the next record is appended. If that rename
+//! fails, the record is refused (`input_log_full`) rather than growing the log past the cap.
 
 use std::io::Write;
 
@@ -46,12 +47,28 @@ impl App {
         context: ApiRequestContext,
         bytes: usize,
     ) -> Result<(), String> {
+        self.record_api_input(method, ws_idx, pane_id, context, bytes)
+            .map_err(|(code, message)| {
+                super::responses::encode_error(id.to_string(), code, message)
+            })
+    }
+
+    /// Appends the log line for an API write; on error returns the refusal code
+    /// (`input_log_full` when the log is at its cap and cannot be rotated, otherwise
+    /// `input_log_unavailable`) and message. The caller must not write on error.
+    pub(super) fn record_api_input(
+        &self,
+        method: &str,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+        context: ApiRequestContext,
+        bytes: usize,
+    ) -> Result<(), (&'static str, String)> {
         let line = self.api_input_log_line(method, ws_idx, pane_id, context, bytes);
         append_line(&self.api_input_log, &line).map_err(|err| {
             tracing::warn!(err = %err, path = %self.api_input_log.display(), "api input log write failed");
-            super::responses::encode_error(
-                id.to_string(),
-                "input_log_unavailable",
+            (
+                refusal_code(&err),
                 format!("cannot record this input in the API input log, so it was not sent: {err}"),
             )
         })
@@ -243,6 +260,43 @@ fn nearest_non_herdr_ancestor(
 /// holding far more API writes than a review of recent turns needs.
 const MAX_LOG_BYTES: u64 = 32 * 1024 * 1024;
 
+/// A log at or over its cap whose rotation to `<log>.1` failed. Appending would grow the log
+/// past the cap, so the record is refused instead.
+#[derive(Debug)]
+struct InputLogFull {
+    path: std::path::PathBuf,
+    rotation: std::io::Error,
+}
+
+impl std::fmt::Display for InputLogFull {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the input log {} is full and could not be rotated: {}",
+            self.path.display(),
+            self.rotation
+        )
+    }
+}
+
+impl std::error::Error for InputLogFull {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.rotation)
+    }
+}
+
+/// The API error code for a failed append.
+fn refusal_code(err: &std::io::Error) -> &'static str {
+    if err
+        .get_ref()
+        .is_some_and(|inner| inner.is::<InputLogFull>())
+    {
+        "input_log_full"
+    } else {
+        "input_log_unavailable"
+    }
+}
+
 /// `path` with `suffix` appended to its file name (`api-input.jsonl` -> `api-input.jsonl.1`).
 fn sibling_path(path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
     let mut name = path.as_os_str().to_owned();
@@ -269,17 +323,19 @@ fn append_line(path: &std::path::Path, line: &str) -> std::io::Result<()> {
 /// That is an accepted limit of the upgrade transition only (see
 /// `platform::rotate_private_log`).
 ///
-/// Rotation never costs a record: if the rename fails, the record goes to the full log. A
-/// symlink or foreign file at the log path is neither rotated nor written (the private open
-/// refuses it), as before.
+/// The cap is never bypassed: if the log is at or over the cap and the rotation fails, the
+/// record is refused with an `InputLogFull` error and the log does not grow, so the caller's
+/// input is refused like any other unloggable write. A symlink or foreign file at the log path
+/// is neither rotated nor written (the private open refuses it), as before.
 fn append_line_with_cap(path: &std::path::Path, line: &str, cap: u64) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let lock = crate::platform::open_private_append_file(&sibling_path(path, ".lock"))?;
     lock.lock()?;
-    rotate_full_log(path, cap);
-    let written = write_record(path, line).and_then(|()| publish_directories(path));
+    let written = rotate_full_log(path, cap)
+        .and_then(|()| write_record(path, line))
+        .and_then(|()| publish_directories(path));
     // Closing the handle also releases the lock; unlock explicitly so Windows releases it now.
     let _ = lock.unlock();
     written
@@ -288,17 +344,22 @@ fn append_line_with_cap(path: &std::path::Path, line: &str, cap: u64) -> std::io
 /// Renames the log to `<log>.1` when it is a regular file we own of at least `cap` bytes.
 /// The caller holds the writer lock. Before the rename the log is opened through the private
 /// open (restricting it to owner-only) and locked against legacy writers that lock the log
-/// itself. A failure is logged and otherwise ignored.
-fn rotate_full_log(path: &std::path::Path, cap: u64) {
+/// itself. A failure returns an `InputLogFull` error, so the caller refuses the record.
+fn rotate_full_log(path: &std::path::Path, cap: u64) -> std::io::Result<()> {
     // Cheap no-follow check first, so a log below the cap is not opened an extra time.
     if crate::platform::private_log_len(path).is_none_or(|len| len < cap) {
-        return;
+        return Ok(());
     }
     let rotated = sibling_path(path, ".1");
-    if let Err(err) = crate::platform::rotate_private_log(path, cap, || rotate_file(path, &rotated))
-    {
-        tracing::warn!(err = %err, path = %path.display(), "input log rotation failed; appending to the full log");
-    }
+    crate::platform::rotate_private_log(path, cap, || rotate_file(path, &rotated))
+        .map(|_| ())
+        .map_err(|rotation| {
+            tracing::warn!(err = %rotation, path = %path.display(), "input log rotation failed; refusing the record");
+            std::io::Error::other(InputLogFull {
+                path: path.to_path_buf(),
+                rotation,
+            })
+        })
 }
 
 #[cfg(not(test))]
@@ -1232,6 +1293,33 @@ mod tests {
         let _ = std::fs::remove_file(&blocker);
     }
 
+    /// herdr#225 review: a full log whose rotation fails refuses the API write as
+    /// `input_log_full` and does not grow.
+    #[tokio::test]
+    async fn a_write_to_a_full_log_that_cannot_rotate_is_refused() {
+        let mut fixture = fixture();
+        let log = fixture.app.api_input_log.clone();
+        let file = std::fs::File::create(&log).unwrap();
+        file.set_len(super::MAX_LOG_BYTES).unwrap();
+        drop(file);
+        std::fs::create_dir(rotated(&log)).unwrap();
+        std::fs::write(rotated(&log).join("keep"), b"").unwrap();
+        let response = send_text(&mut fixture, "x");
+        let response: ErrorResponse = serde_json::from_str(&response).expect("error");
+        assert_eq!(response.error.code, "input_log_full");
+        assert!(
+            response.error.message.contains(&log.display().to_string()),
+            "{}",
+            response.error.message
+        );
+        assert!(
+            fixture.target_rx.try_recv().is_err(),
+            "unlogged input was sent"
+        );
+        assert_eq!(std::fs::metadata(&log).unwrap().len(), super::MAX_LOG_BYTES);
+        std::fs::remove_dir_all(log.parent().unwrap()).unwrap();
+    }
+
     /// A fresh, empty directory for one rotation test; the log inside it is absent.
     fn rotation_log(name: &str) -> std::path::PathBuf {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1446,17 +1534,28 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_rotation_still_appends() {
+    fn a_failed_rotation_at_the_cap_refuses_the_record() {
         let log = rotation_log("rename-fails");
-        let full = format!("{}\n{}\n", record(1), record(2));
-        std::fs::write(&log, &full).unwrap();
         // A non-empty directory at `.1` cannot be replaced by a file.
         std::fs::create_dir(rotated(&log)).unwrap();
         std::fs::write(rotated(&log).join("keep"), b"").unwrap();
         super::ROTATIONS.set(0);
-        super::append_line_with_cap(&log, &record(3), CAP).unwrap();
-        assert_eq!(super::ROTATIONS.get(), 1, "rotation was attempted");
-        assert_eq!(read(&log), format!("{full}{}\n", record(3)));
+        // Below the cap no rotation is attempted, so the blocked `.1` does not matter.
+        super::append_line_with_cap(&log, &record(1), CAP).unwrap();
+        super::append_line_with_cap(&log, &record(2), CAP).unwrap();
+        let full = format!("{}\n{}\n", record(1), record(2));
+        assert_eq!(read(&log), full);
+        assert_eq!(super::ROTATIONS.get(), 0, "below the cap");
+        // At the cap the rotation fails: the record is refused and the log does not grow.
+        for attempt in 1..=2 {
+            let err = super::append_line_with_cap(&log, &record(3), CAP).unwrap_err();
+            assert_eq!(super::refusal_code(&err), "input_log_full");
+            let message = err.to_string();
+            assert!(message.contains(&log.display().to_string()), "{message}");
+            assert!(message.contains("could not be rotated"), "{message}");
+            assert_eq!(super::ROTATIONS.get(), attempt, "rotation was attempted");
+            assert_eq!(read(&log), full);
+        }
         assert!(rotated(&log).is_dir());
         #[cfg(unix)]
         assert_private(&log);

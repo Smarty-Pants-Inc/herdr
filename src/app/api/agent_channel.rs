@@ -476,20 +476,14 @@ impl App {
             params.if_draft_empty,
             Duration::from_millis(timeout),
             || {
-                self.log_api_input(
-                    &params.request_id,
+                self.record_api_input(
                     "agent.prompt_guarded",
                     target.ws_idx,
                     target.pane_id,
                     context,
                     params.text.len(),
                 )
-                .map_err(|_| {
-                    Outcome::failure(
-                        "input_log_unavailable",
-                        "cannot record this input in the API input log, so it was not sent",
-                    )
-                })
+                .map_err(|(code, message)| Outcome::failure(code, message))
             },
         )
     }

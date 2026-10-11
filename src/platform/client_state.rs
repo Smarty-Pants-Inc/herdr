@@ -97,8 +97,8 @@ pub(crate) fn rotate_private_log(
 /// See the other version. Windows cannot rename a file that is open without delete sharing, so
 /// the lock is taken and released and the handle closed before `rename`; a legacy writer in the
 /// middle of an append has finished by then. A legacy writer that opens the log after that
-/// holds it without delete sharing, so the rename fails and the record goes to the full log:
-/// no legacy record lands in `<log>.1`.
+/// holds it without delete sharing, so the rename fails and the caller refuses its record (the
+/// log does not grow past the cap): no legacy record lands in `<log>.1`.
 #[cfg(windows)]
 pub(crate) fn rotate_private_log(
     path: &Path,
