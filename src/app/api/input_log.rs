@@ -80,6 +80,17 @@ impl App {
                 .and_then(|agent| agent.agent_session.as_ref())
                 .map(|session| session.value.clone()),
         });
+        // Attribution only (admission was decided by the guard): the grant id is
+        // the plugin command log id, never the token. Uses the minted record,
+        // so a child exiting after admission keeps the accepted write attributed.
+        if let Some(grant) = self.plugin_action_grants.attribution(context.plugin_action) {
+            caller_fields["plugin_action"] = serde_json::json!({
+                "plugin_id": grant.plugin_id,
+                "action_id": grant.action_id,
+                "invoking_pane": grant.invoking_pane,
+                "grant": grant.grant_id,
+            });
+        }
         // One best-effort snapshot per logged write, independent of pane attribution.
         if let Some(metadata) = context
             .local_peer_identity
@@ -378,6 +389,8 @@ mod tests {
         app: App,
         source_pane_id: String,
         target_pane_id: String,
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        source_rx: tokio::sync::mpsc::Receiver<bytes::Bytes>,
         target_rx: tokio::sync::mpsc::Receiver<bytes::Bytes>,
     }
 
@@ -492,6 +505,8 @@ mod tests {
             source_pane_id: app.public_pane_id(0, source_pane).expect("source pane id"),
             target_pane_id: app.public_pane_id(0, target_pane).expect("target pane id"),
             app,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            source_rx: _source_rx,
             target_rx,
         }
     }
@@ -547,6 +562,159 @@ mod tests {
                 .mode();
             assert_eq!(mode & 0o777, 0o600);
         }
+        let _ = std::fs::remove_file(&fixture.app.api_input_log);
+    }
+
+    /// herdr-8592: a granted plugin action write names plugin, action,
+    /// invoking pane and the non-secret grant id, never the token.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn a_plugin_action_write_is_attributed_without_its_token() {
+        use crate::plugin_action_origin::{PluginActionClaim, PluginActionGrant};
+        let mut fixture = fixture();
+        let (token, key) = fixture
+            .app
+            .plugin_action_grants
+            .mint(PluginActionGrant {
+                plugin_id: "example.explorr".into(),
+                action_id: "open".into(),
+                invoking_pane: Some(fixture.source_pane_id.clone()),
+                grant_id: "plugin-log-9".into(),
+            })
+            .expect("mint");
+        let (ws_idx, pane_id) = fixture
+            .app
+            .parse_pane_id(&fixture.source_pane_id)
+            .expect("invoking pane");
+        let target = fixture
+            .app
+            .terminal_target_for_pane(ws_idx, pane_id)
+            .expect("invoking terminal");
+        assert!(fixture
+            .app
+            .plugin_action_grants
+            .bind_target(key, &target.terminal_id));
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("action child");
+        assert!(fixture
+            .app
+            .plugin_action_grants
+            .activate(key, crate::platform::pin_owned_child(&child).expect("pin")));
+        let response = fixture.app.handle_api_request_with_context(
+            Request {
+                id: "granted".into(),
+                method: Method::PaneSendText(PaneSendTextParams {
+                    pane_id: fixture.source_pane_id.clone(),
+                    text: "open".into(),
+                    allow_cross_pane: false,
+                }),
+            },
+            ApiRequestContext::default().with_plugin_action(PluginActionClaim::Presented(token)),
+        );
+        assert!(response.contains("\"ok\""), "{response}");
+        assert_eq!(fixture.source_rx.try_recv().expect("input"), "open");
+        assert!(fixture.target_rx.try_recv().is_err());
+        let lines = log_lines(&fixture.app);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let action = &lines[0]["caller"]["plugin_action"];
+        assert_eq!(action["plugin_id"], "example.explorr");
+        assert_eq!(action["action_id"], "open");
+        assert_eq!(action["invoking_pane"], fixture.source_pane_id.as_str());
+        assert_eq!(action["grant"], "plugin-log-9");
+        let raw = std::fs::read_to_string(&fixture.app.api_input_log).unwrap();
+        let hex = token.expose_hex();
+        assert!(!raw.contains(&hex) && !raw.contains(&hex[..16]), "{raw}");
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_file(&fixture.app.api_input_log);
+    }
+
+    /// herdr-8592 timing edge: the recorded child exits after the guard admitted
+    /// the write but before the durable log line. The accepted write keeps its
+    /// attribution; any later request with that token is refused.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn grant_revoked_between_admission_and_log_keeps_attribution() {
+        use crate::app::terminal_targets::InputOrigin;
+        use crate::plugin_action_origin::{PluginActionClaim, PluginActionGrant};
+        let fixture = fixture();
+        let grant = PluginActionGrant {
+            plugin_id: "example.explorr".into(),
+            action_id: "open".into(),
+            invoking_pane: Some(fixture.source_pane_id.clone()),
+            grant_id: "plugin-log-10".into(),
+        };
+        let (token, key) = fixture
+            .app
+            .plugin_action_grants
+            .mint(grant.clone())
+            .expect("mint");
+        let (ws_idx, pane_id) = fixture
+            .app
+            .parse_pane_id(&fixture.source_pane_id)
+            .expect("invoking pane");
+        let target = fixture
+            .app
+            .terminal_target_for_pane(ws_idx, pane_id)
+            .expect("invoking terminal");
+        assert!(fixture
+            .app
+            .plugin_action_grants
+            .bind_target(key, &target.terminal_id));
+        let request = Request {
+            id: "late".into(),
+            method: Method::PaneSendText(PaneSendTextParams {
+                pane_id: fixture.source_pane_id.clone(),
+                text: "open".into(),
+                allow_cross_pane: false,
+            }),
+        };
+        let context =
+            ApiRequestContext::default().with_plugin_action(PluginActionClaim::Presented(token));
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("action child");
+        assert!(fixture
+            .app
+            .plugin_action_grants
+            .activate(key, crate::platform::pin_owned_child(&child).expect("pin")));
+        assert_eq!(
+            fixture.app.input_origin_for_context(context),
+            InputOrigin::PluginAction(grant),
+            "live plugin attribution"
+        );
+        assert!(fixture
+            .app
+            .cross_pane_input_denial(&request, context)
+            .is_none());
+        // The child exits and the worker revokes before the log line.
+        child.kill().expect("stop own child");
+        child.wait().expect("reap");
+        fixture.app.plugin_action_grants.revoke(key);
+        assert_eq!(
+            fixture.app.input_origin_for_context(context),
+            InputOrigin::Unknown,
+            "a request after exit is refused"
+        );
+        let denied = fixture
+            .app
+            .cross_pane_input_denial(&request, context)
+            .expect("a later write is refused");
+        assert!(denied.contains("input_origin_unknown"), "{denied}");
+        fixture
+            .app
+            .log_api_input("late", "pane.send_text", ws_idx, pane_id, context, 4)
+            .expect("logged");
+        let lines = log_lines(&fixture.app);
+        let action = &lines.last().expect("line")["caller"]["plugin_action"];
+        assert_eq!(action["plugin_id"], "example.explorr");
+        assert_eq!(action["grant"], "plugin-log-10");
+        assert_eq!(action["invoking_pane"], fixture.source_pane_id.as_str());
+        let raw = std::fs::read_to_string(&fixture.app.api_input_log).unwrap();
+        assert!(!raw.contains(&token.expose_hex()));
         let _ = std::fs::remove_file(&fixture.app.api_input_log);
     }
 

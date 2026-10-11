@@ -3614,6 +3614,7 @@ command = ["show-ctx"]
             local_peer_identity: Some(peer),
             local_peer_pane_origin: crate::platform::PeerPaneOrigin::Absent,
             server_ancestry: None,
+            plugin_action: crate::plugin_action_origin::PluginActionClaim::Absent,
         };
         let invoke = as_pane_a(peer, || {
             app.handle_api_request_with_context(request("invoke-context"), caller)
@@ -3827,6 +3828,7 @@ command = ["sh", "-c", 'printf "%s|%s|%s|%s" "${HERDR_PANE_ID-unset}" "${HERDR_W
             local_peer_identity: Some(fixture.a_peer),
             local_peer_pane_origin: crate::platform::PeerPaneOrigin::Absent,
             server_ancestry: None,
+            plugin_action: crate::plugin_action_origin::PluginActionClaim::Absent,
         }
     }
 
@@ -3980,11 +3982,13 @@ command = ["sh", "-c", 'printf "%s|%s|%s|%s" "${HERDR_PANE_ID-unset}" "${HERDR_W
             local_peer_identity: Some(stale),
             local_peer_pane_origin: crate::platform::PeerPaneOrigin::Absent,
             server_ancestry: None,
+            plugin_action: crate::plugin_action_origin::PluginActionClaim::Absent,
         };
         let marked_unknown = crate::api::ApiRequestContext {
             local_peer_identity: Some(live),
             local_peer_pane_origin: crate::platform::PeerPaneOrigin::Unknown,
             server_ancestry: None,
+            plugin_action: crate::plugin_action_origin::PluginActionClaim::Absent,
         };
         let mut cases = vec![
             ("global-none", None, outside, false),
@@ -5121,5 +5125,157 @@ command = ["act.exe"]
 
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(registry_dir);
+    }
+
+    /// herdr-8592: only a user action child receives a grant; hooks never do.
+    /// The grant binds plugin/action/invoking pane and the log id, and is
+    /// revoked when the recorded child exits even while a descendant still
+    /// holds its stdout/stderr pipes open. The invoking pane comes from the
+    /// caller's live peer attribution (pane A's own peer), and a valid grant
+    /// presented by an outside caller never lends it that invoking pane.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn action_grant_is_bound_and_revoked_at_child_exit_but_hooks_get_none() {
+        use crate::plugin_action_origin::{PluginActionClaim, PluginActionToken};
+        let mut fixture = privacy_fixture("plugin-grant");
+        let root = fixture.root.join("grant");
+        write_manifest_content(
+            &root,
+            r#"
+id = "example.grant"
+name = "Grant"
+version = "0.1.0"
+min_herdr_version = "0.6.10"
+platforms = ["linux", "macos"]
+
+[[actions]]
+id = "hold"
+title = "Hold"
+command = ["sh", "-c", 'printf %s "${HERDR_PLUGIN_ACTION_TOKEN-none}" > tok.tmp && mv tok.tmp tok.txt; sleep 4 & while [ ! -e release ]; do sleep 0.02; done']
+
+[[startup]]
+command = ["sh", "-c", 'printf %s "${HERDR_PLUGIN_ACTION_TOKEN-none}" > hook.tmp && mv hook.tmp hook.txt']
+"#,
+        );
+        link_manifest(&mut fixture.app, &root);
+        fixture.app.run_plugin_startup_hooks();
+        let app = &mut fixture.app;
+        let hook = read_capture_when_ready(&root.join("hook.txt"), || {
+            app.drain_all_internal_events();
+        });
+        assert_eq!(hook, "none", "startup hooks never receive a grant");
+
+        let hold_request = |id: &str| Request {
+            id: id.into(),
+            method: Method::PluginActionInvoke(PluginActionInvokeParams {
+                plugin_id: Some("example.grant".into()),
+                action_id: "hold".into(),
+                context: Some(invoking_pane_context(&fixture.a_pane_public)),
+            }),
+        };
+        // Pane A's own live peer: the invoker is derived from attribution.
+        let a_caller = a_peer_context(&fixture);
+        let a_peer = fixture.a_peer;
+        let invoke = as_pane_a(a_peer, || {
+            fixture
+                .app
+                .handle_api_request_with_context(hold_request("invoke-hold"), a_caller)
+        });
+        let ResponseResult::PluginActionInvoked { log, .. } = response_result(&invoke) else {
+            panic!("expected plugin action invocation: {invoke}");
+        };
+        assert!(!invoke.contains("plugin_action_token"));
+        let app = &mut fixture.app;
+        let hex = read_capture_when_ready(&root.join("tok.txt"), || {
+            app.drain_all_internal_events();
+        });
+        let token = PluginActionToken::parse(&hex).expect("action child received a token");
+        // The child may present it immediately; a pending grant waits for the pin.
+        let claim = PluginActionClaim::Presented(token);
+        let grant = fixture
+            .app
+            .plugin_action_grants
+            .resolve(claim)
+            .expect("live grant")
+            .expect("granted");
+        assert_eq!(grant.plugin_id, "example.grant");
+        assert_eq!(grant.action_id, "hold");
+        assert_eq!(
+            grant.invoking_pane.as_deref(),
+            Some(fixture.a_pane_public.as_str())
+        );
+        assert_eq!(grant.grant_id, log.log_id);
+        assert!(!format!("{grant:?}").contains(&hex));
+        let logs = serde_json::to_string(&fixture.app.state.plugin_command_logs).unwrap();
+        assert!(!logs.contains(&hex), "command log never records the token");
+
+        // A valid grant is not request authority: an outside caller (no peer)
+        // presenting A's live token while claiming pane A gets a global
+        // context, and the child it starts is not bound to any pane.
+        std::fs::remove_file(root.join("tok.txt")).unwrap();
+        let outside_with_token = crate::api::ApiRequestContext::default().with_plugin_action(claim);
+        let outside = as_pane_a(a_peer, || {
+            fixture
+                .app
+                .handle_api_request_with_context(hold_request("invoke-outside"), outside_with_token)
+        });
+        let ResponseResult::PluginActionInvoked {
+            context: outside_context,
+            ..
+        } = response_result(&outside)
+        else {
+            panic!("expected global plugin action invocation: {outside}");
+        };
+        assert_global_context(&outside_context);
+        let app = &mut fixture.app;
+        let outside_hex = read_capture_when_ready(&root.join("tok.txt"), || {
+            app.drain_all_internal_events();
+        });
+        assert_ne!(outside_hex, hex, "each action child gets its own grant");
+        let outside_grant = fixture
+            .app
+            .plugin_action_grants
+            .resolve(PluginActionClaim::Presented(
+                PluginActionToken::parse(&outside_hex).expect("token"),
+            ))
+            .expect("live grant")
+            .expect("granted");
+        assert_eq!(outside_grant.invoking_pane, None);
+        // The presented token still resolves to A's own unchanged grant.
+        assert_eq!(
+            fixture
+                .app
+                .plugin_action_grants
+                .resolve(claim)
+                .expect("live grant")
+                .expect("granted")
+                .invoking_pane
+                .as_deref(),
+            Some(fixture.a_pane_public.as_str())
+        );
+
+        let released = std::time::Instant::now();
+        std::fs::write(root.join("release"), b"").unwrap();
+        while fixture.app.plugin_action_grants.resolve(claim).is_ok() {
+            assert!(
+                released.elapsed() < std::time::Duration::from_secs(3),
+                "grant outlived the action child"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // Revoked while `sleep 4` still holds the output pipes: the command
+        // has not finished from the log's point of view yet.
+        assert!(released.elapsed() < std::time::Duration::from_secs(3));
+        fixture.app.drain_all_internal_events();
+        let still_running = fixture
+            .app
+            .state
+            .plugin_command_logs
+            .iter()
+            .find(|entry| entry.log_id == log.log_id)
+            .map(|entry| entry.status);
+        assert_eq!(still_running, Some(PluginCommandStatus::Running));
+        assert_eq!(fixture.app.plugin_action_grants.resolve(claim), Err(()));
+        let _ = std::fs::remove_dir_all(fixture.root);
     }
 }

@@ -189,6 +189,54 @@ pub(crate) fn input_consumer_random(bytes: &mut [u8]) -> std::io::Result<()> {
         ))
     }
 }
+/// OS CSPRNG bytes for server-local secrets (herdr-8592 plugin action grants).
+/// Unsupported platforms return an error; callers must then grant nothing.
+pub(crate) fn secure_random(bytes: &mut [u8]) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    return linux::input_consumer::random_bytes(bytes);
+    #[cfg(target_os = "macos")]
+    return macos::secure_random_platform(bytes);
+    #[cfg(windows)]
+    return windows::secure_random_platform(bytes);
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    {
+        let _ = bytes;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "no OS random source",
+        ))
+    }
+}
+
+/// Exact pin of a child this server spawned and has not reaped yet. While the
+/// owner holds the unreaped `Child`, its PID cannot be reused, so the start-time
+/// identity names exactly that instance. Linux additionally holds a pidfd
+/// (see `linux::OwnedChildPin`) so exit is observed before the owner reaps it.
+#[cfg(not(target_os = "linux"))]
+#[derive(Debug)]
+pub(crate) struct OwnedChildPin {
+    identity: ProcessIdentity,
+}
+
+#[cfg(not(target_os = "linux"))]
+impl OwnedChildPin {
+    pub(crate) fn identity(&self) -> ProcessIdentity {
+        self.identity
+    }
+
+    /// Exited (even unreaped) or replaced processes are not alive.
+    pub(crate) fn is_alive(&self) -> bool {
+        process_identity(self.identity.pid) == Some(self.identity)
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn pin_owned_child(child: &std::process::Child) -> std::io::Result<OwnedChildPin> {
+    process_identity(child.id())
+        .map(|identity| OwnedChildPin { identity })
+        .ok_or_else(|| std::io::Error::other("cannot pin the spawned process identity"))
+}
+
 /// `connection` is the accepted stream from `peer`. On Linux the sshd lookup
 /// helper receives it to read the peer from the kernel.
 pub(crate) fn resolve_client_principal(

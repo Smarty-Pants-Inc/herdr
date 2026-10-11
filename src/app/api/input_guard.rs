@@ -4,6 +4,8 @@ use crate::api::schema::{Method, Request};
 use crate::api::ApiRequestContext;
 use crate::app::terminal_targets::{InputOrigin, TerminalTarget};
 
+const INPUT_ORIGIN_UNKNOWN_MESSAGE: &str = "cannot validate input origin; retry from a live attributable caller or explicitly opt in with CLI --allow-cross-pane (API allow_cross_pane: true)";
+
 impl App {
     // This is a policy guard, not caller authentication.
     #[cfg(test)]
@@ -30,15 +32,36 @@ impl App {
         let origin = self.input_origin_for_context_with_ancestry(context);
         let (code, message) = match origin {
             InputOrigin::Ordinary => return None,
+            // A user click or keybinding may target only its invoking terminal
+            // and terminals the same grant created (herdr-8592, herdr#223),
+            // by stable terminal ID. Never a fallback to ordinary or agent.
+            InputOrigin::PluginAction(grant) => match self
+                .plugin_action_grants
+                .permits_target(context.plugin_action, &target.terminal_id)
+            {
+                Ok(true) => {
+                    tracing::info!(
+                        plugin_id = %grant.plugin_id,
+                        action_id = %grant.action_id,
+                        invoking_pane = grant.invoking_pane.as_deref().unwrap_or(""),
+                        grant = %grant.grant_id,
+                        target_terminal = %target.terminal_id,
+                        "plugin action input allowed"
+                    );
+                    return None;
+                }
+                Ok(false) => (
+                    "cross_pane_input_denied",
+                    "plugin action input may target only its invoking pane and panes it created",
+                ),
+                Err(()) => ("input_origin_unknown", INPUT_ORIGIN_UNKNOWN_MESSAGE),
+            },
             InputOrigin::Agent(source) if source.terminal_id == target.terminal_id => return None,
             InputOrigin::Agent(_) => (
                 "cross_pane_input_denied",
                 "agent-originated input cannot target a different pane",
             ),
-            InputOrigin::Unknown => (
-                "input_origin_unknown",
-                "cannot validate input origin; retry from a live attributable caller or explicitly opt in with CLI --allow-cross-pane (API allow_cross_pane: true)",
-            ),
+            InputOrigin::Unknown => ("input_origin_unknown", INPUT_ORIGIN_UNKNOWN_MESSAGE),
         };
         Some(encode_error(request.id.clone(), code, message))
     }
@@ -1477,7 +1500,7 @@ mod tests {
             let unknown = ApiRequestContext {
                 local_peer_pane_origin: crate::platform::PeerPaneOrigin::Unknown,
                 local_peer_identity: Some(peer),
-                server_ancestry: None,
+                ..Default::default()
             };
             let response = fixture.app.handle_api_request_with_context(
                 request(
@@ -2640,5 +2663,617 @@ finally:
             .app
             .rebind_stale_report_pane(&mut stale, attributed_context());
         assert_eq!(stale.method, report_working(&fixture.source_pane_id));
+    }
+
+    /// herdr-8592: Explorr shape. The server-spawned action child (`sh`) forks a
+    /// grandchild that inherited the invoking pane's HERDR_PANE_ID marker and the
+    /// grant. Only the grant, while the recorded child lives, admits its bound
+    /// invoking terminal; a pre-existing other pane is refused (herdr#223).
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn plugin_action_grant_admits_grandchild_and_invalid_claims_never_fall_through() {
+        use crate::plugin_action_origin::{
+            PluginActionClaim, PluginActionGrant, PluginActionGrants, PluginActionToken,
+        };
+        use std::io::BufRead;
+        let mut fixture = attributed_agent_fixture();
+        let grant = PluginActionGrant {
+            plugin_id: "example.explorr".into(),
+            action_id: "open".into(),
+            invoking_pane: Some(fixture.source_pane_id.clone()),
+            grant_id: "plugin-log-7".into(),
+        };
+        let (token, key) = fixture
+            .app
+            .plugin_action_grants
+            .mint(grant.clone())
+            .expect("mint");
+        // The production runtime binds the invoking terminal before spawn.
+        let source_terminal = fixture
+            .app
+            .pane_target(&fixture.source_pane_id)
+            .expect("source")
+            .terminal_id;
+        assert!(fixture
+            .app
+            .plugin_action_grants
+            .bind_target(key, &source_terminal));
+        let mut action = GuardTestChild(
+            std::process::Command::new("sh")
+                .args(["-c", "sleep 30 & echo $!; wait"])
+                .env("HERDR_ENV", "1")
+                .env("HERDR_PANE_ID", &fixture.source_pane_id)
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .expect("action child"),
+        );
+        let mut line = String::new();
+        std::io::BufReader::new(action.stdout.take().expect("stdout"))
+            .read_line(&mut line)
+            .expect("grandchild pid");
+        let grandchild: u32 = line.trim().parse().expect("pid");
+        assert!(fixture.app.plugin_action_grants.activate(
+            key,
+            crate::platform::pin_owned_child(&action).expect("pin action child")
+        ));
+        // `sh` prints the child PID immediately after fork. Before the child
+        // execs `sleep`, Linux can expose an empty /proc/<pid>/environ (and
+        // macOS can likewise expose incomplete launch metadata). Poll the
+        // production accept-time probe to wait for the exec, with a bound so
+        // a live process that never reports its pane still fails this test.
+        let origin_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let copied_marker = loop {
+            let context = ApiRequestContext::for_local_peer_pid(Some(grandchild));
+            if context.local_peer_pane_origin == crate::platform::PeerPaneOrigin::HasPane {
+                break context;
+            }
+            assert!(
+                crate::platform::process_identity(grandchild).is_some(),
+                "grandchild exited before its pane origin became observable"
+            );
+            assert!(
+                std::time::Instant::now() < origin_deadline,
+                "grandchild pane origin did not become observable before timeout"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        };
+        let send = |id: &str, pane: &str, opt_in: bool| Request {
+            id: id.into(),
+            method: Method::PaneSendText(PaneSendTextParams {
+                pane_id: pane.into(),
+                text: "open".into(),
+                allow_cross_pane: opt_in,
+            }),
+        };
+
+        // Copied pane marker without a grant is still refused cross-pane (this
+        // fixture's source pane root is the test process, so the descendant is
+        // attributed to the source agent rather than unknown).
+        let refused: ErrorResponse =
+            serde_json::from_str(&fixture.app.handle_api_request_with_context(
+                send("no-token", &fixture.target_pane_id, false),
+                copied_marker,
+            ))
+            .expect("refusal");
+        assert!(matches!(
+            refused.error.code.as_str(),
+            "cross_pane_input_denied" | "input_origin_unknown"
+        ));
+        assert!(fixture.target_rx.try_recv().is_err());
+
+        // The grandchild with the grant reaches its invoking terminal, no
+        // opt-in needed, but not the pre-existing other pane (herdr#223).
+        let granted = copied_marker.with_plugin_action(PluginActionClaim::Presented(token));
+        assert_eq!(
+            fixture.app.input_origin_for_context(granted),
+            InputOrigin::PluginAction(grant.clone())
+        );
+        assert_denied(&fixture.app.handle_api_request_with_context(
+            send("granted-cross", &fixture.target_pane_id, false),
+            granted,
+        ));
+        assert!(fixture.target_rx.try_recv().is_err());
+        assert_ok(&fixture.app.handle_api_request_with_context(
+            send("granted", &fixture.source_pane_id, false),
+            granted,
+        ));
+        // The explicit opt-in remains a separate escape hatch.
+        assert_ok(&fixture.app.handle_api_request_with_context(
+            send("granted-opt-in", &fixture.target_pane_id, true),
+            granted,
+        ));
+        assert_eq!(
+            fixture.target_rx.try_recv().expect("target opt-in"),
+            Bytes::from_static(b"open")
+        );
+        assert_eq!(
+            fixture.source_rx.try_recv().expect("source"),
+            Bytes::from_static(b"open")
+        );
+
+        // Forged, malformed, and another server's token never fall through,
+        // even on an otherwise agent-attributed own-pane write.
+        let other_server = PluginActionGrants::default();
+        assert_eq!(
+            other_server.resolve(PluginActionClaim::Presented(token)),
+            Err(())
+        );
+        for claim in [
+            PluginActionClaim::Presented(PluginActionToken::parse(&"0".repeat(64)).expect("hex")),
+            PluginActionClaim::Malformed,
+        ] {
+            for context in [copied_marker, attributed_context()] {
+                assert_unknown(&fixture.app.handle_api_request_with_context(
+                    send("forged", &fixture.source_pane_id, false),
+                    context.with_plugin_action(claim),
+                ));
+            }
+        }
+        assert!(fixture.source_rx.try_recv().is_err());
+
+        // Counterexamples keep existing behavior: own-agent pane and explicit opt-in.
+        assert_ok(&fixture.app.handle_api_request_with_context(
+            send("own", &fixture.source_pane_id, false),
+            attributed_context(),
+        ));
+        assert!(fixture.source_rx.try_recv().is_ok());
+        assert_denied(&fixture.app.handle_api_request_with_context(
+            send("agent-cross", &fixture.target_pane_id, false),
+            attributed_context(),
+        ));
+        assert_ok(&fixture.app.handle_api_request_with_context(
+            send("opt-in", &fixture.target_pane_id, true),
+            copied_marker,
+        ));
+        assert!(fixture.target_rx.try_recv().is_ok());
+
+        // The recorded child exits while its grandchild lives: replay is denied.
+        action.kill().expect("stop action child");
+        action.wait().expect("reap action child");
+        assert_eq!(
+            crate::platform::process_identity(grandchild).map(|identity| identity.pid),
+            Some(grandchild),
+            "descendant still alive"
+        );
+        for pane in [&fixture.target_pane_id, &fixture.source_pane_id] {
+            assert_unknown(
+                &fixture
+                    .app
+                    .handle_api_request_with_context(send("replay", pane, false), granted),
+            );
+        }
+        assert!(fixture.source_rx.try_recv().is_err());
+        assert!(fixture.target_rx.try_recv().is_err());
+        // SAFETY: signal the exact grandchild PID this test started and still
+        // observes alive (its parent was reaped above, so it is reparented, not
+        // reused; start time is compared just before).
+        unsafe { libc::kill(grandchild as libc::pid_t, libc::SIGKILL) };
+    }
+
+    /// herdr-8592: a grant past its maximum age is refused while the child lives.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn expired_plugin_action_grant_is_unknown_in_actual_guard() {
+        use crate::plugin_action_origin::{PluginActionClaim, PluginActionGrant, MAX_GRANT_AGE};
+        let mut fixture = attributed_agent_fixture();
+        let (token, key) = fixture
+            .app
+            .plugin_action_grants
+            .mint(PluginActionGrant {
+                plugin_id: "example.explorr".into(),
+                action_id: "open".into(),
+                invoking_pane: None,
+                grant_id: "plugin-log-8".into(),
+            })
+            .expect("mint");
+        let action = detached_sleep_child();
+        assert!(fixture
+            .app
+            .plugin_action_grants
+            .activate(key, crate::platform::pin_owned_child(&action).expect("pin")));
+        // A global grant starts empty; give it one target to observe expiry.
+        let target_terminal = fixture
+            .app
+            .pane_target(&fixture.target_pane_id)
+            .expect("target")
+            .terminal_id;
+        assert!(fixture
+            .app
+            .plugin_action_grants
+            .bind_target(key, &target_terminal));
+        let context =
+            ApiRequestContext::default().with_plugin_action(PluginActionClaim::Presented(token));
+        let request = || Request {
+            id: "expiry".into(),
+            method: Method::PaneSendText(PaneSendTextParams {
+                pane_id: fixture.target_pane_id.clone(),
+                text: "late".into(),
+                allow_cross_pane: false,
+            }),
+        };
+        let fresh = request();
+        assert_ok(&fixture.app.handle_api_request_with_context(fresh, context));
+        assert!(fixture.target_rx.try_recv().is_ok());
+        fixture
+            .app
+            .plugin_action_grants
+            .backdate_for_test(key, MAX_GRANT_AGE + std::time::Duration::from_secs(1));
+        let late = request();
+        assert_unknown(&fixture.app.handle_api_request_with_context(late, context));
+        assert!(fixture.target_rx.try_recv().is_err());
+        drop(action);
+    }
+
+    /// herdr-8592: the actual CLI client serialization reaches the production
+    /// receiver parse. A plain ordinary caller stays ordinary with no claim, but
+    /// any supplied malformed, null or forged claim is unknown, never ordinary.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn client_wire_claims_through_receiver_never_promote_or_fall_through() {
+        use crate::api::client::{ApiClient, ConnectionTarget};
+        use crate::plugin_action_origin::{PluginActionClaim, PluginActionToken};
+        use interprocess::local_socket::traits::Listener as _;
+        use std::io::{BufRead, Write};
+        let mut fixture = attributed_agent_fixture();
+        for pane in [&fixture.source_pane_id, &fixture.target_pane_id] {
+            let (_, pane) = fixture.app.parse_pane_id(pane).expect("pane");
+            fixture
+                .app
+                .state
+                .runtime_for_pane_in_workspace(&fixture.app.terminal_runtimes, 0, pane)
+                .expect("runtime")
+                .test_set_child_pid(0);
+        }
+        let ordinary = ApiRequestContext {
+            local_peer_pane_origin: crate::platform::PeerPaneOrigin::Absent,
+            ..attributed_context()
+        };
+        let peer = ordinary.local_peer_identity.expect("live caller");
+        let request = Request {
+            id: "wire".into(),
+            method: Method::PaneSendText(PaneSendTextParams {
+                pane_id: fixture.target_pane_id.clone(),
+                text: "wire".into(),
+                allow_cross_pane: false,
+            }),
+        };
+        // Send through the real ApiClient and capture the exact request line.
+        let capture = |claim: PluginActionClaim| -> String {
+            let path = std::env::temp_dir().join(format!(
+                "hpa-{}-{}.sock",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("clock")
+                    .as_nanos()
+            ));
+            let listener = crate::ipc::bind_private_local_listener(&path).expect("listener");
+            let receiver = std::thread::spawn(move || {
+                let mut stream = std::io::BufReader::new(listener.accept().expect("accept"));
+                let mut line = String::new();
+                stream.read_line(&mut line).expect("request line");
+                stream
+                    .get_mut()
+                    .write_all(b"{\"id\":\"wire\",\"result\":{\"type\":\"ok\"}}\n")
+                    .expect("reply");
+                line
+            });
+            ApiClient::for_target(ConnectionTarget::SocketPath(path.clone()))
+                .with_plugin_action(claim)
+                .request_value(&request)
+                .expect("client round trip");
+            let line = receiver.join().expect("receiver");
+            let _ = std::fs::remove_file(path);
+            line
+        };
+        let forged =
+            PluginActionClaim::Presented(PluginActionToken::parse(&"9".repeat(64)).expect("hex"));
+        let raw_null = serde_json::to_string(&request).expect("request").replacen(
+            '{',
+            "{\"plugin_action_token\":null,",
+            1,
+        );
+        let cases = [
+            ("absent", capture(PluginActionClaim::Absent), true),
+            (
+                "malformed-env",
+                capture(PluginActionClaim::Malformed),
+                false,
+            ),
+            ("forged", capture(forged), false),
+            ("raw-null", raw_null, false),
+        ];
+        crate::platform::with_server_ancestry_for_test(peer, Some(true), || {
+            assert_eq!(
+                fixture.app.input_origin_for_context(ordinary),
+                InputOrigin::Ordinary
+            );
+            for (name, line, allowed) in cases {
+                // Mirror handle_connection_with_stop: typed parse plus the
+                // per-line claim on the accept-time context.
+                let parsed: Request = serde_json::from_str(line.trim()).expect(name);
+                let context =
+                    ordinary.with_plugin_action(PluginActionClaim::from_request_line(line.trim()));
+                let response = fixture.app.handle_api_request_with_context(parsed, context);
+                if allowed {
+                    assert_ok(&response);
+                    assert!(fixture.target_rx.try_recv().is_ok(), "{name}");
+                } else {
+                    assert_unknown(&response);
+                    assert!(fixture.target_rx.try_recv().is_err(), "{name}");
+                }
+            }
+        });
+    }
+
+    /// herdr#223: a grant writes only to its bound invoking terminal and to
+    /// terminals the server actually created for a request carrying that same
+    /// grant, by stable terminal ID, through actual App dispatch.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn plugin_action_grant_targets_only_invoking_and_own_created_terminals() {
+        use crate::api::schema::{
+            PaneMoveDestination, PaneMoveParams, PaneSplitParams, PaneTarget, SplitDirection,
+            TabCreateParams, WorkspaceCreateParams,
+        };
+        use crate::plugin_action_origin::{
+            PluginActionClaim, PluginActionGrant, PluginActionToken,
+        };
+        let env = crate::environment::test_env();
+        env.set("SHELL", super::super::test_support::exiting_test_command());
+        let mut fixture = attributed_agent_fixture();
+        let mint = |fixture: &Fixture, invoking: Option<&str>, log: &str| {
+            let (token, key) = fixture
+                .app
+                .plugin_action_grants
+                .mint(PluginActionGrant {
+                    plugin_id: "example.explorr".into(),
+                    action_id: "open".into(),
+                    invoking_pane: invoking.map(str::to_owned),
+                    grant_id: log.into(),
+                })
+                .expect("mint");
+            (token, key)
+        };
+        let source_terminal = fixture
+            .app
+            .pane_target(&fixture.source_pane_id)
+            .expect("source")
+            .terminal_id;
+        let (token_a, key_a) = mint(&fixture, Some(&fixture.source_pane_id), "plugin-log-a");
+        assert!(fixture
+            .app
+            .plugin_action_grants
+            .bind_target(key_a, &source_terminal));
+        let (token_g, key_g) = mint(&fixture, None, "plugin-log-g");
+        let child_a = detached_sleep_child();
+        let child_g = detached_sleep_child();
+        for (key, child) in [(key_a, &child_a), (key_g, &child_g)] {
+            assert!(fixture
+                .app
+                .plugin_action_grants
+                .activate(key, crate::platform::pin_owned_child(child).expect("pin")));
+        }
+        let ctx = |token: PluginActionToken| {
+            ApiRequestContext::default().with_plugin_action(PluginActionClaim::Presented(token))
+        };
+        let (a, g) = (ctx(token_a), ctx(token_g));
+        let send = |pane: &str| Request {
+            id: "write".into(),
+            method: Method::PaneSendText(PaneSendTextParams {
+                pane_id: pane.into(),
+                text: "open".into(),
+                allow_cross_pane: false,
+            }),
+        };
+        // None: admitted; Some(code): refused with that error code.
+        let decide = |fixture: &Fixture, pane: &str, context: ApiRequestContext| {
+            fixture
+                .app
+                .cross_pane_input_denial(&send(pane), context)
+                .map(|denial| {
+                    serde_json::from_str::<ErrorResponse>(&denial)
+                        .expect("error")
+                        .error
+                        .code
+                })
+        };
+        let denied = Some("cross_pane_input_denied".to_string());
+        let unknown = Some("input_origin_unknown".to_string());
+        let created_pane = |response: &str, kind: &str| -> (String, String) {
+            let value: serde_json::Value = serde_json::from_str(response).expect("json");
+            let pane = match kind {
+                "split" => &value["result"]["pane"],
+                _ => &value["result"]["root_pane"],
+            };
+            (
+                pane["pane_id"].as_str().expect(response).to_owned(),
+                pane["terminal_id"].as_str().expect(response).to_owned(),
+            )
+        };
+        let split = |pane: &str| Request {
+            id: "split".into(),
+            method: Method::PaneSplit(PaneSplitParams {
+                workspace_id: None,
+                target_pane_id: Some(pane.into()),
+                direction: SplitDirection::Right,
+                ratio: None,
+                cwd: None,
+                focus: false,
+                right_click: Default::default(),
+                env: Default::default(),
+            }),
+        };
+
+        // Token A: pre-existing B refused, own invoking A admitted (real write).
+        assert_eq!(decide(&fixture, &fixture.target_pane_id, a), denied);
+        assert_denied(
+            &fixture
+                .app
+                .handle_api_request_with_context(send(&fixture.target_pane_id), a),
+        );
+        assert!(fixture.target_rx.try_recv().is_err());
+        assert_ok(
+            &fixture
+                .app
+                .handle_api_request_with_context(send(&fixture.source_pane_id), a),
+        );
+        assert!(fixture.source_rx.try_recv().is_ok());
+        // The global grant starts empty: neither pre-existing pane.
+        for pane in [&fixture.source_pane_id, &fixture.target_pane_id] {
+            assert_eq!(decide(&fixture, pane, g), denied);
+        }
+
+        // A failed creation (missing target) grants nothing.
+        let failed = fixture
+            .app
+            .handle_api_request_with_context(split("w999:p999"), a);
+        assert!(
+            serde_json::from_str::<ErrorResponse>(&failed).is_ok(),
+            "{failed}"
+        );
+        assert_eq!(decide(&fixture, &fixture.target_pane_id, a), denied);
+
+        // A's own actual split (of the pre-existing other pane) is admitted
+        // for A only; the split target stays refused.
+        let response = fixture
+            .app
+            .handle_api_request_with_context(split(&fixture.target_pane_id), a);
+        let (split_pane, split_terminal) = created_pane(&response, "split");
+        assert_ne!(split_terminal, source_terminal);
+        assert_eq!(decide(&fixture, &split_pane, a), None);
+        assert_eq!(decide(&fixture, &split_pane, g), denied);
+        assert_eq!(decide(&fixture, &fixture.target_pane_id, a), denied);
+
+        // Tab and workspace creation by the global grant: only its own.
+        let response = fixture.app.handle_api_request_with_context(
+            Request {
+                id: "tab".into(),
+                method: Method::TabCreate(TabCreateParams {
+                    workspace_id: None,
+                    cwd: None,
+                    focus: false,
+                    label: None,
+                    env: Default::default(),
+                }),
+            },
+            g,
+        );
+        let (tab_pane, _) = created_pane(&response, "tab");
+        let response = fixture.app.handle_api_request_with_context(
+            Request {
+                id: "workspace".into(),
+                method: Method::WorkspaceCreate(WorkspaceCreateParams {
+                    source_workspace_id: None,
+                    cwd: None,
+                    focus: false,
+                    label: None,
+                    env: Default::default(),
+                }),
+            },
+            g,
+        );
+        let (workspace_pane, _) = created_pane(&response, "workspace");
+        for pane in [&tab_pane, &workspace_pane] {
+            assert_eq!(decide(&fixture, pane, g), None, "{pane}");
+            assert_eq!(decide(&fixture, pane, a), denied, "{pane}");
+        }
+        assert_eq!(decide(&fixture, &split_pane, g), denied);
+        assert_eq!(decide(&fixture, &fixture.source_pane_id, g), denied);
+
+        // Malformed, forged and no-token creations still create under the
+        // existing API but award no rights; forged/malformed writes are
+        // unknown, and no valid grant may adopt the created terminal.
+        let forged =
+            PluginActionClaim::Presented(PluginActionToken::parse(&"0".repeat(64)).expect("hex"));
+        for claim in [
+            PluginActionClaim::Malformed,
+            forged,
+            PluginActionClaim::Absent,
+        ] {
+            let context = ApiRequestContext::default().with_plugin_action(claim);
+            let response = fixture
+                .app
+                .handle_api_request_with_context(split(&fixture.source_pane_id), context);
+            let (pane, _) = created_pane(&response, "split");
+            assert_eq!(decide(&fixture, &pane, a), denied, "{claim:?}");
+            assert_eq!(decide(&fixture, &pane, g), denied, "{claim:?}");
+            if claim != PluginActionClaim::Absent {
+                assert_eq!(decide(&fixture, &pane, context), unknown, "{claim:?}");
+            }
+        }
+
+        // Moving A's created pane changes its public pane ID but keeps its
+        // stable terminal, which stays admitted under the new ID.
+        let moved = fixture.app.handle_api_request_with_context(
+            Request {
+                id: "move".into(),
+                method: Method::PaneMove(PaneMoveParams {
+                    pane_id: split_pane.clone(),
+                    destination: PaneMoveDestination::NewWorkspace {
+                        label: None,
+                        tab_label: None,
+                    },
+                    focus: false,
+                    allow_project_change: false,
+                }),
+            },
+            ApiRequestContext::default(),
+        );
+        assert!(
+            serde_json::from_str::<SuccessResponse>(&moved).is_ok(),
+            "{moved}"
+        );
+        let moved_target = fixture
+            .app
+            .terminal_targets()
+            .into_iter()
+            .find(|target| target.terminal_id == split_terminal)
+            .expect("moved terminal survives");
+        let moved_pane = fixture
+            .app
+            .public_pane_id(moved_target.ws_idx, moved_target.pane_id)
+            .expect("moved pane id");
+        assert_ne!(moved_pane, split_pane, "public pane ID changed");
+        assert_eq!(decide(&fixture, &moved_pane, a), None);
+
+        // Closing it, then a new terminal at a (possibly reused) public pane
+        // ID created without A's grant, is refused for A.
+        let closed = fixture.app.handle_api_request_with_context(
+            Request {
+                id: "close".into(),
+                method: Method::PaneClose(PaneTarget {
+                    pane_id: moved_pane.clone(),
+                }),
+            },
+            ApiRequestContext::default(),
+        );
+        assert!(
+            serde_json::from_str::<SuccessResponse>(&closed).is_ok(),
+            "{closed}"
+        );
+        let response = fixture.app.handle_api_request_with_context(
+            split(&fixture.target_pane_id),
+            ApiRequestContext::default(),
+        );
+        let (new_pane, new_terminal) = created_pane(&response, "split");
+        assert_ne!(new_terminal, split_terminal);
+        assert_eq!(decide(&fixture, &new_pane, a), denied);
+
+        // Revocation stops writes and later registration alike.
+        fixture.app.plugin_action_grants.revoke(key_a);
+        assert_eq!(decide(&fixture, &fixture.source_pane_id, a), unknown);
+        let response = fixture
+            .app
+            .handle_api_request_with_context(split(&fixture.source_pane_id), a);
+        let (late_pane, _) = created_pane(&response, "split");
+        assert_eq!(decide(&fixture, &late_pane, a), unknown);
+        assert_eq!(decide(&fixture, &late_pane, g), denied);
+
+        let runtimes: Vec<_> = fixture.app.terminal_runtimes.drain().collect();
+        for (_terminal_id, runtime) in runtimes {
+            runtime.shutdown();
+        }
+        drop((child_a, child_g));
     }
 }

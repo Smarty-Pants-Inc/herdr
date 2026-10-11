@@ -668,6 +668,29 @@ action = "bootstrap"
 
 Herdr は `HERDR_SOCKET_PATH`、`HERDR_BIN_PATH`、`HERDR_ENV=1`、`HERDR_PLUGIN_ID`、`HERDR_PLUGIN_ROOT`、`HERDR_PLUGIN_CONFIG_DIR`、`HERDR_PLUGIN_STATE_DIR`、`HERDR_PLUGIN_CONTEXT_JSON`、そして利用可能な `HERDR_WORKSPACE_ID`、`HERDR_TAB_ID`、`HERDR_PANE_ID` の値を注入します。アクションコマンドは加えて `HERDR_PLUGIN_ACTION_ID` を受け取ります。イベントフックは `HERDR_PLUGIN_EVENT` と `HERDR_PLUGIN_EVENT_JSON` を、ペインコマンドは `HERDR_PLUGIN_ENTRYPOINT_ID` を受け取ります。
 
+プラグインのアクションコマンドは通常、秘密の `HERDR_PLUGIN_ACTION_TOKEN` も受け取ります。
+ローカル CLI は入力の書き込みリクエストと、`pane.split`、`tab.create`、
+`workspace.create`、`workspace.create_linked` に自動で付けます。生の API クライアントは、
+`id`、`method`、`params` と同じ階層の省略可能な `plugin_action_token` フィールドに
+指定できます。リクエストのパラメーターは変わりません。`allow_cross_pane` なしでは、
+有効なトークンが許可する書き込み先は、アクションの呼び出し元ターミナルと、同じ
+トークンを付けたリクエストで作成されたターミナルだけです。この権限は移動や名前の
+変更をまたいで安定したターミナルの同一性に従いますが、ほかの既存のターミナル、
+再利用された公開 ID、別の許可で作成されたターミナルには及びません。グローバルな
+アクションには呼び出し元のターミナルがなく、自分が作成したターミナルにだけ書き込めます。
+有効なトークンでそれ以外の既存のターミナルを対象にすると `cross_pane_input_denied`
+を返します。不正・期限切れ・失効済み・別のサーバーのもの・形式が誤ったトークンは
+`input_origin_unknown` を返します。明示的な `allow_cross_pane` は引き続き別の
+上書き手段です。トークンは発行元サーバー上で、アクションのプロセスが生存している
+間だけ、最長 10 分有効です。サーバーが保持する許可は失効済みのものを含めて最大
+256 件で、有効または保留中の許可で満杯の場合、アクションはトークンなしで通常の
+入力ルールに従って実行され、新しい許可は発行されません。この場合、グローバルな
+アクションはアクショントークン導入前と同じ通常のクライアントとして実行され、
+そのルールでは既存のペインへの書き込みが許可されます。
+スタートアップフックとイベントフックには渡されません。ログに含めないでください。
+同じ OS ユーザーのプロセスは互いの環境を読み取れる場合があるため、プロセス間の
+隔離境界ではありません。
+
 直近のアクションおよびイベントコマンドのログを一覧する:
 
 ```json
