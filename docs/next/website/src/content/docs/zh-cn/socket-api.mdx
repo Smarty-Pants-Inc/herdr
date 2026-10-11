@@ -617,7 +617,7 @@ action = "bootstrap"
 {"id":"req_plugin_invoke","method":"plugin.action.invoke","params":{"action_id":"example.worktree-bootstrap.bootstrap","context":{"invocation_source":"keybinding"}}}
 ```
 
-`plugin.action.invoke` 解析清单动作,启动清单命令,并返回 Herdr 构建的调用上下文和已启动命令的日志记录。将 `context.focused_pane_id` 设为调用窗格后,Herdr 从该窗格而非 UI 焦点构建工作区、标签页、cwd、智能体和 worktree 字段。未知窗格返回 `pane_not_found`。未指定调用窗格的全局动作不接收窗格字段,也不会隐式接收聚焦工作区的上下文;仍可使用显式工作区/标签页上下文和调用元数据。调用被禁用插件的动作返回 `plugin_disabled` 错误。
+`plugin.action.invoke` 解析清单动作,启动清单命令,并返回 Herdr 构建的调用上下文和已启动命令的日志记录。调用窗格由 Herdr 验证的调用进程归属决定,而不是请求中的 ID 或 UI 焦点。即使未提供窗格 ID,Herdr 也会从该窗格构建工作区、标签页、cwd、智能体和 worktree 字段。对于已归属窗格的调用方,`context.focused_pane_id` 只是待验证的声明;不能解析为调用方自身窗格的 ID 会返回 `invoking_pane_mismatch`。没有窗格归属的调用方无论提供什么窗格 ID,都会得到全局动作,不接收窗格、工作区或标签页字段。调用方提供的派生字段会被忽略,但调用元数据仍可使用。调用被禁用插件的动作返回 `plugin_disabled` 错误。
 
 Herdr 注入 `HERDR_SOCKET_PATH`、`HERDR_BIN_PATH`、`HERDR_ENV=1`、`HERDR_PLUGIN_ID`、`HERDR_PLUGIN_ROOT`、`HERDR_PLUGIN_CONFIG_DIR`、`HERDR_PLUGIN_STATE_DIR`、`HERDR_PLUGIN_CONTEXT_JSON`,以及可用的 `HERDR_WORKSPACE_ID`、`HERDR_TAB_ID` 和 `HERDR_PANE_ID` 值。动作命令还收到 `HERDR_PLUGIN_ACTION_ID`;事件钩子收到 `HERDR_PLUGIN_EVENT` 和 `HERDR_PLUGIN_EVENT_JSON`;窗格命令收到 `HERDR_PLUGIN_ENTRYPOINT_ID`。
 
