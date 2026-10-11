@@ -3631,7 +3631,7 @@ id = "example.privacy"
 name = "Privacy"
 version = "0.1.0"
 min_herdr_version = "0.6.10"
-platforms = ["linux", "macos"]
+platforms = ["linux", "macos", "windows"]
 
 [[actions]]
 id = "dump"
