@@ -91,9 +91,20 @@ fn agent_prompt_against_scripted_server(
     let base = unique_test_dir();
     fs::create_dir_all(&base).unwrap();
     let socket = base.join("herdr.sock");
-    let listener = UnixListener::bind(&socket).unwrap();
+    let server = scripted_server(&socket, reply);
+    let output = run_cli(&socket, args);
+    let request = server.join().unwrap();
+    cleanup_test_base(&base);
+    (output, request)
+}
+
+fn scripted_server(
+    socket: &Path,
+    reply: serde_json::Value,
+) -> thread::JoinHandle<serde_json::Value> {
+    let listener = UnixListener::bind(socket).unwrap();
     listener.set_nonblocking(true).unwrap();
-    let server = thread::spawn(move || {
+    thread::spawn(move || {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             assert!(Instant::now() < deadline, "CLI did not send a request");
@@ -127,11 +138,140 @@ fn agent_prompt_against_scripted_server(
             writeln!(stream, "{reply}").unwrap();
             return request;
         }
-    });
-    let output = run_cli(&socket, args);
-    let request = server.join().unwrap();
+    })
+}
+
+// smarty-dev#9677 review trace 1: an opt-in right after TARGET followed by an
+// option is the literal TEXT, exactly as before; --wait stays an option.
+#[test]
+fn agent_prompt_flag_text_before_an_option_stays_literal() {
+    let (output, request) = agent_prompt_against_scripted_server(
+        &["agent", "prompt", "w1:p2", "--allow-cross-pane", "--wait"],
+        serde_json::json!({"result": {"type": "agent_prompted"}}),
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(request["method"], "agent.prompt");
+    assert_eq!(request["params"]["target"], "w1:p2");
+    assert_eq!(request["params"]["text"], "--allow-cross-pane");
+    assert!(request["params"]["wait"].is_object(), "{request}");
+    assert_ne!(request["params"]["allow_cross_pane"], true);
+}
+
+// smarty-dev#9677 review trace 2: globals around a leading opt-in are applied
+// (--remote then refuses a subcommand), and TARGET is never shifted onto them.
+#[test]
+fn agent_prompt_leading_opt_in_applies_surrounding_globals() {
+    let base = unique_test_dir();
+    fs::create_dir_all(&base).unwrap();
+    let missing_socket = base.join("no-server.sock");
+    let cli = |args: &[&str]| {
+        let output = run_cli(&missing_socket, args);
+        (
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    };
+    for args in [
+        &[
+            "agent",
+            "prompt",
+            "--allow-cross-pane",
+            "--session=work",
+            "w1:p2",
+            "--remote=host",
+        ][..],
+        &[
+            "agent",
+            "prompt",
+            "--allow-cross-pane",
+            "--session=work",
+            "w1:p2",
+            "--remote=host",
+            "hi",
+        ][..],
+    ] {
+        let (code, stderr) = cli(args);
+        assert_eq!(code, Some(2), "{args:?}: {stderr}");
+        assert!(
+            stderr.contains("--remote can only be used with the default launch command"),
+            "{args:?}: {stderr}"
+        );
+    }
+    // Without --remote and without TEXT: a clean usage error, nothing sent.
+    let (code, stderr) = cli(&[
+        "agent",
+        "prompt",
+        "--allow-cross-pane",
+        "--session=work",
+        "w1:p2",
+    ]);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(stderr.contains("agent prompt requires text"), "{stderr}");
+
+    // With TEXT the prompt goes to the named session's socket, with the opt-in.
+    let config_home = base.join("config");
+    let app_dir = if cfg!(debug_assertions) {
+        "herdr-dev"
+    } else {
+        "herdr"
+    };
+    let session_dir = config_home.join(app_dir).join("sessions").join("work");
+    fs::create_dir_all(&session_dir).unwrap();
+    let session_socket = session_dir.join("herdr.sock");
+    for args in [
+        &[
+            "agent",
+            "prompt",
+            "--allow-cross-pane",
+            "--session=work",
+            "w1:p2",
+            "hi",
+        ][..],
+        &[
+            "agent",
+            "prompt",
+            "--allow-cross-pane",
+            "--session",
+            "work",
+            "w1:p2",
+            "hi",
+        ][..],
+        &[
+            "agent",
+            "prompt",
+            "w1:p2",
+            "--allow-cross-pane",
+            "--session=work",
+            "hi",
+        ][..],
+    ] {
+        let server = scripted_server(
+            &session_socket,
+            serde_json::json!({"result": {"type": "agent_prompted"}}),
+        );
+        let mut command = crate::test_command::herdr_command();
+        command
+            .args(args)
+            .env("HERDR_SOCKET_PATH", &missing_socket)
+            .env("XDG_CONFIG_HOME", &config_home);
+        let output = command.output().unwrap();
+        let request = server.join().unwrap();
+        fs::remove_file(&session_socket).unwrap();
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(request["method"], "agent.prompt", "{args:?}");
+        assert_eq!(request["params"]["target"], "w1:p2", "{args:?}");
+        assert_eq!(request["params"]["text"], "hi", "{args:?}");
+        assert_eq!(request["params"]["allow_cross_pane"], true, "{args:?}");
+    }
     cleanup_test_base(&base);
-    (output, request)
 }
 
 // smarty-dev#9677: --allow-cross-pane is accepted before TARGET, between TARGET
