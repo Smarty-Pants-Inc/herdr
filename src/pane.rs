@@ -25,6 +25,7 @@ use crate::pty::actor::{PtyIoActor, PtyIoActorConfig, PtyIoActorHandle, PtyReadR
 use crate::render_signal::RenderSignal;
 
 mod agent_detection;
+mod background_agent;
 mod cursor;
 mod detection_wake;
 mod input;
@@ -38,10 +39,13 @@ use self::agent_detection::{
     codex_prompt_ready, decide_detection_screen_read, decide_screen_detection_publish,
     detection_update_for_publish_with_osc, mark_detection_content_changed,
     observe_detection_content_change, DetectionPublishDecision, DetectionScreenReadDecision,
-    DetectionScreenReadInput, PendingIdleConfirmation, ScreenDetectionPublishInput,
-    AGENT_STARTUP_GRACE_WINDOW,
+    DetectionScreenReadInput, DetectionTextCache, PendingIdleConfirmation,
+    ScreenDetectionPublishInput, AGENT_STARTUP_GRACE_WINDOW,
 };
+use self::background_agent::{AgentJobStatus, AgentJobTracker};
 use self::detection_wake::DetectionWake;
+#[cfg(test)]
+pub(crate) use self::terminal::test_encode_key_for_app;
 #[cfg(unix)]
 pub use self::terminal::InputState;
 use self::terminal::{GhosttyPaneTerminal, PaneTerminal};
@@ -70,7 +74,11 @@ const RELEASE_REACQUIRE_SUPPRESSION: std::time::Duration = std::time::Duration::
 const TERMINAL_COMPRESSION_IDLE: std::time::Duration = std::time::Duration::from_millis(250);
 const TERMINAL_COMPRESSION_STEP: std::time::Duration = std::time::Duration::from_millis(1);
 pub(crate) const PANE_TERM: &str = crate::ghostty::TERM;
+/// Smallest terminal grid a pane is resized to.
+pub(crate) const MIN_PANE_ROWS: u16 = 2;
+pub(crate) const MIN_PANE_COLS: u16 = 4;
 const PANE_COLORTERM: &str = "truecolor";
+const FISH_HANDLE_REFLOW_ENV_VAR: &str = "fish_handle_reflow";
 
 fn terminal_compression_permits() -> Arc<tokio::sync::Semaphore> {
     static PERMITS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
@@ -102,6 +110,16 @@ fn apply_pane_terminal_env(cmd: &mut CommandBuilder) {
     cmd.env("COLORTERM", PANE_COLORTERM);
     cmd.env("TERM_PROGRAM", "herdr");
     cmd.env("TERM_PROGRAM_VERSION", crate::build_info::version());
+    // fish only skips its own resize repaint for terminals it recognizes as
+    // reflowing. Herdr reflows too, and the competing repaint glues prompt copies.
+    // Match the exact casing: Windows env keys are case-insensitive here, but
+    // MSYS/Cygwin fish only reads the lowercase name.
+    if !cmd
+        .iter_full_env_as_str()
+        .any(|(key, _)| key == FISH_HANDLE_REFLOW_ENV_VAR)
+    {
+        cmd.env(FISH_HANDLE_REFLOW_ENV_VAR, "0");
+    }
     // Host handles refer to the outer terminal, never to this pane.
     for key in [
         "ITERM_SESSION_ID",
@@ -444,6 +462,7 @@ fn foreground_member_cwd_different_from_shell(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ForegroundShellAgentAction {
     ObserveProbe,
+    HoldBackgroundAgent,
     ReportProcessExit,
     ReportReplacementProcess,
     ClearAgent,
@@ -454,6 +473,7 @@ fn foreground_shell_agent_action(
     new_agent: Option<Agent>,
     foreground_is_pane_shell: bool,
     process_exit_reported: bool,
+    agent_job: AgentJobStatus,
 ) -> ForegroundShellAgentAction {
     let Some(previous_agent) = previous_agent else {
         return ForegroundShellAgentAction::ObserveProbe;
@@ -467,8 +487,17 @@ fn foreground_shell_agent_action(
             ForegroundShellAgentAction::ObserveProbe
         };
     }
+    if agent_job == AgentJobStatus::ReplacedInFront {
+        // The held agent's identity must not pass to the new process.
+        return ForegroundShellAgentAction::ReportProcessExit;
+    }
     if new_agent.is_some() {
         return ForegroundShellAgentAction::ObserveProbe;
+    }
+    match agent_job {
+        AgentJobStatus::Background => return ForegroundShellAgentAction::HoldBackgroundAgent,
+        AgentJobStatus::ExitedInBackground => return ForegroundShellAgentAction::ReportProcessExit,
+        AgentJobStatus::Unknown | AgentJobStatus::ReplacedInFront => {}
     }
 
     if foreground_is_pane_shell {
@@ -505,6 +534,11 @@ fn apply_foreground_shell_agent_action(
             agent_presence.observe_process_probe(previous_agent);
             true
         }
+        ForegroundShellAgentAction::HoldBackgroundAgent => {
+            *pending_foreground_shell_clear = false;
+            *foreground_shell_exit_reported = false;
+            agent_presence.observe_process_probe(previous_agent)
+        }
         ForegroundShellAgentAction::ReportProcessExit => {
             *pending_foreground_shell_clear = true;
             false
@@ -520,6 +554,109 @@ fn apply_foreground_shell_agent_action(
             agent_presence.observe_process_probe(new_agent)
         }
     }
+}
+
+/// Process facts used to tell a backgrounded agent from an exited one.
+trait AgentProcessLiveness {
+    fn start_token(&self, pid: u32) -> Option<u64>;
+    fn live_process_group(&self, shell_pid: u32, pid: u32, start_token: u64) -> Option<u32>;
+}
+
+struct PlatformAgentProcesses;
+
+impl AgentProcessLiveness for PlatformAgentProcesses {
+    fn start_token(&self, pid: u32) -> Option<u64> {
+        crate::platform::process_start_token(pid)
+    }
+
+    fn live_process_group(&self, shell_pid: u32, pid: u32, start_token: u64) -> Option<u32> {
+        crate::platform::live_pane_process_group(shell_pid, pid, start_token)
+    }
+}
+
+/// One foreground probe result, after a suppressed agent has been filtered out.
+#[derive(Debug, Clone, Copy)]
+struct ForegroundAgentObservation {
+    shell_pid: u32,
+    agent: Option<Agent>,
+    agent_pid: Option<u32>,
+    process_group_id: Option<u32>,
+    foreground_is_pane_shell: bool,
+}
+
+/// Applies one foreground probe to the pane's agent presence. Returns the
+/// chosen action and whether the current agent changed.
+fn observe_foreground_agent(
+    agent_presence: &mut AgentDetectionPresence,
+    agent_job: &mut AgentJobTracker,
+    pending_foreground_shell_clear: &mut bool,
+    foreground_shell_exit_reported: &mut bool,
+    observation: ForegroundAgentObservation,
+    processes: &impl AgentProcessLiveness,
+    pane_id: PaneId,
+) -> (ForegroundShellAgentAction, bool) {
+    let previous_agent = agent_presence.current_agent();
+    let same_agent_in_front = previous_agent.is_some()
+        && observation.agent == previous_agent
+        && !*foreground_shell_exit_reported;
+    let agent_job_status = if same_agent_in_front
+        && agent_job.replaced_in_front(observation.agent_pid, |pid| processes.start_token(pid))
+    {
+        AgentJobStatus::ReplacedInFront
+    } else {
+        agent_job.status(
+            previous_agent.is_some()
+                && observation.agent.is_none()
+                && !*foreground_shell_exit_reported,
+            observation.shell_pid,
+            observation.process_group_id,
+            |shell_pid, pid, start_token| processes.live_process_group(shell_pid, pid, start_token),
+        )
+    };
+    let action = foreground_shell_agent_action(
+        previous_agent,
+        observation.agent,
+        observation.foreground_is_pane_shell,
+        *foreground_shell_exit_reported,
+        agent_job_status,
+    );
+    let changed = apply_foreground_shell_agent_action(
+        agent_presence,
+        action,
+        previous_agent,
+        observation.agent,
+        pending_foreground_shell_clear,
+        foreground_shell_exit_reported,
+    );
+    let was_in_background = agent_job.in_background();
+    agent_job.observe(
+        agent_job_status,
+        agent_presence.current_agent(),
+        observation.agent,
+        observation.agent_pid,
+        |pid| processes.start_token(pid),
+    );
+    if was_in_background != agent_job.in_background() {
+        info!(
+            pane = pane_id.raw(),
+            agent = ?agent_presence.current_agent(),
+            in_background = agent_job.in_background(),
+            "agent job foreground changed"
+        );
+    }
+    (action, changed)
+}
+
+/// Lifecycle-hook authority normally skips steady-state probes, but a held
+/// agent is invisible to its hooks once killed, so it keeps the probe cadence.
+fn should_check_foreground_process(
+    lifecycle_authority_active: bool,
+    agent_held_in_background: bool,
+    input: ProcessProbeInput,
+) -> bool {
+    (agent_held_in_background
+        || !should_skip_process_probe_for_lifecycle_authority(lifecycle_authority_active, input))
+        && should_probe_foreground_job(input)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -664,25 +801,28 @@ struct ProcessProbeResult {
     process_group_id: Option<u32>,
     foreground_is_pane_shell: bool,
     agent: Option<Agent>,
+    /// The process that identified as `agent`, which need not lead its job.
+    agent_pid: Option<u32>,
     process_name: Option<String>,
 }
 
 fn agent_hint_for_foreground_job_members(
     job: &crate::platform::ForegroundJob,
     read_hint: impl Fn(u32) -> Option<Agent>,
-) -> Option<Agent> {
+) -> Option<(Agent, u32)> {
     read_hint(job.process_group_id)
+        .map(|agent| (agent, job.process_group_id))
         .or_else(|| agent_hint_for_non_leader_foreground_job_members(job, read_hint))
 }
 
 fn agent_hint_for_non_leader_foreground_job_members(
     job: &crate::platform::ForegroundJob,
     read_hint: impl Fn(u32) -> Option<Agent>,
-) -> Option<Agent> {
+) -> Option<(Agent, u32)> {
     job.processes
         .iter()
         .filter(|process| process.pid != job.process_group_id)
-        .find_map(|process| read_hint(process.pid))
+        .find_map(|process| read_hint(process.pid).map(|agent| (agent, process.pid)))
 }
 
 fn identify_process_group_leader_in_job(
@@ -702,13 +842,13 @@ fn identify_process_group_leader_in_job(
 fn process_probe_result(
     job: &crate::platform::ForegroundJob,
     pid: u32,
-    agent: Agent,
-    process_name: String,
+    (agent, process_name, agent_pid): (Agent, String, u32),
 ) -> ProcessProbeResult {
     ProcessProbeResult {
         process_group_id: Some(job.process_group_id),
         foreground_is_pane_shell: job.processes.iter().any(|process| process.pid == pid),
         agent: Some(agent),
+        agent_pid: Some(agent_pid),
         process_name: Some(process_name),
     }
 }
@@ -716,15 +856,17 @@ fn process_probe_result(
 fn hinted_process_probe_result(
     job: &crate::platform::ForegroundJob,
     pid: u32,
-    read_hint: impl Fn(u32) -> Option<Agent>,
-) -> Option<ProcessProbeResult> {
-    let agent = agent_hint_for_foreground_job_members(job, read_hint)?;
-    Some(process_probe_result(
+    (agent, agent_pid): (Agent, u32),
+) -> ProcessProbeResult {
+    process_probe_result(
         job,
         pid,
-        agent,
-        crate::detect::agent_label(agent).to_string(),
-    ))
+        (
+            agent,
+            crate::detect::agent_label(agent).to_string(),
+            agent_pid,
+        ),
+    )
 }
 
 fn probe_foreground_process_from_jobs(
@@ -735,42 +877,34 @@ fn probe_foreground_process_from_jobs(
     read_hint: impl Fn(u32) -> Option<Agent> + Copy,
 ) -> ProcessProbeResult {
     if let Some(job) = leader_job.as_ref() {
-        if let Some(hinted) = hinted_process_probe_result(job, pid, read_hint) {
-            return hinted;
+        if let Some(hinted) = agent_hint_for_foreground_job_members(job, read_hint) {
+            return hinted_process_probe_result(job, pid, hinted);
         }
-        if let Some((agent, process_name)) = crate::detect::identify_agent_in_job(job) {
-            return process_probe_result(job, pid, agent, process_name);
+        if let Some(identified) = crate::detect::identify_agent_process_in_job(job) {
+            return process_probe_result(job, pid, identified);
         }
     }
 
     let foreground_job = foreground_job();
     if let Some(job) = foreground_job.as_ref() {
         if let Some(agent) = read_hint(job.process_group_id) {
-            return process_probe_result(
-                job,
-                pid,
-                agent,
-                crate::detect::agent_label(agent).to_string(),
-            );
+            return hinted_process_probe_result(job, pid, (agent, job.process_group_id));
         }
         if let Some((agent, process_name)) = identify_process_group_leader_in_job(job) {
-            return process_probe_result(job, pid, agent, process_name);
+            return process_probe_result(job, pid, (agent, process_name, job.process_group_id));
         }
-        if let Some(agent) = agent_hint_for_non_leader_foreground_job_members(job, read_hint) {
-            return process_probe_result(
-                job,
-                pid,
-                agent,
-                crate::detect::agent_label(agent).to_string(),
-            );
+        if let Some(hinted) = agent_hint_for_non_leader_foreground_job_members(job, read_hint) {
+            return hinted_process_probe_result(job, pid, hinted);
         }
-
-        let identified = crate::detect::identify_agent_in_job(job);
+        if let Some(identified) = crate::detect::identify_agent_process_in_job(job) {
+            return process_probe_result(job, pid, identified);
+        }
         return ProcessProbeResult {
             process_group_id: Some(job.process_group_id),
             foreground_is_pane_shell: job.processes.iter().any(|process| process.pid == pid),
-            agent: identified.as_ref().map(|(agent, _)| *agent),
-            process_name: identified.map(|(_, process_name)| process_name),
+            agent: None,
+            agent_pid: None,
+            process_name: None,
         };
     }
 
@@ -778,6 +912,7 @@ fn probe_foreground_process_from_jobs(
         process_group_id: foreground_pgid,
         foreground_is_pane_shell: false,
         agent: None,
+        agent_pid: None,
         process_name: None,
     }
 }
@@ -799,12 +934,10 @@ fn probe_foreground_process(pid: u32, foreground_pgid: Option<u32>) -> ProcessPr
 
 // These are state-specific transient/safety deadlines, not a pane fallback
 // interval. Stable panes wait only for parsed output/reset and the shared clock.
-#[allow(clippy::too_many_arguments)] // Scheduling mirrors existing independent detector state.
 fn detection_deadline(
     pending_idle: &PendingIdleConfirmation,
     startup_grace_until: Option<std::time::Instant>,
     pending_release: &Mutex<Option<PendingAgentRelease>>,
-    transient_theme: bool,
     acquisition_started_at: Option<std::time::Instant>,
     last_process_check: std::time::Instant,
     self_reported_active: bool,
@@ -826,8 +959,9 @@ fn detection_deadline(
         .and_then(|pending| pending.map(|p| p.until).filter(|until| *until > now));
     include(release_until);
     // Silent replacement by a different agent during suppression still needs
-    // the normal loop's original 50 ms transient observation cadence.
-    if transient_theme || release_until.is_some() {
+    // the normal loop's original 50 ms transient observation cadence. Held
+    // theme overrides use parsed output and the shared clock for owner return.
+    if release_until.is_some() {
         include(Some(now + std::time::Duration::from_millis(50)));
     }
     if let Some(started) = acquisition_started_at {
@@ -850,11 +984,13 @@ fn detection_deadline(
 }
 
 #[cfg(unix)]
-#[allow(clippy::too_many_arguments)] // Imported panes share normal detector wake inputs.
+// Imported panes share wake inputs and both write-bracketed text revision and detection epoch.
+#[allow(clippy::too_many_arguments)]
 fn spawn_basic_detection_task(
     pane_id: PaneId,
     child_pid: Arc<AtomicU32>,
     terminal: Arc<PaneTerminal>,
+    content_seq: Arc<AtomicU64>,
     detection_content_seq: Arc<AtomicU64>,
     detection_notify: Arc<Notify>,
     detection_foreground: DetectionForeground,
@@ -886,20 +1022,20 @@ fn spawn_basic_detection_task(
         let mut pending_foreground_shell_clear = false;
         let mut foreground_shell_exit_reported = false;
         let mut release_was_active = false;
-        let mut last_detection_text = String::new();
+        let mut last_detection_text = DetectionTextCache::default();
         let mut last_screen_scan_detection_content_seq = None;
         let mut agent_startup_grace_until = None;
         let mut pending_idle = PendingIdleConfirmation::default();
         let mut last_codex_prompt_ready = false;
         let mut last_self_reported_shell_check = None;
         let mut wake = DetectionWake::new(detection_notify);
+        let mut agent_job = AgentJobTracker::default();
 
         loop {
             let deadline = detection_deadline(
                 &pending_idle,
                 agent_startup_grace_until,
                 &pending_release_for_task,
-                false,
                 acquisition_started_at,
                 last_process_check,
                 child_pid.load(Ordering::Acquire) > 0
@@ -935,6 +1071,7 @@ fn spawn_basic_detection_task(
                 last_screen_scan_detection_content_seq = None;
                 agent_startup_grace_until = None;
                 pending_idle.clear();
+                agent_job = AgentJobTracker::default();
             }
 
             let now = std::time::Instant::now();
@@ -979,10 +1116,11 @@ fn spawn_basic_detection_task(
                     pending_restore_probe: false,
                     elapsed_since_process_check: now.duration_since(last_process_check),
                 };
-                !should_skip_process_probe_for_lifecycle_authority(
+                should_check_foreground_process(
                     lifecycle_authority_active,
+                    agent_job.in_background(),
                     process_probe_input,
-                ) && should_probe_foreground_job(process_probe_input)
+                )
             };
 
             if should_check_process {
@@ -1003,19 +1141,20 @@ fn spawn_basic_detection_task(
                     }
                 }
                 let previous_agent = agent_presence.current_agent();
-                let foreground_action = foreground_shell_agent_action(
-                    previous_agent,
-                    new_agent,
-                    foreground_is_pane_shell,
-                    foreground_shell_exit_reported,
-                );
-                let changed = apply_foreground_shell_agent_action(
+                let (foreground_action, changed) = observe_foreground_agent(
                     &mut agent_presence,
-                    foreground_action,
-                    previous_agent,
-                    new_agent,
+                    &mut agent_job,
                     &mut pending_foreground_shell_clear,
                     &mut foreground_shell_exit_reported,
+                    ForegroundAgentObservation {
+                        shell_pid: pid,
+                        agent: new_agent,
+                        agent_pid: new_agent.and(probe.agent_pid),
+                        process_group_id,
+                        foreground_is_pane_shell,
+                    },
+                    &PlatformAgentProcesses,
+                    pane_id,
                 );
                 last_foreground_pgid = tracked_process_group_id;
                 if new_agent.is_some() {
@@ -1065,7 +1204,21 @@ fn spawn_basic_detection_task(
                 && agent.is_some()
                 && !foreground_shell_exit_reported;
 
-            if lifecycle_authority_active && !process_exited {
+            // The visible screen belongs to another job while the agent waits
+            // in the background, so it says nothing about the agent's state.
+            if (lifecycle_authority_active || agent_job.in_background()) && !process_exited {
+                // A held agent's old prompt is not evidence that the foreground
+                // consumer accepts agent input. Revoke guarded-prompt readiness.
+                publish_codex_prompt_observation(
+                    &state_events,
+                    pane_id,
+                    agent,
+                    "",
+                    None,
+                    false,
+                    &mut last_codex_prompt_ready,
+                )
+                .await;
                 pending_idle.clear();
                 continue;
             }
@@ -1100,15 +1253,15 @@ fn spawn_basic_detection_task(
                 DetectionScreenReadDecision::Skip => continue,
             }
 
-            let content = terminal.detection_text();
+            let content_changed = last_detection_text
+                .refresh(agent, &content_seq, || terminal.detection_text_for_cache());
+            let content = &last_detection_text.text;
             last_screen_scan_detection_content_seq = current_detection_content_seq;
-            let content_changed = content != last_detection_text;
-            last_detection_text.clone_from(&content);
             let osc_title = terminal.agent_osc_title();
             let osc_progress = terminal.agent_osc_progress();
             let screen_detection = detection_update_for_publish_with_osc(
                 agent,
-                &content,
+                content,
                 &osc_title,
                 &osc_progress,
                 process_exited,
@@ -1117,7 +1270,7 @@ fn spawn_basic_detection_task(
                 &state_events,
                 pane_id,
                 agent,
-                &content,
+                content,
                 screen_detection.as_ref(),
                 process_exited,
                 &mut last_codex_prompt_ready,
@@ -1459,6 +1612,8 @@ enum PaneRuntimeIo {
         sender: mpsc::Sender<Bytes>,
         resize_tx: watch::Sender<(u16, u16, u32, u32)>,
         foreground_cwd: Mutex<Option<std::path::PathBuf>>,
+        #[cfg(unix)]
+        foreground: crate::pty::actor::TestPtyForeground,
     },
 }
 
@@ -1487,7 +1642,7 @@ impl PaneRuntimeIo {
         match self {
             PaneRuntimeIo::Actor(actor) => actor.foreground_observer(),
             #[cfg(test)]
-            PaneRuntimeIo::TestChannel { .. } => DetectionForeground::default(),
+            PaneRuntimeIo::TestChannel { foreground, .. } => foreground.observer(),
         }
     }
 
@@ -1575,9 +1730,43 @@ impl PaneRuntimeIo {
         }
     }
 
-    fn try_send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::TrySendError<Bytes>> {
+    fn queue_input_consumer_operation(
+        &self,
+        operation: crate::pty::input_consumer::ConsumerOperation,
+        audit: Option<crate::pty::input_consumer::AuditSink>,
+    ) -> std::io::Result<std::sync::mpsc::Receiver<crate::pty::input_consumer::ConsumerResponse>>
+    {
         match self {
-            PaneRuntimeIo::Actor(actor) => actor.try_write_user_input(bytes),
+            Self::Actor(actor) => actor.queue_input_consumer_operation(operation, audit),
+            #[cfg(test)]
+            Self::TestChannel { .. } => {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let _ = tx.send(crate::pty::input_consumer::ConsumerResponse::Refused {
+                    reason: "unsupported".into(),
+                });
+                Ok(rx)
+            }
+        }
+    }
+    fn input_consumer_epoch_matches(&self, epoch: &str) -> bool {
+        match self {
+            Self::Actor(actor) => actor.input_consumer_epoch_matches(epoch),
+            #[cfg(test)]
+            Self::TestChannel { .. } => false,
+        }
+    }
+    // Test fixtures still exercise the conservative no-source byte alias.
+    #[cfg(test)]
+    fn try_send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::TrySendError<Bytes>> {
+        self.try_send_bytes_with_source(bytes, crate::pty::input_consumer::InputSource::Api)
+    }
+    fn try_send_bytes_with_source(
+        &self,
+        bytes: Bytes,
+        source: crate::pty::input_consumer::InputSource,
+    ) -> Result<(), mpsc::error::TrySendError<Bytes>> {
+        match self {
+            PaneRuntimeIo::Actor(actor) => actor.try_write_user_input_with_source(bytes, source),
             #[cfg(test)]
             PaneRuntimeIo::TestChannel { sender, .. } => sender.try_send(bytes),
         }
@@ -1595,21 +1784,23 @@ impl PaneRuntimeIo {
         }
     }
 
-    fn queue_user_input_submission(
+    fn queue_user_input_submission_with_source(
         &self,
         text: Bytes,
         enter: Bytes,
         delay: std::time::Duration,
         deadline: Option<std::time::Instant>,
+        source: crate::pty::input_consumer::InputSource,
     ) -> std::io::Result<std::sync::mpsc::Receiver<std::io::Result<()>>> {
         match self {
             PaneRuntimeIo::Actor(actor) => {
                 #[cfg(windows)]
-                return actor.queue_user_input_submission(text, enter, delay, deadline);
+                return actor
+                    .queue_user_input_submission_with_source(text, enter, delay, deadline, source);
                 #[cfg(unix)]
                 {
                     let _ = deadline;
-                    actor.queue_user_input_submission(text, enter, delay)
+                    actor.queue_user_input_submission_with_source(text, enter, delay, source)
                 }
             }
             #[cfg(test)]
@@ -2143,6 +2334,40 @@ fn usable_reported_cwd(cwd: std::path::PathBuf) -> Option<std::path::PathBuf> {
     (cwd.is_absolute() && cwd.is_dir()).then_some(cwd)
 }
 
+fn publish_initial_focus_report_needed(
+    pane_id: PaneId,
+    needed: bool,
+    events: &mpsc::Sender<AppEvent>,
+    runtime: &tokio::runtime::Handle,
+) {
+    if !needed {
+        return;
+    }
+    match events.try_send(AppEvent::TerminalFocusReportingEnabled { pane_id }) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full(event)) => {
+            // Initial focus is not a render hint: retain it under queue pressure.
+            // Never block the PTY actor, which also owns the input response lock.
+            let events = events.clone();
+            runtime.spawn(async move {
+                if let Err(err) = events.send(event).await {
+                    warn!(
+                        pane = pane_id.raw(),
+                        err = %err,
+                        "failed to send initial terminal focus-report request"
+                    );
+                }
+            });
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            warn!(
+                pane = pane_id.raw(),
+                "initial terminal focus-report request channel closed"
+            );
+        }
+    }
+}
+
 fn publish_terminal_bells(pane_id: PaneId, count: u16, events: &mpsc::Sender<AppEvent>) {
     if count == 0 {
         return;
@@ -2571,6 +2796,12 @@ impl PaneRuntime {
                 content_seq.fetch_add(1, Ordering::Release);
                 drop(_content_write_guard);
                 compression_wake.wake();
+                publish_initial_focus_report_needed(
+                    pane_id,
+                    result.initial_focus_report_needed,
+                    &read_events,
+                    &delay_rt,
+                );
                 publish_terminal_bells(pane_id, result.terminal_bells, &read_events);
                 observe_detection_content_change(bytes, &detection_content_seq);
                 if !bytes.is_empty() {
@@ -2635,6 +2866,7 @@ impl PaneRuntime {
             pane_id,
             child_pid.clone(),
             terminal.clone(),
+            content_seq.clone(),
             detection_content_seq.clone(),
             detection_notify.clone(),
             io.detection_foreground(),
@@ -2791,6 +3023,12 @@ impl PaneRuntime {
                 content_seq.fetch_add(1, Ordering::Release);
                 drop(_content_write_guard);
                 compression_wake.wake();
+                publish_initial_focus_report_needed(
+                    pane_id,
+                    result.initial_focus_report_needed,
+                    &events,
+                    &rt,
+                );
                 publish_terminal_bells(pane_id, result.terminal_bells, &events);
                 if agent_detection == AgentDetection::Enabled {
                     observe_detection_content_change(bytes, &detection_content_seq);
@@ -2856,6 +3094,7 @@ impl PaneRuntime {
             let child_pid = child_pid.clone();
             let terminal = terminal.clone();
             let state_events = events.clone();
+            let text_content_seq = content_seq.clone();
             let detection_content_seq = detection_content_seq.clone();
             let detection_notify = detection_notify.clone();
             #[cfg(unix)]
@@ -2888,13 +3127,14 @@ impl PaneRuntime {
                 let mut last_visible_blocker = false;
                 let mut last_visible_working = false;
                 let mut last_visible_signal_refresh = None;
-                let mut last_detection_text = String::new();
+                let mut last_detection_text = DetectionTextCache::default();
                 let mut last_screen_scan_detection_content_seq = None;
                 let mut agent_startup_grace_until = None;
                 let mut pending_idle = PendingIdleConfirmation::default();
                 let mut last_codex_prompt_ready = false;
                 let mut last_self_reported_shell_check = None;
                 let mut wake = DetectionWake::new(detection_notify);
+                let mut agent_job = AgentJobTracker::default();
 
                 tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -2903,7 +3143,6 @@ impl PaneRuntime {
                         &pending_idle,
                         agent_startup_grace_until,
                         &pending_release_for_task,
-                        terminal.has_transient_default_color_override(),
                         acquisition_started_at,
                         last_process_check,
                         child_pid.load(Ordering::Acquire) > 0
@@ -2939,6 +3178,7 @@ impl PaneRuntime {
                         last_screen_scan_detection_content_seq = None;
                         agent_startup_grace_until = None;
                         pending_idle.clear();
+                        agent_job = AgentJobTracker::default();
                     }
 
                     let now = Instant::now();
@@ -3010,10 +3250,11 @@ impl PaneRuntime {
                             foreground_pgid,
                             ..process_probe_input
                         };
-                        !should_skip_process_probe_for_lifecycle_authority(
+                        should_check_foreground_process(
                             lifecycle_authority_active,
+                            agent_job.in_background(),
                             process_probe_input,
-                        ) && should_probe_foreground_job(process_probe_input)
+                        )
                     };
 
                     let mut agent_changed = false;
@@ -3043,19 +3284,20 @@ impl PaneRuntime {
                             }
 
                             let previous_agent = agent_presence.current_agent();
-                            let foreground_action = foreground_shell_agent_action(
-                                previous_agent,
-                                new_agent,
-                                foreground_is_pane_shell,
-                                foreground_shell_exit_reported,
-                            );
-                            let changed = apply_foreground_shell_agent_action(
+                            let (foreground_action, changed) = observe_foreground_agent(
                                 &mut agent_presence,
-                                foreground_action,
-                                previous_agent,
-                                new_agent,
+                                &mut agent_job,
                                 &mut pending_foreground_shell_clear,
                                 &mut foreground_shell_exit_reported,
+                                ForegroundAgentObservation {
+                                    shell_pid: pid,
+                                    agent: new_agent,
+                                    agent_pid: new_agent.and(probe.agent_pid),
+                                    process_group_id,
+                                    foreground_is_pane_shell,
+                                },
+                                &PlatformAgentProcesses,
+                                pane_id,
                             );
                             last_foreground_pgid = tracked_process_group_id;
                             if new_agent.is_some() {
@@ -3140,7 +3382,22 @@ impl PaneRuntime {
                         && agent.is_some()
                         && !foreground_shell_exit_reported;
 
-                    if lifecycle_authority_active && !process_exited {
+                    // The visible screen belongs to another job while the agent
+                    // waits in the background, so it says nothing about its state.
+                    if (lifecycle_authority_active || agent_job.in_background()) && !process_exited
+                    {
+                        // The saved prompt belongs to the held agent, not the
+                        // foreground consumer. Guarded input must fail closed.
+                        publish_codex_prompt_observation(
+                            &state_events,
+                            pane_id,
+                            agent,
+                            "",
+                            None,
+                            false,
+                            &mut last_codex_prompt_ready,
+                        )
+                        .await;
                         pending_idle.clear();
                         continue;
                     }
@@ -3176,15 +3433,17 @@ impl PaneRuntime {
                         DetectionScreenReadDecision::Skip => continue,
                     }
 
-                    let content = terminal.detection_text();
+                    let content_changed =
+                        last_detection_text.refresh(agent, &text_content_seq, || {
+                            terminal.detection_text_for_cache()
+                        });
+                    let content = &last_detection_text.text;
                     last_screen_scan_detection_content_seq = current_detection_content_seq;
-                    let content_changed = content != last_detection_text;
-                    last_detection_text.clone_from(&content);
                     let osc_title = terminal.agent_osc_title();
                     let osc_progress = terminal.agent_osc_progress();
                     let screen_detection = detection_update_for_publish_with_osc(
                         agent,
-                        &content,
+                        content,
                         &osc_title,
                         &osc_progress,
                         process_exited,
@@ -3193,7 +3452,7 @@ impl PaneRuntime {
                         &state_events,
                         pane_id,
                         agent,
-                        &content,
+                        content,
                         screen_detection.as_ref(),
                         process_exited,
                         &mut last_codex_prompt_ready,
@@ -3346,8 +3605,8 @@ impl PaneRuntime {
 
     /// Resize if the dimensions actually changed.
     pub fn resize(&self, rows: u16, cols: u16, cell_width_px: u32, cell_height_px: u32) {
-        let rows = rows.max(2);
-        let cols = cols.max(4);
+        let rows = rows.max(MIN_PANE_ROWS);
+        let cols = cols.max(MIN_PANE_COLS);
         let size = (rows, cols, cell_width_px, cell_height_px);
         if self.current_size.get() == size {
             return;
@@ -3483,8 +3742,8 @@ impl PaneRuntime {
         self.terminal.bracketed_paste_enabled()
     }
 
-    pub fn focus_reporting_enabled(&self) -> bool {
-        self.terminal.focus_reporting_enabled()
+    pub(crate) fn initial_focus_pending(&self) -> bool {
+        self.terminal.initial_focus_pending()
     }
 
     pub fn mouse_reporting_enabled(&self) -> bool {
@@ -3676,34 +3935,53 @@ impl PaneRuntime {
     }
 
     pub fn encode_terminal_key(&self, key: crate::input::TerminalKey) -> Vec<u8> {
-        self.terminal
-            .encode_terminal_key(key, self.keyboard_protocol())
+        self.terminal.encode_terminal_key(key)
     }
 
-    pub fn try_send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::TrySendError<Bytes>> {
-        self.io.try_send_bytes(bytes)
+    pub(crate) fn queue_input_consumer_operation(
+        &self,
+        operation: crate::pty::input_consumer::ConsumerOperation,
+        audit: Option<crate::pty::input_consumer::AuditSink>,
+    ) -> std::io::Result<std::sync::mpsc::Receiver<crate::pty::input_consumer::ConsumerResponse>>
+    {
+        self.io.queue_input_consumer_operation(operation, audit)
     }
-
-    pub fn queue_user_input_submission(
+    pub(crate) fn input_consumer_epoch_matches(&self, epoch: &str) -> bool {
+        self.io.input_consumer_epoch_matches(epoch)
+    }
+    pub(crate) fn try_send_bytes_with_source(
+        &self,
+        bytes: Bytes,
+        source: crate::pty::input_consumer::InputSource,
+    ) -> Result<(), mpsc::error::TrySendError<Bytes>> {
+        self.io.try_send_bytes_with_source(bytes, source.user())
+    }
+    pub(crate) fn queue_user_input_submission_with_source(
         &self,
         text: Bytes,
         enter: Bytes,
         delay: std::time::Duration,
         deadline: Option<std::time::Instant>,
+        source: crate::pty::input_consumer::InputSource,
     ) -> std::io::Result<std::sync::mpsc::Receiver<std::io::Result<()>>> {
         self.io
-            .queue_user_input_submission(text, enter, delay, deadline)
+            .queue_user_input_submission_with_source(text, enter, delay, deadline, source.user())
+    }
+    #[cfg(test)]
+    pub fn try_send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::TrySendError<Bytes>> {
+        self.io.try_send_bytes(bytes)
     }
 
-    pub(crate) fn try_send_paste(
+    pub(crate) fn try_send_paste_with_source(
         &self,
         text: String,
+        source: crate::pty::input_consumer::InputSource,
     ) -> Result<bool, mpsc::error::TrySendError<Bytes>> {
         let payload = self.paste_payload(text);
         if payload.is_empty() {
             return Ok(false);
         }
-        self.try_send_bytes(payload)?;
+        self.try_send_bytes_with_source(payload, source)?;
         Ok(true)
     }
 
@@ -3718,18 +3996,25 @@ impl PaneRuntime {
         Bytes::from(payload)
     }
 
+    // Legacy no-source alias remains only for conservative focus regressions.
+    #[cfg(test)]
     pub fn try_send_focus_event(&self, event: crate::ghostty::FocusEvent) -> bool {
-        if !self.focus_reporting_enabled() {
-            return false;
-        }
-
-        let Ok(bytes) = crate::ghostty::encode_focus(event) else {
-            return false;
-        };
-        if let Err(err) = self.try_send_bytes(Bytes::from(bytes)) {
-            warn!(err = %err, ?event, "failed to forward pane focus event");
-        }
-        true
+        self.try_send_focus_event_with_source(event, crate::pty::input_consumer::InputSource::Api)
+    }
+    pub(crate) fn try_send_focus_event_with_source(
+        &self,
+        event: crate::ghostty::FocusEvent,
+        source: crate::pty::input_consumer::InputSource,
+    ) -> bool {
+        self.terminal.try_send_focus_event(event, |bytes| {
+            match self.try_send_bytes_with_source(bytes, source) {
+                Ok(()) => true,
+                Err(err) => {
+                    warn!(err = %err, ?event, "failed to forward pane focus event");
+                    false
+                }
+            }
+        })
     }
 
     pub fn wheel_routing(&self) -> Option<WheelRouting> {
@@ -3818,14 +4103,14 @@ impl PaneRuntime {
         }
 
         let pid = self.child_pid.load(Ordering::Relaxed);
-        crate::platform::process_cwd(pid)
+        crate::platform::pane_process_cwd(pid)
     }
 
     pub fn cwd_for_persistence(&self) -> Option<std::path::PathBuf> {
         let pid = self.child_pid.load(Ordering::Acquire);
         let exited = self.cwd_process_exited.load(Ordering::Acquire);
         if let Some(cwd) = (!exited)
-            .then(|| crate::platform::process_cwd(pid))
+            .then(|| crate::platform::pane_process_cwd(pid))
             .flatten()
             .filter(|cwd| cwd.is_absolute())
         {
@@ -3950,6 +4235,54 @@ impl PaneRuntime {
         Self::test_with_scrollback_bytes(cols, rows, 0, bytes)
     }
 
+    #[cfg(unix)]
+    pub(crate) fn test_start_basic_detection(&mut self) -> mpsc::Receiver<AppEvent> {
+        if let Some(handle) = self.detect_handle.take() {
+            handle.abort();
+        }
+        let (events, receiver) = mpsc::channel(8);
+        let (handle, reset, release) = spawn_basic_detection_task(
+            self.pane_id,
+            self.child_pid.clone(),
+            self.terminal.clone(),
+            self.content_seq.clone(),
+            self.detection_content_seq.clone(),
+            self.detection_notify.clone(),
+            self.io.detection_foreground(),
+            self.full_lifecycle_authority_active.clone(),
+            self.self_reported_agent_active.clone(),
+            events,
+        );
+        self.detect_handle = Some(handle);
+        self.detect_reset_notify = reset;
+        self.pending_release = release;
+        receiver
+    }
+
+    #[cfg(unix)]
+    pub(crate) async fn test_wait_for_detection_reads(&self, expected: usize) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while self
+                .terminal
+                .ghostty
+                .detection_text_reads
+                .load(Ordering::Relaxed)
+                < expected
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("detection task should extract fresh text");
+    }
+
+    pub(crate) fn test_scroll_metrics_reads(&self) -> usize {
+        self.terminal
+            .ghostty
+            .scroll_metrics_reads
+            .load(Ordering::Relaxed)
+    }
+
     pub(crate) fn test_contend_during_dirty_collection(
         &self,
         bytes: Vec<u8>,
@@ -4036,6 +4369,8 @@ impl PaneRuntime {
         let (resize_tx, _resize_rx) = watch::channel((rows, cols, 0, 0));
         let mut terminal =
             crate::ghostty::Terminal::new(cols, rows, scrollback_limit_bytes).unwrap();
+        // Runtime fixtures model the default config, which enables graphics.
+        terminal.enable_kitty_graphics().unwrap();
         terminal.write(bytes);
         let pane_id = PaneId::from_raw(0);
         let terminal = Arc::new(PaneTerminal::new(
@@ -4051,6 +4386,9 @@ impl PaneRuntime {
                     sender: tx,
                     resize_tx,
                     foreground_cwd: Mutex::new(None),
+                    #[cfg(unix)]
+                    foreground: crate::pty::actor::TestPtyForeground::new()
+                        .expect("live test channel foreground fixture"),
                 },
                 current_size: Cell::new((rows, cols, 0, 0)),
                 child_pid: Arc::new(AtomicU32::new(0)),
@@ -4081,6 +4419,174 @@ impl PaneRuntime {
 mod tests {
     use super::*;
     use std::ffi::OsStr;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_channel_foreground_observer_tracks_fixture_lifetime() {
+        let runtime = PaneRuntime::test_with_screen_bytes(20, 4, b"shell prompt");
+        let observer = runtime.io.detection_foreground();
+        assert_eq!(observer.observe(), Some(None), "test channel is live");
+        drop(runtime);
+        assert_eq!(observer.observe(), None, "fixture owns the descriptor");
+    }
+
+    #[tokio::test]
+    async fn unidentified_text_cache_tracks_runtime_mutations_not_viewport_scroll() {
+        let runtime = PaneRuntime::test_with_scrollback_bytes(
+            12,
+            3,
+            100_000,
+            b"old\r\nold\r\nabcdefghijklmnop\r\nprompt",
+        );
+        let mut cache = DetectionTextCache::default();
+        let reads = Cell::new(0);
+        let refresh = |cache: &mut DetectionTextCache| {
+            cache.refresh(None, &runtime.content_seq, || {
+                reads.set(reads.get() + 1);
+                runtime.terminal.detection_text_for_cache()
+            })
+        };
+        assert!(
+            refresh(&mut cache),
+            "seeded history must be read at revision zero"
+        );
+        assert_eq!(reads.get(), 1);
+        runtime.scroll_up(2);
+        assert!(!refresh(&mut cache));
+        assert_eq!(
+            reads.get(),
+            1,
+            "viewport scrolling must not rebuild bottom text"
+        );
+        assert_eq!(cache.text, runtime.detection_text());
+
+        // Control-only and fragmented output still invalidate the physical read,
+        // but do not manufacture a text change for acquisition scheduling.
+        runtime.test_process_pty_bytes(b"\x1b]0;title\x07\x1b[");
+        assert!(!refresh(&mut cache));
+        assert_eq!(reads.get(), 2);
+        runtime.test_process_pty_bytes(b"2J\x1b[Hupdated");
+        assert!(refresh(&mut cache));
+        assert_eq!(reads.get(), 3);
+        assert_eq!(cache.text, runtime.detection_text());
+
+        runtime.resize(4, 8, 0, 0);
+        refresh(&mut cache);
+        assert_eq!(reads.get(), 4);
+        assert_eq!(cache.text, runtime.detection_text());
+        runtime.clear_screen().unwrap();
+        refresh(&mut cache);
+        assert_eq!(reads.get(), 5);
+        assert_eq!(cache.text, runtime.detection_text());
+        runtime.test_process_pty_bytes(b"\x1b[?1049halt");
+        assert!(refresh(&mut cache));
+        assert_eq!(reads.get(), 6);
+        assert_eq!(cache.text, runtime.detection_text());
+        assert!(!refresh(&mut cache));
+        assert_eq!(reads.get(), 6);
+        runtime.test_process_pty_bytes(b"\x1b[?1049l");
+        assert!(refresh(&mut cache));
+        assert_eq!(reads.get(), 7);
+        assert_eq!(cache.text, runtime.detection_text());
+        assert!(!cache.text.contains("alt"));
+        assert!(!refresh(&mut cache));
+        assert_eq!(reads.get(), 7);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unidentified_text_cache_resets_with_adopted_runtime_and_recreation() {
+        let mut runtime = PaneRuntime::test_with_screen_bytes(20, 4, b"first runtime");
+        let _events = runtime.test_start_basic_detection();
+        runtime.test_wait_for_detection_reads(1).await;
+        let revision = runtime.content_seq();
+        runtime.reset_agent_detection();
+        runtime.test_wait_for_detection_reads(2).await;
+        assert_eq!(
+            runtime.content_seq(),
+            revision,
+            "reset does not require output"
+        );
+        drop(runtime);
+
+        // A new runtime can reuse both the pane identity and revision zero. Its
+        // detector must not inherit the previous runtime's text or revision.
+        let mut recreated = PaneRuntime::test_with_screen_bytes(20, 4, b"second runtime");
+        assert_eq!(recreated.content_seq(), revision);
+        let _events = recreated.test_start_basic_detection();
+        recreated.test_wait_for_detection_reads(1).await;
+        assert!(recreated.visible_text().contains("second runtime"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unidentified_text_cache_resets_in_spawned_runtime_without_output() {
+        let (events, _event_rx) = mpsc::channel(8);
+        let runtime = PaneRuntime::spawn_shell_command(
+            PaneId::from_raw(42),
+            4,
+            20,
+            std::env::temp_dir(),
+            "printf 'cache-ready'; exec sleep 30",
+            &PaneLaunchEnv::default(),
+            AgentDetection::Enabled,
+            0,
+            crate::terminal_theme::TerminalTheme::default(),
+            None,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        )
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !runtime.visible_text().contains("cache-ready") {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("shell should populate the terminal");
+        // The first reset guarantees a populated read even if the initial tick
+        // preceded shell output. The second proves that a warm cache is cleared.
+        let revision = {
+            let _write = runtime.content_write_lock.lock().unwrap();
+            runtime.content_seq()
+        };
+        for _ in 0..2 {
+            let reads = runtime
+                .terminal
+                .ghostty
+                .detection_text_reads
+                .load(Ordering::Relaxed);
+            runtime.reset_agent_detection();
+            runtime.test_wait_for_detection_reads(reads + 1).await;
+        }
+        assert_eq!(runtime.content_seq(), revision);
+        runtime.shutdown();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn focus_reporting_enable_event_survives_full_queue() {
+        let pane_id = PaneId::from_raw(1);
+        let (events, mut receiver) = mpsc::channel(1);
+        events.try_send(AppEvent::GitFilesChanged).unwrap();
+        let runtime = tokio::runtime::Handle::current();
+
+        publish_initial_focus_report_needed(pane_id, true, &events, &runtime);
+        assert!(matches!(
+            receiver.recv().await,
+            Some(AppEvent::GitFilesChanged)
+        ));
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), receiver.recv())
+            .await
+            .expect("initial focus event must survive queue pressure")
+            .expect("event channel stays open");
+        assert!(matches!(
+            event,
+            AppEvent::TerminalFocusReportingEnabled { pane_id: id } if id == pane_id
+        ));
+        publish_initial_focus_report_needed(pane_id, false, &events, &runtime);
+        assert!(receiver.try_recv().is_err());
+    }
 
     #[tokio::test]
     async fn clear_pane_preserves_wrapped_input_and_unfinished_vt_sequence() {
@@ -4250,6 +4756,55 @@ mod tests {
         assert_eq!(
             cmd.get_env("TERM_PROGRAM_VERSION"),
             Some(OsStr::new(&crate::build_info::version()))
+        );
+    }
+
+    #[test]
+    fn pane_terminal_env_tells_fish_that_herdr_reflows() {
+        let mut cmd = CommandBuilder::new("shell");
+        cmd.env_remove(FISH_HANDLE_REFLOW_ENV_VAR);
+        apply_pane_terminal_env(&mut cmd);
+        assert_eq!(
+            cmd.get_env(FISH_HANDLE_REFLOW_ENV_VAR),
+            Some(OsStr::new("0"))
+        );
+    }
+
+    #[test]
+    fn pane_terminal_env_keeps_existing_fish_handle_reflow_entry() {
+        let mut cmd = CommandBuilder::new("shell");
+        cmd.env(FISH_HANDLE_REFLOW_ENV_VAR, "1");
+        apply_pane_terminal_env(&mut cmd);
+        apply_pane_launch_env(&mut cmd, &PaneLaunchEnv::default());
+        assert_eq!(
+            cmd.get_env(FISH_HANDLE_REFLOW_ENV_VAR),
+            Some(OsStr::new("1"))
+        );
+    }
+
+    #[test]
+    fn pane_terminal_env_sets_lowercase_fish_handle_reflow_beside_other_casing() {
+        let mut cmd = CommandBuilder::new("shell");
+        cmd.env_remove(FISH_HANDLE_REFLOW_ENV_VAR);
+        cmd.env("FISH_HANDLE_REFLOW", "1");
+        apply_pane_terminal_env(&mut cmd);
+        assert!(cmd
+            .iter_full_env_as_str()
+            .any(|entry| entry == (FISH_HANDLE_REFLOW_ENV_VAR, "0")));
+    }
+
+    #[test]
+    fn pane_launch_env_explicit_fish_handle_reflow_wins() {
+        let mut explicit = CommandBuilder::new("shell");
+        explicit.env_remove(FISH_HANDLE_REFLOW_ENV_VAR);
+        apply_pane_terminal_env(&mut explicit);
+        apply_pane_launch_env(
+            &mut explicit,
+            &PaneLaunchEnv::from_extra(vec![(FISH_HANDLE_REFLOW_ENV_VAR.into(), "1".into())]),
+        );
+        assert_eq!(
+            explicit.get_env(FISH_HANDLE_REFLOW_ENV_VAR),
+            Some(OsStr::new("1"))
         );
     }
 
@@ -5417,6 +5972,9 @@ mod tests {
                 sender: tx,
                 resize_tx,
                 foreground_cwd: Mutex::new(None),
+                #[cfg(unix)]
+                foreground: crate::pty::actor::TestPtyForeground::new()
+                    .expect("live test channel foreground fixture"),
             },
             current_size: Cell::new((80, 24, 0, 0)),
             child_pid: Arc::new(AtomicU32::new(0)),
@@ -5460,6 +6018,9 @@ mod tests {
                 sender: tx,
                 resize_tx,
                 foreground_cwd: Mutex::new(None),
+                #[cfg(unix)]
+                foreground: crate::pty::actor::TestPtyForeground::new()
+                    .expect("live test channel foreground fixture"),
             },
             current_size: Cell::new((80, 24, 0, 0)),
             child_pid: Arc::new(AtomicU32::new(0)),
@@ -5488,6 +6049,165 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn initial_focus_full_input_queue_retries_on_processed_output() {
+        let (runtime, mut input) = PaneRuntime::test_with_channel_capacity(80, 24, 1);
+        let PaneRuntimeIo::TestChannel { sender, .. } = &runtime.io else {
+            panic!("expected test input channel");
+        };
+        let (events, mut event_rx) = mpsc::channel(4);
+        let handle = tokio::runtime::Handle::current();
+        runtime
+            .try_send_bytes(Bytes::from_static(b"occupied"))
+            .unwrap();
+
+        // Keep input full while consuming every request: one event per PTY write,
+        // even for ordinary output, repeated enables, and synchronized output.
+        for bytes in [
+            b"\x1b[?1004h\x1b[?1004h\x1b[?1004h".as_slice(),
+            b"ordinary output",
+            b"more output",
+            b"\x1b[?1004h\x1b[?1004h",
+            b"\x1b[?2026hhidden output",
+        ] {
+            let result = runtime
+                .terminal
+                .process_pty_bytes(runtime.pane_id, 0, bytes, sender);
+            publish_initial_focus_report_needed(
+                runtime.pane_id,
+                result.initial_focus_report_needed,
+                &events,
+                &handle,
+            );
+            assert!(matches!(
+                event_rx.try_recv().expect("pending output must request focus"),
+                AppEvent::TerminalFocusReportingEnabled { pane_id } if pane_id == runtime.pane_id
+            ));
+            assert!(
+                event_rx.try_recv().is_err(),
+                "one event per processed batch"
+            );
+            assert!(!runtime.try_send_focus_event(crate::ghostty::FocusEvent::Lost));
+            assert!(runtime.initial_focus_pending());
+        }
+
+        for bytes in [b"\x1b[?1004l".as_slice(), b"mode-off output"] {
+            let result = runtime
+                .terminal
+                .process_pty_bytes(runtime.pane_id, 0, bytes, sender);
+            publish_initial_focus_report_needed(
+                runtime.pane_id,
+                result.initial_focus_report_needed,
+                &events,
+                &handle,
+            );
+            assert!(
+                event_rx.try_recv().is_err(),
+                "mode-off writes must not retry"
+            );
+            assert!(runtime.initial_focus_pending(), "mode-off is not delivery");
+        }
+        // Re-enable while still full, consume that event, then recover queue space.
+        let enabled = runtime.terminal.process_pty_bytes(
+            runtime.pane_id,
+            0,
+            b"\x1b[?1004h\x1b[?2026l",
+            sender,
+        );
+        publish_initial_focus_report_needed(
+            runtime.pane_id,
+            enabled.initial_focus_report_needed,
+            &events,
+            &handle,
+        );
+        assert!(matches!(
+            event_rx.try_recv().unwrap(),
+            AppEvent::TerminalFocusReportingEnabled { pane_id } if pane_id == runtime.pane_id
+        ));
+        assert!(event_rx.try_recv().is_err());
+        assert!(!runtime.try_send_focus_event(crate::ghostty::FocusEvent::Lost));
+        assert_eq!(input.try_recv().unwrap(), Bytes::from_static(b"occupied"));
+
+        let retry = runtime.terminal.process_pty_bytes(
+            runtime.pane_id,
+            0,
+            b"later ordinary output",
+            sender,
+        );
+        publish_initial_focus_report_needed(
+            runtime.pane_id,
+            retry.initial_focus_report_needed,
+            &events,
+            &handle,
+        );
+        assert!(matches!(
+            event_rx.try_recv().expect("later output must retry pending focus"),
+            AppEvent::TerminalFocusReportingEnabled { pane_id } if pane_id == runtime.pane_id
+        ));
+        assert!(event_rx.try_recv().is_err(), "retry publishes exactly once");
+        assert!(runtime.try_send_focus_event(crate::ghostty::FocusEvent::Lost));
+        assert_eq!(input.try_recv().unwrap(), Bytes::from_static(b"\x1b[O"));
+        assert!(!runtime.initial_focus_pending());
+
+        for bytes in [b"future output".as_slice(), b"\x1b[?1004h\x1b[?1004h"] {
+            let result = runtime
+                .terminal
+                .process_pty_bytes(runtime.pane_id, 0, bytes, sender);
+            publish_initial_focus_report_needed(
+                runtime.pane_id,
+                result.initial_focus_report_needed,
+                &events,
+                &handle,
+            );
+            assert!(event_rx.try_recv().is_err(), "admission ends retries");
+            assert!(input.try_recv().is_err());
+            assert!(!runtime.initial_focus_pending());
+        }
+    }
+
+    #[tokio::test]
+    async fn focus_send_failures_retain_initial_pending_until_admitted() {
+        let (runtime, mut rx) = PaneRuntime::test_with_channel_capacity(80, 24, 1);
+        runtime.test_process_pty_bytes(b"\x1b[?1004h");
+        assert!(runtime.initial_focus_pending());
+
+        runtime
+            .try_send_bytes(Bytes::from_static(b"occupied"))
+            .unwrap();
+        assert!(!runtime.try_send_focus_event(crate::ghostty::FocusEvent::Gained));
+        assert!(
+            runtime.initial_focus_pending(),
+            "full queue is not delivery"
+        );
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"occupied"));
+
+        assert!(runtime.try_send_focus_event(crate::ghostty::FocusEvent::Lost));
+        assert!(!runtime.initial_focus_pending());
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"\x1b[O"));
+        // Consuming initial pending must not suppress later normal transitions.
+        assert!(runtime.try_send_focus_event(crate::ghostty::FocusEvent::Gained));
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"\x1b[I"));
+
+        runtime.test_process_pty_bytes(b"\x1b[?1004l");
+        runtime.test_process_pty_bytes(b"\x1b[?1004h");
+        drop(rx);
+        assert!(!runtime.try_send_focus_event(crate::ghostty::FocusEvent::Gained));
+        assert!(
+            runtime.initial_focus_pending(),
+            "closed queue is not delivery"
+        );
+    }
+
+    #[tokio::test]
+    async fn focus_send_while_mode_off_does_not_consume_initial_pending() {
+        let (runtime, mut rx) = PaneRuntime::test_with_channel(80, 24);
+        runtime.test_process_pty_bytes(b"\x1b[?1004h");
+        runtime.test_process_pty_bytes(b"\x1b[?1004l");
+        assert!(!runtime.try_send_focus_event(crate::ghostty::FocusEvent::Lost));
+        assert!(runtime.initial_focus_pending());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
     async fn subscribed_idle_child_receives_color_scheme_transition() {
         let (runtime, mut rx) = PaneRuntime::test_with_channel(80, 24);
         runtime.apply_host_terminal_appearance(Some(crate::terminal_theme::HostAppearance::Dark));
@@ -5501,11 +6221,23 @@ mod tests {
     #[test]
     fn foreground_shell_reports_process_exit_before_clearing_agent() {
         assert_eq!(
-            foreground_shell_agent_action(Some(Agent::Codex), None, true, false),
+            foreground_shell_agent_action(
+                Some(Agent::Codex),
+                None,
+                true,
+                false,
+                AgentJobStatus::Unknown
+            ),
             ForegroundShellAgentAction::ReportProcessExit
         );
         assert_eq!(
-            foreground_shell_agent_action(Some(Agent::Codex), None, true, true),
+            foreground_shell_agent_action(
+                Some(Agent::Codex),
+                None,
+                true,
+                true,
+                AgentJobStatus::Unknown
+            ),
             ForegroundShellAgentAction::ClearAgent
         );
     }
@@ -5513,7 +6245,13 @@ mod tests {
     #[test]
     fn same_agent_after_reported_exit_is_a_replacement_process() {
         assert_eq!(
-            foreground_shell_agent_action(Some(Agent::Pi), Some(Agent::Pi), false, true),
+            foreground_shell_agent_action(
+                Some(Agent::Pi),
+                Some(Agent::Pi),
+                false,
+                true,
+                AgentJobStatus::Unknown
+            ),
             ForegroundShellAgentAction::ReportReplacementProcess
         );
     }
@@ -5521,9 +6259,314 @@ mod tests {
     #[test]
     fn unknown_non_shell_foreground_job_is_not_immediate_clear_signal() {
         assert_eq!(
-            foreground_shell_agent_action(Some(Agent::Claude), None, false, false),
+            foreground_shell_agent_action(
+                Some(Agent::Claude),
+                None,
+                false,
+                false,
+                AgentJobStatus::Unknown
+            ),
             ForegroundShellAgentAction::ObserveProbe
         );
+    }
+
+    #[test]
+    fn shell_in_front_of_a_live_agent_job_holds_the_agent() {
+        for foreground_is_pane_shell in [true, false] {
+            assert_eq!(
+                foreground_shell_agent_action(
+                    Some(Agent::Claude),
+                    None,
+                    foreground_is_pane_shell,
+                    false,
+                    AgentJobStatus::Background
+                ),
+                ForegroundShellAgentAction::HoldBackgroundAgent
+            );
+        }
+    }
+
+    #[test]
+    fn held_agent_job_exit_is_reported_behind_any_foreground_job() {
+        for foreground_is_pane_shell in [true, false] {
+            assert_eq!(
+                foreground_shell_agent_action(
+                    Some(Agent::Pi),
+                    None,
+                    foreground_is_pane_shell,
+                    false,
+                    AgentJobStatus::ExitedInBackground
+                ),
+                ForegroundShellAgentAction::ReportProcessExit
+            );
+        }
+    }
+
+    /// Drives `observe_foreground_agent` the way the detection loops do, against
+    /// a fake process table of `pid -> (start token, process group)`.
+    mod held_agent {
+        use super::*;
+        use std::cell::RefCell;
+        use std::collections::HashMap;
+
+        pub(super) const SHELL: u32 = 10;
+        pub(super) const WRAPPER_JOB: u32 = 20;
+        pub(super) const AGENT_PID: u32 = 21;
+        const AGENT_START: u64 = 7_000;
+
+        #[derive(Default)]
+        pub(super) struct FakeProcesses(RefCell<HashMap<u32, (u64, u32)>>);
+
+        impl FakeProcesses {
+            pub(super) fn spawn(&self, pid: u32, start_token: u64, group: u32) {
+                self.0.borrow_mut().insert(pid, (start_token, group));
+            }
+
+            pub(super) fn exit(&self, pid: u32) {
+                self.0.borrow_mut().remove(&pid);
+            }
+        }
+
+        impl AgentProcessLiveness for FakeProcesses {
+            fn start_token(&self, pid: u32) -> Option<u64> {
+                self.0
+                    .borrow()
+                    .get(&pid)
+                    .map(|(start_token, _)| *start_token)
+            }
+
+            fn live_process_group(
+                &self,
+                shell_pid: u32,
+                pid: u32,
+                start_token: u64,
+            ) -> Option<u32> {
+                assert_eq!(shell_pid, SHELL);
+                self.0
+                    .borrow()
+                    .get(&pid)
+                    .filter(|(token, _)| *token == start_token)
+                    .map(|(_, group)| *group)
+            }
+        }
+
+        pub(super) struct Pane {
+            pub(super) presence: AgentDetectionPresence,
+            pub(super) job: AgentJobTracker,
+            pub(super) processes: FakeProcesses,
+            pending_clear: bool,
+            exit_reported: bool,
+        }
+
+        impl Pane {
+            /// An agent process `AGENT_PID` under a wrapper that leads its job.
+            pub(super) fn with_agent(agent: Agent) -> Self {
+                let processes = FakeProcesses::default();
+                processes.spawn(WRAPPER_JOB, 6_000, WRAPPER_JOB);
+                processes.spawn(AGENT_PID, AGENT_START, WRAPPER_JOB);
+                let mut pane = Self {
+                    presence: AgentDetectionPresence::from_agent(None),
+                    job: AgentJobTracker::default(),
+                    processes,
+                    pending_clear: false,
+                    exit_reported: false,
+                };
+                let (_, acquired) = pane.probe(Some(agent), WRAPPER_JOB);
+                assert!(acquired);
+                pane
+            }
+
+            pub(super) fn probe(
+                &mut self,
+                agent: Option<Agent>,
+                foreground_group: u32,
+            ) -> (ForegroundShellAgentAction, bool) {
+                self.probe_process(agent, AGENT_PID, foreground_group)
+            }
+
+            pub(super) fn probe_process(
+                &mut self,
+                agent: Option<Agent>,
+                agent_pid: u32,
+                foreground_group: u32,
+            ) -> (ForegroundShellAgentAction, bool) {
+                let result = observe_foreground_agent(
+                    &mut self.presence,
+                    &mut self.job,
+                    &mut self.pending_clear,
+                    &mut self.exit_reported,
+                    ForegroundAgentObservation {
+                        shell_pid: SHELL,
+                        agent,
+                        agent_pid: agent.map(|_| agent_pid),
+                        process_group_id: Some(foreground_group),
+                        foreground_is_pane_shell: foreground_group == SHELL,
+                    },
+                    &self.processes,
+                    PaneId::from_raw(1),
+                );
+                // The loop publishes the pending exit before the next probe.
+                if self.pending_clear {
+                    self.exit_reported = true;
+                }
+                result
+            }
+
+            pub(super) fn assert_held_while_shell_in_front(&mut self) {
+                for _ in 0..(AGENT_MISS_CONFIRMATION_ATTEMPTS + 2) {
+                    assert_eq!(
+                        self.probe(None, SHELL),
+                        (ForegroundShellAgentAction::HoldBackgroundAgent, false)
+                    );
+                }
+                assert!(self.job.in_background());
+            }
+
+            pub(super) fn assert_exit_reported_then_cleared(&mut self) {
+                assert_eq!(
+                    self.probe(None, SHELL),
+                    (ForegroundShellAgentAction::ReportProcessExit, false)
+                );
+                assert_eq!(
+                    self.probe(None, SHELL),
+                    (ForegroundShellAgentAction::ClearAgent, true)
+                );
+                assert_eq!(self.presence.current_agent(), None);
+                assert!(!self.job.in_background());
+            }
+        }
+    }
+
+    #[test]
+    fn suspend_command_and_resume_publish_no_agent_transition() {
+        let mut pane = held_agent::Pane::with_agent(Agent::Claude);
+
+        // ctrl-z: the shell is in front, the stopped agent is alive.
+        pane.assert_held_while_shell_in_front();
+        // A plain command runs in front of the stopped agent.
+        for _ in 0..(AGENT_MISS_CONFIRMATION_ATTEMPTS + 2) {
+            assert_eq!(
+                pane.probe(None, 30),
+                (ForegroundShellAgentAction::HoldBackgroundAgent, false)
+            );
+        }
+        // fg: the same agent is back in front.
+        assert_eq!(
+            pane.probe(Some(Agent::Claude), held_agent::WRAPPER_JOB),
+            (ForegroundShellAgentAction::ObserveProbe, false)
+        );
+        assert_eq!(pane.presence.current_agent(), Some(Agent::Claude));
+        assert!(!pane.job.in_background());
+
+        // A real exit afterwards still reports and clears.
+        pane.processes.exit(held_agent::AGENT_PID);
+        pane.processes.exit(held_agent::WRAPPER_JOB);
+        pane.assert_exit_reported_then_cleared();
+    }
+
+    #[test]
+    fn agent_killed_while_suspended_reports_its_exit() {
+        let mut pane = held_agent::Pane::with_agent(Agent::Pi);
+        pane.assert_held_while_shell_in_front();
+
+        // `kill -9 %1`: the whole stopped job is gone.
+        pane.processes.exit(held_agent::AGENT_PID);
+        pane.processes.exit(held_agent::WRAPPER_JOB);
+
+        pane.assert_exit_reported_then_cleared();
+    }
+
+    #[test]
+    fn held_agent_exit_is_reported_while_its_wrapper_survives() {
+        let mut pane = held_agent::Pane::with_agent(Agent::Pi);
+        pane.assert_held_while_shell_in_front();
+
+        // The agent dies; the wrapper that leads its job lives on.
+        pane.processes.exit(held_agent::AGENT_PID);
+
+        pane.assert_exit_reported_then_cleared();
+    }
+
+    #[test]
+    fn held_agent_pid_reused_by_another_process_reports_exit() {
+        let mut pane = held_agent::Pane::with_agent(Agent::Claude);
+        pane.assert_held_while_shell_in_front();
+
+        // The agent exits and an unrelated process in the same job gets its pid.
+        pane.processes.exit(held_agent::AGENT_PID);
+        pane.processes
+            .spawn(held_agent::AGENT_PID, 9_000, held_agent::WRAPPER_JOB);
+
+        pane.assert_exit_reported_then_cleared();
+    }
+
+    #[test]
+    fn same_kind_agent_started_in_front_of_a_held_one_replaces_it() {
+        let mut pane = held_agent::Pane::with_agent(Agent::Claude);
+        pane.assert_held_while_shell_in_front();
+
+        // A second Claude starts in front of the suspended one.
+        pane.processes.spawn(31, 9_000, 30);
+        assert_eq!(
+            pane.probe_process(Some(Agent::Claude), 31, 30),
+            (ForegroundShellAgentAction::ReportProcessExit, false)
+        );
+        assert_eq!(
+            pane.probe_process(Some(Agent::Claude), 31, 30),
+            (ForegroundShellAgentAction::ReportReplacementProcess, true)
+        );
+        assert!(!pane.job.in_background());
+    }
+
+    #[test]
+    fn same_kind_agent_reusing_the_held_pid_replaces_it() {
+        let mut pane = held_agent::Pane::with_agent(Agent::Claude);
+        pane.assert_held_while_shell_in_front();
+
+        pane.processes.exit(held_agent::AGENT_PID);
+        pane.processes.spawn(held_agent::AGENT_PID, 9_000, 30);
+
+        assert_eq!(
+            pane.probe(Some(Agent::Claude), 30),
+            (ForegroundShellAgentAction::ReportProcessExit, false)
+        );
+        assert_eq!(
+            pane.probe(Some(Agent::Claude), 30),
+            (ForegroundShellAgentAction::ReportReplacementProcess, true)
+        );
+    }
+
+    #[test]
+    fn held_agent_under_hook_authority_is_reprobed_on_the_identified_cadence() {
+        let mut pane = held_agent::Pane::with_agent(Agent::Pi);
+        pane.assert_held_while_shell_in_front();
+        pane.processes.exit(held_agent::AGENT_PID);
+        pane.processes.exit(held_agent::WRAPPER_JOB);
+
+        // Detection ticks every 300 ms; lifecycle hooks own the pane, and the
+        // foreground group stays the shell's, so only the cadence can probe.
+        let tick = std::time::Duration::from_millis(300);
+        let mut since_check = std::time::Duration::ZERO;
+        loop {
+            since_check += tick;
+            assert!(
+                since_check <= PROCESS_RECHECK_IDENTIFIED + tick,
+                "never reprobed"
+            );
+            let input = ProcessProbeInput {
+                current_agent: pane.presence.current_agent(),
+                foreground_pgid: Some(held_agent::SHELL),
+                last_foreground_pgid: Some(held_agent::SHELL),
+                elapsed_since_process_check: since_check,
+                ..process_probe_input()
+            };
+            if should_check_foreground_process(true, pane.job.in_background(), input) {
+                break;
+            }
+        }
+
+        assert!(since_check >= PROCESS_RECHECK_IDENTIFIED);
+        pane.assert_exit_reported_then_cleared();
     }
 
     #[tokio::test]
@@ -5543,7 +6586,13 @@ mod tests {
     #[test]
     fn reported_process_exit_clears_before_unknown_foreground_probe() {
         assert_eq!(
-            foreground_shell_agent_action(Some(Agent::Claude), None, false, true),
+            foreground_shell_agent_action(
+                Some(Agent::Claude),
+                None,
+                false,
+                true,
+                AgentJobStatus::Unknown
+            ),
             ForegroundShellAgentAction::ClearAgent
         );
     }
@@ -5551,7 +6600,13 @@ mod tests {
     #[test]
     fn foreground_agent_job_is_not_clear_signal() {
         assert_eq!(
-            foreground_shell_agent_action(Some(Agent::Claude), Some(Agent::OpenCode), true, false,),
+            foreground_shell_agent_action(
+                Some(Agent::Claude),
+                Some(Agent::OpenCode),
+                true,
+                false,
+                AgentJobStatus::Unknown
+            ),
             ForegroundShellAgentAction::ObserveProbe
         );
     }
@@ -5577,7 +6632,7 @@ mod tests {
             agent_hint_for_foreground_job_members(&job, |pid| {
                 (pid == 42).then_some(Agent::Claude)
             }),
-            Some(Agent::Claude)
+            Some((Agent::Claude, 42))
         );
     }
 
@@ -5595,7 +6650,7 @@ mod tests {
             agent_hint_for_foreground_job_members(&job, |pid| {
                 (pid == 100).then_some(Agent::Codex)
             }),
-            Some(Agent::Codex)
+            Some((Agent::Codex, 100))
         );
     }
 
@@ -5656,7 +6711,25 @@ mod tests {
         );
 
         assert_eq!(result.agent, Some(Agent::Codex));
+        assert_eq!(result.agent_pid, Some(99));
         assert_eq!(result.process_name.as_deref(), Some("codex"));
+    }
+
+    #[test]
+    fn probe_reports_the_agent_process_behind_an_unrecognized_job_leader() {
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 99,
+            processes: vec![
+                foreground_process(99, "some_wrapper"),
+                foreground_process(100, "claude"),
+            ],
+        };
+
+        let result = probe_foreground_process_from_jobs(42, Some(99), None, || Some(job), |_| None);
+
+        assert_eq!(result.agent, Some(Agent::Claude));
+        assert_eq!(result.agent_pid, Some(100));
+        assert_eq!(result.process_group_id, Some(99));
     }
 
     #[test]
@@ -6243,6 +7316,248 @@ mod tests {
         .expect("re-entering active authority should notify detection reset");
     }
 
+    #[test]
+    fn detection_deadline_pending_release_retains_50ms_recheck() {
+        use std::time::{Duration, Instant};
+
+        let pending_idle = PendingIdleConfirmation::default();
+        let before = Instant::now();
+        let pending_release = Mutex::new(Some(PendingAgentRelease {
+            agent: Agent::Pi,
+            until: before + Duration::from_secs(2),
+        }));
+        let deadline = detection_deadline(
+            &pending_idle,
+            None,
+            &pending_release,
+            None,
+            before,
+            false,
+            None,
+        )
+        .expect("active release needs a bounded recheck");
+        let after = Instant::now();
+        assert!(deadline >= before + Duration::from_millis(50));
+        assert!(deadline <= after + Duration::from_millis(50));
+        assert_eq!(
+            active_pending_release(&pending_release, after),
+            Some(Agent::Pi)
+        );
+
+        let until = Instant::now() + Duration::from_millis(10);
+        pending_release.lock().unwrap().as_mut().unwrap().until = until;
+        assert_eq!(
+            detection_deadline(
+                &pending_idle,
+                None,
+                &pending_release,
+                None,
+                after,
+                false,
+                None,
+            ),
+            Some(until),
+            "release expiry must preempt the 50 ms recheck"
+        );
+    }
+
+    #[test]
+    fn detection_deadline_expired_pending_release_does_not_spin() {
+        use std::time::{Duration, Instant};
+
+        let now = Instant::now();
+        let pending_idle = PendingIdleConfirmation::default();
+        let pending_release = Mutex::new(Some(PendingAgentRelease {
+            agent: Agent::Pi,
+            until: now - Duration::from_millis(1),
+        }));
+        assert_eq!(
+            detection_deadline(
+                &pending_idle,
+                None,
+                &pending_release,
+                None,
+                now,
+                false,
+                None,
+            ),
+            None,
+            "expired release must wait for an ordinary wake, not re-arm"
+        );
+        assert_eq!(active_pending_release(&pending_release, now), None);
+        assert!(pending_release.lock().unwrap().is_none());
+    }
+
+    // Job control gives the OSC-emitting child its own real foreground group.
+    // Both reads are silent with echo disabled: exiting the owner returns to a
+    // live shell without generating output that could hide a missing idle wake.
+    #[cfg(unix)]
+    async fn runtime_with_held_transient_theme() -> PaneRuntime {
+        let mut cmd = CommandBuilder::new("/bin/sh");
+        cmd.args([
+            "-i",
+            "-c",
+            "stty -echo; sh -c 'printf \"\\033]11;#112233\\007\"; read release'; read hold",
+        ]);
+        cmd.env("PS1", "");
+        cmd.env("PS2", "");
+        cmd.cwd(std::env::temp_dir());
+        apply_pane_terminal_env(&mut cmd);
+        apply_pane_launch_env(&mut cmd, &PaneLaunchEnv::default());
+        let (events, _rx) = mpsc::channel(64);
+        let runtime = PaneRuntime::spawn_command_builder(
+            PaneId::from_raw(42),
+            24,
+            80,
+            0,
+            crate::terminal_theme::TerminalTheme {
+                background: Some(crate::terminal_theme::RgbColor {
+                    r: 0xaa,
+                    g: 0xbb,
+                    b: 0xcc,
+                }),
+                ..Default::default()
+            },
+            None,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+            cmd,
+            "failed to spawn transient theme test shell",
+            SpawnInitialState::default(),
+            AgentDetection::Enabled,
+        )
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !runtime.terminal.has_transient_default_color_override() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("real foreground child must acquire the OSC color override");
+        let shell_pid = runtime.child_pid.load(Ordering::Acquire);
+        assert!(shell_pid > 0);
+        assert_ne!(
+            runtime.io.detection_foreground().observe(),
+            Some(Some(shell_pid)),
+            "override owner must be a distinct foreground job"
+        );
+        assert_transient_theme_background(&runtime, b"\x1b]11;rgb:1111/2222/3333\x1b\\");
+        runtime
+    }
+
+    #[cfg(unix)]
+    fn assert_transient_theme_background(runtime: &PaneRuntime, expected: &[u8]) {
+        let (responses, _rx) = mpsc::channel(1);
+        let result = runtime.terminal.process_pty_bytes(
+            runtime.pane_id,
+            runtime.child_pid.load(Ordering::Acquire),
+            b"\x1b]11;?\x1b\\",
+            &responses,
+        );
+        assert_eq!(
+            result.terminal_responses,
+            vec![Bytes::copy_from_slice(expected)]
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn detection_deadline_held_transient_theme_uses_shared_idle_clock() {
+        use std::time::{Duration, Instant};
+
+        let mut runtime = runtime_with_held_transient_theme().await;
+        // Drive the production scheduler directly to count wakes, rather than
+        // adding instrumentation to the runtime or replacing the restore path.
+        runtime.detect_handle.take().unwrap().abort();
+        tokio::task::yield_now().await;
+        let mut wake = DetectionWake::new(runtime.detection_notify.clone());
+        let reset = Notify::new();
+        let pending_idle = PendingIdleConfirmation::default();
+        let started = Instant::now();
+        let finish = started + Duration::from_secs(2);
+        let mut special_deadlines = 0;
+        let mut wakes = 0;
+        loop {
+            let deadline = detection_deadline(
+                &pending_idle,
+                None,
+                &runtime.pending_release,
+                None,
+                started,
+                false,
+                None,
+            );
+            special_deadlines += usize::from(deadline.is_some());
+            if tokio::time::timeout_at(finish.into(), wake.wait(&reset, deadline))
+                .await
+                .is_err()
+            {
+                break;
+            }
+            wakes += 1;
+            assert!(!runtime.terminal.maybe_restore_host_terminal_theme(
+                runtime.pane_id,
+                runtime.child_pid.load(Ordering::Acquire),
+            ));
+        }
+        assert!(runtime.terminal.has_transient_default_color_override());
+        assert_transient_theme_background(&runtime, b"\x1b]11;rgb:1111/2222/3333\x1b\\");
+        eprintln!(
+            "held OSC override over 2 s: {special_deadlines} special deadlines, {wakes} wakes"
+        );
+        runtime.shutdown();
+        assert_eq!(
+            special_deadlines, 0,
+            "held override alone must not add a deadline"
+        );
+        assert!(
+            wakes <= 8,
+            "expected only the shared 300 ms clock, got {wakes} wakes"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn detection_deadline_owner_exit_restores_theme_on_shared_idle_clock() {
+        use std::time::{Duration, Instant};
+
+        let runtime = runtime_with_held_transient_theme().await;
+        // Counterexample: ordinary idle ticks must not restore a live owner's
+        // colors. Leave the real detection task and owner running throughout.
+        tokio::time::sleep(Duration::from_millis(650)).await;
+        assert!(runtime.terminal.has_transient_default_color_override());
+        assert_transient_theme_background(&runtime, b"\x1b]11;rgb:1111/2222/3333\x1b\\");
+        let content_before = runtime.detection_content_seq.load(Ordering::Relaxed);
+        let released = Instant::now();
+        runtime
+            .try_send_bytes(Bytes::from_static(b"release\n"))
+            .unwrap();
+        // One shared 300 ms tick plus 100 ms for process scheduling and the
+        // observation loop; there is no owner-exit PTY output to wake detection.
+        tokio::time::timeout(Duration::from_millis(400), async {
+            while runtime.terminal.has_transient_default_color_override() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("silent owner exit must restore within the shared idle bound");
+        let latency = released.elapsed();
+        assert_eq!(
+            runtime.io.detection_foreground().observe(),
+            Some(Some(runtime.child_pid.load(Ordering::Acquire))),
+            "restoration must follow a real foreground return to the live shell"
+        );
+        assert_eq!(
+            runtime.detection_content_seq.load(Ordering::Relaxed),
+            content_before,
+            "owner exit must be silent, not rescued by parsed output"
+        );
+        assert_transient_theme_background(&runtime, b"\x1b]11;rgb:aaaa/bbbb/cccc\x1b\\");
+        eprintln!("silent OSC owner exit restored host theme after {latency:?}; live owner unchanged for 650 ms");
+        runtime.shutdown();
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn parsed_native_pty_output_and_local_mutations_wake_detection() {
@@ -6335,6 +7650,57 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::Other);
         assert!(error.to_string().contains(&program), "{error}");
         assert!(error.to_string().contains("Unable to spawn"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawned_pane_process_sees_fish_handle_reflow() {
+        let output_dir = std::env::temp_dir().join(format!(
+            "herdr-fish-handle-reflow-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&output_dir).unwrap();
+        let output_path = output_dir.join("out.txt");
+        let (events, _event_rx) = mpsc::channel(8);
+        // The cwd keeps the temp path out of the shell command line.
+        let runtime = PaneRuntime::spawn_shell_command(
+            PaneId::from_raw(42),
+            24,
+            80,
+            output_dir.clone(),
+            "printf '%s\\n' \"$fish_handle_reflow\" > out.txt",
+            &PaneLaunchEnv::default(),
+            AgentDetection::Disabled,
+            0,
+            crate::terminal_theme::TerminalTheme::default(),
+            None,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        )
+        .unwrap();
+
+        let output = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Ok(output) = std::fs::read_to_string(&output_path) {
+                    if output.ends_with('\n') {
+                        break output;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("pane process should write its env");
+        runtime.shutdown();
+        let _ = std::fs::remove_dir_all(&output_dir);
+
+        let expected = std::env::var(FISH_HANDLE_REFLOW_ENV_VAR).unwrap_or_else(|_| "0".into());
+        assert_eq!(output, format!("{expected}\n"));
     }
 
     #[cfg(unix)]
@@ -6437,6 +7803,40 @@ mod tests {
                 observed_at: _,
             } if delivered_pane == pane_id
         ));
+    }
+
+    #[tokio::test]
+    async fn background_agent_revokes_codex_prompt_without_releasing_identity() {
+        let mut pane = held_agent::Pane::with_agent(Agent::Codex);
+        let (tx, mut rx) = mpsc::channel(2);
+        // Readiness was observed before job control handed the terminal back
+        // to the shell. The held agent's identity remains, but its prompt does not.
+        let mut last_ready = true;
+        pane.assert_held_while_shell_in_front();
+        publish_codex_prompt_observation(
+            &tx,
+            PaneId::from_raw(1),
+            pane.presence.current_agent(),
+            "",
+            None,
+            false,
+            &mut last_ready,
+        )
+        .await;
+        assert!(matches!(
+            rx.recv().await,
+            Some(AppEvent::CodexPromptObserved { ready: false, .. })
+        ));
+        assert!(!last_ready);
+        assert_eq!(pane.presence.current_agent(), Some(Agent::Codex));
+        assert!(pane.job.in_background());
+        // Resuming the same process preserves identity without inventing a
+        // fresh prompt observation; only a later screen read can grant readiness.
+        assert_eq!(
+            pane.probe(Some(Agent::Codex), held_agent::WRAPPER_JOB),
+            (ForegroundShellAgentAction::ObserveProbe, false)
+        );
+        assert!(!last_ready);
     }
 
     #[tokio::test]

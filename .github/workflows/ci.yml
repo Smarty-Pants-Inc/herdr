@@ -102,6 +102,15 @@ jobs:
         if: github.event_name == 'push'
         run: python3 scripts/conventional_commits.py --range "${{ github.event.before }}..${{ github.event.after }}"
 
+      # Queue drafts carry Mergify's own merge commits; each PR's commits were
+      # already checked in that PR's own CI.
+      - name: Validate PR commit subjects
+        if: ${{ github.event_name == 'pull_request' && (github.event.pull_request.user.id != 37929162 || startsWith(github.event.pull_request.head.ref, 'mergify/merge-queue/') == false) }}
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: python3 scripts/conventional_commits.py --range "$PR_BASE_SHA..$PR_HEAD_SHA"
+
       - name: Validate PR title
         if: ${{ github.event_name == 'pull_request' && (github.event.pull_request.user.id != 37929162 || startsWith(github.event.pull_request.head.ref, 'mergify/merge-queue/') == false) }}
         env:
@@ -140,7 +149,7 @@ jobs:
           targets: x86_64-pc-windows-msvc
 
       - name: Install Rust tools
-        uses: taiki-e/install-action@fd2f5e3d644b484055ebf4268f474c565f148f25 # v2.81.9
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
           tool: just,cargo-nextest
 
@@ -207,7 +216,7 @@ jobs:
             zig-build-v1-${{ runner.os }}-${{ runner.arch }}-0.16.0-
 
       - name: Restore cargo cache
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
         with:
           cache-bin: false
           key: ${{ matrix.os }}
@@ -343,7 +352,7 @@ jobs:
             zig-build-v1-conpty-package-windows-2022-${{ runner.arch }}-0.16.0-
 
       - name: Restore Cargo cache
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
         with:
           cache-bin: false
           key: conpty-package-windows-2022

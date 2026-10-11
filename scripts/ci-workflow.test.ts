@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -56,6 +56,97 @@ const deduped = {
   CONPTY_RESULT: "skipped",
   PUSH_SENDER_ID: "37929162",
 };
+
+describe("conventional commit ranges check branch history before landing", () => {
+  const conventional = jobs["conventional-commits"];
+  function branchHistory(mergeSubject: string, sideSubject = "fix: base update") {
+    const dir = mkdtempSync(join(process.env.TMPDIR || tmpdir(), "herdr-commit-range-"));
+    const env = {
+      GIT_CONFIG_GLOBAL: process.platform === "win32" ? "NUL" : "/dev/null",
+      GIT_CONFIG_NOSYSTEM: "1",
+      GIT_AUTHOR_NAME: "Commit subject test", GIT_AUTHOR_EMAIL: "test@example.com",
+      GIT_COMMITTER_NAME: "Commit subject test", GIT_COMMITTER_EMAIL: "test@example.com",
+    };
+    function git(...args: string[]): string {
+      const result = spawnSync("git", args, {
+        cwd: dir, env: { PATH: process.env.PATH, ...env }, input: "", encoding: "utf8", timeout: 5_000,
+      });
+      expect(result.error).toBeUndefined();
+      expect(result.status, result.stderr).toBe(0);
+      return result.stdout.trim();
+    }
+    try {
+      git("init", "--quiet");
+      const tree = git("hash-object", "-t", "tree", "-w", "--stdin");
+      const commit = (subject: string, ...parents: string[]) =>
+        git("commit-tree", tree, "-m", subject, ...parents.flatMap((parent) => ["-p", parent]));
+      // Neither the historical base nor GitHub's synthetic checkout merge is in the PR range.
+      const base = commit("historical base subject");
+      const branch = commit("ci: branch work", base);
+      const side = commit(sideSubject, base);
+      const merge = commit(mergeSubject, branch, side);
+      const head = commit("test: valid follow up", merge);
+      const checkout = commit("synthetic checkout merge", base, head);
+      git("update-ref", "HEAD", checkout);
+      mkdirSync(join(dir, "scripts"));
+      writeFileSync(join(dir, "scripts/conventional_commits.py"),
+        readFileSync(new URL("./conventional_commits.py", import.meta.url), "utf8"));
+      return { dir, env: { ...env, PR_BASE_SHA: base, PR_HEAD_SHA: head, GITHUB_SHA: checkout } };
+    } catch (error) {
+      rmSync(dir, { recursive: true, force: true });
+      throw error;
+    }
+  }
+
+  test("PR range uses event base/head SHAs for non-queue PRs, with full checkout history", () => {
+    const check = conventional.steps.find((candidate) => candidate.name === "Validate PR commit subjects");
+    expect(check).toBeDefined();
+    // Mergify's queue drafts carry its own "Merge of #N" commits; each PR's commits
+    // were already checked in that PR's own CI (queue draft #190 failed on them).
+    const queueExempt = "${{ github.event_name == 'pull_request' && (github.event.pull_request.user.id != 37929162 || startsWith(github.event.pull_request.head.ref, 'mergify/merge-queue/') == false) }}";
+    expect(check!.if).toBe(queueExempt);
+    expect(check!.env).toEqual({
+      PR_BASE_SHA: "${{ github.event.pull_request.base.sha }}",
+      PR_HEAD_SHA: "${{ github.event.pull_request.head.sha }}",
+    });
+    expect(check!.run).toBe('python3 scripts/conventional_commits.py --range "$PR_BASE_SHA..$PR_HEAD_SHA"');
+    expect(conventional.steps[0]).toMatchObject({ with: { "fetch-depth": 0, "persist-credentials": false } });
+    const push = conventional.steps.find((candidate) => candidate.name === "Validate commit subjects")!;
+    expect(push.if).toBe("github.event_name == 'push'");
+    expect(push.run).toBe('python3 scripts/conventional_commits.py --range "${{ github.event.before }}..${{ github.event.after }}"');
+    const title = conventional.steps.find((candidate) => candidate.name === "Validate PR title")!;
+    expect(title.if).toBe(queueExempt);
+    expect(title.run).toBe('python3 scripts/conventional_commits.py "$PR_TITLE"');
+  });
+
+  for (const [name, subject, side, status, invalid] of [
+    ["bad internal merge below a valid tip", "Merge master-latest into ci/4346", "fix: base update", 1, "Merge master-latest into ci/4346"],
+    ["conventional internal merge", "merge: master into ci/4346", "fix: base update", 0, ""],
+    ["invalid non-first-parent commit", "merge: master into ci/4346", "bad side subject", 1, "bad side subject"],
+  ] as const) {
+    for (const useWorkflow of [false, true]) {
+      test.skipIf(process.platform === "win32")(`${useWorkflow ? "PR workflow" : "range helper"}: ${name}`, () => {
+        const source = useWorkflow
+          ? conventional.steps.find((candidate) => candidate.name === "Validate PR commit subjects")?.run
+          : 'python3 scripts/conventional_commits.py --range "$PR_BASE_SHA..$PR_HEAD_SHA"';
+        expect(source).toBeDefined();
+        const history = branchHistory(subject, side);
+        try {
+          const result = runShell(source!, history.env, history.dir);
+          expect(result.error).toBeUndefined();
+          expect(result.signal).toBeNull();
+          expect(result.status, result.stdout + result.stderr).toBe(status);
+          if (invalid) expect(result.stdout).toContain(invalid);
+          else expect(result.stdout).toBe("");
+          expect(result.stdout).not.toContain("historical base subject");
+          expect(result.stdout).not.toContain("synthetic checkout merge");
+        } finally {
+          rmSync(history.dir, { recursive: true, force: true });
+        }
+      });
+    }
+  }
+});
 
 describe("CI aggregate runs the real workflow gate", () => {
   const cases: [string, Record<string, string>, boolean][] = [

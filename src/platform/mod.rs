@@ -60,6 +60,11 @@ impl SnapshotFileTrust {
     }
 }
 
+#[cfg(not(windows))]
+pub(crate) fn host_shutdown_in_progress() -> bool {
+    false
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForegroundProcess {
     pub pid: u32,
@@ -81,6 +86,130 @@ pub struct ForegroundJob {
 pub(crate) struct ProcessIdentity {
     pub(crate) pid: u32,
     pub(crate) start_time: u64,
+}
+
+/// Linux consumer proof; unsupported platforms deliberately refuse.
+#[cfg(unix)]
+#[derive(Debug, Clone)]
+pub(crate) struct InputConsumerSnapshot {
+    pub peer: ProcessIdentity,
+    pub pgid: u32,
+    pub leader: ProcessIdentity,
+    pub sid: u32,
+    pub tty: u32,
+    pub termios: Vec<u64>,
+    /// Peer and leader pidfds pinned at enroll. They let the per-event
+    /// liveness check use syscalls instead of /proc reads; `None` falls back
+    /// to the full /proc proof.
+    pub pidfds: Option<std::sync::Arc<[std::os::fd::OwnedFd; 2]>>,
+}
+
+/// Input-consumer cuts are Linux-server only in v2 (ruling r3 C).
+pub(crate) fn input_consumer_supported() -> bool {
+    cfg!(target_os = "linux")
+}
+
+/// (st_dev, st_ino) of the pane slave, opened from the server's own master (TIOCGPTPEER).
+#[cfg(unix)]
+pub(crate) fn pane_tty_identity(master: std::os::fd::RawFd) -> std::io::Result<(u64, u64)> {
+    #[cfg(target_os = "linux")]
+    return linux::input_consumer::pane_tty_identity(master);
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = master;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "unsupported",
+        ))
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn input_consumer_incarnation(
+    fd: std::os::fd::RawFd,
+    peer: ProcessIdentity,
+) -> std::io::Result<ProcessIdentity> {
+    #[cfg(target_os = "linux")]
+    return linux::input_consumer::incarnation(fd, peer);
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (fd, peer);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "unsupported",
+        ))
+    }
+}
+#[cfg(unix)]
+pub(crate) fn input_consumer_snapshot(
+    fd: std::os::fd::RawFd,
+    peer: ProcessIdentity,
+) -> std::io::Result<InputConsumerSnapshot> {
+    #[cfg(target_os = "linux")]
+    return linux::input_consumer::snapshot(fd, peer);
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (fd, peer);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "unsupported",
+        ))
+    }
+}
+#[cfg(unix)]
+pub(crate) fn input_consumer_alive(fd: std::os::fd::RawFd, s: &InputConsumerSnapshot) -> bool {
+    #[cfg(target_os = "linux")]
+    return linux::input_consumer::alive(fd, s);
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (fd, s);
+        false
+    }
+}
+#[cfg(unix)]
+pub(crate) fn input_consumer_unchanged(fd: std::os::fd::RawFd, s: &InputConsumerSnapshot) -> bool {
+    #[cfg(target_os = "linux")]
+    return linux::input_consumer::unchanged(fd, s);
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (fd, s);
+        false
+    }
+}
+#[cfg(unix)]
+pub(crate) fn input_consumer_random(bytes: &mut [u8]) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    return linux::input_consumer::random_bytes(bytes);
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = bytes;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "unsupported",
+        ))
+    }
+}
+/// `connection` is the accepted stream from `peer`. On Linux the sshd lookup
+/// helper receives it to read the peer from the kernel.
+pub(crate) fn resolve_client_principal(
+    peer: Option<ProcessIdentity>,
+    connection: &crate::ipc::LocalStream,
+) -> Option<crate::pty::input_consumer::Principal> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsFd as _;
+        let crate::ipc::LocalStream::UdSocket(stream) = connection;
+        linux::client_identity::resolve_client_principal(peer, stream.as_fd())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (peer, connection);
+        None
+    }
+}
+pub(crate) fn initialize_client_principals() {
+    #[cfg(target_os = "linux")]
+    linux::client_identity::initialize_client_principals();
 }
 
 /// Best-effort diagnostic metadata, never evidence of pane membership.
@@ -121,6 +250,47 @@ fn caller_metadata_rejects_a_stale_process_generation() {
         start_time: 0,
     })
     .is_none());
+}
+
+/// A request from outside the process to stop the server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ServerQuitSignal {
+    #[cfg(unix)]
+    Interrupt,
+    #[cfg(unix)]
+    Terminate,
+    #[cfg(not(unix))]
+    ConsoleControl,
+}
+
+impl std::fmt::Display for ServerQuitSignal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            #[cfg(unix)]
+            Self::Interrupt => "SIGINT",
+            #[cfg(unix)]
+            Self::Terminate => "SIGTERM",
+            #[cfg(not(unix))]
+            Self::ConsoleControl => "console control event",
+        })
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn spawn_server_signal_monitor(
+    on_quit: impl Fn(ServerQuitSignal) + Send + Sync + 'static,
+) {
+    if let Err(err) = ctrlc::set_handler(move || on_quit(ServerQuitSignal::ConsoleControl)) {
+        tracing::warn!(%err, "failed to install server stop handler");
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn ignore_server_hangup() {}
+
+#[cfg(not(unix))]
+pub(crate) fn local_stream_peer_description(_stream: &crate::ipc::LocalStream) -> Option<String> {
+    None
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,6 +378,23 @@ pub(crate) fn process_initial_pane_origin(peer: ProcessIdentity) -> PeerPaneOrig
     environment
         .as_deref()
         .map_or(PeerPaneOrigin::Unknown, pane_origin_from_environment)
+}
+
+/// Diagnostic only, never authorization: whether the pinned caller's environment
+/// names `HERDR_PANE_ID`, whatever its value (empty and malformed count as
+/// present). Linux and macOS read the launch environment; Windows reads the
+/// current PEB block (the same evidence as `process_initial_pane_origin`), so a
+/// caller that edits its own environment changes the answer there.
+/// `None` when the process is stale or unreadable.
+pub(crate) fn process_initial_pane_env_present(peer: ProcessIdentity) -> Option<bool> {
+    if process_identity(peer.pid) != Some(peer) {
+        return None;
+    }
+    let environment = process_initial_environment(peer);
+    if process_identity(peer.pid) != Some(peer) {
+        return None;
+    }
+    Some(environment?.iter().any(|(key, _)| key == "HERDR_PANE_ID"))
 }
 
 fn process_initial_environment(peer: ProcessIdentity) -> Option<Vec<(String, String)>> {
@@ -1138,6 +1325,15 @@ pub(crate) const fn capabilities() -> PlatformCapabilities {
     }
 }
 
+/// The byte the host terminal sends for Backspace according to the tty's erase
+/// setting (e.g. `^H` for MobaXterm and PuTTY-style terminals), when known.
+pub(crate) fn terminal_erase_byte() -> Option<u8> {
+    #[cfg(unix)]
+    return unix_common::terminal_erase_byte();
+    #[cfg(not(unix))]
+    None
+}
+
 pub(crate) fn terminal_grid_size() -> std::io::Result<(u16, u16)> {
     #[cfg(unix)]
     let (cols, rows) = unix_common::read_terminal_grid_size()?;
@@ -1380,7 +1576,8 @@ mod unix_common;
 pub(crate) mod unix_image_files;
 #[cfg(unix)]
 pub(crate) use unix_common::{
-    begin_cli_output, end_cli_output, forward_remote_bridge_stdio, DiagnosticDirectoryScan,
+    begin_cli_output, end_cli_output, forward_remote_bridge_stdio, ignore_server_hangup,
+    local_stream_peer_description, spawn_server_signal_monitor, DiagnosticDirectoryScan,
     PrivateDiagnosticDirectory, RemoteBridgeWake,
 };
 
@@ -1400,6 +1597,10 @@ pub(crate) fn begin_cli_output() {}
 #[cfg(not(unix))]
 pub(crate) fn end_cli_output() {}
 
+/// Linux drops an inherited set-group-id at startup (herdr#188); elsewhere there is no guard.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn drop_inherited_group_privilege() {}
+
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
@@ -1414,6 +1615,9 @@ pub use macos::*;
 mod windows;
 #[cfg(target_os = "windows")]
 pub use windows::*;
+
+#[cfg(not(windows))]
+pub(crate) use process_cwd as pane_process_cwd;
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 mod fallback;
@@ -1621,6 +1825,102 @@ fn child_exit_classification_only_checkpoints_interruptions() {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn live_pane_process_group_rejects_processes_outside_the_pane_session() {
+        use std::os::unix::process::CommandExt;
+
+        let mut detached = std::process::Command::new("sleep");
+        detached.arg("30");
+        // SAFETY: setsid is async-signal-safe and touches only the child.
+        unsafe {
+            detached.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+        let mut detached = detached.spawn().expect("spawn detached");
+        let token = process_start_token(detached.id()).expect("start token");
+        let mut gone = std::process::Command::new("true").spawn().expect("spawn");
+        let gone_pid = gone.id();
+        gone.wait().expect("reap");
+
+        assert_eq!(
+            live_pane_process_group(std::process::id(), detached.id(), token),
+            None,
+            "a live process in another terminal session"
+        );
+        assert_eq!(
+            live_pane_process_group(gone_pid, detached.id(), token),
+            None,
+            "a pane shell that is gone"
+        );
+        let _ = detached.kill();
+        let _ = detached.wait();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn live_pane_process_group_follows_the_agent_process_not_its_job() {
+        use std::os::unix::process::CommandExt;
+
+        let shell_pid = std::process::id();
+        let mut wrapper = std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .expect("spawn wrapper");
+        let job = wrapper.id();
+        let mut agent = std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(job as i32)
+            .spawn()
+            .expect("spawn agent");
+        let agent_pid = agent.id();
+        let token = process_start_token(agent_pid).expect("agent start token");
+        let wrapper_token = process_start_token(job).expect("wrapper start token");
+
+        assert_eq!(
+            live_pane_process_group(shell_pid, agent_pid, token),
+            Some(job)
+        );
+        assert_eq!(
+            live_pane_process_group(shell_pid, agent_pid, token + 1),
+            None,
+            "a reused pid has a different start token"
+        );
+        unsafe {
+            libc::kill(agent_pid as libc::pid_t, libc::SIGSTOP);
+        }
+        assert_eq!(
+            live_pane_process_group(shell_pid, agent_pid, token),
+            Some(job)
+        );
+
+        unsafe {
+            libc::kill(agent_pid as libc::pid_t, libc::SIGKILL);
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while live_pane_process_group(shell_pid, agent_pid, token).is_some()
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            live_pane_process_group(shell_pid, agent_pid, token),
+            None,
+            "an unreaped agent must not count as alive while its wrapper lives"
+        );
+        assert_eq!(
+            live_pane_process_group(shell_pid, job, wrapper_token),
+            Some(job)
+        );
+        agent.wait().expect("reap agent");
+        assert_eq!(live_pane_process_group(shell_pid, agent_pid, token), None);
+        let _ = wrapper.kill();
+        let _ = wrapper.wait();
+    }
 
     #[test]
     fn terminal_resize_signal_is_recorded_once_per_delivery() {

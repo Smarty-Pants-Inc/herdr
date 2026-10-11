@@ -1,5 +1,6 @@
 use crate::api::schema::{
-    WorktreeCreateParams, WorktreeListParams, WorktreeOpenParams, WorktreeRemoveParams,
+    WorktreeCreateParams, WorktreeCreateProjectCheckedParams, WorktreeListParams,
+    WorktreeOpenParams, WorktreeOpenProjectCheckedParams, WorktreeRemoveParams,
 };
 
 // Worktree output is always JSON. The parsers retain `--json` as a hidden compatibility no-op.
@@ -80,6 +81,7 @@ fn worktree_create(args: &[String]) -> std::io::Result<i32> {
     let mut path = None;
     let mut label = None;
     let mut focus = false;
+    let mut allow_project_change = false;
     let mut trust_repository = false;
 
     let mut index = 0;
@@ -141,6 +143,10 @@ fn worktree_create(args: &[String]) -> std::io::Result<i32> {
                 focus = false;
                 index += 1;
             }
+            "--allow-project-change" => {
+                allow_project_change = true;
+                index += 1;
+            }
             "--trust-repository" => {
                 trust_repository = true;
                 index += 1;
@@ -154,20 +160,23 @@ fn worktree_create(args: &[String]) -> std::io::Result<i32> {
     }
     if workspace_id.is_some() && cwd.is_some() {
         eprintln!(
-            "usage: herdr worktree create [--workspace ID | --cwd PATH] [--branch NAME] [--base REF] [--path PATH] [--label TEXT] [--focus] [--no-focus] [--trust-repository]"
+            "usage: herdr worktree create [--workspace ID | --cwd PATH] [--branch NAME] [--base REF] [--path PATH] [--label TEXT] [--allow-project-change] [--focus] [--no-focus] [--trust-repository]"
         );
         return Ok(2);
     }
 
-    super::runtime::worktree_create(WorktreeCreateParams {
-        workspace_id,
-        cwd,
-        branch,
-        base,
-        path,
-        label,
-        focus,
-        trust_repository,
+    super::runtime::worktree_create(WorktreeCreateProjectCheckedParams {
+        params: WorktreeCreateParams {
+            workspace_id,
+            cwd,
+            branch,
+            base,
+            path,
+            label,
+            focus,
+            trust_repository,
+        },
+        allow_project_change,
     })
 }
 
@@ -178,6 +187,7 @@ fn worktree_open(args: &[String]) -> std::io::Result<i32> {
     let mut branch = None;
     let mut label = None;
     let mut focus = false;
+    let mut allow_project_change = false;
     let mut trust_repository = false;
 
     let mut index = 0;
@@ -231,6 +241,10 @@ fn worktree_open(args: &[String]) -> std::io::Result<i32> {
                 focus = false;
                 index += 1;
             }
+            "--allow-project-change" => {
+                allow_project_change = true;
+                index += 1;
+            }
             "--trust-repository" => {
                 trust_repository = true;
                 index += 1;
@@ -244,25 +258,28 @@ fn worktree_open(args: &[String]) -> std::io::Result<i32> {
     }
     if workspace_id.is_some() && cwd.is_some() {
         eprintln!(
-            "usage: herdr worktree open [--workspace ID | --cwd PATH] (--path PATH | --branch NAME) [--label TEXT] [--focus] [--no-focus] [--trust-repository]"
+            "usage: herdr worktree open [--workspace ID | --cwd PATH] (--path PATH | --branch NAME) [--label TEXT] [--allow-project-change] [--focus] [--no-focus] [--trust-repository]"
         );
         return Ok(2);
     }
     if path.is_some() == branch.is_some() {
         eprintln!(
-            "usage: herdr worktree open [--workspace ID | --cwd PATH] (--path PATH | --branch NAME) [--label TEXT] [--focus] [--no-focus] [--trust-repository]"
+            "usage: herdr worktree open [--workspace ID | --cwd PATH] (--path PATH | --branch NAME) [--label TEXT] [--allow-project-change] [--focus] [--no-focus] [--trust-repository]"
         );
         return Ok(2);
     }
 
-    super::runtime::worktree_open(WorktreeOpenParams {
-        workspace_id,
-        cwd,
-        path,
-        branch,
-        label,
-        focus,
-        trust_repository,
+    super::runtime::worktree_open(WorktreeOpenProjectCheckedParams {
+        params: WorktreeOpenParams {
+            workspace_id,
+            cwd,
+            path,
+            branch,
+            label,
+            focus,
+            trust_repository,
+        },
+        allow_project_change,
     })
 }
 
@@ -314,10 +331,10 @@ fn print_worktree_help() {
     eprintln!("herdr worktree commands:");
     eprintln!("  herdr worktree list [--workspace ID | --cwd PATH] [--trust-repository]");
     eprintln!(
-        "  herdr worktree create [--workspace ID | --cwd PATH] [--branch NAME] [--base REF] [--path PATH] [--label TEXT] [--focus] [--no-focus] [--trust-repository]"
+        "  herdr worktree create [--workspace ID | --cwd PATH] [--branch NAME] [--base REF] [--path PATH] [--label TEXT] [--allow-project-change] [--focus] [--no-focus] [--trust-repository]"
     );
     eprintln!(
-        "  herdr worktree open [--workspace ID | --cwd PATH] (--path PATH | --branch NAME) [--label TEXT] [--focus] [--no-focus] [--trust-repository]"
+        "  herdr worktree open [--workspace ID | --cwd PATH] (--path PATH | --branch NAME) [--label TEXT] [--allow-project-change] [--focus] [--no-focus] [--trust-repository]"
     );
     eprintln!("  herdr worktree remove --workspace ID [--force] [--trust-repository]");
 }

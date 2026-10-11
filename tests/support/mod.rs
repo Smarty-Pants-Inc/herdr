@@ -7,6 +7,13 @@ use std::sync::{Mutex, Once, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use portable_pty::CommandBuilder;
+
+// Only process identity is used here; snapshot naming helpers belong to diagnostics.
+#[allow(dead_code)]
+#[path = "../../src/platform/diagnostic_owner.rs"]
+mod diagnostic_owner;
+
 // Re-registration transfers cleanup ownership to the latest registering thread.
 static PID_REGISTRY: OnceLock<Mutex<HashMap<u32, thread::ThreadId>>> = OnceLock::new();
 static RUNTIME_DIR_REGISTRY: OnceLock<Mutex<HashMap<PathBuf, thread::ThreadId>>> = OnceLock::new();
@@ -25,6 +32,11 @@ const CLIENT_MESSAGE_CLIENT_SHELL_PANE_INPUT: u32 = 13;
 const CLIENT_MESSAGE_CLIENT_SHELL_FOCUS: u32 = 18;
 const CLIENT_MESSAGE_ENDPOINT_CONTROL: u32 = 20;
 
+pub fn isolate_herdr_test_process(command: &mut CommandBuilder) {
+    command.env_remove("HERDR_STARTUP_CWD");
+    command.env_remove("HERDR_SESSION");
+}
+
 pub fn register_spawned_herdr_pid(pid: Option<u32>) {
     let Some(pid) = pid else {
         return;
@@ -33,6 +45,19 @@ pub fn register_spawned_herdr_pid(pid: Option<u32>) {
     ensure_cleanup_hooks();
     let mut registry = pid_registry_lock();
     registry.insert(pid, thread::current().id());
+}
+
+/// Asks a spawned herdr process to exit. portable-pty's `kill` sends SIGHUP,
+/// which the server deliberately ignores.
+pub fn stop_spawned_herdr(child: &mut (dyn portable_pty::Child + Send + Sync)) {
+    match child.process_id() {
+        Some(pid) => unsafe {
+            libc::kill(pid as libc::pid_t, libc::SIGTERM);
+        },
+        None => {
+            let _ = child.kill();
+        }
+    }
 }
 
 pub fn unregister_spawned_herdr_pid(pid: Option<u32>) {
@@ -113,27 +138,72 @@ pub struct ScopedHandoffServer {
 }
 
 fn process_start_identity(pid: u32) -> std::io::Result<Option<String>> {
-    let output = std::process::Command::new("/bin/ps")
-        .args(["-p", &pid.to_string(), "-o", "lstart=", "-o", "stat="])
-        .env("LC_ALL", "C")
-        .output()?;
-    if !output.status.success() && !output.stderr.is_empty() {
-        return Err(std::io::Error::other(format!(
-            "cannot inspect exact PID {pid}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )));
+    diagnostic_owner::diagnostic_owner_identity(pid)
+}
+
+fn owned_process_running(pid: u32, identity: &str) -> std::io::Result<bool> {
+    match process_start_identity(pid)? {
+        None => Ok(false),
+        Some(current) if current == identity => Ok(true),
+        Some(_) => Err(std::io::Error::other(format!(
+            "PID {pid} has a different kernel owner; preserving runtime"
+        ))),
     }
-    let text = String::from_utf8_lossy(&output.stdout);
-    let text = text.trim();
-    if text.is_empty() {
-        return Ok(None);
+}
+
+// Run in the current integration executable, then keep the same PID across exec.
+// Separate environment entries preserve even non-UTF8 arguments without letting
+// libtest interpret Herdr's flags. They are removed from the final environment.
+#[cfg(test)]
+#[test]
+#[ignore = "only invoked by the scoped handoff importer wrapper"]
+fn handoff_importer_exec() {
+    use std::os::unix::process::CommandExt;
+    let record = PathBuf::from(std::env::var_os("H4609_IMPORTER_RECORD").expect("owner record"));
+    let count: usize = std::env::var("H4609_IMPORTER_ARG_COUNT")
+        .expect("argument count")
+        .parse()
+        .expect("numeric argument count");
+    let target = std::env::var_os("H4609_IMPORTER_TARGET").expect("importer target");
+    let mut command = std::process::Command::new(target);
+    command.env_remove("H4609_IMPORTER_TARGET");
+    command.env_remove("H4609_IMPORTER_RECORD");
+    command.env_remove("H4609_IMPORTER_ARG_COUNT");
+    for index in 0..count {
+        let key = format!("H4609_IMPORTER_ARG_{index}");
+        command.arg(std::env::var_os(&key).expect("importer argument"));
+        command.env_remove(key);
     }
-    let (identity, state) = text
-        .rsplit_once(char::is_whitespace)
-        .ok_or_else(|| std::io::Error::other("ps omitted process state"))?;
-    // Detached children may be zombies until the host reaps them. They have
-    // terminated and cannot own sockets/workloads; kill(pid, 0) alone misreports them.
-    Ok((!state.starts_with('Z')).then(|| identity.trim().to_owned()))
+    let pid = std::process::id();
+    let identity = process_start_identity(pid).unwrap().expect("live importer");
+    let staged = record.with_extension("tmp");
+    fs::write(&staged, format!("{pid}\n{identity}\n")).expect("stage importer identity");
+    fs::rename(staged, record).expect("publish importer identity before exec");
+    // Publish the native owner before opening stderr, so cleanup can stop this
+    // same PID even if diagnostics setup or the final exec fails.
+    if let Some(start) = std::env::var_os("H4609_IMPORTER_START") {
+        let uptime = fs::read_to_string("/proc/uptime")
+            .ok()
+            .and_then(|text| text.split_whitespace().next().map(str::to_owned))
+            .unwrap_or_else(|| "unavailable".into());
+        fs::write(start, format!("pid={pid}\nuptime={uptime}\n")).expect("importer start receipt");
+    }
+    if let Some(fifo) = std::env::var_os("H4609_IMPORTER_STDERR") {
+        use std::os::fd::AsRawFd;
+        // Read-write never blocks, even if the drainer has not opened it yet.
+        let capture = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(fifo)
+            .expect("open importer stderr capture");
+        assert_eq!(
+            unsafe { libc::dup2(capture.as_raw_fd(), libc::STDERR_FILENO) },
+            libc::STDERR_FILENO
+        );
+    }
+    command.env_remove("H4609_IMPORTER_START");
+    command.env_remove("H4609_IMPORTER_STDERR");
+    panic!("exec importer failed: {}", command.exec());
 }
 
 pub fn test_process_running(pid: u32) -> bool {
@@ -193,10 +263,11 @@ impl ScopedHandoffServer {
         let record = self.base.join(format!("importer-{index}.owner"));
         let wrapper = self.base.join(format!("importer-{index}.sh"));
         fs::create_dir_all(&self.base).unwrap();
+        // Resolve the runner before creating a capture that must be joined.
+        let runner = std::env::current_exe().unwrap();
+        let capture_count = self.captures.len();
         let quote =
             |path: &Path| format!("'{}'", path.display().to_string().replace('\'', "'\\''"));
-        // Register the path before spawning: failure cleanup also reads it.
-        self.importer_records.push(record.clone());
         let mut diagnostics = String::new();
         if let Some(dir) = &self.diagnostics {
             // stderr (wrapper errors, panics, the importer's returned error) goes to a
@@ -213,36 +284,73 @@ impl ScopedHandoffServer {
                     .expect("create bounded importer stderr capture");
             self.captures.push(capture);
             diagnostics = format!(
-                "up=unavailable; {{ read -r up _ < /proc/uptime; }} 2>/dev/null || :; printf 'pid=%s\\nuptime=%s\\n' \"$$\" \"$up\" > {start}\n",
-                start = quote(&start),
+                "export H4609_IMPORTER_START={}\nexport H4609_IMPORTER_STDERR={}\n",
+                quote(&start),
+                quote(&fifo),
             );
-            // Read-write never blocks, even if the drainer has not opened it yet.
-            diagnostics.push_str(&format!("exec 2<> {}\n", quote(&fifo)));
         }
         for (key, value) in &self.importer_env {
             diagnostics.push_str(&format!("export {key}={}\n", quote(Path::new(value))));
         }
-        fs::write(&wrapper, format!(
-            "#!/bin/sh\nset -eu\n{{ printf '%s\\n' \"$$\"; LC_ALL=C /bin/ps -p \"$$\" -o lstart=; }} > {}\nmv {} {}\n{diagnostics}exec {} \"$@\"\n",
-            quote(&record.with_extension("tmp")), quote(&record.with_extension("tmp")),
-            quote(&record), quote(&self.importer_target)
-        )).unwrap();
-        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).unwrap();
+        // Register only after capture setup succeeds, but before the wrapper can
+        // be spawned: failure cleanup also reads this record.
+        self.importer_records.push(record.clone());
+        let built = fs::write(&wrapper, format!(
+            "#!/bin/sh\nset -eu\n{diagnostics}export H4609_IMPORTER_RECORD={}\nexport H4609_IMPORTER_TARGET={}\ni=0\nfor arg do\n  export \"H4609_IMPORTER_ARG_$i=$arg\"\n  i=$((i + 1))\ndone\nexport H4609_IMPORTER_ARG_COUNT=\"$i\"\nexec {} --exact support::handoff_importer_exec --ignored --nocapture\n",
+            quote(&record), quote(&self.importer_target), quote(&runner)
+        )).and_then(|()| fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)));
+        if let Err(error) = built {
+            // No wrapper was returned, so none of these newly created resources
+            // can have a live importer. Roll them back in reverse order here;
+            // normal cleanup must still fail closed on missing returned records.
+            let _ = fs::remove_file(&wrapper);
+            self.importer_records.pop();
+            let _ = fs::remove_file(&record);
+            for capture in self.captures.drain(capture_count..).rev() {
+                capture.finish();
+            }
+            if let Some(dir) = &self.diagnostics {
+                let _ = fs::remove_file(dir.join(format!("importer-{index}.stderr")));
+                let _ = fs::remove_file(self.base.join(format!("importer-{index}.stderr.fifo")));
+            }
+            panic!("construct importer wrapper: {error}");
+        }
         wrapper
+    }
+
+    /// Discards the latest wrapper only when the caller knows it was never
+    /// spawned. Removing the executable prevents a later accidental launch;
+    /// ordinary cleanup must still fail closed on absent owner records.
+    pub fn discard_unspawned_importer(&mut self, wrapper: &Path) {
+        let index = self
+            .importer_records
+            .len()
+            .checked_sub(1)
+            .expect("registered wrapper");
+        assert_eq!(wrapper, self.base.join(format!("importer-{index}.sh")));
+        assert!(
+            !self.importer_records[index].exists(),
+            "wrapper already published an owner"
+        );
+        fs::remove_file(wrapper).expect("remove unspawned wrapper");
+        self.importer_records.pop();
     }
 
     fn read_importers(&mut self) -> std::io::Result<()> {
         for record in &self.importer_records {
-            let text = match fs::read_to_string(record) {
-                Ok(text) => text,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error),
-            };
+            // A registered importer may be alive before publishing. Absence is
+            // not evidence of termination; leave all owners and paths intact.
+            let text = fs::read_to_string(record)?;
             let (pid, identity) = text
                 .split_once('\n')
                 .ok_or_else(|| std::io::Error::other("incomplete importer identity"))?;
             let pid: u32 = pid.parse().map_err(std::io::Error::other)?;
-            if pid == 0 || pid == std::process::id() || identity.trim().is_empty() {
+            if pid == 0
+                || pid > i32::MAX as u32
+                || pid == std::process::id()
+                || identity.trim().is_empty()
+                || identity.trim().contains(char::is_whitespace)
+            {
                 return Err(std::io::Error::other("invalid importer identity"));
             }
             let owner = (pid, identity.trim().to_owned());
@@ -271,12 +379,18 @@ impl ScopedHandoffServer {
     pub fn stop_and_cleanup(&mut self) -> std::io::Result<()> {
         use std::os::unix::fs::MetadataExt;
         self.read_importers()?;
+        // Validate all owners before socket shutdown as well as before signals.
+        // Unreadable or recycled PIDs cannot authorize removal of their paths.
+        let mut live_owner = false;
+        for (pid, identity) in &self.owners {
+            live_owner |= owned_process_running(*pid, identity)?;
+        }
         // Only address the exact private socket generation observed by this test.
         // On a pre-refresh failure, bounded PID/identity cleanup still works.
         let same_socket = fs::metadata(&self.socket)
             .ok()
             .is_some_and(|m| self.socket_identity == Some((m.dev(), m.ino())));
-        if same_socket {
+        if same_socket && live_owner {
             if let Ok(mut stream) = UnixStream::connect(&self.socket) {
                 stream.set_write_timeout(Some(Duration::from_secs(2)))?;
                 let _ = stream.write_all(
@@ -312,7 +426,7 @@ impl ScopedHandoffServer {
     fn terminate_owners(&self, from: usize) -> std::io::Result<()> {
         for (pid, identity) in &self.owners[from..] {
             for signal in [libc::SIGTERM, libc::SIGKILL] {
-                if process_start_identity(*pid)?.as_ref() != Some(identity) {
+                if !owned_process_running(*pid, identity)? {
                     break;
                 }
                 unsafe {
@@ -320,13 +434,13 @@ impl ScopedHandoffServer {
                 }
                 let deadline = Instant::now() + Duration::from_secs(5);
                 while Instant::now() < deadline {
-                    if process_start_identity(*pid)?.as_ref() != Some(identity) {
+                    if !owned_process_running(*pid, identity)? {
                         break;
                     }
                     thread::sleep(Duration::from_millis(25));
                 }
             }
-            if process_start_identity(*pid)?.as_ref() == Some(identity) {
+            if owned_process_running(*pid, identity)? {
                 return Err(std::io::Error::other(format!(
                     "owned server {pid} did not terminate; preserving runtime"
                 )));
@@ -391,12 +505,19 @@ fn spawn_capped_capture(fifo: &Path, out: &Path) -> std::io::Result<StderrCaptur
         return Err(std::io::Error::last_os_error());
     }
     // Read access lets keep_tail rewrite the file in place.
-    let mut file = fs::OpenOptions::new()
+    let mut file = match fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(true)
-        .open(out)?;
+        .open(out)
+    {
+        Ok(file) => file,
+        Err(error) => {
+            let _ = fs::remove_file(fifo);
+            return Err(error);
+        }
+    };
     let path = fifo.to_path_buf();
     let fifo = path.clone();
     let drainer = thread::Builder::new()
@@ -425,7 +546,15 @@ fn spawn_capped_capture(fifo: &Path, out: &Path) -> std::io::Result<StderrCaptur
                 }
             }
             let _ = keep_tail(&mut file, len);
-        })?;
+        });
+    let drainer = match drainer {
+        Ok(drainer) => drainer,
+        Err(error) => {
+            let _ = fs::remove_file(out);
+            let _ = fs::remove_file(&path);
+            return Err(error);
+        }
+    };
     Ok(StderrCapture {
         fifo: path,
         drainer,
@@ -1654,6 +1783,11 @@ fn process_exists(pid: libc::pid_t) -> bool {
 }
 
 #[cfg(test)]
+mod cleanup_tests;
+#[cfg(test)]
+mod importer_exec_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1689,11 +1823,54 @@ mod tests {
         cleanup
             .owners
             .push((pid, "not this process start identity".to_owned()));
-        cleanup.stop_and_cleanup().unwrap();
+        assert!(cleanup.stop_and_cleanup().is_err());
         assert!(
             test_process_running(pid),
             "cleanup must not signal a reused/unowned PID"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn importer_wrapper_write_failure_joins_capture_and_unregisters_owner() {
+        let capture_threads = || {
+            fs::read_dir("/proc/self/task")
+                .unwrap()
+                .flatten()
+                .filter(|task| {
+                    fs::read_to_string(task.path().join("comm"))
+                        .is_ok_and(|comm| comm.trim() == "importer-stderr")
+                })
+                .count()
+        };
+        let before = capture_threads();
+        let base = unique_missing_runtime_dir("wrapper-write-failure");
+        let fixture = base.join("fixture");
+        let artifacts = base.join("artifacts");
+        let mut cleanup = ScopedHandoffServer::new(&fixture);
+        cleanup.set_diagnostics(&artifacts);
+        // A directory at the wrapper path makes the real write fail only after
+        // capture setup and owner registration, before any wrapper is returned.
+        fs::create_dir_all(fixture.join("importer-0.sh")).unwrap();
+        let built =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cleanup.importer_exe()));
+        assert!(built.is_err(), "wrapper construction must fail");
+        assert!(
+            cleanup.importer_records.is_empty(),
+            "owner must be unregistered"
+        );
+        assert!(cleanup.captures.is_empty(), "capture must be consumed");
+        assert_eq!(
+            capture_threads(),
+            before,
+            "drainer must be joined, not detached"
+        );
+        assert!(!fixture.join("importer-0.owner").exists());
+        assert!(!fixture.join("importer-0.stderr.fifo").exists());
+        assert!(!artifacts.join("importer-0.stderr").exists());
+        cleanup.stop_and_cleanup().unwrap();
+        assert!(!fixture.exists());
+        fs::remove_dir_all(base).unwrap();
     }
 
     #[test]

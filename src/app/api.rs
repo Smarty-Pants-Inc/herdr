@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 mod agent_view;
 mod agents;
 mod env;
+mod input_consumer;
 mod input_guard;
 pub(super) mod input_log;
 mod integrations;
@@ -51,11 +52,13 @@ impl App {
                 let changes_workspace = matches!(
                     &result.request.method,
                     crate::api::schema::Method::WorktreeOpen(_)
+                        | crate::api::schema::Method::WorktreeOpenProjectChecked(_)
                 );
                 self.handle_api_worktree_read_finished(*result);
                 changes_workspace
             }
-            ev @ AppEvent::TerminalBell { .. } => {
+            ev @ (AppEvent::TerminalBell { .. }
+            | AppEvent::TerminalFocusReportingEnabled { .. }) => {
                 self.handle_internal_event(ev);
                 false
             }
@@ -118,6 +121,25 @@ impl App {
             }
             ev => ev,
         };
+        if let AppEvent::TerminalFocusReportingEnabled { pane_id } = &ev {
+            // The legacy app-only path has no shell-client focus evidence.
+            // Do not infer Gained from app navigation or unknown host focus.
+            if let Some((ws_idx, _)) = self.find_pane(*pane_id) {
+                let Some(runtime) = self.state.runtime_for_pane_in_workspace(
+                    &self.terminal_runtimes,
+                    ws_idx,
+                    *pane_id,
+                ) else {
+                    return Vec::new();
+                };
+                // A normal focus transition may have satisfied this queued report.
+                if !runtime.initial_focus_pending() {
+                    return Vec::new();
+                }
+                self.send_pane_focus_event(ws_idx, *pane_id, crate::ghostty::FocusEvent::Lost);
+            }
+            return Vec::new();
+        }
         if matches!(
             &ev,
             AppEvent::TerminalBell { .. } | AppEvent::ClipboardWrite { .. }
@@ -136,6 +158,34 @@ impl App {
         } = ev
         {
             self.handle_git_status_refreshed(results, cache_updates);
+            return Vec::new();
+        }
+
+        if let AppEvent::RestoredWorktreeSpaceChecked {
+            workspace_id,
+            expected,
+            valid,
+        } = ev
+        {
+            self.pending_restored_worktree_spaces
+                .retain(|(id, space)| id != &workspace_id || space != &expected);
+            let changed_workspace = (!valid)
+                .then(|| {
+                    self.state.workspaces.iter().position(|workspace| {
+                        workspace.id == workspace_id
+                            && workspace.worktree_space.as_ref() == Some(&expected)
+                    })
+                })
+                .flatten();
+            self.state
+                .handle_app_event(AppEvent::RestoredWorktreeSpaceChecked {
+                    workspace_id,
+                    expected,
+                    valid,
+                });
+            if let Some(ws_idx) = changed_workspace {
+                self.emit_workspace_updated(ws_idx);
+            }
             return Vec::new();
         }
 
@@ -582,7 +632,13 @@ impl App {
             .terminal_runtimes
             .get(&terminal_id)
             .map(|runtime| runtime.current_size())
-            .unwrap_or_else(|| self.state.estimate_pane_size());
+            .unwrap_or_else(|| {
+                self.state
+                    .new_pane_size(crate::ui::NewPanePlacement::Existing {
+                        ws_idx,
+                        pane: pane_id,
+                    })
+            });
         let Some(launch_env) = self.pane_launch_env(ws_idx, pane_id, Vec::new()) else {
             return false;
         };
@@ -902,7 +958,8 @@ impl App {
         }) else {
             return;
         };
-        runtime.try_send_focus_event(event);
+        runtime
+            .try_send_focus_event_with_source(event, crate::pty::input_consumer::InputSource::Api);
     }
 
     #[cfg(test)]
@@ -1095,15 +1152,16 @@ impl App {
             Method::WorkspaceClose(target) => {
                 return self.handle_workspace_close(request.id, target);
             }
-            Method::WorktreeList(_) | Method::WorktreeOpen(_) => {
+            Method::WorktreeList(_)
+            | Method::WorktreeOpen(_)
+            | Method::WorktreeOpenProjectChecked(_) => {
                 return responses::encode_error(
                     request.id,
                     "invalid_request",
                     "worktree discovery is handled asynchronously by the app runtime",
                 );
             }
-            Method::WorktreeCreate(params) => {
-                let _ = params;
+            Method::WorktreeCreate(_) | Method::WorktreeCreateProjectChecked(_) => {
                 return responses::encode_error(
                     request.id,
                     "invalid_request",
@@ -1145,6 +1203,15 @@ impl App {
             }
             Method::AgentStart(params) | Method::AgentStartGuarded(params) => {
                 return self.handle_agent_start(request.id, params);
+            }
+            Method::PaneInputConsumerEnroll(_)
+            | Method::PaneInputConsumerCut(_)
+            | Method::PaneInputConsumerRelease(_) => {
+                return responses::encode_error(
+                    request.id,
+                    "invalid_request",
+                    "input consumer operations require the asynchronous local API route",
+                );
             }
             Method::AgentPrompt(_) => {
                 return responses::encode_error(
@@ -1642,8 +1709,17 @@ mod tests {
             .attached_terminal_id
             .clone();
         let (runtime, _rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        #[cfg(unix)]
+        let (runtime, _detection_events) = {
+            let mut runtime = runtime;
+            runtime.test_process_pty_bytes(b"shell prompt");
+            let events = runtime.test_start_basic_detection();
+            runtime.test_wait_for_detection_reads(1).await;
+            (runtime, events)
+        };
+        #[cfg(not(unix))]
         let reset_notify = runtime.agent_detection_reset_notify_for_test();
-        app.terminal_runtimes.insert(terminal_id, runtime);
+        app.terminal_runtimes.insert(terminal_id.clone(), runtime);
 
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "reload_manifests".into(),
@@ -1658,6 +1734,13 @@ mod tests {
             .unwrap()
             .is_empty());
 
+        #[cfg(unix)]
+        app.terminal_runtimes
+            .get(&terminal_id)
+            .unwrap()
+            .test_wait_for_detection_reads(2)
+            .await;
+        #[cfg(not(unix))]
         tokio::time::timeout(
             std::time::Duration::from_millis(50),
             reset_notify.notified(),

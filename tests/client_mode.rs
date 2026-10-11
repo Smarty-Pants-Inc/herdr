@@ -52,7 +52,7 @@ impl SpawnedHerdr {
 impl Drop for SpawnedHerdr {
     fn drop(&mut self) {
         let pid = self.child.process_id();
-        let _ = self.child.kill();
+        support::stop_spawned_herdr(&mut *self.child);
         self.close_master();
 
         if let Some(pid) = pid {
@@ -1319,12 +1319,10 @@ fn unused_importer_stderr_capture_is_joined_by_cleanup() {
         }),
         "drainer waits for the wrapper"
     );
-    // The owner record is published before any stderr setup, so teardown
-    // between the two can still find and stop the wrapper's PID.
-    let script = fs::read_to_string(&wrapper).unwrap();
-    let published = script.find(".owner'\n").expect("owner record publish");
-    let capture = script.find("exec 2<>").expect("stderr capture");
-    assert!(published < capture, "{script}");
+    assert!(wrapper.exists());
+    // This test knows the wrapper was never spawned. Missing records otherwise
+    // fail closed, since a live helper may not have published its identity yet.
+    cleanup.discard_unspawned_importer(&wrapper);
     cleanup.stop_and_cleanup().unwrap();
     assert!(
         wait_until(Duration::from_secs(1), Duration::from_millis(10), || {
@@ -1332,6 +1330,32 @@ fn unused_importer_stderr_capture_is_joined_by_cleanup() {
         }),
         "cleanup must unblock and join a drainer whose wrapper never ran"
     );
+    let _ = fs::remove_dir_all(&base);
+}
+
+#[test]
+fn importer_owner_is_published_before_stderr_setup_failure() {
+    let base = unique_test_dir();
+    let fixture = base.join("fixture");
+    let mut cleanup = support::ScopedHandoffServer::new(&fixture);
+    cleanup.set_diagnostics(&base.join("artifacts"));
+    // The native helper cannot open a directory read-write as stderr. Unlike
+    // capture construction failure, this occurs in the spawned importer PID.
+    cleanup.set_importer_env("H4609_IMPORTER_STDERR", fixture.to_str().unwrap());
+    let wrapper = cleanup.importer_exe();
+    let mut child = std::process::Command::new(wrapper)
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    assert!(!child.wait().unwrap().success());
+    let record = fs::read_to_string(fixture.join("importer-0.owner")).unwrap();
+    let (pid, identity) = record.split_once('\n').unwrap();
+    assert_eq!(pid.parse::<u32>().unwrap(), child.id());
+    assert!(!identity.trim().is_empty());
+    cleanup.stop_and_cleanup().unwrap();
+    assert!(!fixture.exists());
     let _ = fs::remove_dir_all(&base);
 }
 
@@ -2107,7 +2131,7 @@ fn federated_client_starts_without_local_and_survives_its_restart() {
         || screen_text().contains("local-online")
     ));
 
-    local.child.kill().unwrap();
+    support::stop_spawned_herdr(&mut *local.child);
     local.close_master();
     drop(local);
     assert!(
@@ -2208,7 +2232,7 @@ fn federated_client_starts_without_local_and_survives_its_restart() {
     ));
 
     let watermark = output_len(&output);
-    remote_server.child.kill().unwrap();
+    support::stop_spawned_herdr(&mut *remote_server.child);
     assert!(
         wait_until(Duration::from_secs(10), Duration::from_millis(20), || {
             read_output(&output)[watermark..].contains("reconnecting")

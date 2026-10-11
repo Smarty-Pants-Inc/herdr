@@ -14,6 +14,7 @@ fn connect_media_shell(
             surface_delta: false,
             surface_scroll: false,
             media_capable,
+            principal: None,
             client_id,
             surface_cols: 80,
             surface_rows: 23,

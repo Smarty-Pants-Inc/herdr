@@ -12,9 +12,6 @@ pub(super) use crate::support::{
 };
 use portable_pty::{native_pty_system, Child, MasterPty, PtySize};
 
-pub(super) const WORKTREE_BOOTSTRAP_MANAGED_COMPONENT: &str =
-    "example.worktree-bootstrap-ef876653ffc3";
-
 pub(super) fn unique_test_dir() -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -24,7 +21,10 @@ pub(super) fn unique_test_dir() -> PathBuf {
 }
 
 pub(super) fn managed_github_plugin_dir(config_home: &Path) -> PathBuf {
-    config_home.join("herdr-dev").join("plugins").join("github")
+    config_home
+        .join("herdr-dev")
+        .join("plugins")
+        .join("github-installations")
 }
 
 pub(super) fn path_missing_or_empty(path: &Path) -> bool {
@@ -81,7 +81,7 @@ impl Drop for SpawnedServerProcess {
 impl Drop for SpawnedHerdr {
     fn drop(&mut self) {
         let pid = self.child.process_id();
-        let _ = self.child.kill();
+        crate::support::stop_spawned_herdr(&mut *self.child);
 
         if let Some(pid) = pid {
             let deadline = Instant::now() + Duration::from_secs(2);
@@ -182,6 +182,8 @@ pub(super) fn spawn_named_server(
         .env_remove("HERDR_SOCKET_PATH")
         .env_remove("HERDR_CLIENT_SOCKET_PATH")
         .env_remove("HERDR_ENV")
+        .env_remove("HERDR_STARTUP_CWD")
+        .env_remove("HERDR_SESSION")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
