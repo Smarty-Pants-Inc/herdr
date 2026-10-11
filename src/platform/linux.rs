@@ -1504,12 +1504,21 @@ pub(crate) fn process_caller_metadata_platform(
                     .map(str::to_owned)
             })
         });
+    // Reuse the stat snapshot above, rather than adding a getsid syscall (or
+    // another /proc read) just for the log. Field 6 is the OS session ID.
+    let sid = stat
+        .get(stat.rfind(')')? + 2..)?
+        .split_whitespace()
+        .nth(3)
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|sid| *sid != 0);
     // The exe and cgroup lookups reopen a numeric PID; discard the entire
     // snapshot if the original instance exited or was replaced during either.
     (process_identity(peer.pid) == Some(peer)).then_some(super::CallerMetadata {
         exe,
         ppid: Some(ppid),
         unit,
+        sid,
     })
 }
 
@@ -1536,16 +1545,23 @@ fn process_identity_and_parent_from_stat(
 /// outside this server only when its ancestry reaches a strictly older process
 /// before reaching the current server. Missing, reused, exited, or newer
 /// evidence remains unknown; pane markers are enforced by the caller.
-pub(crate) fn process_identity_outside_server_ancestry(
-    peer: crate::platform::ProcessIdentity,
-) -> Option<bool> {
-    let server = process_identity(std::process::id())?;
-    crate::platform::observe_outside_server_ancestry(
-        peer,
-        server,
-        process_identity,
-        parent_process_identity,
-    )
+pub(crate) fn process_identity_server_ancestry_observation(
+    peer: super::ProcessIdentity,
+) -> super::ServerAncestryObservation {
+    let mut root_pid = None;
+    let outside = process_identity(std::process::id()).and_then(|server| {
+        super::observe_outside_server_ancestry_with_root(
+            peer,
+            server,
+            process_identity,
+            parent_process_identity,
+            &mut root_pid,
+        )
+    });
+    super::ServerAncestryObservation {
+        verdict: super::server_ancestry_observation(outside),
+        root_pid,
+    }
 }
 
 fn process_session_id(pid: u32) -> Option<i32> {
@@ -1559,6 +1575,24 @@ fn process_session_id(pid: u32) -> Option<i32> {
 mod tests {
     use super::*;
     use std::{cell::RefCell, collections::HashMap};
+
+    #[test]
+    fn caller_metadata_sid_matches_getsid_without_an_extra_production_syscall() {
+        let peer = process_identity(std::process::id()).expect("live peer");
+        let metadata = process_caller_metadata_platform(peer).expect("live metadata");
+        // SAFETY: getsid only reads the current process's session ID. The
+        // production metadata path instead extracts it from its existing stat.
+        let sid = unsafe { libc::getsid(0) };
+        assert!(sid > 0);
+        assert_eq!(metadata.sid, Some(sid as u32));
+        assert!(
+            process_caller_metadata_platform(super::super::ProcessIdentity {
+                start_time: peer.start_time.wrapping_add(1),
+                ..peer
+            })
+            .is_none()
+        );
+    }
 
     #[test]
     fn initial_environment_parser_distinguishes_absence_and_malformed_data() {

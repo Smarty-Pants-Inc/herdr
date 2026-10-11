@@ -1104,6 +1104,21 @@ These fields are omitted when unavailable; they are not recorded on Windows or o
 platforms. Metadata lookup failure does not refuse input. Typed input does not add an
 API log record.
 
+Every record with a socket peer identity includes `caller.ancestry`: `outside`
+(the peer's ancestry is proven outside this server), `unknown` (the proof could
+not be completed or is unsupported), or `reached` (the walk reached this server).
+This is independent of pane attribution; a null `caller.pane` is not itself an
+ancestry verdict. The log reuses the guard's request-local proof when available.
+Linux additionally records `caller.sid`, the peer's OS session ID (the same ID as
+`getsid`, read from the existing process snapshot), and `caller.ancestry_root_pid`,
+the last pinned PID examined by that walk: the server PID for `reached`, otherwise
+the topmost ancestor examined before the proof stopped. These two fields are
+omitted when unavailable and are absent on other platforms. `caller.ancestor_exe`
+and `caller.ancestor_pid` identify the nearest non-Herdr ancestor when observable;
+`caller.pane_env_present` records only whether `HERDR_PANE_ID` is present, never
+its value. None of these diagnostic fields grants authorization or changes the
+input guard.
+
 A reader of an agent's session can then tell turns that the API sent into a pane from
 turns typed there, without anything in the terminal byte stream.
 

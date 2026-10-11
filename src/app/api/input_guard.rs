@@ -6,10 +6,19 @@ use crate::app::terminal_targets::{InputOrigin, TerminalTarget};
 
 impl App {
     // This is a policy guard, not caller authentication.
+    #[cfg(test)]
     pub(super) fn cross_pane_input_denial(
         &self,
         request: &Request,
-        context: ApiRequestContext,
+        mut context: ApiRequestContext,
+    ) -> Option<String> {
+        self.cross_pane_input_denial_with_ancestry(request, &mut context)
+    }
+
+    pub(super) fn cross_pane_input_denial_with_ancestry(
+        &self,
+        request: &Request,
+        context: &mut ApiRequestContext,
     ) -> Option<String> {
         // Decide from the method first: attribution walks every agent pane's session in
         // /proc, so doing it for each API request kept the server busy (smarty-dev#931).
@@ -18,7 +27,7 @@ impl App {
             return None;
         }
         let target = self.content_write_target(&request.method)?;
-        let origin = self.input_origin_for_context(context);
+        let origin = self.input_origin_for_context_with_ancestry(context);
         let (code, message) = match origin {
             InputOrigin::Ordinary => return None,
             InputOrigin::Agent(source) if source.terminal_id == target.terminal_id => return None,
@@ -1422,7 +1431,7 @@ mod tests {
 
             // Check the native adapter against a real strictly older ancestor.
             assert_eq!(
-                crate::platform::process_identity_server_ancestry(ordinary_peer),
+                crate::platform::process_identity_server_ancestry(ordinary_peer).verdict,
                 crate::platform::ServerAncestry::Outside
             );
             // Capture readable absence from an actual sanitized exec. Model its
@@ -1466,6 +1475,7 @@ mod tests {
             let unknown = ApiRequestContext {
                 local_peer_pane_origin: crate::platform::PeerPaneOrigin::Unknown,
                 local_peer_identity: Some(peer),
+                server_ancestry: None,
             };
             let response = fixture.app.handle_api_request_with_context(
                 request(
@@ -1657,7 +1667,7 @@ mod tests {
         );
         #[cfg(target_os = "macos")]
         assert_eq!(
-            crate::platform::process_identity_server_ancestry(peer),
+            crate::platform::process_identity_server_ancestry(peer).verdict,
             crate::platform::ServerAncestry::ReachedServer
         );
         let mut line = String::new();
@@ -1827,7 +1837,7 @@ mod tests {
             crate::platform::PeerPaneOrigin::Absent
         );
         assert_eq!(
-            crate::platform::process_identity_server_ancestry(peer),
+            crate::platform::process_identity_server_ancestry(peer).verdict,
             crate::platform::ServerAncestry::ReachedServer
         );
         assert!(caller
@@ -2439,7 +2449,8 @@ finally:
         assert_eq!(
             crate::platform::process_identity_server_ancestry(
                 context.local_peer_identity.expect("native Darwin caller")
-            ),
+            )
+            .verdict,
             crate::platform::ServerAncestry::ReachedServer,
             "a real ordinary child reaches the server; it is not an outside-proof seam"
         );

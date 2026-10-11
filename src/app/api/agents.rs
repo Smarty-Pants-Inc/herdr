@@ -82,13 +82,13 @@ impl App {
     pub(crate) fn handle_deferred_agent_api_request(
         &mut self,
         request: crate::api::schema::Request,
-        context: crate::api::ApiRequestContext,
+        mut context: crate::api::ApiRequestContext,
         respond_to: std::sync::mpsc::Sender<String>,
     ) -> bool {
         if !matches!(request.method, crate::api::schema::Method::AgentPrompt(_)) {
             return false;
         }
-        if let Some(response) = self.cross_pane_input_denial(&request, context) {
+        if let Some(response) = self.cross_pane_input_denial_with_ancestry(&request, &mut context) {
             let _ = respond_to.send(response);
             return true;
         }

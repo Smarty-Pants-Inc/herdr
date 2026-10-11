@@ -219,6 +219,9 @@ pub(crate) struct CallerMetadata {
     pub(crate) exe: Option<String>,
     pub(crate) ppid: Option<u32>,
     pub(crate) unit: Option<String>,
+    /// Linux stat's session field: the same session ID returned by getsid.
+    #[cfg(target_os = "linux")]
+    pub(crate) sid: Option<u32>,
 }
 
 /// Snapshot only the transport-pinned process instance; unsupported platforms
@@ -463,27 +466,53 @@ pub(crate) enum ServerAncestry {
     Unknown,
 }
 
-pub(crate) fn process_identity_server_ancestry(peer: ProcessIdentity) -> ServerAncestry {
+/// Request-local diagnostic observation of the very same proof used by the guard.
+/// The root is the last pinned process examined, not a second diagnostic walk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ServerAncestryObservation {
+    pub(crate) verdict: ServerAncestry,
+    #[cfg(target_os = "linux")]
+    pub(crate) root_pid: Option<u32>,
+}
+
+#[cfg(test)]
+pub(crate) fn server_ancestry_verdict_for_test(peer: ProcessIdentity) -> ServerAncestry {
+    process_identity_server_ancestry(peer).verdict
+}
+
+pub(crate) fn process_identity_server_ancestry(peer: ProcessIdentity) -> ServerAncestryObservation {
     #[cfg(test)]
     if let Some((expected, observation)) = TEST_SERVER_ANCESTRY.with(|value| value.get()) {
         if peer == expected {
-            return if process_identity(peer.pid) == Some(peer) {
-                observation
-            } else {
-                ServerAncestry::Unknown
+            return ServerAncestryObservation {
+                verdict: if process_identity(peer.pid) == Some(peer) {
+                    observation
+                } else {
+                    ServerAncestry::Unknown
+                },
+                #[cfg(target_os = "linux")]
+                root_pid: None,
             };
         }
     }
     #[cfg(windows)]
-    return server_ancestry_observation(windows::process_identity_outside_server_ancestry(peer));
+    return ServerAncestryObservation {
+        verdict: server_ancestry_observation(windows::process_identity_outside_server_ancestry(
+            peer,
+        )),
+    };
     #[cfg(target_os = "macos")]
-    return server_ancestry_observation(macos::process_identity_outside_server_ancestry(peer));
+    return ServerAncestryObservation {
+        verdict: server_ancestry_observation(macos::process_identity_outside_server_ancestry(peer)),
+    };
     #[cfg(target_os = "linux")]
-    return server_ancestry_observation(linux::process_identity_outside_server_ancestry(peer));
+    return linux::process_identity_server_ancestry_observation(peer);
     #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     {
         let _ = peer;
-        ServerAncestry::NotApplicable
+        ServerAncestryObservation {
+            verdict: ServerAncestry::NotApplicable,
+        }
     }
 }
 
@@ -501,13 +530,25 @@ fn server_ancestry_observation(observation: Option<bool>) -> ServerAncestry {
 /// descend from the pinned server; equal timestamps are not a negative proof.
 /// Every observation remains tied to its original process generation, including
 /// successful terminal observations.
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[cfg(any(target_os = "macos", test))]
 pub(crate) fn observe_outside_server_ancestry(
     peer: ProcessIdentity,
     server: ProcessIdentity,
     identity_of: impl Fn(u32) -> Option<ProcessIdentity>,
     parent_of: impl Fn(ProcessIdentity) -> Option<ProcessIdentity>,
 ) -> Option<bool> {
+    observe_outside_server_ancestry_with_root(peer, server, identity_of, parent_of, &mut None)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+pub(crate) fn observe_outside_server_ancestry_with_root(
+    peer: ProcessIdentity,
+    server: ProcessIdentity,
+    identity_of: impl Fn(u32) -> Option<ProcessIdentity>,
+    parent_of: impl Fn(ProcessIdentity) -> Option<ProcessIdentity>,
+    root_pid: &mut Option<u32>,
+) -> Option<bool> {
+    *root_pid = None;
     const MAX_DEPTH: usize = 32;
     let mut current = peer;
     let mut seen = Vec::with_capacity(MAX_DEPTH + 1);
@@ -526,6 +567,7 @@ pub(crate) fn observe_outside_server_ancestry(
             return None;
         }
         seen.push(current);
+        *root_pid = Some(current.pid);
         let terminal = if current == server {
             Some(false)
         } else if current.start_time < server.start_time {
@@ -688,6 +730,7 @@ fn observe_parent_identity(
 
 #[cfg(test)]
 mod pane_origin_tests {
+    use super::server_ancestry_verdict_for_test as process_identity_server_ancestry;
     use super::*;
 
     #[test]
@@ -937,6 +980,61 @@ mod server_chronology_tests {
                 "sequence {sequence}"
             );
         }
+    }
+
+    fn assert_walk_root(parent: Option<ProcessIdentity>, expected: Option<bool>, root: u32) {
+        let peer = identity(200, 40);
+        let server = identity(100, 20);
+        let mut last = None;
+        let observation = observe_outside_server_ancestry_with_root(
+            peer,
+            server,
+            |pid| {
+                if pid == peer.pid {
+                    Some(peer)
+                } else if pid == server.pid {
+                    Some(server)
+                } else {
+                    parent.filter(|parent| parent.pid == pid)
+                }
+            },
+            |child| (child == peer).then_some(parent).flatten(),
+            &mut last,
+        );
+        assert_eq!(observation, expected);
+        assert_eq!(last, Some(root));
+    }
+
+    #[test]
+    fn chronology_walk_root_is_the_server_when_reached() {
+        assert_walk_root(Some(identity(100, 20)), Some(false), 100);
+    }
+
+    #[test]
+    fn chronology_walk_root_is_the_older_witness_when_outside() {
+        assert_walk_root(Some(identity(201, 10)), Some(true), 201);
+    }
+
+    #[test]
+    fn chronology_walk_root_is_the_last_examined_ancestor_when_unknown() {
+        assert_walk_root(Some(identity(201, 30)), None, 201);
+        assert_walk_root(None, None, 200);
+    }
+
+    #[test]
+    fn chronology_walk_root_is_absent_if_the_peer_cannot_be_examined() {
+        let mut root = Some(999);
+        assert_eq!(
+            observe_outside_server_ancestry_with_root(
+                identity(200, 40),
+                identity(100, 20),
+                |_| None,
+                |_| panic!("stale endpoint must not walk"),
+                &mut root,
+            ),
+            None
+        );
+        assert_eq!(root, None);
     }
 
     #[test]
