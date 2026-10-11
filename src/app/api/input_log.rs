@@ -406,6 +406,7 @@ mod tests {
             Request {
                 id: "send".into(),
                 method: Method::PaneSendText(PaneSendTextParams {
+                    expected_agent_session_id: None,
                     pane_id: fixture.target_pane_id.clone(),
                     text: text.into(),
                     allow_cross_pane: true,
@@ -496,6 +497,7 @@ mod tests {
             Request {
                 id: "granted".into(),
                 method: Method::PaneSendText(PaneSendTextParams {
+                    expected_agent_session_id: None,
                     pane_id: fixture.source_pane_id.clone(),
                     text: "open".into(),
                     allow_cross_pane: false,
@@ -556,6 +558,7 @@ mod tests {
         let request = Request {
             id: "late".into(),
             method: Method::PaneSendText(PaneSendTextParams {
+                expected_agent_session_id: None,
                 pane_id: fixture.source_pane_id.clone(),
                 text: "open".into(),
                 allow_cross_pane: false,
@@ -855,6 +858,7 @@ mod tests {
             Request {
                 id: "keys".into(),
                 method: Method::PaneSendKeys(PaneSendKeysParams {
+                    expected_agent_session_id: None,
                     pane_id: fixture.target_pane_id.clone(),
                     keys: vec!["enter".into()],
                     allow_cross_pane: true,

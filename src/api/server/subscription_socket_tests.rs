@@ -235,6 +235,7 @@ fn reply_to_probe(request: ApiRequestMessage) {
                 state_labels: Default::default(),
                 tokens: Default::default(),
                 agent_session: None,
+                agent_session_id: None,
                 scroll: None,
                 revision: 0,
             },

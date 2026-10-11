@@ -293,7 +293,7 @@ fn integration_commands_run_locally_when_server_is_missing() {
         .unwrap();
     assert_eq!(integration_status.status.code(), Some(0));
     let status_stdout = String::from_utf8_lossy(&integration_status.stdout);
-    assert!(status_stdout.contains("pi: current (v10)"));
+    assert!(status_stdout.contains("pi: current (v11)"));
     assert!(status_stdout.contains("claude: not installed"));
 
     let integration_uninstall = crate::test_command::herdr_command()

@@ -46,6 +46,23 @@ fn protocol_schema_document() -> serde_json::Value {
 }
 
 #[test]
+fn clear_input_poison_method_is_registered_and_advertised() {
+    let value = serde_json::json!({"id":"clear", "method":"pane.clear_input_poison", "params":{"pane_id":"p1"}});
+    let request: Request = serde_json::from_value(value.clone()).unwrap();
+    assert!(matches!(request.method, Method::PaneClearInputPoison(_)));
+    assert_eq!(
+        crate::api::api_method_name(&request.method),
+        "pane.clear_input_poison"
+    );
+    assert!(
+        crate::server::client_commands::supports_client_shell_method_name(
+            "pane.clear_input_poison"
+        )
+    );
+    assert_eq!(serde_json::to_value(request).unwrap(), value);
+}
+
+#[test]
 fn input_consumer_local_methods_are_registered_and_not_endpoint_methods() {
     for (name, params) in [
         (
@@ -275,6 +292,8 @@ fn agent_start_and_prompt_requests_round_trip() {
     let prompt = Request {
         id: "prompt".into(),
         method: Method::AgentPrompt(AgentPromptParams {
+            expected_agent_session_id: None,
+            expected_pane_id: None,
             target: "reviewer".into(),
             text: "review this".into(),
             wait: None,
@@ -291,6 +310,8 @@ fn agent_start_and_prompt_requests_round_trip() {
     let prompt_and_wait = Request {
         id: "prompt-and-wait".into(),
         method: Method::AgentPrompt(AgentPromptParams {
+            expected_agent_session_id: None,
+            expected_pane_id: None,
             target: "reviewer".into(),
             text: "review this".into(),
             wait: Some(AgentPromptWaitOptions {
@@ -635,7 +656,69 @@ fn old_server_capabilities_do_not_advertise_expected_terminal_guard() {
     let caps: ServerCapabilities =
         serde_json::from_value(serde_json::json!({"live_handoff": false})).unwrap();
     assert!(!caps.expected_terminal_guard);
+    assert!(!caps.expected_agent_session_guard);
     assert!(!caps.input_consumer);
+}
+
+#[test]
+fn agent_session_expectations_are_optional_but_present_null_cannot_disable_them() {
+    for (method, params) in [
+        (
+            "agent.prompt",
+            serde_json::json!({"target": "sink", "text": "hello"}),
+        ),
+        (
+            "agent.prompt_session_checked",
+            serde_json::json!({"target": "sink", "text": "hello"}),
+        ),
+        (
+            "pane.send_text",
+            serde_json::json!({"pane_id": "w1:p1", "text": "hello"}),
+        ),
+        (
+            "pane.send_text_session_checked",
+            serde_json::json!({"pane_id": "w1:p1", "text": "hello"}),
+        ),
+        (
+            "pane.send_keys",
+            serde_json::json!({"pane_id": "w1:p1", "keys": ["enter"]}),
+        ),
+        (
+            "pane.send_keys_session_checked",
+            serde_json::json!({"pane_id": "w1:p1", "keys": ["enter"]}),
+        ),
+    ] {
+        let mut value = serde_json::json!({"id": "guard", "method": method, "params": params});
+        let request: Request =
+            serde_json::from_value(value.clone()).expect("optional expectations");
+        assert_eq!(crate::api::api_method_name(&request.method), method);
+        if method.ends_with("_session_checked") {
+            assert!(!crate::server::client_commands::supports_client_shell_method_name(method));
+        }
+        assert!(serde_json::to_value(request).unwrap()["params"]
+            .get("expected_agent_session_id")
+            .is_none());
+        for field in if method.starts_with("agent.") {
+            vec!["expected_agent_session_id", "expected_pane_id"]
+        } else {
+            vec!["expected_agent_session_id"]
+        } {
+            for malformed in [
+                serde_json::Value::Null,
+                serde_json::json!(1),
+                serde_json::json!(false),
+            ] {
+                value["params"][field] = malformed;
+                assert!(serde_json::from_value::<Request>(value.clone()).is_err());
+            }
+            value["params"][field] = "expected".into();
+            let request: Request = serde_json::from_value(value.clone()).expect("valid guard");
+            assert_eq!(
+                serde_json::to_value(request).unwrap()["params"][field],
+                "expected"
+            );
+        }
+    }
 }
 
 #[test]
@@ -977,6 +1060,7 @@ fn success_response_round_trips() {
                 ssh_agent_registration: false,
                 guarded_live_handoff: true,
                 expected_terminal_guard: true,
+                expected_agent_session_guard: true,
                 input_consumer: false,
             }),
         },
@@ -1088,6 +1172,7 @@ fn worktree_request_and_response_round_trip() {
                 state_labels: HashMap::new(),
                 tokens: HashMap::new(),
                 agent_session: None,
+                agent_session_id: None,
                 scroll: None,
                 revision: 0,
             },
@@ -1517,6 +1602,7 @@ fn create_response_round_trips_with_root_pane() {
                 state_labels: HashMap::new(),
                 tokens: HashMap::new(),
                 agent_session: None,
+                agent_session_id: None,
                 scroll: None,
                 revision: 0,
             },

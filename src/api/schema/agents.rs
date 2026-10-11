@@ -191,6 +191,22 @@ pub struct AgentStartParams {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AgentPromptParams {
+    /// Refuse input unless the resolved agent still reports this session ID.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "super::deserialize_expected_terminal"
+    )]
+    #[schemars(with = "String")]
+    pub expected_agent_session_id: Option<String>,
+    /// Refuse input unless the target alias resolves to this pane.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "super::deserialize_expected_terminal"
+    )]
+    #[schemars(with = "String")]
+    pub expected_pane_id: Option<String>,
     pub target: String,
     pub text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -225,6 +241,9 @@ pub struct AgentInfo {
     pub tokens: HashMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_session: Option<AgentSessionInfo>,
+    /// Actual ID from the accepted current report, independent of its resume path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_session_id: Option<String>,
     pub workspace_id: String,
     pub tab_id: String,
     pub pane_id: String,
