@@ -2704,11 +2704,27 @@ finally:
             key,
             crate::platform::pin_owned_child(&action).expect("pin action child")
         ));
-        let copied_marker = ApiRequestContext::for_local_peer_pid(Some(grandchild));
-        assert_eq!(
-            copied_marker.local_peer_pane_origin,
-            crate::platform::PeerPaneOrigin::HasPane
-        );
+        // `sh` prints the child PID immediately after fork. Before the child
+        // execs `sleep`, Linux can expose an empty /proc/<pid>/environ (and
+        // macOS can likewise expose incomplete launch metadata). Poll the
+        // production accept-time probe to wait for the exec, with a bound so
+        // a live process that never reports its pane still fails this test.
+        let origin_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let copied_marker = loop {
+            let context = ApiRequestContext::for_local_peer_pid(Some(grandchild));
+            if context.local_peer_pane_origin == crate::platform::PeerPaneOrigin::HasPane {
+                break context;
+            }
+            assert!(
+                crate::platform::process_identity(grandchild).is_some(),
+                "grandchild exited before its pane origin became observable"
+            );
+            assert!(
+                std::time::Instant::now() < origin_deadline,
+                "grandchild pane origin did not become observable before timeout"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        };
         let send = |id: &str, pane: &str, opt_in: bool| Request {
             id: id.into(),
             method: Method::PaneSendText(PaneSendTextParams {
