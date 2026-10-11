@@ -923,10 +923,10 @@ it created. A valid token aimed at any other existing terminal returns
 tokens return `input_origin_unknown`. Explicit `allow_cross_pane` remains a
 separate override. A token is valid only on the issuing server, while the action
 process is alive, and for at most ten minutes. The server keeps at most 256
-grants, including revoked ones; when live or pending grants fill it, the action runs
-without a token under the ordinary input rules. No new grant is issued. On cap
-exhaustion, a global action runs as an ordinary client, as before action tokens
-were introduced; those rules allow writes to existing panes. Startup and event
+grants, including revoked ones. If live or pending grants fill it, secure random
+generation is unavailable, or the invoking terminal cannot be bound, no grant is
+issued and the user-invoked action, global or pane, does not launch. Herdr shows
+an error saying the action could not get a security grant; try again. Startup and event
 hooks receive no action token. Never log the token. Same-user processes may read each other's
 environment, so it does not isolate processes running as the same OS user.
 
