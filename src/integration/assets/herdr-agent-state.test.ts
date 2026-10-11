@@ -1,4 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { rm } from "node:fs/promises";
 import net, { createServer, type Server } from "node:net";
 import { tmpdir } from "node:os";
@@ -865,7 +866,7 @@ for (const mode of ["rpc", "print", "json", undefined]) {
   });
 }
 
-registeredChannelTest("Pi opens registration directly in-process only at TUI session_start, with no inherited pane/pid assertion", async () => {
+registeredChannelTest("Pi opens its channel connection in-process at extension load and registers only at TUI session_start, with no inherited pane/pid assertion", async () => {
   const { connections, reports } = await startChannelServer();
   process.env.HERDR_PANE_ID = "stale:p999";
   const connectionPids: number[] = [];
@@ -876,12 +877,88 @@ registeredChannelTest("Pi opens registration directly in-process only at TUI ses
   const { handlers, calls } = await loadChannelAsset(accepted);
   handlers.get("agent_start")?.({}, channelContext());
   await Bun.sleep(30);
-  expect(connectionPids).toEqual([]);
+  expect(connectionPids).toEqual([process.pid]); // The channel connection, opened at load.
+  expect(connections).toEqual([]); // No registration before session_start.
+  expect(reports).toEqual([]);
   await handlers.get("session_start")?.({}, channelContext());
   await waitFor(() => connections.length === 1 && reports.length === 1);
+  // session_start registers over the load-time connection; only the state report connects.
   expect(connectionPids).toEqual([process.pid, process.pid]);
   expect(connections[0].registration.params).toEqual({ session_generation: "session-1" });
   expect(calls).toEqual([]); // Ready registration is not an input receipt.
+});
+
+// Pi runs a native /new, /resume or /fork session_start inside a temporary input fence. Input
+// whose async context descends from that callback is refused for good once the fence ends
+// (pi#163 security r3). This fixture models only that async-context rule, not Pi admission.
+function inputFenceFixture() {
+  const fence = new AsyncLocalStorage<{ active: boolean }>();
+  const submit = (request: AdmissionRequest): Promise<AdmissionReceipt> => {
+    const scope = fence.getStore();
+    if (scope && !scope.active) {
+      return Promise.resolve({
+        status: "rejected", reason: "session_changed", sessionGeneration: request.sessionGeneration,
+      });
+    }
+    return accepted(request);
+  };
+  const fenced = async (operation: () => unknown) => {
+    const scope = { active: true };
+    try {
+      return await fence.run(scope, async () => await operation());
+    } finally {
+      scope.active = false;
+    }
+  };
+  return { submit, fenced };
+}
+
+registeredChannelTest("Pi channel ingress never descends from a fenced session_start, across replacement and reconnect", async () => {
+  const { connections } = await startChannelServer();
+  const { submit, fenced } = inputFenceFixture();
+  const asset = await loadChannelAsset(submit);
+  await fenced(() => asset.handlers.get("session_start")?.({}, channelContext()));
+  await waitFor(() => connections.length === 1);
+  deliver(connections[0], "first");
+  await waitFor(() => connections[0].acks.length === 1);
+  expect(connections[0].acks[0]).toMatchObject({ request_id: "first", status: "accepted" });
+  // A native /new: the old registration is retired inside the fence, yet the replacement
+  // connection and its reader still run outside it.
+  await fenced(() => asset.handlers.get("session_start")?.({ reason: "new" }, channelContext("session-2")));
+  await waitFor(() => connections.length === 2 && connections[0].closed);
+  deliver(connections[1], "second");
+  await waitFor(() => connections[1].acks.length === 1);
+  expect(connections[1].acks[0]).toMatchObject({
+    request_id: "second", status: "accepted", session_generation: "session-2",
+  });
+  // Transport loss after a fenced session_start reconnects outside the fence too.
+  connections[1].socket.destroy();
+  await waitFor(() => connections.length === 3);
+  deliver(connections[2], "third");
+  await waitFor(() => connections[2].acks.length === 1);
+  expect(connections[2].acks[0]).toMatchObject({ request_id: "third", status: "accepted" });
+  expect(asset.calls.map((call) => call.requestId)).toEqual(["first", "second", "third"]);
+});
+
+registeredChannelTest("Pi reconnects outside the fence when the load-time connection closed before a fenced session_start", async () => {
+  const { connections } = await startChannelServer();
+  const clients: net.Socket[] = [];
+  net.createConnection = ((...args: unknown[]) => {
+    const socket = Reflect.apply(originalCreateConnection, net, args);
+    clients.push(socket);
+    return socket;
+  }) as typeof net.createConnection;
+  const { submit, fenced } = inputFenceFixture();
+  const asset = await loadChannelAsset(submit);
+  expect(clients).toHaveLength(1);
+  clients[0].destroy(); // e.g. Herdr's initial-request timeout before a slow startup finished.
+  await Bun.sleep(30);
+  expect(clients).toHaveLength(1); // No session wants a channel yet: nothing reconnects.
+  await fenced(() => asset.handlers.get("session_start")?.({}, channelContext()));
+  await waitFor(() => connections.length === 1);
+  deliver(connections[0], "fresh");
+  await waitFor(() => connections[0].acks.length === 1);
+  expect(connections[0].acks[0]).toMatchObject({ request_id: "fresh", status: "accepted" });
 });
 
 test("Pi Windows state reports still work but never advertise the unsupported receipt channel", async () => {
