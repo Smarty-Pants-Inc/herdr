@@ -264,7 +264,7 @@ impl PluginActionGrants {
     /// dead grants become tombstones, and, only when still full, the oldest
     /// tombstones are evicted (their attribution is then lost). If pending and
     /// live grants alone fill the cap this fails closed with an error that
-    /// carries no secret; the caller runs the action without a token.
+    /// carries no secret; the runtime refuses to launch the user action.
     pub(crate) fn mint(
         &self,
         grant: PluginActionGrant,
