@@ -474,7 +474,9 @@ mod rollover_transport {
         );
         let raw = std::fs::read_to_string(&app.api_input_log).unwrap();
         let last: serde_json::Value = serde_json::from_str(raw.lines().last().unwrap()).unwrap();
-        for field in ["ancestry", "sid", "ancestry_root_pid"] {
+        // smarty-dev#931: a peerless line is classified unknown, with no caller identity.
+        assert_eq!(last["caller"]["ancestry"], "unknown");
+        for field in ["sid", "ancestry_root_pid"] {
             assert!(last["caller"].get(field).is_none());
         }
         assert!(

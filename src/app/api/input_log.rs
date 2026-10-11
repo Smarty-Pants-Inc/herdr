@@ -123,6 +123,17 @@ impl App {
             if let Some(present) = crate::platform::process_initial_pane_env_present(peer) {
                 caller_fields["pane_env_present"] = present.into();
             }
+        } else {
+            // smarty-dev#931: every null-caller line is classified. Without a peer there is
+            // nothing to walk, so the verdict is unknown and no caller identity is invented.
+            add_server_ancestry_fields(
+                &mut caller_fields,
+                crate::platform::ServerAncestryObservation {
+                    verdict: crate::platform::ServerAncestry::Unknown,
+                    #[cfg(target_os = "linux")]
+                    root_pid: None,
+                },
+            );
         }
         let ts_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -224,13 +235,54 @@ fn nearest_non_herdr_ancestor(
 /// path that exists is not proof that it was made durable (an earlier attempt or another
 /// process may have failed after creating it, or the log may have been moved aside and
 /// recreated). ponytail: a few directory syncs per API write; API writes are infrequent.
+///
+/// Retention is bounded: see [`append_line_capped`].
 fn append_line(path: &std::path::Path, line: &str) -> std::io::Result<()> {
+    append_line_capped(path, line, LOG_ROTATE_BYTES)
+}
+
+/// ponytail: one 32 MiB generation plus one rotated `.1` bounds the log near 64 MiB, which
+/// keeps months of metadata-only records; raise it if forensics need a longer window.
+const LOG_ROTATE_BYTES: u64 = 32 * 1024 * 1024;
+
+/// The rotated generation: `<name>.1` beside the live log.
+fn rotated_log_path(path: &std::path::Path) -> std::path::PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".1");
+    path.with_file_name(name)
+}
+
+/// [`append_line`] with an explicit cap (tests pass a small one). While holding the lock on a
+/// log at or above `cap`, renames it to `<name>.1` (replacing an older `.1`) and appends to a
+/// fresh private log. Rotation never fails the write: if the rename or the fresh open fails,
+/// the record is appended to the file already open, as before rotation existed.
+fn append_line_capped(path: &std::path::Path, line: &str, cap: u64) -> std::io::Result<()> {
     use std::io::{Read, Seek, SeekFrom};
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let mut file = crate::platform::open_private_append_file(path)?;
     file.lock()?;
+    let held = file.metadata()?.len();
+    if held >= cap {
+        // Another writer may have rotated while this one waited for the lock: the file held is
+        // then `.1`, and the live path is a fresh, shorter log. Append there; never rotate twice.
+        let live_is_held = std::fs::symlink_metadata(path).is_ok_and(|live| live.len() == held);
+        let replacement = if live_is_held {
+            std::fs::rename(path, rotated_log_path(path))
+                .and_then(|()| crate::platform::open_private_append_file(path))
+        } else {
+            crate::platform::open_private_append_file(path)
+        };
+        match replacement.and_then(|fresh| fresh.lock().map(|()| fresh)) {
+            Ok(fresh) => file = fresh,
+            Err(err) => tracing::warn!(
+                err = %err,
+                path = %path.display(),
+                "log rotation failed; appending to the file already open"
+            ),
+        }
+    }
     let mut record = Vec::with_capacity(line.len() + 2);
     if file.metadata()?.len() > 0 {
         let mut last = [0u8; 1];
@@ -581,7 +633,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn diagnostic_ancestry_fields_are_absent_without_a_peer() {
+    async fn diagnostic_ancestry_is_unknown_without_a_peer() {
         let fixture = fixture();
         let pane = fixture.app.state.workspaces[0].tabs[0].root_pane;
         let raw = fixture.app.api_input_log_line(
@@ -592,9 +644,130 @@ mod tests {
             1,
         );
         let line: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        for field in ["ancestry", "sid", "ancestry_root_pid"] {
+        // smarty-dev#931: a null-caller line is still classified, with no invented identity.
+        assert_eq!(line["caller"]["ancestry"], "unknown", "{raw}");
+        assert!(line["caller"]["pid"].is_null(), "{raw}");
+        for field in [
+            "sid",
+            "ancestry_root_pid",
+            "ancestor_pid",
+            "ancestor_exe",
+            "pane_env_present",
+            "exe",
+            "ppid",
+            "unit",
+        ] {
             assert!(line["caller"].get(field).is_none(), "{raw}");
         }
+    }
+
+    /// A unique log path beside the fixture's, and its rotated generation.
+    fn rotation_paths(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let base = fixture().app.api_input_log;
+        let path = base.with_extension(format!("{tag}.jsonl"));
+        let rotated = super::rotated_log_path(&path);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&rotated);
+        (path, rotated)
+    }
+
+    /// Appends `prefix` records without rotating until the log reaches `cap` bytes.
+    fn fill_to_cap(path: &std::path::Path, prefix: &str, cap: u64) {
+        let mut n = 0;
+        while std::fs::metadata(path).map_or(0, |meta| meta.len()) < cap {
+            super::append_line_capped(path, &format!("{{\"{prefix}\":{n}}}"), u64::MAX).unwrap();
+            n += 1;
+        }
+    }
+
+    fn read_lines(path: &std::path::Path) -> Vec<String> {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn crossing_the_cap_rotates_once_and_keeps_the_new_record() {
+        const CAP: u64 = 64;
+        let (path, rotated) = rotation_paths("rotate-once");
+        fill_to_cap(&path, "old", CAP);
+        let before = std::fs::read(&path).unwrap();
+        super::append_line_capped(&path, "{\"new\":0}", CAP).unwrap();
+        assert_eq!(
+            std::fs::read(&rotated).unwrap(),
+            before,
+            "old generation moved intact"
+        );
+        assert_eq!(read_lines(&path), ["{\"new\":0}"]);
+        // Below the cap again: the next record appends, and .1 is untouched.
+        super::append_line_capped(&path, "{\"new\":1}", CAP).unwrap();
+        assert_eq!(read_lines(&path), ["{\"new\":0}", "{\"new\":1}"]);
+        assert_eq!(std::fs::read(&rotated).unwrap(), before);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for file in [&path, &rotated] {
+                let mode = std::fs::metadata(file).unwrap().permissions().mode();
+                assert_eq!(mode & 0o777, 0o600, "{}", file.display());
+            }
+        }
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&rotated);
+    }
+
+    #[tokio::test]
+    async fn a_second_crossing_replaces_the_rotated_generation() {
+        const CAP: u64 = 64;
+        let (path, rotated) = rotation_paths("rotate-twice");
+        fill_to_cap(&path, "first", CAP);
+        super::append_line_capped(&path, "{\"second\":-1}", CAP).unwrap();
+        fill_to_cap(&path, "second", CAP);
+        let second = std::fs::read(&path).unwrap();
+        super::append_line_capped(&path, "{\"third\":0}", CAP).unwrap();
+        assert_eq!(std::fs::read(&rotated).unwrap(), second);
+        assert!(!String::from_utf8(second).unwrap().contains("first"));
+        assert_eq!(read_lines(&path), ["{\"third\":0}"]);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&rotated);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rotation_preserves_the_private_mode_of_both_generations() {
+        use std::os::unix::fs::PermissionsExt;
+        const CAP: u64 = 64;
+        let (path, rotated) = rotation_paths("rotate-mode");
+        fill_to_cap(&path, "old", CAP);
+        // A stale readable .1 is replaced by the private generation, not kept.
+        std::fs::write(&rotated, b"stale\n").unwrap();
+        std::fs::set_permissions(&rotated, std::fs::Permissions::from_mode(0o644)).unwrap();
+        super::append_line_capped(&path, "{\"new\":0}", CAP).unwrap();
+        assert!(!std::fs::read_to_string(&rotated).unwrap().contains("stale"));
+        for file in [&path, &rotated] {
+            let mode = std::fs::metadata(file).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "{}", file.display());
+        }
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&rotated);
+    }
+
+    #[tokio::test]
+    async fn a_failed_rotation_still_appends_the_record() {
+        const CAP: u64 = 64;
+        let (path, rotated) = rotation_paths("rotate-blocked");
+        // A non-empty directory at `.1` makes the rename fail on every platform.
+        std::fs::create_dir_all(rotated.join("occupied")).unwrap();
+        fill_to_cap(&path, "old", CAP);
+        let mut expected = read_lines(&path);
+        super::append_line_capped(&path, "{\"new\":0}", CAP)
+            .expect("rotation alone never fails closed");
+        expected.push("{\"new\":0}".into());
+        assert_eq!(read_lines(&path), expected);
+        assert!(rotated.join("occupied").is_dir());
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&rotated);
     }
 
     #[tokio::test]
