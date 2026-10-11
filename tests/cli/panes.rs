@@ -673,6 +673,28 @@ fn pane_agent_reports_accept_options_before_pane() {
         .unwrap()
         .to_string();
 
+    // A custom report is released when the pane returns to its idle shell.
+    // Hold a real foreground process, and use its connection as the readiness
+    // event rather than racing the detector with a report over an empty shell.
+    let ready_path = base.join("agent-ready.sock");
+    let listener = UnixListener::bind(&ready_path).unwrap();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let ready_thread = thread::spawn(move || {
+        ready_tx.send(listener.accept().unwrap().0).unwrap();
+    });
+    let command = format!(
+        "python3 -c 'import socket; s = socket.socket(socket.AF_UNIX); s.connect(\"{}\"); s.recv(1)'",
+        ready_path.display()
+    );
+    let started = run_cli(&socket_path, &["pane", "run", &pane_id, &command]);
+    assert!(
+        started.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let agent_process = ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    ready_thread.join().unwrap();
+
     let state_report = run_cli(
         &socket_path,
         &[
@@ -743,7 +765,19 @@ fn pane_agent_reports_accept_options_before_pane() {
     assert!(resume_report.stdout.is_empty());
     assert!(resume_report.stderr.is_empty());
 
+    // Reports are applied before their replies: no wait/retry is needed for
+    // the next lookup. Prompt guards must resolve this custom agent too, then
+    // reject its unsupported process type (not claim that it was not found).
+    let agent = run_cli_json(&socket_path, &["agent", "get", &pane_id]);
+    assert_eq!(agent["result"]["agent"]["agent"], "cli-test");
+    assert_eq!(agent["result"]["agent"]["agent_status"], "idle");
+    let prompt = run_cli(&socket_path, &["agent", "prompt", &pane_id, "probe"]);
+    assert!(!prompt.status.success());
+    let error: serde_json::Value = serde_json::from_slice(&prompt.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "agent_not_ready");
+
     cleanup_spawned_herdr(herdr, base);
+    drop(agent_process);
 }
 
 #[test]
