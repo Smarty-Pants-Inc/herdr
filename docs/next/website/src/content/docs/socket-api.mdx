@@ -1179,7 +1179,7 @@ Use `events.subscribe` for lifecycle events. Dedicated wait helpers are document
 ## API input log
 
 Before `pane.send_text`, `pane.send_input`, `pane.send_keys`, `agent.send_keys`, or
-`agent.prompt` writes to a pane, herdr appends one JSON line to `api-input.jsonl` in its
+`agent.prompt` writes to a pane, or `agent.prompt_guarded` delivers to an agent channel, herdr appends one JSON line to `api-input.jsonl` in its
 state directory (for example `~/.local/state/herdr/api-input.jsonl`; the file is readable
 by its owner only). The line records the time (`ts_ms`), the method, the target pane and
 terminal, the byte count, and the caller as herdr knows it from the socket peer process:
