@@ -422,6 +422,15 @@ fn detection_events_silent_exec_replacement_rescans_unchanged_idle_buffer() {
 
 #[test]
 fn detection_events_single_frame_agent_exec_after_acquisition_is_identified() {
+    single_frame_agent_exec_after_acquisition(false);
+}
+
+#[test]
+fn detection_events_single_frame_agent_exec_after_probe_throttle_is_identified() {
+    single_frame_agent_exec_after_acquisition(true);
+}
+
+fn single_frame_agent_exec_after_acquisition(after_probe_throttle: bool) {
     // #3261 / #197: continuous launcher output outlasts acquisition without
     // an idle reset. The late agent execs in place, renders ONE frame during
     // the 5s probe throttle, then stays silent. Only the event-triggered
@@ -456,7 +465,15 @@ while [ "$i" -lt 55 ]; do
 done
 printf 'launcher ready\n'
 IFS= read -r command <&3
-[ "$command" = go ] || exit 2
+case "$command" in
+    go) ;;
+    go-late)
+        # First allow the launcher's pending 5s trailing probe to be consumed,
+        # then cross another 5s without output. No new acquisition stream.
+        /bin/sleep 10.1
+        ;;
+    *) exit 2 ;;
+esac
 HERDR_AGENT=pi exec /bin/sh -c '
     printf "%s\n" "$$" > "$1/agent.pid"
     printf "\033[2J\033[HE2E:READY"
@@ -511,14 +528,47 @@ HERDR_AGENT=pi exec /bin/sh -c '
     let info = run_cli_json(&socket, &["pane", "get", &pane])["result"]["pane"].clone();
     assert!(info["agent"].is_null(), "launcher misidentified: {info}");
     let started = Instant::now();
-    writeln!(control, "go").unwrap();
+    writeln!(
+        control,
+        "{}",
+        if after_probe_throttle {
+            "go-late"
+        } else {
+            "go"
+        }
+    )
+    .unwrap();
     control.flush().unwrap();
+    if after_probe_throttle {
+        // Event-driven observation of exactly one frame after the producer's
+        // necessary quiet interval; the producer then blocks on the FIFO.
+        let frame = run_cli(
+            &socket,
+            &[
+                "pane",
+                "wait-output",
+                &pane,
+                "--source",
+                "detection",
+                "--match",
+                "E2E:READY",
+                "--timeout",
+                "13000",
+            ],
+        );
+        assert!(frame.status.success(), "{frame:?}");
+    }
 
     // Same-PGID acquisition probes finish near 8s; the late single frame at
     // 11s precedes their next 5s recheck. Allow 3s scheduling slack, bounded
     // socket reads and the existing test hang watchdog, without polling.
+    let detection_deadline = if after_probe_throttle {
+        Instant::now() + OUTPUT_DEADLINE
+    } else {
+        started + Duration::from_secs(8)
+    };
     loop {
-        let event = events.next(started + Duration::from_secs(8));
+        let event = events.next(detection_deadline);
         if event["event"] == "pane_agent_detected"
             && event["data"]["pane_id"] == pane
             && event["data"]["agent"] == "pi"
