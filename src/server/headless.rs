@@ -3363,6 +3363,13 @@ impl HeadlessServer {
                 })
                 .unwrap_or_else(|_| "{}".to_string())
             })
+        } else if client_local {
+            // Authenticated client-shell endpoint lane: keeps its server-resolved pane.
+            self.app
+                .handle_trusted_client_shell_api_request_after_internal_events_drained(
+                    msg.request,
+                    msg.context,
+                )
         } else {
             self.app
                 .handle_api_request_after_internal_events_drained_with_context(

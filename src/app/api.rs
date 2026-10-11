@@ -989,10 +989,33 @@ impl App {
         )
     }
 
+    /// Public JSON API dispatch. The caller's invoking pane, if any, comes only
+    /// from `context`'s live peer attribution.
     pub(crate) fn handle_api_request_after_internal_events_drained_with_context(
         &mut self,
         request: crate::api::schema::Request,
         context: crate::api::ApiRequestContext,
+    ) -> String {
+        self.handle_api_request_with_ingress(request, context, ApiIngress::Public)
+    }
+
+    /// Dispatch for the authenticated client-shell endpoint lane only (the
+    /// headless server's `client_local` route). Its client-resolved pane for a
+    /// key press, command or link click is trusted as before. Never reachable
+    /// from the public socket or from any request field.
+    pub(crate) fn handle_trusted_client_shell_api_request_after_internal_events_drained(
+        &mut self,
+        request: crate::api::schema::Request,
+        context: crate::api::ApiRequestContext,
+    ) -> String {
+        self.handle_api_request_with_ingress(request, context, ApiIngress::TrustedClientShell)
+    }
+
+    fn handle_api_request_with_ingress(
+        &mut self,
+        request: crate::api::schema::Request,
+        context: crate::api::ApiRequestContext,
+        ingress: ApiIngress,
     ) -> String {
         self.sync_pending_terminal_titles();
         if let Some(response) = self.cross_pane_input_denial(&request, context) {
@@ -1114,7 +1137,14 @@ impl App {
                 return responses::encode_success(request.id, ResponseResult::Ok {});
             }
             Method::CommandInvoke(params) => {
-                return self.handle_command_invoke(request.id, params);
+                return match ingress {
+                    ApiIngress::TrustedClientShell => {
+                        self.handle_command_invoke(request.id, params)
+                    }
+                    ApiIngress::Public => {
+                        self.handle_public_command_invoke(request.id, params, context)
+                    }
+                };
             }
             Method::ClientWindowTitleSet(_) | Method::ClientWindowTitleClear(_) => {
                 return responses::encode_success(
@@ -1292,7 +1322,14 @@ impl App {
                 return self.handle_pane_link_resolve(request.id, params);
             }
             Method::PaneLinkActivate(params) => {
-                return self.handle_pane_link_activate(request.id, params);
+                return match ingress {
+                    ApiIngress::TrustedClientShell => {
+                        self.handle_pane_link_activate(request.id, params)
+                    }
+                    ApiIngress::Public => {
+                        self.handle_public_pane_link_activate(request.id, params, context)
+                    }
+                };
             }
             Method::PaneRename(params) => return self.handle_pane_rename(request.id, params),
             Method::PaneRead(params) => return self.handle_pane_read(request.id, params),
@@ -1363,7 +1400,7 @@ impl App {
                 return self.handle_plugin_action_list(request.id, params);
             }
             Method::PluginActionInvoke(params) => {
-                return self.handle_plugin_action_invoke(request.id, params);
+                return self.handle_plugin_action_invoke(request.id, params, context);
             }
             Method::PluginLogList(params) => {
                 return self.handle_plugin_log_list(request.id, params);
@@ -1499,6 +1536,19 @@ fn agent_manifest_info(
         warning: summary.warning,
     }
 }
+
+/// Server-only dispatch origin; never derived from the wire request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApiIngress {
+    Public,
+    TrustedClientShell,
+}
+
+/// Refusal for a public caller naming an invoking pane other than its own
+/// attributed pane. It deliberately does not echo the claimed pane.
+pub(super) const INVOKING_PANE_MISMATCH: &str = "invoking_pane_mismatch";
+pub(super) const INVOKING_PANE_MISMATCH_MESSAGE: &str =
+    "the invoking pane must be the calling process's own pane";
 
 #[cfg(test)]
 pub(super) mod test_support {
