@@ -176,7 +176,7 @@ fn channel_command() -> Command {
 }
 
 fn server_command() -> Command {
-    Command::new("server")
+    let command = Command::new("server")
         .about("Run or control the headless server")
         .subcommand(Command::new("stop").about("Stop the running server"))
         .subcommand(Command::new("reload-config").about("Reload config in the running server"))
@@ -193,7 +193,13 @@ fn server_command() -> Command {
         .subcommand(
             Command::new("reload-agent-manifests")
                 .about("Reload local agent detection manifest overrides"),
-        )
+        );
+    #[cfg(windows)]
+    let command = command.arg(
+        flag("allow-unelevated-clients")
+            .help("Allow ordinary same-account clients to control this elevated server"),
+    );
+    command
 }
 
 fn api_command() -> Command {
@@ -347,6 +353,53 @@ fn agent_command() -> Command {
         .subcommand(Command::new("list").about("List agents"))
         .subcommand(id_command("get", "target", "Show an agent"))
         .subcommand(
+            Command::new("channel-info")
+                .about("Inspect a terminal's registered agent channel without requiring agent detection")
+                .arg(required("target", "TARGET").allow_hyphen_values(true))
+                .after_help("JSON ready means a registered receiver is available, not that a prompt was admitted."),
+        )
+        .subcommand(
+            Command::new("draft-state")
+                .about("Inspect registered Pi editor emptiness and UI holds without exposing draft text or size")
+                .arg(required("target", "TARGET").allow_hyphen_values(true))
+                .arg(
+                    flag("allow-cross-pane")
+                        .help("Deliberately allow an agent-originated query to observe another pane"),
+                )
+                .after_help("Callers are authorized like agent prompt: an agent may observe its own pane, and another pane only with --allow-cross-pane. An unregistered pane, an old extension, or an unavailable reply returns unknown. This snapshot does not authorize a later prompt; use --if-draft-empty for an atomic check."),
+        )
+        .subcommand(
+            Command::new("prompt-guarded")
+                .about("Submit literal text over a pinned registered agent channel, never through PTY input")
+                .arg(required("target", "TARGET").allow_hyphen_values(true))
+                .arg(required("text", "TEXT").allow_hyphen_values(true))
+                .arg(expected_terminal_option().required(true))
+                .arg(
+                    option("expected-registration-epoch", "EPOCH")
+                        .required(true)
+                        .help("Refuse unless this exact registration epoch is still active"),
+                )
+                .arg(
+                    option("request-id", "ID")
+                        .required(true)
+                        .help("Caller-chosen deduplication key within this registration epoch"),
+                )
+                .arg(
+                    option("timeout-ms", "MS")
+                        .value_parser(clap::value_parser!(u64).range(1..=300_000))
+                        .help("Wait for an admission receipt (default: 10000; max: 300000)"),
+                )
+                .arg(
+                    flag("allow-cross-pane")
+                        .help("Deliberately allow an agent-originated request to target another pane"),
+                )
+                .arg(
+                    flag("if-draft-empty")
+                        .help("Atomically refuse unless the registered Pi editor is empty and has no UI hold"),
+                )
+                .after_help("Success acknowledges accepted or queued input, not model completion. A lost receipt may return delivery_unknown; never automatically replay it with a fresh epoch or request ID. TARGET and TEXT are literal argv values. Put options before -- when payload values match an option. Registration must be performed in the agent process over its own persistent socket."),
+        )
+        .subcommand(
             Command::new("read")
                 .about("Read agent terminal output")
                 .override_usage("herdr agent read <TARGET> [OPTIONS]")
@@ -376,6 +429,17 @@ fn agent_command() -> Command {
                 .arg(expected_session_option())
                 .arg(option("expected-pane", "ID")
                     .help("Refuse unless the agent target resolves to this pane_id; requires server support"))
+                .arg(
+                    flag("if-draft-empty")
+                        .conflicts_with_all([
+                            "wait",
+                            "until",
+                            "timeout",
+                            "expected-session",
+                            "expected-pane",
+                        ])
+                        .help("Use the registered Pi channel; refuse on a draft, UI hold, or unknown state; never type"),
+                )
                 .arg(
                     flag("wait")
                         .help("Wait for the first matching state observed after submission"),
@@ -881,6 +945,17 @@ fn plugin_command() -> Command {
                 .arg(required("plugin", "PLUGIN")),
         )
         .subcommand(
+            Command::new("update")
+                .about("Update GitHub-installed plugins")
+                .arg(Arg::new("plugins").value_name("PLUGIN").num_args(0..))
+                .arg(
+                    Arg::new("yes")
+                        .short('y')
+                        .long("yes")
+                        .action(ArgAction::SetTrue),
+                ),
+        )
+        .subcommand(
             Command::new("link")
                 .about("Link a local plugin")
                 .arg(path_arg("path", "PATH"))
@@ -1296,6 +1371,156 @@ mod tests {
             assert!(output.contains("expected-session"), "{shell:?}");
             assert!(output.contains("expected-pane"), "{shell:?}");
         }
+    }
+
+    #[test]
+    fn channel_commands_are_public_but_self_registration_is_not() {
+        let cmd = super::command();
+        let info = command_path(&cmd, &["agent", "channel-info"]);
+        assert!(argument(info, "target").is_required_set());
+        let guarded = command_path(&cmd, &["agent", "prompt-guarded"]);
+        for name in [
+            "expected-terminal",
+            "expected-registration-epoch",
+            "request-id",
+        ] {
+            assert!(option_arg(guarded, name).is_required_set());
+        }
+        assert!(has_option(guarded, "timeout-ms"));
+        assert!(has_option(guarded, "allow-cross-pane"));
+        assert!(has_option(guarded, "if-draft-empty"));
+        assert!(
+            argument(command_path(&cmd, &["agent", "draft-state"]), "target").is_required_set()
+        );
+        assert!(has_option(
+            command_path(&cmd, &["agent", "draft-state"]),
+            "allow-cross-pane"
+        ));
+        assert!(has_option(
+            command_path(&cmd, &["agent", "prompt"]),
+            "if-draft-empty"
+        ));
+        for old in ["wait", "until", "timeout"] {
+            assert!(!has_option(guarded, old));
+        }
+        assert!(command_path(&cmd, &["agent"])
+            .get_subcommands()
+            .all(|command| command.get_name() != "register-self"));
+        assert!(long_help(&["agent", "prompt-guarded"]).contains("delivery_unknown"));
+    }
+
+    #[test]
+    fn guarded_spec_accepts_required_guards_and_separator_payload() {
+        let valid = [
+            "herdr",
+            "agent",
+            "prompt-guarded",
+            "--expected-terminal=term",
+            "--expected-registration-epoch=epoch",
+            "--request-id=request",
+            "--timeout-ms=1",
+            "--allow-cross-pane",
+            "--if-draft-empty",
+            "--",
+            "--help",
+            "--session=literal",
+        ];
+        let matches = super::command().try_get_matches_from(valid).unwrap();
+        let leaf = matches
+            .subcommand_matches("agent")
+            .unwrap()
+            .subcommand_matches("prompt-guarded")
+            .unwrap();
+        assert_eq!(
+            leaf.get_one::<String>("target").map(String::as_str),
+            Some("--help")
+        );
+        assert_eq!(
+            leaf.get_one::<String>("text").map(String::as_str),
+            Some("--session=literal")
+        );
+        assert_eq!(leaf.get_one::<u64>("timeout-ms"), Some(&1));
+        assert!(leaf.get_flag("if-draft-empty"));
+        for missing in [
+            "--expected-terminal=term",
+            "--expected-registration-epoch=epoch",
+            "--request-id=request",
+        ] {
+            let input = valid.iter().copied().filter(|value| *value != missing);
+            assert!(super::command().try_get_matches_from(input).is_err());
+        }
+    }
+
+    #[test]
+    fn channel_literal_help_text_is_not_intercepted() {
+        for text in ["--help", "-h"] {
+            let args = [
+                "herdr",
+                "agent",
+                "prompt-guarded",
+                "worker",
+                text,
+                "--expected-terminal",
+                "term",
+                "--expected-registration-epoch",
+                "epoch",
+                "--request-id",
+                "request",
+            ]
+            .map(str::to_owned);
+            let mut output = Vec::new();
+            assert!(!super::write_requested_help(&args, &mut output, || {}).unwrap());
+            assert!(output.is_empty());
+            let args = ["herdr", "agent", "channel-info", "--", text].map(str::to_owned);
+            assert!(!super::write_requested_help(&args, &mut output, || {}).unwrap());
+        }
+    }
+
+    #[test]
+    fn draft_guard_spec_excludes_legacy_wait_and_keeps_literal_payload() {
+        let parsed = super::command()
+            .try_get_matches_from([
+                "herdr",
+                "agent",
+                "prompt",
+                "worker",
+                "hello",
+                "--if-draft-empty",
+            ])
+            .unwrap();
+        assert!(parsed
+            .subcommand_matches("agent")
+            .unwrap()
+            .subcommand_matches("prompt")
+            .unwrap()
+            .get_flag("if-draft-empty"));
+        assert!(super::command()
+            .try_get_matches_from([
+                "herdr",
+                "agent",
+                "prompt",
+                "worker",
+                "hello",
+                "--if-draft-empty",
+                "--wait"
+            ])
+            .is_err());
+        for expectation in ["--expected-session=s", "--expected-pane=p"] {
+            assert!(super::command()
+                .try_get_matches_from([
+                    "herdr",
+                    "agent",
+                    "prompt",
+                    "worker",
+                    "hello",
+                    "--if-draft-empty",
+                    expectation,
+                ])
+                .is_err());
+        }
+        assert!(super::command()
+            .try_get_matches_from(["herdr", "agent", "draft-state", "--", "--help"])
+            .is_ok());
     }
 
     #[test]

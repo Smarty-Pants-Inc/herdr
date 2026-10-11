@@ -621,6 +621,47 @@ fn process_group_pids(process_group_id: u32) -> Vec<u32> {
 
 /// Read `e_tpgid` (foreground process group of the controlling terminal)
 /// for the given PID.
+pub(crate) fn registered_process_liveness(peer: super::ProcessIdentity) -> super::ProcessLiveness {
+    use super::ProcessLiveness;
+    if let Some(info) = process_bsdinfo(peer.pid) {
+        if info.pbi_status == libc::SZOMB {
+            return ProcessLiveness::Dead;
+        }
+        return match process_identity_from_bsdinfo(peer.pid, &info) {
+            Some(identity) if identity == peer => ProcessLiveness::Alive,
+            Some(_) => ProcessLiveness::Dead,
+            None => ProcessLiveness::Unknown,
+        };
+    }
+    let result = unsafe { libc::kill(peer.pid as libc::pid_t, 0) };
+    if result < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+        ProcessLiveness::Dead
+    } else {
+        ProcessLiveness::Unknown
+    }
+}
+
+pub(crate) fn registered_process_is_foreground(
+    root: super::ProcessIdentity,
+    peer: super::ProcessIdentity,
+) -> bool {
+    if process_identity(root.pid) != Some(root) || process_identity(peer.pid) != Some(peer) {
+        return false;
+    }
+    let Some(info) = process_bsdinfo(peer.pid) else {
+        return false;
+    };
+    if info.pbi_status == libc::SSTOP || info.pbi_status == libc::SZOMB {
+        return false;
+    }
+    let group = unsafe { libc::getpgid(peer.pid as libc::pid_t) };
+    group > 0
+        && foreground_process_group_id(root.pid) == Some(group as u32)
+        && super::process_identity_in_pane_session(root, peer) == Some(true)
+        && process_identity(root.pid) == Some(root)
+        && process_identity(peer.pid) == Some(peer)
+}
+
 pub fn foreground_process_group_id(pid: u32) -> Option<u32> {
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
     let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
@@ -783,6 +824,10 @@ pub fn read_clipboard_text() -> Option<String> {
         LimitedRead::Empty => None,
         LimitedRead::Oversized => unreachable!("oversized clipboard text is handled before wait"),
     }
+}
+
+pub fn clipboard_text_matches(_bytes: &[u8]) -> Option<bool> {
+    None
 }
 
 pub fn open_url(url: &str) -> std::io::Result<Option<std::process::Child>> {
@@ -1113,6 +1158,39 @@ pub(crate) fn process_identity_outside_server_ancestry(
     super::observe_outside_server_ancestry(peer, server, process_identity, parent_process_identity)
 }
 
+/// Start time of `pid` in microseconds. It tells a process apart from a later
+/// one that reuses its pid.
+pub fn process_start_token(pid: u32) -> Option<u64> {
+    process_bsdinfo(pid).map(|info| bsdinfo_start_token(&info))
+}
+
+/// Process group of `pid` while that same process, matched by its start
+/// token, is alive on the terminal of the pane shell `shell_pid`. A stopped or
+/// backgrounded job still counts.
+pub fn live_pane_process_group(shell_pid: u32, pid: u32, start_token: u64) -> Option<u32> {
+    let process = process_bsdinfo(pid)?;
+    let shell = process_bsdinfo(shell_pid)?;
+    (process.pbi_status != libc::SZOMB
+        && bsdinfo_start_token(&process) == start_token
+        && process.e_tdev == shell.e_tdev)
+        .then_some(process.pbi_pgid)
+}
+
+fn bsdinfo_start_token(info: &libc::proc_bsdinfo) -> u64 {
+    info.pbi_start_tvsec
+        .saturating_mul(1_000_000)
+        .saturating_add(info.pbi_start_tvusec)
+}
+
+pub(super) fn socket_peer_pid(fd: RawFd) -> Option<u32> {
+    local_socket_peer_pid_platform(fd)
+}
+
+pub(super) fn process_name_and_parent(pid: u32) -> Option<(String, u32)> {
+    let info = process_bsdinfo(pid)?;
+    Some((comm_from_bsdinfo(&info)?, info.pbi_ppid))
+}
+
 fn process_bsdinfo(pid: u32) -> Option<libc::proc_bsdinfo> {
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
     let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
@@ -1410,6 +1488,17 @@ pub fn process_exists(pid: u32) -> bool {
     } else {
         std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
     }
+}
+
+/// OS CSPRNG via getentropy(2), at most 256 bytes per call (herdr-8592).
+pub(crate) fn secure_random_platform(bytes: &mut [u8]) -> std::io::Result<()> {
+    for chunk in bytes.chunks_mut(256) {
+        // SAFETY: the chunk is valid for writes of its (<= 256 byte) length.
+        if unsafe { libc::getentropy(chunk.as_mut_ptr().cast(), chunk.len()) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

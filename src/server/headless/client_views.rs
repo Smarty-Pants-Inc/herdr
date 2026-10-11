@@ -415,6 +415,37 @@ impl HeadlessServer {
         self.focus_target_for_surface(self.shell_target_for_client(client_id)?)
     }
 
+    pub(super) fn send_current_pane_focus_event(&self, pane_id: crate::layout::PaneId) {
+        let Some((workspace_index, _)) = self.app.find_pane(pane_id) else {
+            return;
+        };
+        let Some(runtime) = self.app.state.runtime_for_pane_in_workspace(
+            &self.app.terminal_runtimes,
+            workspace_index,
+            pane_id,
+        ) else {
+            return;
+        };
+        // A normal focus transition may have already satisfied this queued enable.
+        if !runtime.initial_focus_pending() {
+            return;
+        }
+        let focused = self.clients.iter().any(|(&client_id, client)| {
+            client.is_active_shell_client()
+                && client.outer_terminal_focus == Some(true)
+                && self
+                    .shell_focus_target(client_id)
+                    .is_some_and(|target| target.pane_id == pane_id)
+        });
+        let event = if focused {
+            crate::ghostty::FocusEvent::Gained
+        } else {
+            crate::ghostty::FocusEvent::Lost
+        };
+        self.app
+            .send_pane_focus_event(workspace_index, pane_id, event);
+    }
+
     pub(super) fn focused_shell_tabs(&self) -> HashSet<String> {
         self.clients
             .iter()

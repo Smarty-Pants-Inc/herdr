@@ -2,31 +2,67 @@ use crate::api::schema::{EventData, PluginInvocationContext};
 use crate::app::App;
 
 impl App {
+    /// Builds a public API invocation context from the caller's trusted
+    /// invoking pane (its live peer attribution), never from UI focus or a
+    /// request claim. With an invoker, workspace, tab, cwd and agent are
+    /// rebuilt from that real pane, and a provided `focused_pane_id` is only
+    /// validated: it must resolve (aliases included) to the invoker, else
+    /// `invoking_pane_mismatch` before anything else is built. Without an
+    /// invoker the invocation is global: any pane claim is ignored and all
+    /// pane, workspace and tab fields are absent, including caller-supplied
+    /// ones. Caller-own fields (selection, source, correlation, URL, handler)
+    /// are kept as the caller's input.
     pub(super) fn merge_plugin_context(
         &self,
         provided: Option<PluginInvocationContext>,
         correlation_id: &str,
-    ) -> PluginInvocationContext {
-        let mut context = self.current_plugin_context(correlation_id);
-        if let Some(provided) = provided {
-            context.workspace_id = provided.workspace_id.or(context.workspace_id);
-            context.workspace_label = provided.workspace_label.or(context.workspace_label);
-            context.workspace_cwd = provided.workspace_cwd.or(context.workspace_cwd);
-            context.worktree = provided.worktree.or(context.worktree);
-            context.tab_id = provided.tab_id.or(context.tab_id);
-            context.tab_label = provided.tab_label.or(context.tab_label);
-            context.focused_pane_id = provided.focused_pane_id.or(context.focused_pane_id);
-            context.focused_pane_cwd = provided.focused_pane_cwd.or(context.focused_pane_cwd);
-            context.focused_pane_agent = provided.focused_pane_agent.or(context.focused_pane_agent);
-            context.focused_pane_status =
-                provided.focused_pane_status.or(context.focused_pane_status);
-            context.selected_text = provided.selected_text.or(context.selected_text);
-            context.invocation_source = provided.invocation_source.or(context.invocation_source);
-            context.correlation_id = provided.correlation_id.or(context.correlation_id);
-            context.clicked_url = provided.clicked_url.or(context.clicked_url);
-            context.link_handler_id = provided.link_handler_id.or(context.link_handler_id);
+        invoker: Option<(usize, crate::layout::PaneId)>,
+    ) -> Result<PluginInvocationContext, (&'static str, String)> {
+        if let (Some(claim), Some(invoker)) = (
+            provided
+                .as_ref()
+                .and_then(|provided| provided.focused_pane_id.as_deref()),
+            invoker,
+        ) {
+            if self.parse_pane_id(claim) != Some(invoker) {
+                return Err((
+                    super::super::INVOKING_PANE_MISMATCH,
+                    super::super::INVOKING_PANE_MISMATCH_MESSAGE.to_owned(),
+                ));
+            }
         }
-        context
+        let mut context = self.invoking_plugin_context(invoker, correlation_id);
+        let Some(provided) = provided else {
+            return Ok(context);
+        };
+        context.selected_text = provided.selected_text;
+        context.invocation_source = provided.invocation_source.or(context.invocation_source);
+        context.correlation_id = provided.correlation_id.or(context.correlation_id);
+        context.clicked_url = provided.clicked_url;
+        context.link_handler_id = provided.link_handler_id;
+        Ok(context)
+    }
+
+    /// Context for an invocation that may have no invoking pane (a global
+    /// keybinding, CLI call or startup hook). It never falls back to UI focus.
+    pub(super) fn invoking_plugin_context(
+        &self,
+        invoking_pane: Option<(usize, crate::layout::PaneId)>,
+        correlation_id: &str,
+    ) -> PluginInvocationContext {
+        match invoking_pane {
+            Some((ws_idx, pane_id))
+                if self
+                    .state
+                    .workspaces
+                    .get(ws_idx)
+                    .and_then(|ws| ws.find_tab_index_for_pane(pane_id))
+                    .is_some() =>
+            {
+                self.plugin_context_for_pane(ws_idx, pane_id, correlation_id)
+            }
+            _ => empty_plugin_context(correlation_id),
+        }
     }
 
     pub(super) fn current_plugin_context(&self, correlation_id: &str) -> PluginInvocationContext {
@@ -267,7 +303,7 @@ impl App {
             })
     }
 
-    fn plugin_context_for_public_pane_id(
+    pub(super) fn plugin_context_for_public_pane_id(
         &self,
         pane_id: &str,
         correlation_id: &str,

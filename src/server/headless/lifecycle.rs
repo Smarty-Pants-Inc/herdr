@@ -95,6 +95,8 @@ impl HeadlessServer {
             }
         }
 
+        // Channels/epochs are not handoff state. Revoke before any runtime transfer.
+        self.app.revoke_agent_channels();
         self.handoff_in_progress = true;
         self.disconnect_all_clients_for_handoff();
         let _ = reject_pending_client_connections(&self.client_listener);
@@ -447,7 +449,7 @@ impl HeadlessServer {
             path,
             api_tx,
             self.app.event_hub.clone(),
-            self.should_quit.clone(),
+            self.server_stop.clone(),
         )?;
         self.api_server = Some(api_server);
         Ok(())
@@ -499,7 +501,14 @@ impl HeadlessServer {
         if self.shutting_down {
             return;
         }
-        info!("server shutdown initiated");
+        let reason = if self.host_shutdown_requested.load(Ordering::Acquire) {
+            ShutdownReason::HostShutdown
+        } else {
+            self.server_stop
+                .take_reason()
+                .unwrap_or(ShutdownReason::Unknown)
+        };
+        info!(%reason, "server shutdown initiated");
         self.shutting_down = true;
 
         // Clear client-local host graphics, then send ServerShutdown to all connected clients.

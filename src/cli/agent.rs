@@ -6,6 +6,10 @@ use crate::api::schema::{
     ErrorResponse, Method, PaneProcessInfoParams, PaneTarget, ReadFormat, ReadSource, Request,
 };
 
+mod channel;
+
+pub(crate) use channel::literal_slots as agent_channel_literal_slots;
+
 const AGENT_START_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const PANE_SHELL_READINESS_RETRY_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -18,6 +22,9 @@ pub(super) fn run_agent_command(args: &[String]) -> std::io::Result<i32> {
     match subcommand {
         "list" => agent_list(&args[1..]),
         "get" => agent_get(&args[1..]),
+        "channel-info" => channel::channel_info(&args[1..]),
+        "draft-state" => channel::draft_state(&args[1..]),
+        "prompt-guarded" => channel::prompt_guarded(&args[1..]),
         "read" => agent_read(&args[1..]),
         "send-keys" => agent_send_keys(&args[1..]),
         "prompt" => agent_prompt(&args[1..]),
@@ -767,8 +774,10 @@ fn agent_rename(args: &[String]) -> std::io::Result<i32> {
     })?)
 }
 
+const AGENT_PROMPT_USAGE: &str = "usage: herdr agent prompt <target> <text> [--if-draft-empty | [--expected-session ID] [--expected-pane ID] [--wait [--until STATUS]... [--timeout MS]]] [--allow-cross-pane]";
+
 fn parse_agent_prompt_args(args: &[String]) -> Result<AgentPromptParams, String> {
-    let target = args.first().ok_or("usage: herdr agent prompt <target> <text> [--expected-session ID] [--expected-pane ID] [--wait] [--until STATUS]... [--timeout MS] [--allow-cross-pane]")?;
+    let target = args.first().ok_or(AGENT_PROMPT_USAGE)?;
     let text = args.get(1).ok_or("agent prompt requires text")?;
     // Keep the fixed positional text literal, including flag-shaped prompts.
     let options = super::expand_equals_args(
@@ -849,6 +858,35 @@ fn parse_agent_prompt_args(args: &[String]) -> Result<AgentPromptParams, String>
 }
 
 fn agent_prompt(args: &[String]) -> std::io::Result<i32> {
+    let Some(target) = args.first() else {
+        eprintln!("{AGENT_PROMPT_USAGE}");
+        return Ok(2);
+    };
+    let Some(text) = args.get(1) else {
+        eprintln!("agent prompt requires text");
+        return Ok(2);
+    };
+    // The first two argv remain literal target/text, including flag-shaped text.
+    // Select the guarded route before parsing any legacy wait options so it can
+    // never accidentally reach the typing path or turn-completion machinery.
+    // Session expectations are extra arguments on this route and are refused.
+    if args[2..].iter().any(|arg| arg == "--if-draft-empty") {
+        let mut if_draft_empty = false;
+        let mut allow_cross_pane = false;
+        for option in &args[2..] {
+            match option.as_str() {
+                "--if-draft-empty" if !if_draft_empty => if_draft_empty = true,
+                "--allow-cross-pane" => allow_cross_pane = true,
+                _ => {
+                    eprintln!(
+                        "agent prompt --if-draft-empty only supports --allow-cross-pane; --wait, --until, --timeout, duplicate guards, and extra arguments are refused before sending"
+                    );
+                    return Ok(2);
+                }
+            }
+        }
+        return channel::prompt_if_draft_empty(target, text, allow_cross_pane);
+    }
     let params = match parse_agent_prompt_args(args) {
         Ok(params) => params,
         Err(message) => {
@@ -896,7 +934,9 @@ fn agent_send_keys(args: &[String]) -> std::io::Result<i32> {
 
 fn agent_read(args: &[String]) -> std::io::Result<i32> {
     let Some(target) = args.first() else {
-        eprintln!("usage: herdr agent read <target> [--source visible|recent|recent-unwrapped] [--lines N] [--format text|ansi] [--ansi]");
+        eprintln!(
+            "usage: herdr agent read <target> [--source visible|recent|recent-unwrapped] [--lines N] [--format text|ansi] [--ansi]"
+        );
         return Ok(2);
     };
 
@@ -962,9 +1002,18 @@ fn print_agent_help() {
     eprintln!("herdr agent commands:");
     eprintln!("  herdr agent list");
     eprintln!("  herdr agent get <target>");
-    eprintln!("  herdr agent read <target> [--source visible|recent|recent-unwrapped|detection] [--lines N] [--format text|ansi] [--ansi]");
+    eprintln!("  herdr agent channel-info <target>");
+    eprintln!("  herdr agent draft-state <target> [--allow-cross-pane]");
+    eprintln!(
+        "  herdr agent prompt-guarded <target> <text> --expected-terminal TERMINAL_ID --expected-registration-epoch EPOCH --request-id ID [--timeout-ms MS] [--allow-cross-pane] [--if-draft-empty]"
+    );
+    eprintln!(
+        "  herdr agent read <target> [--source visible|recent|recent-unwrapped|detection] [--lines N] [--format text|ansi] [--ansi]"
+    );
     eprintln!("  herdr agent send-keys <target> [--allow-cross-pane] <key> [key ...]");
-    eprintln!("  herdr agent prompt <target> <text> [--expected-session ID] [--expected-pane ID] [--wait] [--until STATUS]... [--timeout MS] [--allow-cross-pane]");
+    eprintln!(
+        "  herdr agent prompt <target> <text> [--if-draft-empty | [--expected-session ID] [--expected-pane ID] [--wait [--until STATUS]... [--timeout MS]]] [--allow-cross-pane]"
+    );
     eprintln!("  herdr agent rename <target> <name>|--clear");
     eprintln!("  herdr agent focus <target>");
     eprintln!("  herdr agent wait <target> [--until STATUS]... [--timeout MS]");
@@ -977,6 +1026,9 @@ fn print_agent_help() {
         "  herdr agent explain --file PATH --agent LABEL [--json|--format text|json] [--verbose]"
     );
     eprintln!("  targets accept unique agent names and pane ids that currently host agents");
+    eprintln!(
+        "  channel-info, draft-state, and guarded prompts also accept terminal targets without agent detection"
+    );
     eprintln!("  kinds: {}", super::spec::agent_kind_values().join("|"));
 }
 

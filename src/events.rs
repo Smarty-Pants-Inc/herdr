@@ -177,6 +177,10 @@ pub enum AppEvent {
         activated: Vec<crate::detect::Agent>,
         status: crate::detect::manifest_update::ManifestUpdateStatus,
     },
+    /// An enabled pane child still needs its initial current-focus report.
+    /// PTY writes repeat this request until focus input is successfully admitted.
+    /// This runtime event is independent of pane visibility and rendering.
+    TerminalFocusReportingEnabled { pane_id: PaneId },
     /// A pane child emitted one or more executable BEL characters.
     /// The host-facing process forwards them to its outer terminal.
     TerminalBell { pane_id: PaneId, count: u16 },
@@ -191,10 +195,19 @@ pub enum AppEvent {
     },
     /// Coalesced native git metadata change; debounced by the app refresh scheduler.
     GitFilesChanged,
-    /// Background git status refresh completed for workspaces.
+    /// Background git status refresh completed for workspaces. `generation`
+    /// identifies the worker start so results older than the latest identity
+    /// request can be dropped.
     GitStatusRefreshed {
+        generation: u64,
         results: Vec<WorkspaceGitStatus>,
         cache_updates: Vec<(std::path::PathBuf, GitStatusCacheEntry)>,
+    },
+    /// Background validation of a saved membership after session restore.
+    RestoredWorktreeSpaceChecked {
+        workspace_id: String,
+        expected: crate::workspace::WorktreeSpaceMembership,
+        valid: bool,
     },
     /// A configured tab bar status command finished.
     TabBarCommandFinished {

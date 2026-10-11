@@ -531,6 +531,9 @@ impl TerminalRuntime {
     ) -> Result<bool, mpsc::error::TrySendError<Bytes>> {
         self.0.try_send_paste_with_source(text, source)
     }
+    pub(crate) fn initial_focus_pending(&self) -> bool {
+        self.0.initial_focus_pending()
+    }
     pub(crate) fn try_send_focus_event_with_source(
         &self,
         event: crate::ghostty::FocusEvent,
@@ -666,6 +669,20 @@ impl TerminalRuntime {
         hook: Box<dyn FnMut(usize) + Send>,
     ) -> std::io::Result<()> {
         self.0.test_set_before_write(hook)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn test_start_basic_detection(&mut self) -> mpsc::Receiver<crate::events::AppEvent> {
+        self.0.test_start_basic_detection()
+    }
+
+    #[cfg(unix)]
+    pub(crate) async fn test_wait_for_detection_reads(&self, expected: usize) {
+        self.0.test_wait_for_detection_reads(expected).await;
+    }
+
+    pub(crate) fn test_scroll_metrics_reads(&self) -> usize {
+        self.0.test_scroll_metrics_reads()
     }
 
     #[cfg(unix)]
