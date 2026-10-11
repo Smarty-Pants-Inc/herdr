@@ -219,6 +219,28 @@ impl RemoteBridgeWake {
     }
 }
 
+/// Ends a server-side client pipe connection. Disconnecting forces the client
+/// end closed, and cancelling wakes a writer or reader that is blocked on any
+/// duplicated handle of this pipe, so both transport threads return.
+pub(crate) fn shutdown_client_stream(stream: &crate::ipc::LocalStream) -> std::io::Result<()> {
+    use std::os::windows::io::{AsHandle, AsRawHandle};
+
+    let crate::ipc::LocalStream::NamedPipe(pipe) = stream;
+    let handle = pipe.as_handle().as_raw_handle();
+    // SAFETY: `handle` is a live server pipe handle borrowed from `stream`.
+    let disconnected = unsafe { windows_sys::Win32::System::Pipes::DisconnectNamedPipe(handle) };
+    let result = if disconnected == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    };
+    // Pending I/O is cancelled per pipe instance, which duplicated handles share.
+    // ERROR_NOT_FOUND only means nothing was pending.
+    // SAFETY: as above; a null OVERLAPPED cancels every request on the handle.
+    unsafe { windows_sys::Win32::System::IO::CancelIoEx(handle, std::ptr::null()) };
+    result
+}
+
 pub(crate) fn wait_client_stream_readable(
     _stream: &crate::ipc::LocalStream,
 ) -> std::io::Result<()> {

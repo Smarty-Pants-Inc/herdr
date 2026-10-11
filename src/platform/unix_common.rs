@@ -95,6 +95,85 @@ pub(crate) fn shutdown_client_stream(stream: &crate::ipc::LocalStream) -> std::i
     stream.inner().shutdown(std::net::Shutdown::Both)
 }
 
+/// Fresh real streams with a small server send buffer; no fixture bytes are sent.
+#[cfg(test)]
+pub(crate) fn blocked_client_stream_pair_for_test(
+) -> std::io::Result<(crate::ipc::LocalStream, crate::ipc::LocalStream, usize)> {
+    use interprocess::os::unix::uds_local_socket;
+    use std::os::fd::AsRawFd as _;
+
+    let (client, server) = std::os::unix::net::UnixStream::pair()?;
+    let requested: libc::c_int = 4096;
+    // SAFETY: server owns a live socket and requested is a correctly sized int.
+    if unsafe {
+        libc::setsockopt(
+            server.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
+            std::ptr::from_ref(&requested).cast(),
+            std::mem::size_of_val(&requested) as libc::socklen_t,
+        )
+    } < 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut capacity: libc::c_int = 0;
+    let mut length = std::mem::size_of_val(&capacity) as libc::socklen_t;
+    // SAFETY: both output pointers refer to live, correctly sized storage.
+    if unsafe {
+        libc::getsockopt(
+            server.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
+            std::ptr::from_mut(&mut capacity).cast(),
+            &mut length,
+        )
+    } < 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    if capacity <= 0 {
+        return Err(std::io::Error::other("test socket has no send buffer"));
+    }
+    Ok((
+        uds_local_socket::Stream::from(client).into(),
+        uds_local_socket::Stream::from(server).into(),
+        capacity as usize,
+    ))
+}
+
+/// Non-consuming evidence that the sole frame reached the kernel and exhausted
+/// server write readiness. SO_SNDBUF includes kernel bookkeeping (not just bytes),
+/// so compare readiness, not FIONREAD against the reported accounting capacity.
+#[cfg(test)]
+pub(crate) fn client_stream_buffer_full_for_test(
+    client: &crate::ipc::LocalStream,
+    server: &crate::ipc::LocalStream,
+    _capacity: usize,
+) -> std::io::Result<bool> {
+    use std::os::fd::AsRawFd as _;
+
+    let crate::ipc::LocalStream::UdSocket(client) = client;
+    let crate::ipc::LocalStream::UdSocket(server) = server;
+    let mut available: libc::c_int = 0;
+    // SAFETY: FIONREAD only reports queued bytes into this live int; no read occurs.
+    if unsafe { libc::ioctl(client.inner().as_raw_fd(), libc::FIONREAD, &mut available) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut descriptor = libc::pollfd {
+        fd: server.inner().as_raw_fd(),
+        events: libc::POLLOUT,
+        revents: 0,
+    };
+    // SAFETY: the borrowed socket remains live and the array has one descriptor.
+    let ready = unsafe { libc::poll(&mut descriptor, 1, 0) };
+    if ready < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // A closed/error socket also wakes poll, so it cannot be mistaken for fullness.
+    Ok(available > 0 && ready == 0)
+}
+
 pub(crate) struct ClientStreamReader<'a>(pub(crate) &'a mut crate::ipc::LocalStream);
 
 impl std::io::Read for ClientStreamReader<'_> {

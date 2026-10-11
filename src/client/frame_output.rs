@@ -13,12 +13,18 @@ use base64::Engine as _;
 pub(crate) struct ComposedFrame {
     pub(crate) frame: FrameData,
     pub(crate) graphics: GraphicsOutput,
+    /// Shell graphics-cache changes this frame carries; committed only once presented.
+    pub(crate) graphics_delivery: Option<u64>,
 }
 
 impl From<FrameData> for ComposedFrame {
     fn from(mut frame: FrameData) -> Self {
         let graphics = GraphicsOutput::from_bytes(std::mem::take(&mut frame.graphics));
-        Self { frame, graphics }
+        Self {
+            frame,
+            graphics,
+            graphics_delivery: None,
+        }
     }
 }
 
