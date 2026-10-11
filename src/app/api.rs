@@ -1011,7 +1011,7 @@ impl App {
     pub(crate) fn handle_api_request_after_internal_events_drained_with_context(
         &mut self,
         request: crate::api::schema::Request,
-        context: crate::api::ApiRequestContext,
+        mut context: crate::api::ApiRequestContext,
     ) -> String {
         self.handle_api_request_with_ingress(request, context, ApiIngress::Public)
     }
@@ -1035,7 +1035,7 @@ impl App {
         ingress: ApiIngress,
     ) -> String {
         self.sync_pending_terminal_titles();
-        if let Some(response) = self.cross_pane_input_denial(&request, context) {
+        if let Some(response) = self.cross_pane_input_denial_with_ancestry(&request, &mut context) {
             return response;
         }
         let mut request = request;

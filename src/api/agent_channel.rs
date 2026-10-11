@@ -302,11 +302,21 @@ impl Channel {
                 ledger.requests.values().all(|delivery| !delivery.pending())
             })
     }
+    #[cfg(test)]
     pub(crate) fn reserve(
         &self,
         request_id: String,
         text: String,
         timeout: Duration,
+    ) -> Result<Reservation, Outcome> {
+        self.reserve_with_audit(request_id, text, timeout, || Ok(()))
+    }
+    pub(crate) fn reserve_with_audit(
+        &self,
+        request_id: String,
+        text: String,
+        timeout: Duration,
+        audit: impl FnOnce() -> Result<(), Outcome>,
     ) -> Result<Reservation, Outcome> {
         if !self.is_ready() && !self.rotating.load(Ordering::Acquire) {
             return Err(Outcome::failure(
@@ -375,6 +385,9 @@ impl Channel {
             channel_waiters: self.waiters.clone(),
         });
         let waiter = delivery.waiter()?; // Capacity refusal is before the dispatch queue effect.
+                                         // Audit only a fresh, validated admission, durably before reservation/enqueue.
+                                         // Receipt-only retries never reach the sink, including on retired epochs.
+        audit()?;
         ledger.bytes += retained_bytes;
         ledger.requests.insert(request_id, delivery.clone()); // Reservation precedes enqueue/effect.
         if ledger.requests.len() >= ROTATE_LEDGER_KEYS || ledger.bytes >= ROTATE_LEDGER_BYTES {

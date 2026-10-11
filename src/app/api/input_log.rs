@@ -94,8 +94,19 @@ impl App {
             if let Some(unit) = metadata.unit {
                 caller_fields["unit"] = unit.into();
             }
+            #[cfg(target_os = "linux")]
+            if let Some(sid) = metadata.sid {
+                caller_fields["sid"] = sid.into();
+            }
         }
         if let Some(peer) = context.local_peer_identity {
+            // The guard may have skipped its chronology proof (explicit opt-in
+            // or captured pane markers). Otherwise reuse its request-local
+            // observation: no additional /proc walk to log verdict or root.
+            let ancestry = context
+                .server_ancestry
+                .unwrap_or_else(|| crate::platform::process_identity_server_ancestry(peer));
+            add_server_ancestry_fields(&mut caller_fields, ancestry);
             let herdr_exe = crate::platform::launch_executable()
                 .ok()
                 .and_then(|path| path.file_name()?.to_str().map(str::to_owned));
@@ -130,6 +141,23 @@ impl App {
             "caller": caller_fields,
         })
         .to_string()
+    }
+}
+
+fn add_server_ancestry_fields(
+    caller: &mut serde_json::Value,
+    observation: crate::platform::ServerAncestryObservation,
+) {
+    caller["ancestry"] = match observation.verdict {
+        crate::platform::ServerAncestry::Outside => "outside",
+        crate::platform::ServerAncestry::ReachedServer => "reached",
+        crate::platform::ServerAncestry::Unknown
+        | crate::platform::ServerAncestry::NotApplicable => "unknown",
+    }
+    .into();
+    #[cfg(target_os = "linux")]
+    if let Some(root) = observation.root_pid {
+        caller["ancestry_root_pid"] = root.into();
     }
 }
 
@@ -489,6 +517,9 @@ mod tests {
             assert_eq!(presence, Some(&serde_json::json!(expected)), "{raw}");
         } else {
             assert!(presence.is_none_or(serde_json::Value::is_null), "{raw}");
+            assert_eq!(line["caller"]["ancestry"], "unknown", "{raw}");
+            assert!(line["caller"].get("sid").is_none(), "{raw}");
+            assert!(line["caller"].get("ancestry_root_pid").is_none(), "{raw}");
         }
     }
 
@@ -514,6 +545,119 @@ mod tests {
     #[tokio::test]
     async fn diagnostic_pane_env_presence_stale_caller_is_unknown_and_private() {
         assert_logged_pane_env_presence(Some("931-private-stale-pane-marker"), None);
+    }
+
+    fn assert_ancestry_field(verdict: crate::platform::ServerAncestry, expected: &str) {
+        let mut caller = serde_json::json!({});
+        super::add_server_ancestry_fields(
+            &mut caller,
+            crate::platform::ServerAncestryObservation {
+                verdict,
+                #[cfg(target_os = "linux")]
+                root_pid: Some(421),
+            },
+        );
+        assert_eq!(caller["ancestry"], expected);
+        #[cfg(target_os = "linux")]
+        assert_eq!(caller["ancestry_root_pid"], 421);
+        #[cfg(not(target_os = "linux"))]
+        assert!(caller.get("ancestry_root_pid").is_none());
+    }
+
+    #[test]
+    fn diagnostic_ancestry_outside_is_logged() {
+        assert_ancestry_field(crate::platform::ServerAncestry::Outside, "outside");
+    }
+
+    #[test]
+    fn diagnostic_ancestry_unknown_is_logged() {
+        assert_ancestry_field(crate::platform::ServerAncestry::Unknown, "unknown");
+        assert_ancestry_field(crate::platform::ServerAncestry::NotApplicable, "unknown");
+    }
+
+    #[test]
+    fn diagnostic_ancestry_reached_is_logged() {
+        assert_ancestry_field(crate::platform::ServerAncestry::ReachedServer, "reached");
+    }
+
+    #[tokio::test]
+    async fn diagnostic_ancestry_fields_are_absent_without_a_peer() {
+        let fixture = fixture();
+        let pane = fixture.app.state.workspaces[0].tabs[0].root_pane;
+        let raw = fixture.app.api_input_log_line(
+            "pane.send_text",
+            0,
+            pane,
+            ApiRequestContext::default(),
+            1,
+        );
+        let line: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        for field in ["ancestry", "sid", "ancestry_root_pid"] {
+            assert!(line["caller"].get(field).is_none(), "{raw}");
+        }
+    }
+
+    #[tokio::test]
+    async fn diagnostic_ancestry_reuses_the_guard_observation_without_another_walk() {
+        let fixture = fixture();
+        let mut context = ApiRequestContext {
+            local_peer_pane_origin: crate::platform::PeerPaneOrigin::Absent,
+            ..ApiRequestContext::for_local_peer_pid(Some(std::process::id()))
+        };
+        let peer = context.local_peer_identity.expect("live peer");
+        let request = Request {
+            id: "cached-ancestry".into(),
+            method: Method::PaneSendText(PaneSendTextParams {
+                pane_id: fixture.target_pane_id.clone(),
+                text: "secret-not-logged".into(),
+                allow_cross_pane: false,
+            }),
+        };
+        crate::platform::with_server_ancestry_for_test(peer, Some(true), || {
+            assert!(fixture
+                .app
+                .cross_pane_input_denial_with_ancestry(&request, &mut context)
+                .is_none());
+        });
+        let saved = context.server_ancestry.expect("guard retained observation");
+        assert_eq!(saved.verdict, crate::platform::ServerAncestry::Outside);
+        let pane = fixture.app.state.workspaces[0].tabs[0].root_pane;
+        // A second observation would now return unknown. The logged outside
+        // result proves the fallback is lazy, not a duplicate guard walk.
+        crate::platform::with_server_ancestry_for_test(peer, None, || {
+            let raw = fixture
+                .app
+                .api_input_log_line("pane.send_text", 0, pane, context, 1);
+            let line: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(line["caller"]["ancestry"], "outside");
+            assert!(!raw.contains("secret-not-logged"));
+            // The original accept context is not modified: the next request
+            // observes its own proof, rather than retaining a prior request's.
+            let fresh = ApiRequestContext::for_local_peer_pid(Some(peer.pid));
+            assert!(fresh.server_ancestry.is_none());
+            let raw = fixture
+                .app
+                .api_input_log_line("pane.send_text", 0, pane, fresh, 1);
+            let line: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(line["caller"]["ancestry"], "unknown");
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn diagnostic_linux_session_and_walk_root_are_logged_before_exit() {
+        let fixture = fixture();
+        let pane = fixture.app.state.workspaces[0].tabs[0].root_pane;
+        let context = ApiRequestContext::for_local_peer_pid(Some(std::process::id()));
+        let raw = fixture
+            .app
+            .api_input_log_line("pane.send_text", 0, pane, context, 1);
+        let line: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let metadata =
+            crate::platform::process_caller_metadata(context.local_peer_identity.unwrap()).unwrap();
+        assert_eq!(line["caller"]["sid"], metadata.sid.unwrap());
+        assert_eq!(line["caller"]["ancestry"], "reached");
+        assert_eq!(line["caller"]["ancestry_root_pid"], std::process::id());
     }
 
     fn diagnostic_identity(pid: u32) -> crate::platform::ProcessIdentity {

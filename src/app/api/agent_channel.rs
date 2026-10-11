@@ -308,7 +308,7 @@ impl App {
     pub(crate) fn handle_deferred_guarded_agent_prompt(
         &mut self,
         request: Request,
-        context: crate::api::ApiRequestContext,
+        mut context: crate::api::ApiRequestContext,
         respond_to: std::sync::mpsc::Sender<String>,
     ) -> bool {
         if !matches!(request.method, Method::AgentPromptGuarded(_)) {
@@ -322,14 +322,14 @@ impl App {
             ));
             return true;
         }
-        if let Some(response) = self.cross_pane_input_denial(&request, context) {
+        if let Some(response) = self.cross_pane_input_denial_with_ancestry(&request, &mut context) {
             let _ = respond_to.send(response);
             return true;
         }
         let Method::AgentPromptGuarded(params) = request.method else {
             return false;
         };
-        let reservation = self.reserve_guarded_prompt(&params);
+        let reservation = self.reserve_guarded_prompt(&params, context);
         match reservation {
             Ok((delivery, duplicate, waiter)) => {
                 std::thread::spawn(move || {
@@ -346,6 +346,7 @@ impl App {
     fn reserve_guarded_prompt(
         &mut self,
         params: &AgentPromptGuardedParams,
+        context: crate::api::ApiRequestContext,
     ) -> Result<
         (
             Arc<crate::api::agent_channel::Delivery>,
@@ -411,10 +412,26 @@ impl App {
                 "registered owner is disconnected, stale or not foreground",
             ));
         }
-        channel.reserve(
+        channel.reserve_with_audit(
             params.request_id.clone(),
             params.text.clone(),
             Duration::from_millis(timeout),
+            || {
+                self.log_api_input(
+                    &params.request_id,
+                    "agent.prompt_guarded",
+                    target.ws_idx,
+                    target.pane_id,
+                    context,
+                    params.text.len(),
+                )
+                .map_err(|_| {
+                    Outcome::failure(
+                        "input_log_unavailable",
+                        "cannot record this input in the API input log, so it was not sent",
+                    )
+                })
+            },
         )
     }
 }

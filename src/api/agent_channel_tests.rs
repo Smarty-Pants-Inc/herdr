@@ -81,6 +81,50 @@ fn channel_dedup_reserves_before_dispatch_and_shares_one_outcome() {
     assert_eq!(result["result"]["duplicate"], true);
 }
 #[test]
+fn channel_audit_precedes_enqueue_and_failed_audit_leaves_key_unreserved() {
+    let (channel, receiver) = channel();
+    let refused = channel.reserve_with_audit(
+        "r".into(),
+        "private prompt".into(),
+        Duration::from_secs(1),
+        || {
+            assert!(receiver.try_recv().is_err());
+            Err(Outcome::failure("input_log_unavailable", "audit failed"))
+        },
+    );
+    assert_eq!(code(refused.err().unwrap()), "input_log_unavailable");
+    assert!(receiver.try_recv().is_err());
+    assert!(channel.ledger.lock().unwrap().requests.is_empty());
+    assert_eq!(channel.ledger.lock().unwrap().bytes, 0);
+    assert_eq!(channel.waiters.load(Ordering::Acquire), 0);
+    let audited = Cell::new(0);
+    let (first, duplicate, _waiter) = channel
+        .reserve_with_audit(
+            "r".into(),
+            "private prompt".into(),
+            Duration::from_secs(1),
+            || {
+                assert!(receiver.try_recv().is_err());
+                audited.set(audited.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap();
+    assert!(!duplicate);
+    assert!(Arc::ptr_eq(&first, &receiver.try_recv().unwrap()));
+    let (_, duplicate, _retry_waiter) = channel
+        .reserve_with_audit(
+            "r".into(),
+            "private prompt".into(),
+            Duration::from_secs(1),
+            || panic!("receipt-only retry must not audit or enqueue"),
+        )
+        .unwrap();
+    assert!(duplicate);
+    assert_eq!(audited.get(), 1);
+    assert!(receiver.try_recv().is_err());
+}
+#[test]
 fn channel_ack_requires_complete_dispatch_and_all_correlations() {
     let (channel, _receiver) = channel();
     let (delivery, _, _waiter) = reserve(&channel, "r");

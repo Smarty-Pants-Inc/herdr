@@ -899,6 +899,8 @@ Worktree 事件订阅包括 `worktree.created`、`worktree.opened` 和 `worktree
 
 在 Linux 和 macOS 上，`caller.exe` 和 `caller.ppid` 记录写入时的可执行文件基本名称（不是可修改的进程标签）和父进程 PID，即使调用方不属于任何窗格。在 Linux 上，如果调用方的 cgroup 路径包含 systemd 的 `.service` 或 `.scope`，还会记录 `caller.unit`。无法获取的字段会省略；Windows 和其他平台不记录这些字段。元数据查询失败不会拒绝输入。键入的输入不会添加 API 日志记录。
 
+每条具有 socket 对端身份的记录都包含 `caller.ancestry`：`outside`（已证明调用方的祖先链不属于此服务器）、`unknown`（无法完成证明或平台不支持）或 `reached`（祖先遍历已到达此服务器）。该判定与窗格归属无关；`caller.pane` 为 null 本身并不代表任何祖先判定。输入守卫已在当前请求中取得证明时，日志会复用它。Linux 还记录 `caller.sid`（对端的 OS 会话 ID，与 `getsid` 返回的 ID 相同，从现有进程快照读取）和 `caller.ancestry_root_pid`（遍历中最后检查的已固定 PID：`reached` 时为服务器 PID，否则为证明停止前检查的最上层祖先进程）。这两个字段在无法获取时省略，其他平台不包含它们。`caller.ancestor_exe` 和 `caller.ancestor_pid` 标识可观测到的最近一个非 Herdr 祖先进程；`caller.pane_env_present` 仅记录是否存在 `HERDR_PANE_ID`，从不记录其值。这些诊断字段不授予权限，也不改变输入守卫。
+
 这样，读取智能体会话的一方无需在终端字节流中添加任何内容，就能区分 API 发送到窗格的轮次和在窗格中键入的轮次。
 
 ## 读取窗格
