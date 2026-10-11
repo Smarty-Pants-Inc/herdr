@@ -2346,7 +2346,10 @@ mod tests {
         assert_eq!(queue.recv(), None, "writer thread stops after overflow");
     }
 
-    #[cfg(any(unix, windows))]
+    // herdr#189 accepts cancelling a blocked Windows named-pipe write as a
+    // follow-up; only bounded memory and dropping the client are guaranteed there.
+    // The cross-platform control_queue_overflow_closes_the_writer test covers the bound.
+    #[cfg(unix)]
     #[test]
     fn control_overflow_unblocks_a_writer_stuck_on_a_non_reading_client() {
         let (mut client_stream, server_stream, capacity) =
