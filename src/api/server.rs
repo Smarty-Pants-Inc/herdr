@@ -1501,11 +1501,30 @@ mod tests {
         }
     }
 
+    struct AcceptFailureGate {
+        observed: std::sync::mpsc::Sender<()>,
+        resume: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
     #[derive(Clone)]
-    struct LogCapture(Arc<Mutex<Vec<u8>>>);
+    struct LogCapture(Arc<Mutex<Vec<u8>>>, Option<Arc<AcceptFailureGate>>);
     impl Write for LogCapture {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
             self.0.lock().unwrap().extend_from_slice(bytes);
+            if let Some(gate) = &self.1 {
+                let warning = b"temporary api listener accept failure";
+                if bytes.windows(warning.len()).any(|part| part == warning) {
+                    // Pin the listener at its observed EMFILE failure until the
+                    // test has retired it or released pressure. Do not retain
+                    // the log mutex while waiting for the test's acknowledgement.
+                    gate.observed.send(()).unwrap();
+                    gate.resume
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(10))
+                        .unwrap();
+                }
+            }
             Ok(bytes.len())
         }
         fn flush(&mut self) -> io::Result<()> {
@@ -1514,7 +1533,11 @@ mod tests {
     }
 
     fn capture_listener_logs() -> LogCapture {
-        let logs = LogCapture(Arc::new(Mutex::new(Vec::new())));
+        capture_listener_logs_with_gate(None)
+    }
+
+    fn capture_listener_logs_with_gate(gate: Option<AcceptFailureGate>) -> LogCapture {
+        let logs = LogCapture(Arc::new(Mutex::new(Vec::new())), gate.map(Arc::new));
         let writer = logs.clone();
         tracing::subscriber::set_global_default(
             tracing_subscriber::fmt()
@@ -1576,16 +1599,15 @@ mod tests {
     }
 
     fn assert_listener_channel_closed(rx: &mut mpsc::UnboundedReceiver<ApiRequestMessage>) {
-        let deadline = Instant::now() + Duration::from_secs(3);
-        loop {
-            match rx.try_recv() {
-                Err(mpsc::error::TryRecvError::Disconnected) => return,
-                Err(mpsc::error::TryRecvError::Empty) => {
-                    assert!(Instant::now() < deadline, "retired listener must exit");
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                Ok(message) => panic!("retired listener dispatched {:?}", message.request),
-            }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let received = runtime
+            .block_on(async { tokio::time::timeout(Duration::from_secs(3), rx.recv()).await })
+            .expect("retired listener must exit");
+        if let Some(message) = received {
+            panic!("retired listener dispatched {:?}", message.request);
         }
     }
 
@@ -1634,7 +1656,12 @@ mod tests {
             return;
         }
 
-        let logs = capture_listener_logs();
+        let (observed_tx, observed_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let logs = capture_listener_logs_with_gate(Some(AcceptFailureGate {
+            observed: observed_tx,
+            resume: Mutex::new(resume_rx),
+        }));
 
         let path = unique_test_path("emfile-api");
         let config_home = PathBuf::from(std::env::var_os("XDG_CONFIG_HOME").unwrap());
@@ -1697,15 +1724,9 @@ mod tests {
         client.write_all(queued_request).unwrap();
 
         let warning = "temporary api listener accept failure";
-        let deadline = Instant::now() + Duration::from_secs(3);
-        loop {
-            if String::from_utf8_lossy(&logs.0.lock().unwrap()).contains(warning) {
-                break;
-            }
-            assert!(Instant::now() < deadline, "accept must observe EMFILE");
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        std::thread::sleep(Duration::from_millis(150));
+        observed_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("accept must observe EMFILE");
         assert!(
             !handle._thread.is_finished(),
             "listener must survive EMFILE"
@@ -1720,6 +1741,7 @@ mod tests {
             drop(handle);
             assert!(!path.exists(), "drop must remove the owned socket name");
             drop(files);
+            resume_tx.send(()).unwrap();
             // Only the listener/its handlers own senders. Disconnection proves their
             // exit, and receiving anything instead catches dispatch of queued work.
             assert_listener_channel_closed(&mut rx);
@@ -1731,6 +1753,7 @@ mod tests {
             return;
         }
         drop(files);
+        resume_tx.send(()).unwrap();
 
         let mut response = String::new();
         let queued_read = BufReader::new(&mut client).read_line(&mut response);
@@ -1770,7 +1793,7 @@ mod tests {
         assert_eq!(std::process::id(), pid);
         assert!(!handle._thread.is_finished());
         println!(
-            "EMFILE observed; one warning during repeated retries; fresh correlated pong on the same PID {pid} and live listener (queued pong required except macOS EOF/reset)"
+            "EMFILE observed; pressure released; fresh correlated pong on the same PID {pid} and live listener (queued pong required except macOS EOF/reset)"
         );
         drop(fresh);
         drop(handle);
