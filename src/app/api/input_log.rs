@@ -261,6 +261,14 @@ fn append_line(path: &std::path::Path, line: &str) -> std::io::Result<()> {
 /// fresh, the record appended and the handle closed. No writer keeps a log handle across
 /// appends, so none can write to a generation that was already rotated away.
 ///
+/// An older Herdr writer (the pre-upgrade binary during a live handoff) does not know
+/// `<log>.lock`; it locks the log file itself. Rotation therefore also takes that lock on the
+/// current log before renaming it, so such a writer in the middle of an append finishes first.
+/// On Unix, a legacy writer that was already waiting for the old inode's lock may still append
+/// its record to `<log>.1` after the rename; the record is kept there until the next rotation.
+/// That is an accepted limit of the upgrade transition only (see
+/// `platform::rotate_private_log`).
+///
 /// Rotation never costs a record: if the rename fails, the record goes to the full log. A
 /// symlink or foreign file at the log path is neither rotated nor written (the private open
 /// refuses it), as before.
@@ -278,13 +286,17 @@ fn append_line_with_cap(path: &std::path::Path, line: &str, cap: u64) -> std::io
 }
 
 /// Renames the log to `<log>.1` when it is a regular file we own of at least `cap` bytes.
-/// The caller holds the writer lock. A failure is logged and otherwise ignored.
+/// The caller holds the writer lock. Before the rename the log is opened through the private
+/// open (restricting it to owner-only) and locked against legacy writers that lock the log
+/// itself. A failure is logged and otherwise ignored.
 fn rotate_full_log(path: &std::path::Path, cap: u64) {
+    // Cheap no-follow check first, so a log below the cap is not opened an extra time.
     if crate::platform::private_log_len(path).is_none_or(|len| len < cap) {
         return;
     }
     let rotated = sibling_path(path, ".1");
-    if let Err(err) = rotate_file(path, &rotated) {
+    if let Err(err) = crate::platform::rotate_private_log(path, cap, || rotate_file(path, &rotated))
+    {
         tracing::warn!(err = %err, path = %path.display(), "input log rotation failed; appending to the full log");
     }
 }
@@ -1448,6 +1460,76 @@ mod tests {
         assert!(rotated(&log).is_dir());
         #[cfg(unix)]
         assert_private(&log);
+        std::fs::remove_dir_all(log.parent().unwrap()).unwrap();
+    }
+
+    /// herdr#225 review: a group- and world-readable log already at the cap is restricted by
+    /// the private open before it is renamed, so the rotated generation is owner-only.
+    #[cfg(unix)]
+    #[test]
+    fn a_readable_log_at_the_cap_rotates_to_a_private_generation() {
+        use std::os::unix::fs::PermissionsExt;
+        let log = rotation_log("readable");
+        let full = format!("{}\n{}\n", record(1), record(2));
+        std::fs::write(&log, &full).unwrap();
+        std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            std::fs::metadata(&log).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        super::ROTATIONS.set(0);
+        super::append_line_with_cap(&log, &record(3), CAP).unwrap();
+        assert_eq!(super::ROTATIONS.get(), 1);
+        assert_eq!(read(&rotated(&log)), full);
+        assert_eq!(read(&log), format!("{}\n", record(3)));
+        assert_private(&rotated(&log));
+        assert_private(&log);
+        std::fs::remove_dir_all(log.parent().unwrap()).unwrap();
+    }
+
+    /// herdr#225 review: an older Herdr writer locks the log file itself, not `<log>.lock`.
+    /// Rotation waits for that lock, so the legacy writer's append completes in the full
+    /// generation before it is renamed, and the new record goes to the fresh log.
+    #[test]
+    fn a_legacy_lock_on_the_log_delays_rotation_until_released() {
+        use std::io::Write as _;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let log = rotation_log("legacy-lock");
+        let full = format!("{}\n{}\n", record(1), record(2));
+        std::fs::write(&log, &full).unwrap();
+        let legacy = std::fs::OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(&log)
+            .unwrap();
+        legacy.lock().unwrap();
+        let done = AtomicBool::new(false);
+        let (finished_early, rotated_early) = std::thread::scope(|scope| {
+            let writer = scope.spawn(|| {
+                let result = super::append_line_with_cap(&log, &record(3), CAP);
+                done.store(true, Ordering::SeqCst);
+                result
+            });
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let observed = (done.load(Ordering::SeqCst), rotated(&log).exists());
+            // The legacy writer finishes its append on the full log, then releases its lock.
+            (&legacy)
+                .write_all(format!("{}\n", record(9)).as_bytes())
+                .unwrap();
+            legacy.unlock().unwrap();
+            drop(legacy);
+            writer.join().unwrap().unwrap();
+            observed
+        });
+        assert!(
+            !finished_early,
+            "the append did not wait for the legacy lock"
+        );
+        assert!(!rotated_early, "the log was rotated under the legacy lock");
+        assert_eq!(read(&rotated(&log)), format!("{full}{}\n", record(9)));
+        assert_eq!(read(&log), format!("{}\n", record(3)));
+        #[cfg(unix)]
+        assert_private(&rotated(&log));
         std::fs::remove_dir_all(log.parent().unwrap()).unwrap();
     }
 

@@ -62,6 +62,60 @@ pub(crate) fn private_log_len(path: &Path) -> Option<u64> {
     metadata.file_type().is_file().then_some(metadata.len())
 }
 
+/// Rotates the private log at `path` with `rename` if it has reached `cap` bytes. Returns
+/// whether `rename` ran (its error is returned).
+///
+/// The log is first opened through the private open, which refuses a symlink, a non-file and a
+/// foreign owner, and restricts an existing file that others can read to owner-only, so the
+/// generation that becomes `<log>.1` is never left readable by others. The size is read from
+/// that handle. The handle then takes the exclusive lock that older Herdr writers take on the
+/// log file itself, so a legacy writer in the middle of an append finishes it before the
+/// rename.
+///
+/// Unix: the lock is held across the rename and released after it. A legacy writer that was
+/// already waiting for the old inode's lock still appends its record to `<log>.1` once the lock
+/// is released. That record is kept in `<log>.1` until the next rotation replaces it: an
+/// accepted limit that lasts only while a pre-upgrade binary is still writing.
+#[cfg(not(windows))]
+pub(crate) fn rotate_private_log(
+    path: &Path,
+    cap: u64,
+    rename: impl FnOnce() -> std::io::Result<()>,
+) -> std::io::Result<bool> {
+    let file = open_private_append_file(path)?;
+    file.lock()?;
+    let rotated = if file.metadata()?.len() >= cap {
+        rename().map(|()| true)
+    } else {
+        Ok(false)
+    };
+    // Closing the handle also releases the lock; unlock explicitly so the release is immediate.
+    let _ = file.unlock();
+    rotated
+}
+
+/// See the other version. Windows cannot rename a file that is open without delete sharing, so
+/// the lock is taken and released and the handle closed before `rename`; a legacy writer in the
+/// middle of an append has finished by then. A legacy writer that opens the log after that
+/// holds it without delete sharing, so the rename fails and the record goes to the full log:
+/// no legacy record lands in `<log>.1`.
+#[cfg(windows)]
+pub(crate) fn rotate_private_log(
+    path: &Path,
+    cap: u64,
+    rename: impl FnOnce() -> std::io::Result<()>,
+) -> std::io::Result<bool> {
+    let file = open_private_append_file(path)?;
+    file.lock()?;
+    let full = file.metadata().map(|metadata| metadata.len() >= cap);
+    let _ = file.unlock();
+    drop(file);
+    if !full? {
+        return Ok(false);
+    }
+    rename().map(|()| true)
+}
+
 /// Opens `path` for reading and appending as an owner-only log. It creates the file with mode
 /// 0600, does not follow a final symlink, refuses anything but a regular file owned by this
 /// user, and restricts an existing file that others can read or write to 0600.
