@@ -57,30 +57,6 @@ pub(crate) fn open_private_append_file(path: &Path) -> std::io::Result<std::fs::
     Ok(file)
 }
 
-/// Whether `path` still names the open `file`, checked without following a final symlink:
-/// `Some(true)` only if the entry is a regular file owned by this user with the handle's
-/// (dev, ino); `Some(false)` if it names anything else or nothing.
-#[cfg(unix)]
-pub(crate) fn path_names_open_file(path: &Path, file: &std::fs::File) -> Option<bool> {
-    use std::os::unix::fs::MetadataExt;
-    let (Ok(live), Ok(held)) = (std::fs::symlink_metadata(path), file.metadata()) else {
-        return Some(false);
-    };
-    Some(
-        live.file_type().is_file()
-            && live.uid() == unsafe { libc::geteuid() }
-            && (live.dev(), live.ino()) == (held.dev(), held.ino()),
-    )
-}
-
-/// `None`: identity is not checked here, so callers never rename the entry. On Windows the
-/// private log handle denies delete sharing, so its entry cannot be renamed or replaced while
-/// it is open, and log rotation is a documented no-op (records append in place).
-#[cfg(not(unix))]
-pub(crate) fn path_names_open_file(_path: &Path, _file: &std::fs::File) -> Option<bool> {
-    None
-}
-
 /// Opens `path` as a private log; see `windows::open_private_log_file`. The handle is opened
 /// for writing, not appending, so callers must write at the end of the file.
 #[cfg(windows)]

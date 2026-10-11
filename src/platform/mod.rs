@@ -1793,8 +1793,7 @@ pub(crate) use unsupported_diagnostics::{DiagnosticDirectoryScan, PrivateDiagnos
 
 mod client_state;
 pub(crate) use client_state::{
-    create_private_state_file, open_private_append_file, path_names_open_file, replace_file,
-    sync_parent_directory,
+    create_private_state_file, open_private_append_file, replace_file, sync_parent_directory,
 };
 
 #[cfg(not(unix))]
