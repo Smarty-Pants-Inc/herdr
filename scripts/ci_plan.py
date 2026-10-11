@@ -47,12 +47,23 @@ def object_or_empty(value: object) -> dict:
     return value if isinstance(value, dict) else {}
 
 
-def check_matrix(event_name: str, event: dict) -> dict:
+def check_matrix(event_name: str, event: dict, *, conpty: bool | None = None) -> dict:
+    if conpty is None:
+        conpty = needs_conpty(event_name, event)
+    pr = object_or_empty(event.get("pull_request"))
+    head_ref = object_or_empty(pr.get("head")).get("ref")
+    queue = (
+        event_name == "pull_request"
+        and object_or_empty(pr.get("user")).get("id") == 37929162
+        and isinstance(head_ref, str)
+        and head_ref.startswith("mergify/merge-queue/")
+    )
     hosted_macos = object_or_empty(event.get("inputs")).get("hosted_macos")
     include = [{"os": "ubuntu-latest", "kind": "unix", "nextest_filter": "all()"}]
     if event_name == "workflow_dispatch" and (hosted_macos is True or hosted_macos == "true"):
         include.append({"os": "macos-latest", "kind": "unix", "nextest_filter": MACOS_FILTER})
-    include.append({"os": "windows-latest", "kind": "windows"})
+    if conpty or event_name == "workflow_dispatch" or queue:
+        include.append({"os": "windows-latest", "kind": "windows"})
     return {"include": include}
 
 
@@ -132,10 +143,10 @@ def main() -> int:
     except (OSError, ValueError, UnicodeError) as error:
         print(f"ci_plan: cannot read event; using conservative plan ({error})", file=sys.stderr)
         event = {}
-    matrix = json.dumps(check_matrix(args.event_name, event), separators=(",", ":"))
-    conpty = str(needs_conpty(args.event_name, event)).lower()
+    conpty = needs_conpty(args.event_name, event)
+    matrix = json.dumps(check_matrix(args.event_name, event, conpty=conpty), separators=(",", ":"))
     with args.github_output.open("a", encoding="utf-8") as output:
-        output.write(f"matrix={matrix}\nconpty={conpty}\n")
+        output.write(f"matrix={matrix}\nconpty={str(conpty).lower()}\n")
     return 0
 
 

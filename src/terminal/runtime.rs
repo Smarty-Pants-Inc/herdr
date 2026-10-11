@@ -474,30 +474,57 @@ impl TerminalRuntime {
         self.0.encode_terminal_key(key)
     }
 
-    pub fn try_send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::TrySendError<Bytes>> {
-        self.0.try_send_bytes(bytes)
+    pub(crate) fn queue_input_consumer_operation(
+        &self,
+        operation: crate::pty::input_consumer::ConsumerOperation,
+        audit: Option<crate::pty::input_consumer::AuditSink>,
+    ) -> std::io::Result<std::sync::mpsc::Receiver<crate::pty::input_consumer::ConsumerResponse>>
+    {
+        self.0.queue_input_consumer_operation(operation, audit)
     }
-
-    pub fn queue_user_input_submission(
+    pub(crate) fn input_consumer_epoch_matches(&self, epoch: &str) -> bool {
+        self.0.input_consumer_epoch_matches(epoch)
+    }
+    pub(crate) fn try_send_bytes_with_source(
+        &self,
+        bytes: Bytes,
+        source: crate::pty::input_consumer::InputSource,
+    ) -> Result<(), mpsc::error::TrySendError<Bytes>> {
+        self.0.try_send_bytes_with_source(bytes, source)
+    }
+    pub(crate) fn queue_user_input_submission_with_source(
         &self,
         text: Bytes,
         enter: Bytes,
         delay: std::time::Duration,
         deadline: Option<std::time::Instant>,
+        source: crate::pty::input_consumer::InputSource,
     ) -> std::io::Result<std::sync::mpsc::Receiver<std::io::Result<()>>> {
         self.0
-            .queue_user_input_submission(text, enter, delay, deadline)
+            .queue_user_input_submission_with_source(text, enter, delay, deadline, source)
     }
-
-    pub(crate) fn try_send_paste(
+    pub(crate) fn try_send_paste_with_source(
         &self,
         text: String,
+        source: crate::pty::input_consumer::InputSource,
     ) -> Result<bool, mpsc::error::TrySendError<Bytes>> {
-        self.0.try_send_paste(text)
+        self.0.try_send_paste_with_source(text, source)
     }
-
-    pub fn try_send_focus_event(&self, event: crate::ghostty::FocusEvent) -> bool {
-        self.0.try_send_focus_event(event)
+    pub(crate) fn initial_focus_pending(&self) -> bool {
+        self.0.initial_focus_pending()
+    }
+    pub(crate) fn try_send_focus_event_with_source(
+        &self,
+        event: crate::ghostty::FocusEvent,
+        source: crate::pty::input_consumer::InputSource,
+    ) -> bool {
+        self.0.try_send_focus_event_with_source(event, source)
+    }
+    // All production inputs now explicitly carry a source; old test fillers
+    // remain API, never implicitly neutral or client.
+    #[cfg(test)]
+    pub fn try_send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::TrySendError<Bytes>> {
+        self.0.try_send_bytes(bytes)
     }
 
     pub fn wheel_routing(&self) -> Option<crate::pane::WheelRouting> {
@@ -608,6 +635,20 @@ impl TerminalRuntime {
 
 #[cfg(test)]
 impl TerminalRuntime {
+    #[cfg(unix)]
+    pub(crate) fn test_start_basic_detection(&mut self) -> mpsc::Receiver<crate::events::AppEvent> {
+        self.0.test_start_basic_detection()
+    }
+
+    #[cfg(unix)]
+    pub(crate) async fn test_wait_for_detection_reads(&self, expected: usize) {
+        self.0.test_wait_for_detection_reads(expected).await;
+    }
+
+    pub(crate) fn test_scroll_metrics_reads(&self) -> usize {
+        self.0.test_scroll_metrics_reads()
+    }
+
     #[cfg(unix)]
     pub(crate) fn test_enable_kitty_source_forwarding(&self) {
         self.0.test_enable_kitty_source_forwarding();

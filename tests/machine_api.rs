@@ -503,8 +503,58 @@ fn machine_api_remote_paths_and_wait_parameters_reach_the_server() {
                 "--path",
                 "/srv/review",
             ],
-            "worktree.create",
-            json!({"cwd":"~/Projects/herdr", "branch":"review", "path":"/srv/review"}),
+            "worktree.create_project_checked",
+            json!({"cwd":"~/Projects/herdr", "branch":"review", "path":"/srv/review", "focus":false, "allow_project_change":false}),
+        ),
+        (
+            vec![
+                "worktree",
+                "create",
+                "--cwd",
+                "~/Projects/herdr",
+                "--branch",
+                "review",
+                "--base",
+                "main",
+                "--path",
+                "~/.worktrees/review",
+                "--label",
+                "remote review",
+                "--focus",
+                "--trust-repository",
+                "--allow-project-change",
+            ],
+            "worktree.create_project_checked",
+            json!({"cwd":"~/Projects/herdr", "branch":"review", "base":"main", "path":"~/.worktrees/review", "label":"remote review", "focus":true, "trust_repository":true, "allow_project_change":true}),
+        ),
+        (
+            vec![
+                "worktree",
+                "open",
+                "--cwd",
+                "~/Projects/herdr",
+                "--path",
+                "~/.worktrees/review",
+            ],
+            "worktree.open_project_checked",
+            json!({"cwd":"~/Projects/herdr", "path":"~/.worktrees/review", "focus":false, "allow_project_change":false}),
+        ),
+        (
+            vec![
+                "worktree",
+                "open",
+                "--workspace",
+                "4",
+                "--branch",
+                "review",
+                "--label",
+                "remote review",
+                "--focus",
+                "--trust-repository",
+                "--allow-project-change",
+            ],
+            "worktree.open_project_checked",
+            json!({"workspace_id":"4", "branch":"review", "label":"remote review", "focus":true, "trust_repository":true, "allow_project_change":true}),
         ),
         (
             vec![
@@ -526,8 +576,9 @@ fn machine_api_remote_paths_and_wait_parameters_reach_the_server() {
         success(command.args(args).output().unwrap());
         let request = server.join().unwrap();
         assert_eq!(request["method"], method);
+        assert!(request["params"].get("params").is_none());
         for (key, value) in expected.as_object().unwrap() {
-            assert_eq!(&request["params"][key], value);
+            assert_eq!(&request["params"][key], value, "{method}: {key}");
         }
         harness.assert_local_untouched();
     }
