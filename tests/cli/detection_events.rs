@@ -241,7 +241,11 @@ struct DetectionEvents {
 
 impl DetectionEvents {
     fn subscribe(fixture: &DetectorFixture) -> Self {
-        let mut stream = UnixStream::connect(&fixture.socket).unwrap();
+        Self::subscribe_pane(&fixture.socket, &fixture.pane)
+    }
+
+    fn subscribe_pane(socket: &Path, pane: &str) -> Self {
+        let mut stream = UnixStream::connect(socket).unwrap();
         stream.set_read_timeout(Some(SETUP_DEADLINE)).unwrap();
         writeln!(
             stream,
@@ -250,7 +254,7 @@ impl DetectionEvents {
                 "id": "synthetic-detector-events",
                 "method": "events.subscribe",
                 "params": {"subscriptions": [
-                    {"type": "pane.agent_status_changed", "pane_id": fixture.pane},
+                    {"type": "pane.agent_status_changed", "pane_id": pane},
                     {"type": "pane.agent_detected"}
                 ]}
             })
@@ -259,7 +263,7 @@ impl DetectionEvents {
         stream.flush().unwrap();
         let mut events = Self {
             reader: BufReader::new(stream),
-            pane: fixture.pane.clone(),
+            pane: pane.to_string(),
         };
         let response = events.next(Instant::now() + SETUP_DEADLINE);
         assert_eq!(
@@ -417,10 +421,11 @@ fn detection_events_silent_exec_replacement_rescans_unchanged_idle_buffer() {
 }
 
 #[test]
-fn detection_events_agent_exec_after_acquisition_window_is_identified() {
-    // #3261: a launcher keeps writing output past the acquisition window, then
-    // execs the agent in place (same PID and PGID, like a wrapper that becomes
-    // Pi). The agent keeps rendering changed frames, like a real Pi TUI.
+fn detection_events_single_frame_agent_exec_after_acquisition_is_identified() {
+    // #3261 / #197: continuous launcher output outlasts acquisition without
+    // an idle reset. The late agent execs in place, renders ONE frame during
+    // the 5s probe throttle, then stays silent. Only the event-triggered
+    // trailing edge may add a deadline; this must not require another frame.
     let base = unique_test_dir();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
@@ -428,17 +433,35 @@ fn detection_events_agent_exec_after_acquisition_window_is_identified() {
     let manifests = config_home.join(app_dir_name()).join("agent-detection");
     fs::create_dir_all(&manifests).unwrap();
     fs::write(manifests.join("pi.toml"), synthetic_manifest("pi")).unwrap();
+    let fifo = base.join("control");
+    let fifo_c = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+    let mut control = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&fifo)
+        .unwrap();
     let launcher = base.join("launcher.sh");
     fs::write(
         &launcher,
         r#"#!/bin/sh
+exec 3<"$1/control"
+printf '%s\n' "$$" > "$1/launcher.pid"
 i=0
-while [ ! -e "$1/go" ]; do
+while [ "$i" -lt 55 ]; do
     printf 'launcher tick %s\n' "$i"
     i=$((i + 1))
+    # Producer cadence is stimulus, not a test-side sleep or observation poll.
     /bin/sleep 0.2
 done
-HERDR_AGENT=pi exec /bin/sh -c 'i=0; while :; do printf "\033[2J\033[Hagent tick %s\nE2E:READY" "$i"; i=$((i + 1)); /bin/sleep 0.2; done'
+printf 'launcher ready\n'
+IFS= read -r command <&3
+[ "$command" = go ] || exit 2
+HERDR_AGENT=pi exec /bin/sh -c '
+    printf "%s\n" "$$" > "$1/agent.pid"
+    printf "\033[2J\033[HE2E:READY"
+    IFS= read -r hold <&3
+' synthetic-agent "$1"
 "#,
     )
     .unwrap();
@@ -468,32 +491,64 @@ HERDR_AGENT=pi exec /bin/sh -c 'i=0; while :; do printf "\033[2J\033[Hagent tick
     );
     let launched = run_cli(&socket, &["pane", "run", &pane, &launch]);
     assert!(launched.status.success(), "{launched:?}");
-    let pane_info = || run_cli_json(&socket, &["pane", "get", &pane])["result"]["pane"].clone();
-
-    // Outlast the 8s acquisition window with output that never pauses for 2s.
-    let launched_at = Instant::now();
-    while launched_at.elapsed() < Duration::from_secs(11) {
-        let info = pane_info();
-        assert!(info["agent"].is_null(), "launcher misidentified: {info}");
-        std::thread::sleep(Duration::from_millis(250));
-    }
-    fs::write(base.join("go"), "").unwrap();
-
-    // Rendering wakes the rate-limited 5s recheck; allow 3s CI slack, no timer.
-    let mut last = serde_json::Value::Null;
-    assert!(
-        wait_until(Duration::from_secs(8), Duration::from_millis(50), || {
-            last = pane_info();
-            last["agent"] == "pi"
-        }),
-        "agent exec'd after the acquisition window was never identified: {last}"
+    let mut events = DetectionEvents::subscribe_pane(&socket, &pane);
+    // Wait for the producer's 11s stream, not test-side sleeps or pane polling.
+    let ready = run_cli(
+        &socket,
+        &[
+            "pane",
+            "wait-output",
+            &pane,
+            "--source",
+            "detection",
+            "--match",
+            "launcher ready",
+            "--timeout",
+            "16000",
+        ],
     );
-    // Identification starts the 3s startup grace before the screen is read.
-    assert!(
-        wait_until(Duration::from_secs(5), Duration::from_millis(50), || {
-            last = pane_info();
-            last["agent"] == "pi" && status_matches(&last["agent_status"], "idle")
-        }),
-        "identified agent never reached idle: {last}"
+    assert!(ready.status.success(), "{ready:?}");
+    let info = run_cli_json(&socket, &["pane", "get", &pane])["result"]["pane"].clone();
+    assert!(info["agent"].is_null(), "launcher misidentified: {info}");
+    let started = Instant::now();
+    writeln!(control, "go").unwrap();
+    control.flush().unwrap();
+
+    // Same-PGID acquisition probes finish near 8s; the late single frame at
+    // 11s precedes their next 5s recheck. Allow 3s scheduling slack, bounded
+    // socket reads and the existing test hang watchdog, without polling.
+    loop {
+        let event = events.next(started + Duration::from_secs(8));
+        if event["event"] == "pane_agent_detected"
+            && event["data"]["pane_id"] == pane
+            && event["data"]["agent"] == "pi"
+        {
+            break;
+        }
+    }
+    let event = events.wait_status("idle", Instant::now() + Duration::from_secs(5));
+    assert_eq!(event["data"]["agent"], "pi", "{event}");
+    assert_eq!(
+        fs::read_to_string(base.join("launcher.pid")).unwrap(),
+        fs::read_to_string(base.join("agent.pid")).unwrap(),
+        "exec must preserve the launcher PID and foreground group"
+    );
+    let screen = run_cli(
+        &socket,
+        &[
+            "pane",
+            "read",
+            &pane,
+            "--source",
+            "detection",
+            "--format",
+            "text",
+        ],
+    );
+    assert!(screen.status.success(), "{screen:?}");
+    assert_eq!(
+        String::from_utf8(screen.stdout).unwrap().lines().last(),
+        Some("E2E:READY"),
+        "the single agent frame must remain at the bottom of the detection buffer"
     );
 }
