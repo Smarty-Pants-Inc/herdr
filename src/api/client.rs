@@ -32,6 +32,9 @@ impl ConnectionTarget {
 #[derive(Debug, Clone)]
 pub struct ApiClient {
     target: ConnectionTarget,
+    /// Local plugin action grant forwarded only with content writes. Never set
+    /// for remote machine targets. Debug redacts it.
+    plugin_action: crate::plugin_action_origin::PluginActionClaim,
 }
 
 impl ApiClient {
@@ -40,7 +43,19 @@ impl ApiClient {
     }
 
     pub fn for_target(target: ConnectionTarget) -> Self {
-        Self { target }
+        Self {
+            target,
+            plugin_action: crate::plugin_action_origin::PluginActionClaim::Absent,
+        }
+    }
+
+    /// Attach this process's plugin action claim (herdr-8592).
+    pub(crate) fn with_plugin_action(
+        mut self,
+        claim: crate::plugin_action_origin::PluginActionClaim,
+    ) -> Self {
+        self.plugin_action = claim;
+        self
     }
 
     pub fn socket_path(&self) -> PathBuf {
@@ -54,7 +69,7 @@ impl ApiClient {
 
     pub fn request_value(&self, request: &Request) -> Result<serde_json::Value, ApiClientError> {
         let mut stream = self.connect()?;
-        write_request(&mut stream, request)?;
+        write_request(&mut stream, request, self.plugin_action)?;
 
         let mut reader = BufReader::new(stream);
         read_json_line(&mut reader)
@@ -68,7 +83,7 @@ impl ApiClient {
         let mut stream = self.connect()?;
         set_timeout_best_effort(&stream, TimeoutKind::Send, timeout)?;
         set_timeout_best_effort(&stream, TimeoutKind::Recv, timeout)?;
-        write_request(&mut stream, request)?;
+        write_request(&mut stream, request, self.plugin_action)?;
 
         let mut reader = BufReader::new(stream);
         read_json_line(&mut reader)
@@ -96,7 +111,11 @@ impl ApiClient {
         let response = match timeout {
             Some(timeout) => {
                 let mut stream = self.connect()?;
-                write_request(&mut stream, &request)?;
+                write_request(
+                    &mut stream,
+                    &request,
+                    crate::plugin_action_origin::PluginActionClaim::Absent,
+                )?;
                 crate::ipc::set_local_stream_polling(&mut stream, true)?;
                 let mut reader = BufReader::new(DeadlineReader {
                     stream: &mut stream,
@@ -182,11 +201,37 @@ impl From<serde_json::Error> for ApiClientError {
     }
 }
 
-fn write_request(stream: &mut LocalStream, request: &Request) -> Result<(), ApiClientError> {
-    stream.write_all(serde_json::to_string(request)?.as_bytes())?;
+fn write_request(
+    stream: &mut LocalStream,
+    request: &Request,
+    plugin_action: crate::plugin_action_origin::PluginActionClaim,
+) -> Result<(), ApiClientError> {
+    stream.write_all(request_line(request, plugin_action)?.as_bytes())?;
     stream.write_all(b"\n")?;
     stream.flush()?;
     Ok(())
+}
+
+/// The grant rides as an optional top-level field, only on content writes,
+/// so no `Method` shape changes and other requests never carry the secret.
+fn request_line(
+    request: &Request,
+    plugin_action: crate::plugin_action_origin::PluginActionClaim,
+) -> Result<String, serde_json::Error> {
+    let Some(value_text) = plugin_action
+        .wire_value()
+        .filter(|_| crate::plugin_action_origin::method_carries_grant(&request.method))
+    else {
+        return serde_json::to_string(request);
+    };
+    let mut value = serde_json::to_value(request)?;
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            crate::plugin_action_origin::TOKEN_FIELD.into(),
+            value_text.into(),
+        );
+    }
+    serde_json::to_string(&value)
 }
 
 struct DeadlineReader<'a> {
@@ -280,6 +325,62 @@ mod tests {
         );
         server.join().unwrap();
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn plugin_action_claim_rides_only_on_content_writes() {
+        use crate::api::schema::{PaneSendInputParams, PaneSendTextParams};
+        use crate::plugin_action_origin::{PluginActionClaim, PluginActionToken};
+        let hex = "ab".repeat(32);
+        let presented = PluginActionClaim::Presented(PluginActionToken::parse(&hex).unwrap());
+        let write = Request {
+            id: "w".into(),
+            method: Method::PaneSendInput(PaneSendInputParams {
+                pane_id: "w1:p2".into(),
+                text: "open".into(),
+                keys: vec!["Enter".into()],
+                expected_terminal: None,
+                allow_cross_pane: false,
+            }),
+        };
+        let line = request_line(&write, presented).unwrap();
+        assert_eq!(PluginActionClaim::from_request_line(&line), presented);
+        let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+        // The typed request is unchanged by the optional envelope field.
+        assert_eq!(serde_json::from_value::<Request>(value).unwrap(), write);
+        // A supplied-but-malformed env claim is forwarded as malformed.
+        let line = request_line(&write, PluginActionClaim::Malformed).unwrap();
+        assert_eq!(
+            PluginActionClaim::from_request_line(&line),
+            PluginActionClaim::Malformed
+        );
+        let line = request_line(&write, PluginActionClaim::Absent).unwrap();
+        assert_eq!(
+            PluginActionClaim::from_request_line(&line),
+            PluginActionClaim::Absent
+        );
+        let text = Request {
+            id: "t".into(),
+            method: Method::PaneSendText(PaneSendTextParams {
+                pane_id: "w1:p2".into(),
+                text: "x".into(),
+                allow_cross_pane: true,
+            }),
+        };
+        assert!(request_line(&text, presented).unwrap().contains(&hex));
+        let ping = Request {
+            id: "p".into(),
+            method: Method::Ping(PingParams::default()),
+        };
+        for claim in [presented, PluginActionClaim::Malformed] {
+            let line = request_line(&ping, claim).unwrap();
+            assert!(!line.contains("plugin_action_token"), "{line}");
+        }
+        let client = ApiClient::local().with_plugin_action(presented);
+        assert!(
+            !format!("{client:?}").contains(&hex),
+            "Debug redacts the token"
+        );
     }
 
     #[test]

@@ -1429,3 +1429,193 @@ EOF
 
     cleanup_test_base(&base);
 }
+
+/// herdr-8592 real-server path: an Explorr-shaped action child (`sh`) splits
+/// a pane and forks a `herdr pane run` grandchild into the new pane without
+/// --allow-cross-pane. This CLI invocation has no live-attributed invoking
+/// pane, so the grant is global: it admits only the pane it created while the
+/// action child lives, never pre-existing panes (herdr#223); a copied HERDR_PANE_ID without the token, a malformed token,
+/// and a replay after the action child exits are refused. Startup hooks never
+/// receive a grant.
+#[cfg(target_os = "linux")]
+#[test]
+fn plugin_action_grandchild_pane_run_uses_server_minted_grant() {
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let plugin_dir = base.join("plugins").join("grant");
+    fs::create_dir_all(&plugin_dir).unwrap();
+    fs::write(
+        plugin_dir.join("herdr-plugin.toml"),
+        r#"
+id = "example.grant"
+name = "Grant"
+version = "0.1.0"
+min_herdr_version = "0.6.10"
+platforms = ["linux"]
+
+[[actions]]
+id = "open"
+title = "Open"
+command = ["sh", "-c", '''
+e=$(cat target)
+"$HERDR_BIN_PATH" pane run "$e" "echo existing-marker" > existing.out 2>&1; echo $? > existing.rc
+c=$(cat caller)
+"$HERDR_BIN_PATH" pane run "$c" "echo caller-marker" > caller.out 2>&1; echo $? > caller.rc
+"$HERDR_BIN_PATH" pane split "$c" --direction down > split.json 2> split.err
+t=$(sed -n 's/.*"pane_id": *"\([^"]*\)".*/\1/p' split.json | head -n 1)
+printf %s "$t" > created.tmp; mv created.tmp created
+"$HERDR_BIN_PATH" pane run "$t" "echo granted-marker" > granted.out 2>&1; echo $? > granted.rc
+env -u HERDR_PLUGIN_ACTION_TOKEN "$HERDR_BIN_PATH" pane run "$t" "echo copied-marker" > copied.out 2>&1; echo $? > copied.rc
+HERDR_PLUGIN_ACTION_TOKEN=forged "$HERDR_BIN_PATH" pane run "$t" "echo forged-marker" > forged.out 2>&1; echo $? > forged.rc
+( while kill -0 $PPID_SH 2>/dev/null; do sleep 0.05; done; "$HERDR_BIN_PATH" pane run "$t" "echo replay-marker" > replay.out 2>&1; echo $? > replay.tmp; mv replay.tmp replay.rc ) </dev/null >/dev/null 2>&1 &
+''']
+
+[[startup]]
+command = ["sh", "-c", 'printf %s "${HERDR_PLUGIN_ACTION_TOKEN-none}" > hook.tmp && mv hook.tmp hook.txt']
+"#
+        .replace("$PPID_SH", "$$"),
+    )
+    .unwrap();
+
+    let server = spawn_named_server(&config_home, &runtime_dir, "grant");
+    let socket = named_session_socket(&config_home, "grant");
+    wait_for_socket(&socket, Duration::from_secs(5));
+    let created = run_named_cli_json(
+        &config_home,
+        &runtime_dir,
+        &[
+            "--session",
+            "grant",
+            "workspace",
+            "create",
+            "--cwd",
+            base.to_str().unwrap(),
+        ],
+    );
+    let caller_pane = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let split = run_named_cli_json(
+        &config_home,
+        &runtime_dir,
+        &[
+            "--session",
+            "grant",
+            "pane",
+            "split",
+            &caller_pane,
+            "--direction",
+            "right",
+        ],
+    );
+    let target_pane = split["result"]["pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    fs::write(plugin_dir.join("target"), &target_pane).unwrap();
+    fs::write(plugin_dir.join("caller"), &caller_pane).unwrap();
+    run_named_cli_json(
+        &config_home,
+        &runtime_dir,
+        &[
+            "--session",
+            "grant",
+            "plugin",
+            "link",
+            plugin_dir.to_str().unwrap(),
+        ],
+    );
+
+    // A marker-only HERDR_PANE_ID never makes an outside CLI caller an
+    // invoker: this invocation is global.
+    let invoked = run_named_cli_with_env(
+        &config_home,
+        &runtime_dir,
+        &[
+            "--session",
+            "grant",
+            "plugin",
+            "action",
+            "invoke",
+            "open",
+            "--plugin",
+            "example.grant",
+        ],
+        &[("HERDR_PANE_ID", Path::new(&caller_pane))],
+    );
+    assert!(
+        invoked.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&invoked.stdout),
+        String::from_utf8_lossy(&invoked.stderr)
+    );
+    let read = |name: &str| {
+        let path = plugin_dir.join(name);
+        assert!(
+            wait_until(Duration::from_secs(20), Duration::from_millis(25), || {
+                fs::read_to_string(&path).is_ok_and(|text| !text.trim().is_empty())
+            }),
+            "missing {name}"
+        );
+        fs::read_to_string(&path).unwrap()
+    };
+    let out = |name: &str| fs::read_to_string(plugin_dir.join(name)).unwrap_or_default();
+    assert_eq!(
+        read("granted.rc").trim(),
+        "0",
+        "granted: {}; split: {}; split stderr: {}",
+        out("granted.out"),
+        out("split.json"),
+        out("split.err")
+    );
+    let created_pane = read("created").trim().to_string();
+    assert_ne!(created_pane, target_pane);
+    assert_ne!(created_pane, caller_pane);
+    for case in ["existing", "caller"] {
+        assert_ne!(read(&format!("{case}.rc")).trim(), "0", "{case}");
+        let output = out(&format!("{case}.out"));
+        assert!(
+            output.contains("cross_pane_input_denied"),
+            "pre-existing {case} pane: {output}"
+        );
+    }
+    for case in ["copied", "forged", "replay"] {
+        assert_ne!(read(&format!("{case}.rc")).trim(), "0", "{case}");
+        let output = out(&format!("{case}.out"));
+        assert!(output.contains("input_origin_unknown"), "{case}: {output}");
+    }
+    assert!(wait_until(
+        Duration::from_secs(10),
+        Duration::from_millis(50),
+        || pane_read_recent_contains(&socket, &created_pane, "granted-marker")
+    ));
+    for refused in ["copied-marker", "forged-marker", "replay-marker"] {
+        assert!(!pane_read_recent_contains(
+            &socket,
+            &created_pane,
+            &format!("\n{refused}")
+        ));
+    }
+    assert!(!pane_read_recent_contains(
+        &socket,
+        &target_pane,
+        "\nexisting-marker"
+    ));
+    assert!(!pane_read_recent_contains(
+        &socket,
+        &caller_pane,
+        "\ncaller-marker"
+    ));
+
+    // Startup hooks never see a grant (restart runs them).
+    let _ = run_named_cli(&config_home, &runtime_dir, &["session", "stop", "grant"]);
+    drop(server);
+    let server = spawn_named_server(&config_home, &runtime_dir, "grant");
+    wait_for_socket(&socket, Duration::from_secs(5));
+    assert_eq!(read("hook.txt"), "none");
+    let _ = run_named_cli(&config_home, &runtime_dir, &["session", "stop", "grant"]);
+    drop(server);
+    cleanup_test_base(&base);
+}

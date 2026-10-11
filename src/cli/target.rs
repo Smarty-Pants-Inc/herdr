@@ -67,7 +67,10 @@ pub(super) fn api_client() -> io::Result<ApiClient> {
     TARGET.with(|target| {
         let mut target = target.borrow_mut();
         let Some(target) = target.as_mut() else {
-            return Ok(ApiClient::local());
+            // A local plugin action grant is for this machine's server only;
+            // --machine targets below never receive it.
+            return Ok(ApiClient::local()
+                .with_plugin_action(crate::plugin_action_origin::claim_from_env()));
         };
         #[cfg(test)]
         if let Some(client) = &target.client_override {
