@@ -1028,6 +1028,60 @@ impl App {
         self.handle_api_request_with_ingress(request, context, ApiIngress::TrustedClientShell)
     }
 
+    /// herdr#223: runs one creation handler and, only for a request that
+    /// presented a grant token, adds the terminal the server actually created
+    /// to that grant. The new terminal comes from the successful response and
+    /// must exist in server state under the same pane; failures, other result
+    /// shapes or no new terminal add nothing. The registry rejects invalid,
+    /// foreign, expired or revoked claims, so they award nothing. No pane scan.
+    fn with_plugin_action_creation(
+        &mut self,
+        context: crate::api::ApiRequestContext,
+        create: impl FnOnce(&mut Self) -> String,
+    ) -> String {
+        if !matches!(
+            context.plugin_action,
+            crate::plugin_action_origin::PluginActionClaim::Presented(_)
+        ) {
+            return create(self);
+        }
+        let terminals_before = self.state.terminals.len();
+        let response = create(self);
+        if let Some(terminal_id) = self.created_terminal_id(&response, terminals_before) {
+            if self
+                .plugin_action_grants
+                .register_created_target(context.plugin_action, &terminal_id)
+            {
+                tracing::debug!(
+                    terminal = %terminal_id,
+                    "plugin action created terminal registered"
+                );
+            }
+        }
+        response
+    }
+
+    fn created_terminal_id(&self, response: &str, terminals_before: usize) -> Option<String> {
+        use crate::api::schema::ResponseResult;
+        if self.state.terminals.len() <= terminals_before {
+            return None;
+        }
+        let response: crate::api::schema::SuccessResponse = serde_json::from_str(response).ok()?;
+        let pane = match response.result {
+            ResponseResult::PaneInfo { pane }
+            | ResponseResult::TabCreated {
+                root_pane: pane, ..
+            }
+            | ResponseResult::WorkspaceCreated {
+                root_pane: pane, ..
+            } => pane,
+            _ => return None,
+        };
+        let (ws_idx, pane_id) = self.parse_pane_id(&pane.pane_id)?;
+        let target = self.terminal_target_for_pane(ws_idx, pane_id)?;
+        (target.terminal_id == pane.terminal_id).then_some(target.terminal_id)
+    }
+
     fn handle_api_request_with_ingress(
         &mut self,
         request: crate::api::schema::Request,
@@ -1177,10 +1231,14 @@ impl App {
             Method::WorkspaceList(_) => return self.handle_workspace_list(request.id),
             Method::WorkspaceGet(target) => return self.handle_workspace_get(request.id, target),
             Method::WorkspaceCreate(params) => {
-                return self.handle_workspace_create(request.id, params);
+                return self.with_plugin_action_creation(context, move |app| {
+                    app.handle_workspace_create(request.id, params)
+                });
             }
             Method::WorkspaceCreateLinked(params) => {
-                return self.handle_workspace_create_linked(request.id, params);
+                return self.with_plugin_action_creation(context, move |app| {
+                    app.handle_workspace_create_linked(request.id, params)
+                });
             }
             Method::WorkspaceFocus(target) => {
                 return self.handle_workspace_focus(request.id, target);
@@ -1226,7 +1284,11 @@ impl App {
             }
             Method::TabList(params) => return self.handle_tab_list(request.id, params),
             Method::TabGet(target) => return self.handle_tab_get(request.id, target),
-            Method::TabCreate(params) => return self.handle_tab_create(request.id, params),
+            Method::TabCreate(params) => {
+                return self.with_plugin_action_creation(context, move |app| {
+                    app.handle_tab_create(request.id, params)
+                });
+            }
             Method::TabFocus(target) => return self.handle_tab_focus(request.id, target),
             Method::TabRename(params) => return self.handle_tab_rename(request.id, params),
             Method::TabMove(params) => return self.handle_tab_move(request.id, params),
@@ -1293,7 +1355,11 @@ impl App {
             Method::AgentSendKeys(params) => {
                 return self.handle_agent_send_keys(request.id, params, context);
             }
-            Method::PaneSplit(params) => return self.handle_pane_split(request.id, params),
+            Method::PaneSplit(params) => {
+                return self.with_plugin_action_creation(context, move |app| {
+                    app.handle_pane_split(request.id, params)
+                });
+            }
             Method::PaneSwap(params) => return self.handle_pane_swap(request.id, params),
             Method::PaneSwapProjectChecked(params) => {
                 return self.handle_pane_swap_project_checked(request.id, params)
