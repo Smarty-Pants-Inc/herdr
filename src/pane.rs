@@ -670,6 +670,16 @@ struct ProcessProbeInput {
     pending_foreground_shell_clear: bool,
     pending_restore_probe: bool,
     elapsed_since_process_check: std::time::Duration,
+    /// An unidentified pane's screen changed after the last process probe.
+    unidentified_output_since_process_check: bool,
+}
+
+fn unidentified_output_since(
+    last_content_change_at: Option<std::time::Instant>,
+    last_process_check: std::time::Instant,
+) -> bool {
+    // Equal: this pass probed before it read the frame, so the probe may predate it.
+    last_content_change_at.is_some_and(|changed| changed >= last_process_check)
 }
 
 fn foreground_group_changed(
@@ -745,8 +755,14 @@ fn should_probe_foreground_job(input: ProcessProbeInput) -> bool {
     }
 
     if input.current_agent.is_none() {
+        // An exec in place (a launcher that becomes the agent) keeps the PGID,
+        // and output that never pauses keeps one acquisition window from
+        // re-arming. Output arms one trailing-edge probe at most once per 5 s;
+        // a quiet pane schedules nothing (#3261).
         return !input.has_process_probe
             || foreground_group_changed
+            || (input.unidentified_output_since_process_check
+                && input.elapsed_since_process_check >= PROCESS_RECHECK_IDENTIFIED)
             || (input.foreground_pgid.is_none()
                 && input.elapsed_since_process_check >= PROCESS_RECHECK_MISSING_FOREGROUND_GROUP);
     }
@@ -934,11 +950,14 @@ fn probe_foreground_process(pid: u32, foreground_pgid: Option<u32>) -> ProcessPr
 
 // These are state-specific transient/safety deadlines, not a pane fallback
 // interval. Stable panes wait only for parsed output/reset and the shared clock.
+// Keep each independent deadline source explicit, shared by both detector loops.
+#[allow(clippy::too_many_arguments)]
 fn detection_deadline(
     pending_idle: &PendingIdleConfirmation,
     startup_grace_until: Option<std::time::Instant>,
     pending_release: &Mutex<Option<PendingAgentRelease>>,
     acquisition_started_at: Option<std::time::Instant>,
+    last_content_change_at: Option<std::time::Instant>,
     last_process_check: std::time::Instant,
     self_reported_active: bool,
     last_self_reported_check: Option<std::time::Instant>,
@@ -974,6 +993,13 @@ fn detection_deadline(
             };
             include((last_process_check + interval > now).then_some(last_process_check + interval));
         }
+    }
+    if unidentified_output_since(last_content_change_at, last_process_check) {
+        // Event-triggered debounce, not polling: no wake without prior output.
+        // A throttled frame gets one trailing-edge probe even if output stops;
+        // advancing last_process_check consumes it until another frame arrives.
+        let trailing_edge = last_process_check + PROCESS_RECHECK_IDENTIFIED;
+        include((trailing_edge > now).then_some(trailing_edge));
     }
     if self_reported_active {
         include(Some(
@@ -1037,6 +1063,7 @@ fn spawn_basic_detection_task(
                 agent_startup_grace_until,
                 &pending_release_for_task,
                 acquisition_started_at,
+                last_content_change_at,
                 last_process_check,
                 child_pid.load(Ordering::Acquire) > 0
                     && self_reported_agent_active.load(Ordering::Acquire),
@@ -1115,6 +1142,10 @@ fn spawn_basic_detection_task(
                     pending_foreground_shell_clear,
                     pending_restore_probe: false,
                     elapsed_since_process_check: now.duration_since(last_process_check),
+                    unidentified_output_since_process_check: unidentified_output_since(
+                        last_content_change_at,
+                        last_process_check,
+                    ),
                 };
                 should_check_foreground_process(
                     lifecycle_authority_active,
@@ -3144,6 +3175,7 @@ impl PaneRuntime {
                         agent_startup_grace_until,
                         &pending_release_for_task,
                         acquisition_started_at,
+                        last_content_change_at,
                         last_process_check,
                         child_pid.load(Ordering::Acquire) > 0
                             && self_reported_agent_active_for_task.load(Ordering::Acquire),
@@ -3217,6 +3249,10 @@ impl PaneRuntime {
                         pending_foreground_shell_clear,
                         pending_restore_probe,
                         elapsed_since_process_check: now.duration_since(last_process_check),
+                        unidentified_output_since_process_check: unidentified_output_since(
+                            last_content_change_at,
+                            last_process_check,
+                        ),
                     };
                     #[cfg(windows)]
                     let content_seq = detection_content_seq.load(Ordering::Relaxed);
@@ -6765,6 +6801,7 @@ mod tests {
             pending_foreground_shell_clear: false,
             pending_restore_probe: false,
             elapsed_since_process_check: std::time::Duration::from_secs(1),
+            unidentified_output_since_process_check: false,
         }
     }
 
@@ -7182,6 +7219,139 @@ mod tests {
     }
 
     #[test]
+    fn unidentified_output_rechecks_process_after_acquisition_window() {
+        let changed = ProcessProbeInput {
+            unidentified_output_since_process_check: true,
+            elapsed_since_process_check: PROCESS_RECHECK_IDENTIFIED,
+            ..process_probe_input()
+        };
+        assert!(should_probe_foreground_job(changed));
+        assert!(!should_probe_foreground_job(ProcessProbeInput {
+            elapsed_since_process_check: PROCESS_RECHECK_IDENTIFIED
+                - std::time::Duration::from_millis(1),
+            ..changed
+        }));
+        assert!(!should_probe_foreground_job(ProcessProbeInput {
+            unidentified_output_since_process_check: false,
+            ..changed
+        }));
+
+        let checked = std::time::Instant::now();
+        assert!(unidentified_output_since(Some(checked), checked));
+        assert!(!unidentified_output_since(
+            Some(checked - std::time::Duration::from_millis(1)),
+            checked
+        ));
+        assert!(!unidentified_output_since(None, checked));
+    }
+
+    #[test]
+    fn detection_deadline_unidentified_single_frame_gets_one_trailing_edge_probe() {
+        let changed = std::time::Instant::now();
+        let checked = changed - std::time::Duration::from_secs(1);
+        let mut acquisition_started_at =
+            Some(changed - PROCESS_ACQUISITION_WINDOW - PROCESS_ACQUISITION_IDLE_RESET);
+        let mut last_content_change_at = Some(changed - std::time::Duration::from_millis(200));
+        sync_content_change_acquisition(
+            None,
+            None,
+            false,
+            true,
+            changed,
+            &mut acquisition_started_at,
+            &mut last_content_change_at,
+        );
+        let input = ProcessProbeInput {
+            acquisition_age: acquisition_started_at.map(|started| changed.duration_since(started)),
+            elapsed_since_process_check: changed.duration_since(checked),
+            unidentified_output_since_process_check: unidentified_output_since(
+                last_content_change_at,
+                checked,
+            ),
+            ..process_probe_input()
+        };
+        assert!(!should_probe_foreground_job(input), "frame is throttled");
+        let deadline = detection_deadline(
+            &PendingIdleConfirmation::default(),
+            None,
+            &Mutex::new(None),
+            acquisition_started_at,
+            last_content_change_at,
+            checked,
+            false,
+            None,
+        );
+        let trailing_edge = checked + PROCESS_RECHECK_IDENTIFIED;
+        assert_eq!(deadline, Some(trailing_edge));
+        assert!(should_probe_foreground_job(ProcessProbeInput {
+            acquisition_age: acquisition_started_at
+                .map(|started| trailing_edge.duration_since(started)),
+            elapsed_since_process_check: PROCESS_RECHECK_IDENTIFIED,
+            ..input
+        }));
+        assert_eq!(
+            detection_deadline(
+                &PendingIdleConfirmation::default(),
+                None,
+                &Mutex::new(None),
+                acquisition_started_at,
+                last_content_change_at,
+                trailing_edge,
+                false,
+                None,
+            ),
+            None,
+            "the trailing-edge probe consumes the frame; silence must not re-arm it"
+        );
+    }
+
+    #[test]
+    fn detection_deadline_unidentified_quiet_pane_has_no_trailing_edge_probe() {
+        let checked = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        for last_content_change_at in [None, Some(checked - std::time::Duration::from_millis(1))] {
+            assert_eq!(
+                detection_deadline(
+                    &PendingIdleConfirmation::default(),
+                    None,
+                    &Mutex::new(None),
+                    None,
+                    last_content_change_at,
+                    checked,
+                    false,
+                    None,
+                ),
+                None,
+                "no output since the probe must not schedule a wake"
+            );
+        }
+    }
+
+    #[test]
+    fn unidentified_continuous_output_probes_at_most_once_per_five_seconds() {
+        let started = std::time::Instant::now();
+        let mut checked = started;
+        let mut probes = 0;
+        // Continuous changed frames after acquisition, with an unchanged PGID.
+        for frame in 1..=300 {
+            let changed = started + std::time::Duration::from_millis(frame * 100);
+            let elapsed = changed.duration_since(checked);
+            if should_probe_foreground_job(ProcessProbeInput {
+                elapsed_since_process_check: elapsed,
+                unidentified_output_since_process_check: unidentified_output_since(
+                    Some(changed),
+                    checked,
+                ),
+                ..process_probe_input()
+            }) {
+                assert!(elapsed >= PROCESS_RECHECK_IDENTIFIED);
+                checked = changed;
+                probes += 1;
+            }
+        }
+        assert_eq!(probes, 6, "one probe per 5 s over 30 s of output");
+    }
+
+    #[test]
     fn release_expiry_can_force_reacquire_probe_by_resetting_probe_state() {
         assert!(should_probe_foreground_job(ProcessProbeInput {
             current_agent: None,
@@ -7331,6 +7501,7 @@ mod tests {
             None,
             &pending_release,
             None,
+            None,
             before,
             false,
             None,
@@ -7351,6 +7522,7 @@ mod tests {
                 &pending_idle,
                 None,
                 &pending_release,
+                None,
                 None,
                 after,
                 false,
@@ -7376,6 +7548,7 @@ mod tests {
                 &pending_idle,
                 None,
                 &pending_release,
+                None,
                 None,
                 now,
                 false,
@@ -7483,6 +7656,7 @@ mod tests {
                 &pending_idle,
                 None,
                 &runtime.pending_release,
+                None,
                 None,
                 started,
                 false,
