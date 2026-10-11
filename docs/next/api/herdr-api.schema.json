@@ -1239,6 +1239,22 @@
           ],
           "type": "object"
         },
+        "AgentDraftStateParams": {
+          "additionalProperties": false,
+          "description": "A read-only observation, never authority for a later prompt. Callers are\nauthorized exactly like `agent.prompt`: an attributed agent may observe its own\npane, and another pane only with explicit `allow_cross_pane`.",
+          "properties": {
+            "allow_cross_pane": {
+              "type": "boolean"
+            },
+            "target": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "target"
+          ],
+          "type": "object"
+        },
         "AgentPromptGuardedParams": {
           "properties": {
             "allow_cross_pane": {
@@ -1249,6 +1265,9 @@
             },
             "expected_terminal": {
               "type": "string"
+            },
+            "if_draft_empty": {
+              "type": "boolean"
             },
             "request_id": {
               "type": "string"
@@ -1355,6 +1374,9 @@
         },
         "AgentRegisterSelfParams": {
           "properties": {
+            "draft_guard": {
+              "type": "boolean"
+            },
             "pane_id": {
               "type": [
                 "string",
@@ -6029,6 +6051,22 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/AgentChannelInfoParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "agent.draft_state",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentDraftStateParams"
             }
           },
           "required": [
