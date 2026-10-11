@@ -1647,6 +1647,7 @@ impl AppState {
             AppEvent::GitStatusRefreshed {
                 results,
                 cache_updates,
+                ..
             } => {
                 let _ = results;
                 let _ = cache_updates;

@@ -195,8 +195,11 @@ pub enum AppEvent {
     },
     /// Coalesced native git metadata change; debounced by the app refresh scheduler.
     GitFilesChanged,
-    /// Background git status refresh completed for workspaces.
+    /// Background git status refresh completed for workspaces. `generation`
+    /// identifies the worker start so results older than the latest identity
+    /// request can be dropped.
     GitStatusRefreshed {
+        generation: u64,
         results: Vec<WorkspaceGitStatus>,
         cache_updates: Vec<(std::path::PathBuf, GitStatusCacheEntry)>,
     },
