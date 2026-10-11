@@ -717,7 +717,10 @@
                   "type": "string"
                 },
                 "previous_session_id": {
-                  "type": "string"
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 },
                 "session_id": {
                   "type": "string"
@@ -7300,7 +7303,10 @@
             },
             "previous_session_id": {
               "description": "`null` when the pane had no reported session before.",
-              "type": "string"
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "session_id": {
               "type": "string"
@@ -8415,7 +8421,10 @@
                   "type": "string"
                 },
                 "previous_session_id": {
-                  "type": "string"
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 },
                 "session_id": {
                   "type": "string"

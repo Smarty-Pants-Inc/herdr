@@ -22,6 +22,15 @@ pub(super) fn metadata_token_values_schema(
     })
 }
 
+/// A required key whose value may be `null`. `#[schemars(required)]` on an
+/// `Option<T>` field drops the `null` type, so required-but-nullable fields
+/// need this explicit schema.
+pub(super) fn nullable_string_schema(
+    generator: &mut schemars::SchemaGenerator,
+) -> schemars::Schema {
+    generator.subschema_for::<Option<String>>()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default)]
 pub struct EmptyParams {}
 

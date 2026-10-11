@@ -427,7 +427,7 @@ pub struct PaneAgentSessionChangedEvent {
     pub agent: String,
     pub session_id: String,
     /// `null` when the pane had no reported session before.
-    #[schemars(required)]
+    #[schemars(required, schema_with = "super::common::nullable_string_schema")]
     pub previous_session_id: Option<String>,
 }
 
@@ -576,7 +576,7 @@ pub enum EventData {
         workspace_id: String,
         agent: String,
         session_id: String,
-        #[schemars(required)]
+        #[schemars(required, schema_with = "super::common::nullable_string_schema")]
         previous_session_id: Option<String>,
     },
     LayoutUpdated {
