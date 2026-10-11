@@ -3307,6 +3307,11 @@ impl HeadlessServer {
             return changed;
         }
         let alt_screen_read_spec = self.alt_screen_read_spec(&msg.request);
+        if matches!(&msg.request.method, api::schema::Method::AgentDraftState(_)) {
+            self.app
+                .handle_deferred_agent_api_request(msg.request, msg.context, msg.respond_to);
+            return changed; // Observation is not input or a presentation-state mutation.
+        }
         if matches!(
             &msg.request.method,
             api::schema::Method::AgentPrompt(_) | api::schema::Method::AgentPromptGuarded(_)

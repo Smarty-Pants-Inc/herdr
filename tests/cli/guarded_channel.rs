@@ -19,7 +19,7 @@ const GENERATION: &str = "test-session-1";
 // recorder's control barrier drains stdin before replying, including on a PTY
 // with no newline. A positive control tests this instrumentation separately.
 const PROCESS: &str = r#"
-import json, os, pathlib, select, socket, subprocess, sys, tty
+import json, os, pathlib, select, socket, subprocess, sys, threading, time, tty
 
 role = sys.argv[1]
 directory = pathlib.Path(sys.argv[2])
@@ -64,6 +64,8 @@ def register(claim):
     s.settimeout(10)
     s.connect(os.environ['CHANNEL_TEST_SOCKET'])
     params = {'session_generation': 'test-session-1'}
+    if os.environ.get('CHANNEL_TEST_MODE') != 'old_extension':
+        params['draft_guard'] = True
     if claim:
         params['pane_id'] = os.environ['HERDR_PANE_ID'] if claim == 'self' else claim
     send_json(s, {'id': 'real-process-register', 'method': 'agent.register_self', 'params': params})
@@ -175,6 +177,15 @@ while True:
                     old.close()
                 buffer.clear()
                 paused = False
+            elif op == 'query':
+                # The real CLI as a child of this registered agent: actual kernel
+                # caller attribution, never a supplied pane ID. A thread keeps this
+                # loop serving our own channel so a same-pane query can complete.
+                def run_query(argv, name):
+                    env = dict(os.environ, HERDR_SOCKET_PATH=os.environ['CHANNEL_TEST_SOCKET'])
+                    done = subprocess.run(argv, env=env, capture_output=True, text=True, timeout=10)
+                    publish(name, {'status': done.returncode, 'stdout': done.stdout, 'stderr': done.stderr})
+                threading.Thread(target=run_query, args=(command['argv'], command['name']), daemon=True).start()
             elif op == 'peer':
                 # A second real process, still in this pane's foreground group,
                 # must not replace the live registrant (even after disconnect).
@@ -207,14 +218,49 @@ while True:
             line, _, rest = buffer.partition(b'\n')
             buffer = bytearray(rest)
             frame = json.loads(line)
-            assert frame['type'] == 'deliver', frame
             assert frame['registration_epoch'] == epoch, frame
             assert frame['session_generation'] == 'test-session-1', frame
+            if frame['type'] == 'draft_state':
+                # Deliberately read-only: no admission log, editor data or prompt
+                # ingress. The fake peer exercises real server projection/parser.
+                append('queries.jsonl', frame)
+                reply = {key: frame[key] for key in ('registration_epoch', 'request_id', 'session_generation')}
+                reply.update(type='draft_state', empty=True, hold=None)
+                if mode == 'query_timeout':
+                    continue
+                if mode == 'query_unknown':
+                    reply = {key: reply[key] for key in ('type', 'registration_epoch', 'request_id', 'session_generation')}
+                    reply['unknown'] = True
+                elif mode == 'query_nonempty':
+                    reply.update(empty=False)
+                elif mode in ('query_dialog', 'query_custom', 'query_editor'):
+                    reply['hold'] = mode.removeprefix('query_')
+                elif mode == 'query_text':
+                    reply['text'] = 'private draft must never escape API'
+                elif mode == 'query_wrong_epoch':
+                    reply['registration_epoch'] = 'wrong'
+                elif mode == 'query_wrong_session':
+                    reply['session_generation'] = 'wrong'
+                elif mode == 'query_wrong_id':
+                    reply['request_id'] = 'wrong'
+                elif mode == 'query_count':
+                    # A legacy/foreign draft size must fail closed, never be projected.
+                    reply['chars'] = 7
+                send_json(channel, reply)
+                continue
+            assert frame['type'] == 'deliver', frame
             append('frames.jsonl', frame)
             status = 'queued' if mode == 'queued' else 'accepted'
+            reason = None
             if mode == 'rejected':
-                status = 'rejected'
-            elif mode != 'complete_before_admission':
+                status, reason = 'rejected', 'admission_refused'
+            if frame.get('if_draft_empty'):
+                assert isinstance(frame.get('deadline_ms'), int), frame
+                if time.time() * 1000 >= frame['deadline_ms']:
+                    status, reason = 'rejected', 'expired'
+                elif mode in ('draft_present', 'ui_hold', 'unknown'):
+                    status, reason = 'rejected', mode
+            if status != 'rejected' and mode != 'complete_before_admission':
                 # No receiver dedup to conceal a server redispatch bug. Count
                 # every ingress attempt independently of the caller's result.
                 append('queue.jsonl' if status == 'queued' else 'admitted.jsonl', frame)
@@ -224,7 +270,7 @@ while True:
             ack = {key: frame[key] for key in ('registration_epoch', 'request_id', 'session_generation')}
             ack.update(type='ack', status=status)
             if status == 'rejected':
-                ack['reason'] = 'admission_refused'
+                ack['reason'] = reason
             if mode == 'wrong_ack':
                 ack['request_id'] = 'uncorrelated-request'
             send_json(channel, ack)
@@ -361,6 +407,27 @@ impl ChannelServer {
             // authority even when the test runner inherits an outer Herdr pane.
             "allow_cross_pane": true,
         })
+    }
+
+    /// Receiver-focused draft query. As with prompt_params, caller policy is covered
+    /// separately (with sanitized real CLI callers), so an inherited outer Herdr pane
+    /// marker on the test runner cannot change these results.
+    fn draft_state(&self, pane: &TestPane) -> Value {
+        self.request(
+            "agent.draft_state",
+            json!({"target": pane.id, "allow_cross_pane": true}),
+        )
+    }
+
+    /// Real `herdr agent draft-state` from outside every pane, sanitized env.
+    fn cli_draft_state(&self, target: &str, allow: bool, env: &[(&str, &str)]) -> Value {
+        let mut command = self.command();
+        command.args(["agent", "draft-state", target]);
+        if allow {
+            command.arg("--allow-cross-pane");
+        }
+        command.envs(env.iter().copied());
+        cli_reply(command.output().unwrap())
     }
 
     fn prompt(&self, pane: &TestPane, registration: &Value, id: &str, text: &str) -> Value {
@@ -529,6 +596,26 @@ impl TestPane {
         self.registration(number)
     }
 
+    /// `herdr agent draft-state` run by this pane's registered agent process.
+    fn agent_cli_draft_state(&self, name: &str, target: &str, allow: bool) -> Value {
+        let mut argv = vec![env!("CARGO_BIN_EXE_herdr"), "agent", "draft-state", target];
+        if allow {
+            argv.push("--allow-cross-pane");
+        }
+        let started = self.control(json!({"op": "query", "argv": argv, "name": name}));
+        assert_eq!(started["ok"], true, "{started}");
+        let done = self.file(name);
+        let stream = if done["status"] == 0 {
+            "stdout"
+        } else {
+            "stderr"
+        };
+        let reply: Value = serde_json::from_str(done[stream].as_str().unwrap())
+            .unwrap_or_else(|error| panic!("{error}: {done}"));
+        assert_eq!(done["status"] == 0, reply.get("result").is_some(), "{done}");
+        reply
+    }
+
     fn entries(&self, name: &str) -> Vec<Value> {
         fs::read_to_string(self.directory.join(name))
             .unwrap_or_default()
@@ -536,6 +623,25 @@ impl TestPane {
             .map(|line| serde_json::from_str(line).unwrap())
             .collect()
     }
+}
+
+/// CLI success prints the response on stdout; refusals print it on stderr with exit 1.
+fn cli_reply(output: std::process::Output) -> Value {
+    let code = output.status.code();
+    let stream = if code == Some(0) {
+        &output.stdout
+    } else {
+        &output.stderr
+    };
+    let reply: Value = serde_json::from_slice(stream).unwrap_or_else(|error| {
+        panic!(
+            "{error}: status {code:?}\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    });
+    assert_eq!(code == Some(0), reply.get("result").is_some(), "{reply}");
+    reply
 }
 
 fn request_control(socket: &Path, command: Value) -> Value {
@@ -988,6 +1094,256 @@ fn guarded_channel_stale_terminal_and_epoch_have_no_delivery_effects() {
     assert_eq!(pane.entries("admitted.jsonl").len(), 1);
     pane.assert_no_shell_input(1);
     other.assert_no_shell_input(1);
+}
+
+#[test]
+fn guarded_channel_if_draft_empty_accepts_and_retains_flag_identity_across_epochs() {
+    let server = ChannelServer::new();
+    let pane = server.pane("draft-guard-accepted", "accepted", "self");
+    let registration = pane.registration(1);
+    assert_eq!(server.info(&pane)["draft_guard"], true);
+    let text = literal_text(&server);
+    let mut params = server.prompt_params(&pane, &registration, "guarded-first", &text);
+    params["if_draft_empty"] = true.into();
+    let accepted = server.request("agent.prompt_guarded", params.clone());
+    assert_receipt(&accepted, &registration, "guarded-first", "accepted");
+    let duplicate = server.request("agent.prompt_guarded", params.clone());
+    assert_eq!(duplicate["result"]["duplicate"], true);
+    let mut mismatch = params.clone();
+    mismatch["if_draft_empty"] = false.into();
+    assert_eq!(
+        server.request("agent.prompt_guarded", mismatch.clone())["error"]["code"],
+        "payload_mismatch"
+    );
+    let current = pane.control(json!({"op":"reregister"}));
+    assert_result(&current);
+    pane.wait_ready(&current["result"]);
+    let retained = server.request("agent.prompt_guarded", params);
+    assert_receipt(&retained, &registration, "guarded-first", "accepted");
+    assert_eq!(retained["result"]["duplicate"], true);
+    assert_eq!(
+        server.request("agent.prompt_guarded", mismatch)["error"]["code"],
+        "payload_mismatch"
+    );
+    let frames = pane.entries("frames.jsonl");
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0]["if_draft_empty"], true);
+    assert!(frames[0]["deadline_ms"].as_u64().is_some());
+    pane.exit(1);
+    pane.assert_no_shell_input(1);
+    assert!(!server.base.join("must-not-execute").exists());
+}
+
+#[test]
+fn guarded_channel_if_draft_empty_typed_refusals_send_no_input_and_do_not_replay() {
+    let server = ChannelServer::new();
+    let pane = server.pane("draft-guard-refusals", "accepted", "");
+    let registration = pane.registration(1);
+    for reason in ["draft_present", "ui_hold", "unknown"] {
+        pane.control(json!({"op":"mode", "mode":reason}));
+        let mut params = server.prompt_params(&pane, &registration, reason, &literal_text(&server));
+        params["if_draft_empty"] = true.into();
+        let rejected = server.request("agent.prompt_guarded", params.clone());
+        assert_refusal(&rejected);
+        assert_eq!(rejected["error"]["code"], "agent_prompt_rejected");
+        assert_eq!(rejected["error"]["reason"], reason);
+        // Even after the UI becomes observable/empty, this key retains its refusal.
+        pane.control(json!({"op":"mode", "mode":"accepted"}));
+        let retained = server.request("agent.prompt_guarded", params);
+        assert_eq!(retained["error"]["reason"], reason);
+        assert_eq!(retained["error"]["duplicate"], true);
+    }
+    pane.exit(1);
+    assert_eq!(pane.entries("frames.jsonl").len(), 3);
+    assert!(pane.entries("admitted.jsonl").is_empty());
+    assert!(pane.entries("queue.jsonl").is_empty());
+    pane.assert_no_shell_input(1);
+    assert!(!server.base.join("must-not-execute").exists());
+}
+
+#[test]
+fn guarded_channel_draft_query_known_unknown_timeout_is_read_only_and_not_authority() {
+    let server = ChannelServer::new();
+    let pane = server.pane("draft-query", "accepted", "");
+    let registration = pane.registration(1);
+    for (mode, expected) in [
+        (
+            "accepted",
+            json!({"status":"known", "empty":true, "hold":null}),
+        ),
+        (
+            "query_nonempty",
+            json!({"status":"known", "empty":false, "hold":null}),
+        ),
+        (
+            "query_dialog",
+            json!({"status":"known", "empty":true, "hold":"dialog"}),
+        ),
+        (
+            "query_custom",
+            json!({"status":"known", "empty":true, "hold":"custom"}),
+        ),
+        (
+            "query_editor",
+            json!({"status":"known", "empty":true, "hold":"editor"}),
+        ),
+        (
+            "query_unknown",
+            json!({"status":"unknown", "reason":"unknown"}),
+        ),
+        (
+            "query_timeout",
+            json!({"status":"unknown", "reason":"timeout"}),
+        ),
+    ] {
+        pane.control(json!({"op":"mode", "mode":mode}));
+        let start = std::time::Instant::now();
+        let response = server.draft_state(&pane);
+        assert_result(&response);
+        assert_eq!(response["result"], expected, "mode {mode}: {response}");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "query exceeded bounded default"
+        );
+    }
+    assert!(pane.entries("frames.jsonl").is_empty());
+    assert!(pane.entries("admitted.jsonl").is_empty());
+    // A previous empty observation cannot authorize a later prompt after draft changes.
+    pane.control(json!({"op":"mode", "mode":"draft_present"}));
+    let mut params = server.prompt_params(&pane, &registration, "after-query", "literal");
+    params["if_draft_empty"] = true.into();
+    assert_eq!(
+        server.request("agent.prompt_guarded", params)["error"]["reason"],
+        "draft_present"
+    );
+    assert_eq!(pane.entries("queries.jsonl").len(), 7);
+    for query in pane.entries("queries.jsonl") {
+        assert_eq!(query.as_object().unwrap().len(), 4);
+        assert!(query.get("text").is_none());
+    }
+    pane.exit(1);
+    pane.assert_no_shell_input(1);
+}
+
+#[test]
+fn guarded_channel_draft_query_unregistered_and_old_extension_send_no_frames() {
+    let server = ChannelServer::new();
+    let absent = server.pane("draft-unregistered", "no_channel", "");
+    absent.file("recorder-1.json");
+    let response = server.draft_state(&absent);
+    assert_eq!(
+        response["result"],
+        json!({"status":"unknown", "reason":"unregistered"})
+    );
+    let mut params = server.prompt_params(
+        &absent,
+        &json!({"registration_epoch":"absent"}),
+        "none",
+        "literal",
+    );
+    params["if_draft_empty"] = true.into();
+    let rejected = server.request("agent.prompt_guarded", params);
+    assert_eq!(rejected["error"]["code"], "agent_prompt_rejected");
+    assert_eq!(rejected["error"]["reason"], "unregistered");
+    absent.assert_no_shell_input(1);
+    let old = server.pane("draft-old-extension", "old_extension", "");
+    let registration = old.registration(1);
+    assert_eq!(server.info(&old)["draft_guard"], false);
+    let response = server.draft_state(&old);
+    assert_eq!(
+        response["result"],
+        json!({"status":"unknown", "reason":"unsupported"})
+    );
+    let mut params = server.prompt_params(&old, &registration, "unsupported", "literal");
+    params["if_draft_empty"] = true.into();
+    let rejected = server.request("agent.prompt_guarded", params);
+    assert_eq!(rejected["error"]["code"], "agent_prompt_rejected");
+    assert_eq!(rejected["error"]["reason"], "unsupported");
+    assert!(old.entries("frames.jsonl").is_empty());
+    assert!(old.entries("queries.jsonl").is_empty());
+    // Legacy explicit ingress remains available, but guarded failures never fall back.
+    assert_receipt(
+        &server.prompt(&old, &registration, "legacy", "literal"),
+        &registration,
+        "legacy",
+        "accepted",
+    );
+    old.exit(1);
+    old.assert_no_shell_input(1);
+    assert_eq!(old.entries("frames.jsonl").len(), 1);
+}
+
+#[test]
+fn guarded_channel_draft_query_bad_receipt_or_private_text_fails_closed_without_leak() {
+    let server = ChannelServer::new();
+    for mode in [
+        "query_text",
+        "query_wrong_epoch",
+        "query_wrong_session",
+        "query_wrong_id",
+        "query_count",
+    ] {
+        let pane = server.pane(mode, mode, "");
+        pane.registration(1);
+        let response = server.draft_state(&pane);
+        assert_result(&response);
+        assert_eq!(
+            response["result"],
+            json!({"status":"unknown", "reason":"unknown"})
+        );
+        assert!(!response.to_string().contains("private draft"));
+        assert!(response["result"].get("chars").is_none());
+        assert!(pane.entries("admitted.jsonl").is_empty());
+        pane.exit(1);
+        pane.assert_no_shell_input(1);
+    }
+}
+
+/// agent.draft_state uses agent.prompt's caller policy, decided before any ledger
+/// reservation or receiver frame. Callers are real `herdr` CLI processes: one run by
+/// pane A's registered agent (kernel-attributed), others outside every pane.
+#[test]
+fn guarded_channel_draft_query_authorizes_caller_before_reservation_or_frame() {
+    let server = ChannelServer::new();
+    let source = server.pane("draft-auth-source", "accepted", "");
+    source.registration(1);
+    let target = server.pane("draft-auth-target", "accepted", "");
+    target.registration(1);
+    let known = json!({"status":"known", "empty":true, "hold":null});
+
+    // Agent -> another pane without opt-in: refused; the receiver sees no frame.
+    let denied = source.agent_cli_draft_state("cross-denied.json", &target.id, false);
+    assert_refusal(&denied);
+    assert_eq!(denied["error"]["code"], "cross_pane_input_denied");
+    assert!(!denied.to_string().contains("empty"), "{denied}");
+    // An unattributable caller is refused the same way unless it opts in.
+    let unknown = server.cli_draft_state(&target.id, false, &[("HERDR_ENV", "0")]);
+    assert_refusal(&unknown);
+    assert_eq!(unknown["error"]["code"], "input_origin_unknown");
+    assert!(target.entries("queries.jsonl").is_empty());
+    assert!(source.entries("queries.jsonl").is_empty());
+
+    // Same pane by default, and another pane only with the explicit flag.
+    let own = source.agent_cli_draft_state("own.json", &source.id, false);
+    assert_eq!(own["result"], known, "{own}");
+    assert_eq!(source.entries("queries.jsonl").len(), 1);
+    let allowed = source.agent_cli_draft_state("cross-allowed.json", &target.id, true);
+    assert_eq!(allowed["result"], known, "{allowed}");
+    assert_eq!(target.entries("queries.jsonl").len(), 1);
+    let unknown = server.cli_draft_state(&target.id, true, &[("HERDR_ENV", "0")]);
+    assert_eq!(unknown["result"], known, "{unknown}");
+    // An ordinary external operator keeps agent.prompt's ordinary policy.
+    let ordinary = server.cli_draft_state(&target.id, false, &[]);
+    assert_eq!(ordinary["result"], known, "{ordinary}");
+    assert_eq!(target.entries("queries.jsonl").len(), 3);
+    assert_eq!(source.entries("queries.jsonl").len(), 1);
+
+    for pane in [&source, &target] {
+        assert!(pane.entries("frames.jsonl").is_empty());
+        assert!(pane.entries("admitted.jsonl").is_empty());
+        pane.exit(1);
+        pane.assert_no_shell_input(1);
+    }
 }
 
 #[test]
