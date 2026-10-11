@@ -1211,8 +1211,12 @@ Before `pane.send_text`, `pane.send_input`, `pane.send_keys`, `agent.send_keys`,
 state directory (for example `~/.local/state/herdr/api-input.jsonl`; the file is readable
 by its owner only). The line records the time (`ts_ms`), the method, the target pane and
 terminal, the byte count, and the caller as herdr knows it from the socket peer process:
-its pid, pane, agent name, and agent session. It never records the text. If herdr cannot
-write the line, it refuses the input with `input_log_unavailable`.
+its pid, pane, agent name, and agent session. It never records the text. When the log
+reaches 32 MiB, herdr renames it to `api-input.jsonl.1` (replacing the previous
+generation) before appending the next line. If the log is full and that rotation fails,
+herdr refuses the input with `input_log_full`; the error names the log path and the
+rotation error. If herdr cannot write the line for any other reason, it refuses the input
+with `input_log_unavailable`.
 
 On Linux and macOS, `caller.exe` and `caller.ppid` record the executable basename
 (not a mutable process label) and parent PID at write time, even when the caller is
