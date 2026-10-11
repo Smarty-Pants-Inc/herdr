@@ -1142,14 +1142,37 @@ fn channel_guarded_deadline_wall_before_monotonic_bounds_read_delay_on_stable_wa
         ),
         Some((base + timeout, None))
     );
+    // Windows FILETIME's signed 64-bit 100ns range is smaller than the JSON safe
+    // millisecond range. Construct the boundary only when SystemTime can hold it.
+    let limit_offset = Duration::from_millis(MAX_SAFE_JSON_INTEGER - 1_500);
+    if let Some(at_limit) = UNIX_EPOCH.checked_add(limit_offset) {
+        assert_eq!(
+            request_deadlines(timeout, true, || at_limit, || base).map(|(_, ms)| ms),
+            Some(Some(MAX_SAFE_JSON_INTEGER))
+        );
+        assert_eq!(
+            request_deadlines(
+                timeout + Duration::from_millis(1),
+                true,
+                || at_limit,
+                || panic!("monotonic deadline sampled after wall refusal")
+            ),
+            None
+        );
+    } else {
+        // A tighter native wall-clock range must also refuse before the next read.
+        assert_eq!(
+            request_deadlines(
+                limit_offset,
+                true,
+                || UNIX_EPOCH,
+                || panic!("monotonic deadline sampled after native wall overflow")
+            ),
+            None
+        );
+    }
     // Unrepresentable wall deadlines refuse without sampling Herdr's deadline.
-    let at_limit = UNIX_EPOCH + Duration::from_millis(MAX_SAFE_JSON_INTEGER - 1_500);
-    assert_eq!(
-        request_deadlines(timeout, true, || at_limit, || base).map(|(_, ms)| ms),
-        Some(Some(MAX_SAFE_JSON_INTEGER))
-    );
     for (wall, timeout) in [
-        (at_limit + Duration::from_millis(1), timeout),
         (UNIX_EPOCH - Duration::from_secs(10), timeout),
         (SystemTime::now(), Duration::MAX),
     ] {
@@ -1163,6 +1186,80 @@ fn channel_guarded_deadline_wall_before_monotonic_bounds_read_delay_on_stable_wa
             None
         );
     }
+}
+
+#[test]
+fn channel_request_deadlines_monotonic_overflow_refuses_guarded_and_unguarded() {
+    // Find a valid near-limit Instant using checked arithmetic, without assuming
+    // Unix's signed Timespec or Windows' QPC-relative Duration representation.
+    let mut near_limit = Instant::now();
+    for shift in (0..64).rev() {
+        if let Some(next) = near_limit.checked_add(Duration::from_secs(1_u64 << shift)) {
+            near_limit = next;
+        }
+    }
+    let timeout = Duration::from_secs(2);
+    assert!(near_limit.checked_add(timeout).is_none());
+    for guarded in [false, true] {
+        let reads = std::cell::RefCell::new(Vec::new());
+        assert_eq!(
+            request_deadlines(
+                timeout,
+                guarded,
+                || {
+                    assert!(guarded, "unguarded request read the wall clock");
+                    reads.borrow_mut().push("wall");
+                    std::time::UNIX_EPOCH
+                },
+                || {
+                    reads.borrow_mut().push("monotonic");
+                    near_limit
+                }
+            ),
+            None
+        );
+        assert_eq!(
+            *reads.borrow(),
+            if guarded {
+                vec!["wall", "monotonic"]
+            } else {
+                vec!["monotonic"]
+            }
+        );
+    }
+}
+
+#[test]
+fn channel_deadline_overflow_refuses_before_reservation_or_dispatch() {
+    let (channel, receiver) = channel();
+    channel.set_draft_guard(true);
+    assert!(Instant::now().checked_add(Duration::MAX).is_none());
+    for guarded in [false, true] {
+        assert_eq!(
+            channel
+                .reserve_prompt("r".into(), "literal".into(), guarded, Duration::MAX)
+                .err()
+                .unwrap(),
+            Outcome::failure("agent_prompt_rejected", "unknown")
+        );
+    }
+    assert_eq!(
+        channel
+            .reserve_draft_state("r".into(), Duration::MAX)
+            .err()
+            .unwrap(),
+        Outcome::failure("agent_prompt_rejected", "unknown")
+    );
+    let ledger = channel.ledger.lock().unwrap();
+    assert!(ledger.requests.is_empty());
+    assert_eq!(ledger.bytes, 0);
+    drop(ledger);
+    assert_eq!(channel.waiters.load(Ordering::Acquire), 0);
+    assert!(!channel.rotating.load(Ordering::Acquire));
+    assert!(receiver.try_recv().is_err());
+    // A refused ID is not retained, so a representable retry is a fresh request.
+    assert!(!reserve(&channel, "r").1);
+    assert_eq!(receiver.try_iter().count(), 1);
 }
 
 #[test]

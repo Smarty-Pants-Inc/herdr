@@ -650,8 +650,8 @@ impl Channel {
 /// after Herdr's monotonic wait has reported timeout (as `delivery_unknown` once dispatch
 /// was possible). That is the pre-existing limitation of any wall-clock deadline.
 /// Clocks are injected so the read order is unit-testable.
-/// `None` means the wall deadline is unrepresentable (overflow, pre-epoch or above the
-/// JSON safe-integer range); callers refuse before reservation.
+/// `None` means either deadline is unrepresentable (monotonic or wall-clock overflow,
+/// pre-epoch wall time or above the JSON safe-integer range); callers refuse before reservation.
 fn request_deadlines(
     timeout: Duration,
     guarded: bool,
@@ -669,8 +669,8 @@ fn request_deadlines(
     } else {
         None
     };
-    // Same monotonic arithmetic as every unguarded request; timeouts are App-bounded.
-    Some((monotonic_now() + timeout, deadline_ms))
+    // App-bounded timeouts still must fit the platform's monotonic representation.
+    Some((monotonic_now().checked_add(timeout)?, deadline_ms))
 }
 
 /// Single-use connection-local install slot. Caller JSON cannot supply this authority.
