@@ -29,6 +29,8 @@ use crate::ipc::{
 use crate::server::shutdown::{ServerStop, ShutdownReason};
 
 #[cfg(test)]
+mod channel_contract_tests;
+#[cfg(test)]
 mod subscription_socket_tests;
 
 const SOCKET_PERMISSION_MODE: u32 = 0o600;
@@ -622,6 +624,42 @@ fn handle_connection_with_stop(
             )?;
             finish_wait_response(&mut stream, response, &request_id, method, changes_ui)
         }
+        Method::AgentRegisterSelf(mut params) => {
+            let transport = crate::api::agent_channel::RegistrationTransport::default();
+            params.transport = Some(transport.clone());
+            let response = dispatch_to_app_with_timeout_and_context(
+                Request {
+                    id: request_id.clone(),
+                    method: Method::AgentRegisterSelf(params),
+                },
+                api_tx,
+                Some(INITIAL_REQUEST_TIMEOUT),
+                context,
+            );
+            let installed = transport.take();
+            if let Some((channel, receiver)) = installed {
+                if serde_json::from_str::<serde_json::Value>(&response)
+                    .ok()
+                    .is_some_and(|value| value["result"]["ready"] == true)
+                {
+                    channel.mark_ready();
+                    if let Err(error) = write_text_line(&mut stream, &response) {
+                        channel.revoke();
+                        return Err(error);
+                    }
+                    return crate::api::agent_channel::serve(
+                        stream,
+                        channel,
+                        receiver,
+                        api_tx,
+                        running,
+                        server_stop.map(|stop| stop.flag().as_ref()),
+                    );
+                }
+                channel.revoke();
+            }
+            write_text_line_allow_disconnect(&mut stream, &response)
+        }
         Method::AgentPrompt(params) => {
             let response = prompt_agent(
                 request_id.clone(),
@@ -744,7 +782,7 @@ fn handle_request_with_context(
     response_write_complete: Option<std::sync::mpsc::Receiver<()>>,
 ) -> String {
     if matches!(&request.method, Method::Ping(_)) {
-        return serde_json::to_string(&SuccessResponse {
+        let response = serde_json::to_value(&SuccessResponse {
             id: request.id,
             result: ResponseResult::Pong {
                 version: crate::build_info::version(),
@@ -752,10 +790,30 @@ fn handle_request_with_context(
                 capabilities,
             },
         })
+        .map(|mut response| {
+            // Optional JSON-only capability additions: no frozen binary codec changes.
+            if response["result"]["capabilities"].is_object() {
+                let supported = crate::platform::capabilities().registered_agent_channel;
+                response["result"]["capabilities"]["agent_registration_channel"] = supported.into();
+                response["result"]["capabilities"]["guarded_agent_prompt"] = supported.into();
+                response["result"]["capabilities"]["agent_channel_info"] = true.into();
+                response["result"]["capabilities"]["agent_channel_methods"] = if supported {
+                    serde_json::json!([
+                        "agent.register_self",
+                        "agent.channel_info",
+                        "agent.prompt_guarded"
+                    ])
+                } else {
+                    serde_json::json!(["agent.channel_info"])
+                };
+            }
+            response.to_string()
+        })
         .unwrap_or_else(|_| {
             r#"{"id":"","error":{"code":"internal_error","message":"failed to encode response"}}"#
-                .to_string()
+                .into()
         });
+        return response;
     }
 
     if matches!(&request.method, Method::ClientShellSurfaceSet(_)) {
@@ -862,6 +920,9 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::AgentStart(_) => "agent.start",
         Method::AgentStartGuarded(_) => "agent.start_guarded",
         Method::AgentPrompt(_) => "agent.prompt",
+        Method::AgentRegisterSelf(_) => "agent.register_self",
+        Method::AgentChannelInfo(_) => "agent.channel_info",
+        Method::AgentPromptGuarded(_) => "agent.prompt_guarded",
         Method::AgentWait(_) => "agent.wait",
         Method::PaneSplit(_) => "pane.split",
         Method::PaneSwap(_) => "pane.swap",

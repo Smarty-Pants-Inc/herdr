@@ -353,6 +353,39 @@ fn agent_command() -> Command {
         .subcommand(Command::new("list").about("List agents"))
         .subcommand(id_command("get", "target", "Show an agent"))
         .subcommand(
+            Command::new("channel-info")
+                .about("Inspect a terminal's registered agent channel without requiring agent detection")
+                .arg(required("target", "TARGET").allow_hyphen_values(true))
+                .after_help("JSON ready means a registered receiver is available, not that a prompt was admitted."),
+        )
+        .subcommand(
+            Command::new("prompt-guarded")
+                .about("Submit literal text over a pinned registered agent channel, never through PTY input")
+                .arg(required("target", "TARGET").allow_hyphen_values(true))
+                .arg(required("text", "TEXT").allow_hyphen_values(true))
+                .arg(expected_terminal_option().required(true))
+                .arg(
+                    option("expected-registration-epoch", "EPOCH")
+                        .required(true)
+                        .help("Refuse unless this exact registration epoch is still active"),
+                )
+                .arg(
+                    option("request-id", "ID")
+                        .required(true)
+                        .help("Caller-chosen deduplication key within this registration epoch"),
+                )
+                .arg(
+                    option("timeout-ms", "MS")
+                        .value_parser(clap::value_parser!(u64).range(1..=300_000))
+                        .help("Wait for an admission receipt (default: 10000; max: 300000)"),
+                )
+                .arg(
+                    flag("allow-cross-pane")
+                        .help("Deliberately allow an agent-originated request to target another pane"),
+                )
+                .after_help("Success acknowledges accepted or queued input, not model completion. A lost receipt may return delivery_unknown; never automatically replay it with a fresh epoch or request ID. TARGET and TEXT are literal argv values. Put options before -- when payload values match an option. Registration must be performed in the agent process over its own persistent socket."),
+        )
+        .subcommand(
             Command::new("read")
                 .about("Read agent terminal output")
                 .override_usage("herdr agent read <TARGET> [OPTIONS]")
@@ -1257,6 +1290,95 @@ mod tests {
                     path.join(" ")
                 );
             }
+        }
+    }
+
+    #[test]
+    fn channel_commands_are_public_but_self_registration_is_not() {
+        let cmd = super::command();
+        let info = command_path(&cmd, &["agent", "channel-info"]);
+        assert!(argument(info, "target").is_required_set());
+        let guarded = command_path(&cmd, &["agent", "prompt-guarded"]);
+        for name in [
+            "expected-terminal",
+            "expected-registration-epoch",
+            "request-id",
+        ] {
+            assert!(option_arg(guarded, name).is_required_set());
+        }
+        assert!(has_option(guarded, "timeout-ms"));
+        assert!(has_option(guarded, "allow-cross-pane"));
+        for old in ["wait", "until", "timeout"] {
+            assert!(!has_option(guarded, old));
+        }
+        assert!(command_path(&cmd, &["agent"])
+            .get_subcommands()
+            .all(|command| command.get_name() != "register-self"));
+        assert!(long_help(&["agent", "prompt-guarded"]).contains("delivery_unknown"));
+    }
+
+    #[test]
+    fn guarded_spec_accepts_required_guards_and_separator_payload() {
+        let valid = [
+            "herdr",
+            "agent",
+            "prompt-guarded",
+            "--expected-terminal=term",
+            "--expected-registration-epoch=epoch",
+            "--request-id=request",
+            "--timeout-ms=1",
+            "--allow-cross-pane",
+            "--",
+            "--help",
+            "--session=literal",
+        ];
+        let matches = super::command().try_get_matches_from(valid).unwrap();
+        let leaf = matches
+            .subcommand_matches("agent")
+            .unwrap()
+            .subcommand_matches("prompt-guarded")
+            .unwrap();
+        assert_eq!(
+            leaf.get_one::<String>("target").map(String::as_str),
+            Some("--help")
+        );
+        assert_eq!(
+            leaf.get_one::<String>("text").map(String::as_str),
+            Some("--session=literal")
+        );
+        assert_eq!(leaf.get_one::<u64>("timeout-ms"), Some(&1));
+        for missing in [
+            "--expected-terminal=term",
+            "--expected-registration-epoch=epoch",
+            "--request-id=request",
+        ] {
+            let input = valid.iter().copied().filter(|value| *value != missing);
+            assert!(super::command().try_get_matches_from(input).is_err());
+        }
+    }
+
+    #[test]
+    fn channel_literal_help_text_is_not_intercepted() {
+        for text in ["--help", "-h"] {
+            let args = [
+                "herdr",
+                "agent",
+                "prompt-guarded",
+                "worker",
+                text,
+                "--expected-terminal",
+                "term",
+                "--expected-registration-epoch",
+                "epoch",
+                "--request-id",
+                "request",
+            ]
+            .map(str::to_owned);
+            let mut output = Vec::new();
+            assert!(!super::write_requested_help(&args, &mut output, || {}).unwrap());
+            assert!(output.is_empty());
+            let args = ["herdr", "agent", "channel-info", "--", text].map(str::to_owned);
+            assert!(!super::write_requested_help(&args, &mut output, || {}).unwrap());
         }
     }
 

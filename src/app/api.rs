@@ -1,5 +1,6 @@
 use std::time::{Duration, Instant};
 
+pub(super) mod agent_channel;
 mod agent_view;
 mod agents;
 mod env;
@@ -246,6 +247,11 @@ impl App {
 
         let mut worktree_restore_updates = Vec::new();
         if let AppEvent::PaneDied { pane_id, .. } = &ev {
+            if let Some((workspace, _)) = self.find_pane(*pane_id) {
+                if let Some(terminal_id) = self.state.terminal_id_for_pane(workspace, *pane_id) {
+                    self.agent_channels.revoke_terminal(terminal_id.as_str());
+                }
+            }
             if self
                 .state
                 .popup_pane
@@ -1005,6 +1011,7 @@ impl App {
         };
         let response = match request.method {
             Method::ServerStop(_) => {
+                self.revoke_agent_channels();
                 self.state.should_quit = true;
                 SuccessResponse {
                     id: request.id,
@@ -1186,6 +1193,19 @@ impl App {
                 return self.handle_tab_move_project_checked(request.id, params)
             }
             Method::TabClose(target) => return self.handle_tab_close(request.id, target),
+            Method::AgentRegisterSelf(params) => {
+                return self.handle_agent_register_self(request.id, params, context)
+            }
+            Method::AgentChannelInfo(params) => {
+                return self.handle_agent_channel_info(request.id, params)
+            }
+            Method::AgentPromptGuarded(_) => {
+                return responses::encode_error(
+                    request.id,
+                    "invalid_request",
+                    "agent.prompt_guarded is handled asynchronously by the app runtime",
+                )
+            }
             Method::AgentList(_) => return self.handle_agent_list(request.id),
             Method::AgentGet(target) => return self.handle_agent_get(request.id, target),
             Method::AgentFocus(target) => return self.handle_agent_focus(request.id, target),

@@ -107,13 +107,74 @@ Raw socket method names use dot notation:
 | Input consumer (local JSON only) | `pane.input_consumer.enroll`, `pane.input_consumer.cut`, `pane.input_consumer.release` |
 | Popup | `popup.close` |
 | Layout | `layout.export`, `layout.apply`, `layout.apply_restorable`, `layout.set_split_ratio` |
-| Agent | `agent.list`, `agent.get`, `agent.read`, `agent.explain`, `agent.send_keys`, `agent.prompt`, `agent.wait`, `agent.rename`, `agent.focus`, `agent.start`, `agent.start_guarded`, `agent.view.set`, `agent.view.clear` |
+| Agent | `agent.list`, `agent.get`, `agent.read`, `agent.explain`, `agent.send_keys`, `agent.prompt`, `agent.register_self`, `agent.channel_info`, `agent.prompt_guarded`, `agent.wait`, `agent.rename`, `agent.focus`, `agent.start`, `agent.start_guarded`, `agent.view.set`, `agent.view.clear` |
 | Events | `events.subscribe`, `events.wait` |
 | Integrations | `integration.install`, `integration.uninstall` |
 | Plugins | `plugin.link`, `plugin.list`, `plugin.unlink`, `plugin.enable`, `plugin.disable`, `plugin.action.list`, `plugin.action.invoke`, `plugin.log.list`, `plugin.pane.open`, `plugin.pane.focus`, `plugin.pane.close` |
 | Media | `pane.media_open`, `media.answer`, `media.mute`, `media.state`, `media.close` |
 
 `pane.media_open` asks the attached Herdr client whose input last reached the pane, within 10 seconds, to act as the WebRTC audio peer for that pane: it captures the microphone and plays the reply on the user's machine, and the server carries only SDP and control. It routes only to that client, and only when it advertises native media support (`media.webrtc.v1`). The response is `media_offer` with a `session_id` and the client's SDP offer. Post the remote answer with `media.answer`, mute with `media.mute`, poll `media.state` (`opening`, `offered`, `connecting`, `connected`, `failed` or `closed` with a `code`), and end the call with `media.close`, which releases the microphone. Errors: `media_no_client` (no recent input from an attached client), `media_unsupported_client` (the client that typed last has no media support), `media_refused` (the client declined; the message starts with a code such as `declined`, `disabled`, `not_viewed` or `stale_input`) and `media_timeout`. The client setting `media = "off" | "ask" | "auto"` controls consent; `ask`, the default, prompts once per client run.
+
+### Registered agent channels (unreleased)
+
+Registered channels are a socket-only prompt-delivery path. They do not write PTY text, preparatory bytes, input-focus events, escape sequences, or Enter, and they never fall back to `agent.prompt`. There is no registration CLI: the agent integration registers itself directly on a persistent local socket.
+
+Check `ping.result.capabilities.agent_channel_methods` before using the feature. On supported Linux and macOS servers it includes `agent.register_self`, `agent.channel_info`, and `agent.prompt_guarded`. On Windows `agent_registration_channel` and `guarded_agent_prompt` are `false`; `agent.channel_info` remains queryable but reports `ready: false` and no delivery is attempted.
+
+#### Registration and discovery
+
+`agent.register_self` is accepted only as the first request on a persistent direct-local socket. The socket peer is attributed to exactly one live pane using kernel identity and checked ancestry; caller-supplied process IDs, executable names, titles, scripts, and agent detection are not registration authority. For example:
+
+```json
+{"id":"register","method":"agent.register_self","params":{"session_generation":"pi-session-token","pane_id":"w1:p1"}}
+```
+
+`pane_id` is optional and only asserts the peer's current pane; it does not select a pane. A successful response means that the connection is ready to receive deliveries, not that any prompt was accepted:
+
+```json
+{"id":"register","result":{"terminal_id":"term_opaque","registration_epoch":"epoch_opaque","session_generation":"pi-session-token","ready":true}}
+```
+
+Use `agent.channel_info` to discover the current terminal channel without agent screen detection:
+
+```json
+{"id":"info","method":"agent.channel_info","params":{"target":"w1:p1"}}
+```
+
+A ready result contains `terminal_id`, `registration_epoch`, and `session_generation`; a missing, stale, disconnected, unsupported, or not-yet-registered channel returns `ready: false`. A caller must pin the terminal and registration epoch from this result and pass both to delivery. Re-registration by the same live peer revokes the old epoch before activating a new one; a different live peer is refused. Disconnect revokes readiness while retaining the live owner's reservation. Only confirmed process death releases it; unknown liveness refuses takeover. Terminal/root replacement, handoff, restore, and workspace teardown revoke the channel.
+
+The registration socket remains open after the response. Server-to-agent deliveries and agent-to-server acknowledgements are bounded newline-delimited JSON frames:
+
+```json
+{"type":"deliver","registration_epoch":"epoch_opaque","request_id":"caller-key","session_generation":"pi-session-token","text":"literal message"}
+{"type":"ack","registration_epoch":"epoch_opaque","request_id":"caller-key","session_generation":"pi-session-token","status":"accepted"}
+```
+
+ACKs must match the live connection, epoch, request ID, and session generation. ACK `status` is `accepted`, `queued`, or `rejected`; `rejected` requires a typed `reason`, and `duplicate: true` is optional. A rejected ACK becomes an `agent_prompt_rejected` error with that `reason`, not a success receipt.
+
+Only complete frames are submitted. Frame size, in-flight requests, receipt waiters, and the per-epoch dedup ledger are bounded; capacity exhaustion refuses rather than evicting reusable dedup keys. The server reserves `(registration_epoch, request_id, exact text)` before dispatch. A duplicate with the same payload shares the first receipt and is marked `duplicate`; a changed payload is rejected with `payload_mismatch`. A new request ID is never an automatic retry.
+
+#### Guarded delivery and admission
+
+`agent.prompt_guarded` requires a target, literal `text`, `expected_terminal`, `expected_registration_epoch`, and caller-unique `request_id`. `timeout_ms` defaults to 10000 and must be between 1 and 300000; `allow_cross_pane` is optional and does not bypass channel validation:
+
+```json
+{"id":"deliver-1","method":"agent.prompt_guarded","params":{"target":"w1:p1","text":"Review this change","expected_terminal":"term_opaque","expected_registration_epoch":"epoch_opaque","request_id":"review-1","timeout_ms":10000}}
+```
+
+The server rechecks terminal attachment, pane ancestry, owner liveness, foreground eligibility, epoch, and the socket write boundary. It sends the frame only when the pinned channel remains valid. A successful response is an admission receipt:
+
+```json
+{"id":"deliver-1","result":{"terminal_id":"term_opaque","registration_epoch":"epoch_opaque","request_id":"review-1","status":"accepted","session_generation":"pi-session-token"}}
+```
+
+`accepted` means admitted to the active Pi session's input; `queued` means admitted to that session's follow-up queue. Neither means that a model turn has completed or succeeded. The managed Pi integration registers only in TUI mode and feature-detects both `pi.submitUserMessage` and `ctx.userMessageSessionGeneration`. If either is missing, or the session is headless, no receiver is registered and guarded delivery refuses; the old void `sendUserMessage` API is never used as a fallback.
+
+Pi calls its receipt-returning ingress with `registrationEpoch`, `requestId`, `sessionGeneration`, literal `text`, `deliverAs: "followUp"`, and `expandPromptTemplates: false`. It returns `accepted`, `queued`, or typed `rejected` reasons such as `no_session`, `session_changed`, `payload_mismatch`, `shutting_down`, `admission_refused`, or `unsupported`. A consumed or rejected input hook is not an accepted user message. Queued work remains bound to its captured session generation; session replacement cancels it instead of retargeting it.
+
+If a socket closes or a timeout occurs before dispatch is possible, delivery fails closed. If admission may have happened but the ACK is lost, the result is `delivery_unknown`, not success and not proof of non-delivery. Never automatically retry, replay an old epoch, create a new request ID to resend, or fall back to PTY input. A channel is at-most-once for a retained epoch ledger, not crash-time exactly-once.
+
+The identity boundary is cooperative and same-user: kernel peer identity proves a process and pane attribution, not that the process is Pi or that a same-user peer cannot forge this protocol. Existing-owner conflict prevents accidental takeover, not hostile same-user impersonation. Reconnect, reload, or session replacement requires fresh registration; server restart, restore, handoff, or terminal/root replacement does not preserve channels or pins. Fresh epochs and session-generation fences prevent late frames or ACKs from crossing those boundaries; uncertain deliveries are never replayed.
 
 `agent.wait` is server-owned and event-driven. It pins the resolved pane occupant so a replacement cannot satisfy the wait. `agent.prompt` accepts an optional `wait` object with `until` and `timeout_ms`; this submits the prompt and starts the wait in one request, avoiding a race between separate calls. If the resolved agent is already `blocked`, `agent.prompt` returns `agent_blocked` without sending input or starting the wait.
 

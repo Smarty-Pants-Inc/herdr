@@ -29,6 +29,8 @@ pub(crate) use super::unix_common::{
 pub(crate) use super::unix_common::remote_bridge_endpoint_path_in;
 
 #[cfg(test)]
+mod agent_channel_tests;
+#[cfg(test)]
 mod config_file_tests;
 
 pub(super) mod client_identity;
@@ -811,6 +813,62 @@ pub fn foreground_group_leader_job(process_group_id: u32) -> Option<ForegroundJo
             argv,
         }],
     })
+}
+
+pub(crate) fn registered_process_liveness(peer: super::ProcessIdentity) -> super::ProcessLiveness {
+    use super::ProcessLiveness;
+    match std::fs::read_to_string(format!("/proc/{}/stat", peer.pid)) {
+        Ok(stat) => match process_identity_and_parent_from_stat(peer.pid, &stat) {
+            Some((identity, _)) if identity != peer => ProcessLiveness::Dead,
+            Some(_) => {
+                let state = stat
+                    .rfind(')')
+                    .and_then(|end| stat.get(end + 2..))
+                    .and_then(|rest| rest.chars().next());
+                match state {
+                    Some('Z' | 'X' | 'x') => ProcessLiveness::Dead,
+                    Some(_) => ProcessLiveness::Alive,
+                    None => ProcessLiveness::Unknown,
+                }
+            }
+            None => ProcessLiveness::Unknown,
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => ProcessLiveness::Dead,
+        Err(_) => ProcessLiveness::Unknown,
+    }
+}
+
+pub(crate) fn registered_process_is_foreground(
+    root: super::ProcessIdentity,
+    peer: super::ProcessIdentity,
+) -> bool {
+    if registered_process_liveness(root) != super::ProcessLiveness::Alive
+        || registered_process_liveness(peer) != super::ProcessLiveness::Alive
+    {
+        return false;
+    }
+    let Some(stat) = std::fs::read_to_string(format!("/proc/{}/stat", peer.pid)).ok() else {
+        return false;
+    };
+    let Some(rest) = stat.rfind(')').and_then(|end| stat.get(end + 2..)) else {
+        return false;
+    };
+    if rest
+        .chars()
+        .next()
+        .is_none_or(|state| matches!(state, 'T' | 't' | 'Z' | 'X' | 'x'))
+    {
+        return false;
+    }
+    let group = rest
+        .split_whitespace()
+        .nth(2)
+        .and_then(|value| value.parse::<u32>().ok());
+    let foreground = foreground_process_group_id(root.pid);
+    group.is_some_and(|group| group > 0 && Some(group) == foreground)
+        && process_identity(root.pid) == Some(root)
+        && process_identity(peer.pid) == Some(peer)
+        && super::process_identity_in_pane_session(root, peer) == Some(true)
 }
 
 pub fn foreground_process_group_id(child_pid: u32) -> Option<u32> {

@@ -13,6 +13,8 @@ pub(crate) const MAX_ENDPOINT_REQUEST_ID_BYTES: usize = 128;
 const ENDPOINT_RESPONSE_CHUNK_BYTES: usize = 512 * 1024;
 
 const CLIENT_SHELL_METHODS: &[&str] = &[
+    "agent.channel_info",
+    "agent.prompt_guarded",
     "client_shell.surface.set",
     "command.invoke",
     "integration.install",
@@ -297,6 +299,14 @@ mod tests {
         .expect("endpoint method shape fixture");
         let mut actual = endpoint_method_shape_digests();
         // Freeze additive methods separately without rewriting the published fixture.
+        assert_eq!(
+            actual.remove("agent.channel_info").as_deref(),
+            Some("ff7122e87f015f9329f35072af52f0fe2f013fb6a4a742f416a5822939f28ca1")
+        );
+        assert_eq!(
+            actual.remove("agent.prompt_guarded").as_deref(),
+            Some("0050a4d70632bcb5f0fe36a83a901ce950e88c01cb10bcd14242e773bf3a350b")
+        );
         assert_eq!(
             actual.remove("pane.clear").as_deref(),
             Some("0301d288ba198ddaa427dd7421c71911cccaf4ea03544531efa8b67ca21b08f6")

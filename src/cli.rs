@@ -23,6 +23,7 @@ macro_rules! println {
 }
 
 mod agent;
+pub(crate) use agent::agent_channel_literal_slots;
 mod api;
 mod completion;
 mod integration;
