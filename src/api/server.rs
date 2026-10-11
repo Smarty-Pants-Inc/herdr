@@ -152,6 +152,9 @@ fn default_capabilities() -> Option<ServerCapabilities> {
         ssh_agent_registration: false,
         guarded_live_handoff: crate::platform::capabilities().live_handoff,
         expected_terminal_guard: true,
+        // Native live-generation and PTY foreground proof is required. Other
+        // platforms deliberately refuse guarded session delivery.
+        expected_agent_session_guard: crate::platform::expected_agent_session_guard_supported(),
         input_consumer: crate::platform::input_consumer_supported(),
     })
 }
@@ -463,7 +466,7 @@ fn restrict_socket_permissions(path: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(test)]
-fn handle_connection(
+pub(crate) fn handle_connection(
     stream: LocalStream,
     api_tx: &ApiRequestSender,
     event_hub: &EventHub,
@@ -665,10 +668,11 @@ fn handle_connection_with_stop(
             }
             write_text_line_allow_disconnect(&mut stream, &response)
         }
-        Method::AgentPrompt(params) => {
+        Method::AgentPrompt(params) | Method::AgentPromptSessionChecked(params) => {
             let response = prompt_agent(
                 request_id.clone(),
                 params,
+                method == "agent.prompt_session_checked",
                 context,
                 &mut stream,
                 api_tx,
@@ -977,6 +981,7 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::AgentChannelInfo(_) => "agent.channel_info",
         Method::AgentDraftState(_) => "agent.draft_state",
         Method::AgentPromptGuarded(_) => "agent.prompt_guarded",
+        Method::AgentPromptSessionChecked(_) => "agent.prompt_session_checked",
         Method::AgentWait(_) => "agent.wait",
         Method::PaneSplit(_) => "pane.split",
         Method::PaneSwap(_) => "pane.swap",
@@ -997,6 +1002,7 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::PaneResize(_) => "pane.resize",
         Method::PaneScroll(_) => "pane.scroll",
         Method::PaneClear(_) => "pane.clear",
+        Method::PaneClearInputPoison(_) => "pane.clear_input_poison",
         Method::PaneEditScrollback(_) => "pane.edit_scrollback",
         Method::PaneSelectionRead(_) => "pane.selection.read",
         Method::PaneCopyMotion(_) => "pane.copy_motion",
@@ -1014,7 +1020,9 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::PaneLinkResolve(_) => "pane.link.resolve",
         Method::PaneRename(_) => "pane.rename",
         Method::PaneSendText(_) => "pane.send_text",
+        Method::PaneSendTextSessionChecked(_) => "pane.send_text_session_checked",
         Method::PaneSendKeys(_) => "pane.send_keys",
+        Method::PaneSendKeysSessionChecked(_) => "pane.send_keys_session_checked",
         Method::PaneSendInput(_) => "pane.send_input",
         Method::PaneSendInputGuarded(_) => "pane.send_input_guarded",
         Method::PaneRead(_) => "pane.read",
@@ -1520,6 +1528,8 @@ fn caller_timeout_dispatch_uses_timeout_error() {
         Request {
             id: "prompt-timeout".into(),
             method: Method::AgentPrompt(crate::api::schema::AgentPromptParams {
+                expected_agent_session_id: None,
+                expected_pane_id: None,
                 target: "reviewer".into(),
                 text: "review this".into(),
                 wait: None,
@@ -1557,6 +1567,15 @@ mod tests {
     fn input_consumer_capability_is_advertised_only_on_linux() {
         let caps = default_capabilities().expect("capabilities");
         assert_eq!(caps.input_consumer, cfg!(target_os = "linux"));
+    }
+
+    #[test]
+    fn session_reporter_foreground_capability_requires_native_live_proof() {
+        let caps = default_capabilities().expect("capabilities");
+        assert_eq!(
+            caps.expected_agent_session_guard,
+            crate::platform::expected_agent_session_guard_supported()
+        );
     }
     use std::collections::HashMap;
     use std::io::{BufRead, BufReader, Read};
@@ -1987,6 +2006,7 @@ mod tests {
             state_labels: HashMap::new(),
             tokens: HashMap::new(),
             agent_session: None,
+            agent_session_id: None,
             scroll: None,
             revision: 0,
         }
@@ -2236,6 +2256,7 @@ mod tests {
                 ssh_agent_registration: false,
                 guarded_live_handoff: true,
                 expected_terminal_guard: true,
+                expected_agent_session_guard: true,
                 input_consumer: false,
             }),
             None,
@@ -2760,6 +2781,7 @@ mod tests {
                             state_labels: HashMap::new(),
                             tokens: HashMap::new(),
                             agent_session: None,
+                            agent_session_id: None,
                             workspace_id: "ws_1".into(),
                             tab_id: "tab_1".into(),
                             pane_id: "pane_1".into(),

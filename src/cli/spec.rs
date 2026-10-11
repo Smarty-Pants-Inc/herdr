@@ -426,9 +426,18 @@ fn agent_command() -> Command {
                 .override_usage("herdr agent prompt <TARGET> <TEXT> [OPTIONS]")
                 .arg(required("target", "TARGET"))
                 .arg(required("text", "TEXT"))
+                .arg(expected_session_option())
+                .arg(option("expected-pane", "ID")
+                    .help("Refuse unless the agent target resolves to this pane_id; requires server support"))
                 .arg(
                     flag("if-draft-empty")
-                        .conflicts_with_all(["wait", "until", "timeout"])
+                        .conflicts_with_all([
+                            "wait",
+                            "until",
+                            "timeout",
+                            "expected-session",
+                            "expected-pane",
+                        ])
                         .help("Use the registered Pi channel; refuse on a draft, UI hold, or unknown state; never type"),
                 )
                 .arg(
@@ -679,9 +688,15 @@ fn pane_command() -> Command {
                 .arg(flag("no-focus")),
         )
         .subcommand(id_command("close", "pane_id", "Close a pane"))
+        .subcommand(id_command(
+            "clear-input-poison",
+            "pane_id",
+            "Explicitly unblock input after inspecting or discarding staged text",
+        ))
         .subcommand(
             Command::new("send-text")
                 .about("Send literal text to a pane")
+                .arg(expected_session_option())
                 .arg(required("pane_id", "PANE_ID"))
                 .arg(required("text", "TEXT").num_args(1..).action(ArgAction::Append))
                 .arg(
@@ -695,6 +710,7 @@ fn pane_command() -> Command {
         .subcommand(
             Command::new("send-keys")
                 .about("Send key presses to a pane")
+                .arg(expected_session_option())
                 .arg(required("pane_id", "PANE_ID"))
                 .arg(required("key", "KEY").num_args(1..).action(ArgAction::Append))
                 .arg(
@@ -748,6 +764,11 @@ fn pane_command() -> Command {
         .subcommand(report_agent_session_command())
         .subcommand(release_agent_command())
         .subcommand(report_metadata_command())
+}
+
+fn expected_session_option() -> Arg {
+    option("expected-session", "ID")
+        .help("Refuse unless the pane still reports this agent session ID at enqueue; requires server support")
 }
 
 fn expected_terminal_option() -> Arg {
@@ -1313,6 +1334,46 @@ mod tests {
     }
 
     #[test]
+    fn session_expectation_flags_have_scoped_help_and_completions() {
+        let cmd = super::command();
+        for path in [
+            &["agent", "prompt"][..],
+            &["pane", "send-text"][..],
+            &["pane", "send-keys"][..],
+        ] {
+            let leaf = command_path(&cmd, path);
+            assert!(has_option(leaf, "expected-session"));
+            assert_eq!(
+                has_option(leaf, "expected-pane"),
+                path == ["agent", "prompt"]
+            );
+            assert!(long_help(path).contains("--expected-session"));
+        }
+        assert!(long_help(&["agent", "prompt"]).contains("--expected-pane"));
+        for path in [
+            &["agent", "send-keys"][..],
+            &["agent", "start"][..],
+            &["pane", "run"][..],
+        ] {
+            let leaf = command_path(&cmd, path);
+            assert!(!has_option(leaf, "expected-session"));
+            assert!(!has_option(leaf, "expected-pane"));
+        }
+        for shell in [
+            clap_complete::Shell::Bash,
+            clap_complete::Shell::Fish,
+            clap_complete::Shell::Zsh,
+        ] {
+            let mut command = super::command();
+            let mut output = Vec::new();
+            clap_complete::generate(shell, &mut command, "herdr", &mut output);
+            let output = String::from_utf8(output).unwrap();
+            assert!(output.contains("expected-session"), "{shell:?}");
+            assert!(output.contains("expected-pane"), "{shell:?}");
+        }
+    }
+
+    #[test]
     fn channel_commands_are_public_but_self_registration_is_not() {
         let cmd = super::command();
         let info = command_path(&cmd, &["agent", "channel-info"]);
@@ -1444,6 +1505,19 @@ mod tests {
                 "--wait"
             ])
             .is_err());
+        for expectation in ["--expected-session=s", "--expected-pane=p"] {
+            assert!(super::command()
+                .try_get_matches_from([
+                    "herdr",
+                    "agent",
+                    "prompt",
+                    "worker",
+                    "hello",
+                    "--if-draft-empty",
+                    expectation,
+                ])
+                .is_err());
+        }
         assert!(super::command()
             .try_get_matches_from(["herdr", "agent", "draft-state", "--", "--help"])
             .is_ok());

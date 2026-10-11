@@ -360,6 +360,7 @@ impl App {
             state_labels: presentation.state_labels,
             tokens: terminal.metadata_tokens.values(),
             agent_session: terminal_agent_session_info(terminal),
+            agent_session_id: terminal.reported_agent_session_id().map(str::to_owned),
             scroll: None,
             revision: terminal.revision,
         })

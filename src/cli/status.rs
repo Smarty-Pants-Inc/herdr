@@ -321,6 +321,7 @@ struct ServerStatusJson {
 #[derive(Serialize)]
 struct ServerCapabilitiesJson {
     expected_terminal_guard: bool,
+    expected_agent_session_guard: bool,
     live_handoff: bool,
     detached_server_daemon: bool,
     endpoint_protocol_generation: Option<u32>,
@@ -372,6 +373,7 @@ fn server_status_json(server: &ServerRuntimeStatus) -> ServerStatusJson {
                 .as_ref()
                 .map(|capabilities| ServerCapabilitiesJson {
                     expected_terminal_guard: capabilities.expected_terminal_guard,
+                    expected_agent_session_guard: capabilities.expected_agent_session_guard,
                     live_handoff: capabilities.live_handoff,
                     detached_server_daemon: capabilities.detached_server_daemon,
                     endpoint_protocol_generation: capabilities.endpoint_protocol_generation,
@@ -480,6 +482,7 @@ mod tests {
                 ssh_agent_registration: false,
                 guarded_live_handoff: true,
                 expected_terminal_guard: true,
+                expected_agent_session_guard: true,
                 input_consumer: false,
             }),
         }
@@ -507,6 +510,28 @@ mod tests {
             let args = args.into_iter().map(str::to_owned).collect::<Vec<_>>();
             assert!(parse_status_args(&args).is_none());
         }
+    }
+
+    #[test]
+    fn status_exposes_expected_agent_session_guard() {
+        let server = running_server(Some("test"), None);
+        let value = serde_json::to_value(server_status_json(&server)).unwrap();
+        assert_eq!(value["capabilities"]["expected_agent_session_guard"], true);
+        let ServerRuntimeStatus::Running {
+            version, protocol, ..
+        } = server
+        else {
+            panic!("test server must be running");
+        };
+        let capabilities =
+            serde_json::from_value(serde_json::json!({"live_handoff": false})).unwrap();
+        let legacy = ServerRuntimeStatus::Running {
+            version,
+            protocol,
+            capabilities: Some(capabilities),
+        };
+        let value = serde_json::to_value(server_status_json(&legacy)).unwrap();
+        assert_eq!(value["capabilities"]["expected_agent_session_guard"], false);
     }
 
     #[test]
