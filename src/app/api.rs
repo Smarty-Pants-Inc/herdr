@@ -1199,11 +1199,11 @@ impl App {
             Method::AgentChannelInfo(params) => {
                 return self.handle_agent_channel_info(request.id, params)
             }
-            Method::AgentPromptGuarded(_) => {
+            Method::AgentPromptGuarded(_) | Method::AgentDraftState(_) => {
                 return responses::encode_error(
                     request.id,
                     "invalid_request",
-                    "agent.prompt_guarded is handled asynchronously by the app runtime",
+                    "registered channel requests are handled asynchronously by the app runtime",
                 )
             }
             Method::AgentList(_) => return self.handle_agent_list(request.id),

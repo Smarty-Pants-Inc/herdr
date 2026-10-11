@@ -4,9 +4,12 @@
 mod tests;
 
 use super::responses::{encode_error, encode_error_body};
-use crate::api::agent_channel::{json_success, Channel, Outcome, MAX_ID_BYTES};
+use crate::api::agent_channel::{
+    json_success, Channel, Outcome, Reservation, DRAFT_STATE_TIMEOUT, MAX_ID_BYTES,
+};
 use crate::api::schema::{
-    AgentChannelInfoParams, AgentPromptGuardedParams, AgentRegisterSelfParams, Method, Request,
+    AgentChannelInfoParams, AgentDraftStateParams, AgentPromptGuardedParams,
+    AgentRegisterSelfParams, DraftStateUnknownReason, Method, Request,
 };
 use crate::app::App;
 use std::sync::Arc;
@@ -266,6 +269,7 @@ impl App {
                 .get(&target.terminal_id)
                 .map(Arc::as_ref),
         );
+        channel.set_draft_guard(params.draft_guard);
         // Replacement revokes the old epoch before the new socket can activate.
         self.agent_channels.replace(channel.clone());
         if let Some(terminal) = self.state.terminals.get(target.terminal_id.as_str()) {
@@ -276,7 +280,7 @@ impl App {
         json_success(
             id,
             serde_json::json!({"terminal_id":target.terminal_id,"registration_epoch":epoch,
-            "session_generation":params.session_generation,"ready":true}),
+            "session_generation":params.session_generation,"ready":true,"draft_guard":params.draft_guard}),
         )
     }
     pub(super) fn handle_agent_channel_info(
@@ -291,6 +295,7 @@ impl App {
         let mut result = serde_json::json!({"terminal_id":target.terminal_id,"ready":false});
         if crate::platform::capabilities().registered_agent_channel {
             if let Some(channel) = self.agent_channels.owners.get(&target.terminal_id) {
+                result["draft_guard"] = channel.supports_draft_guard().into();
                 if self.channel_valid(channel) {
                     result["ready"] = true.into();
                     result["registration_epoch"] = channel.epoch.clone().into();
@@ -311,6 +316,18 @@ impl App {
         context: crate::api::ApiRequestContext,
         respond_to: std::sync::mpsc::Sender<String>,
     ) -> bool {
+        if let Method::AgentDraftState(params) = &request.method {
+            // Same caller policy as agent.prompt, decided BEFORE any ledger reservation
+            // or frame: a denied caller learns nothing and the receiver sees nothing.
+            // The query never acquires a PTY writer, focus, or submission authority.
+            if let Some(response) = self.cross_pane_input_denial(&request, context) {
+                let _ = respond_to.send(response);
+                return true;
+            }
+            let reservation = self.reserve_draft_state(params);
+            Self::respond_channel_reservation(request.id, reservation, respond_to);
+            return true;
+        }
         if !matches!(request.method, Method::AgentPromptGuarded(_)) {
             return false;
         }
@@ -330,30 +347,59 @@ impl App {
             return false;
         };
         let reservation = self.reserve_guarded_prompt(&params);
+        Self::respond_channel_reservation(request.id, reservation, respond_to);
+        true
+    }
+    fn respond_channel_reservation(
+        id: String,
+        reservation: Result<Reservation, Outcome>,
+        respond_to: std::sync::mpsc::Sender<String>,
+    ) {
         match reservation {
             Ok((delivery, duplicate, waiter)) => {
                 std::thread::spawn(move || {
                     let _waiter = waiter;
-                    let _ = respond_to.send(delivery.wait().response(request.id, duplicate));
+                    let _ = respond_to.send(delivery.wait().response(id, duplicate));
                 });
             }
             Err(outcome) => {
-                let _ = respond_to.send(outcome.response(request.id, false));
+                let _ = respond_to.send(outcome.response(id, false));
             }
         }
-        true
+    }
+    fn reserve_draft_state(&self, params: &AgentDraftStateParams) -> Result<Reservation, Outcome> {
+        if !crate::platform::capabilities().registered_agent_channel {
+            return Err(Outcome::draft_unknown(DraftStateUnknownReason::Unsupported));
+        }
+        let target = self.resolve_terminal_target(&params.target).map_err(|_| {
+            Outcome::failure("agent_not_found", "terminal target not found or ambiguous")
+        })?;
+        let channel = self
+            .agent_channels
+            .owners
+            .get(&target.terminal_id)
+            .ok_or_else(|| Outcome::draft_unknown(DraftStateUnknownReason::Unregistered))?;
+        if !self.channel_valid(channel) {
+            return Err(Outcome::draft_unknown(DraftStateUnknownReason::Unknown));
+        }
+        if !channel.supports_draft_guard() {
+            return Err(Outcome::draft_unknown(DraftStateUnknownReason::Unsupported));
+        }
+        // Internal fresh correlation; caller request IDs and prior observations
+        // cannot choose, reuse or spoof the query ledger payload.
+        let request_id = crate::platform::fresh_registration_epoch()
+            .map_err(|_| Outcome::draft_unknown(DraftStateUnknownReason::Unknown))?;
+        channel
+            .reserve_draft_state(request_id, DRAFT_STATE_TIMEOUT)
+            .map_err(|outcome| match outcome {
+                Outcome::Receipt(_) => outcome,
+                Outcome::Failure { .. } => Outcome::draft_unknown(DraftStateUnknownReason::Unknown),
+            })
     }
     fn reserve_guarded_prompt(
         &mut self,
         params: &AgentPromptGuardedParams,
-    ) -> Result<
-        (
-            Arc<crate::api::agent_channel::Delivery>,
-            bool,
-            crate::api::agent_channel::ReceiptWaiter,
-        ),
-        Outcome,
-    > {
+    ) -> Result<Reservation, Outcome> {
         if !crate::platform::capabilities().registered_agent_channel {
             return Err(Outcome::failure(
                 "unsupported_platform",
@@ -390,12 +436,22 @@ impl App {
             .agent_channels
             .owners
             .get(&target.terminal_id)
-            .ok_or_else(|| Outcome::failure("agent_channel_unavailable", "no registered owner"))?;
+            .ok_or_else(|| {
+                if params.if_draft_empty {
+                    Outcome::failure("agent_prompt_rejected", "unregistered")
+                } else {
+                    Outcome::failure("agent_channel_unavailable", "no registered owner")
+                }
+            })?;
         if channel.epoch != params.expected_registration_epoch {
             if let Some(old) = self.agent_channels.retired.get(&target.terminal_id) {
                 if old.epoch == params.expected_registration_epoch && self.channel_eligible(channel)
                 {
-                    if let Some(duplicate) = old.duplicate(&params.request_id, &params.text)? {
+                    if let Some(duplicate) = old.duplicate_prompt(
+                        &params.request_id,
+                        &params.text,
+                        params.if_draft_empty,
+                    )? {
                         return Ok(duplicate);
                     }
                 }
@@ -411,9 +467,10 @@ impl App {
                 "registered owner is disconnected, stale or not foreground",
             ));
         }
-        channel.reserve(
+        channel.reserve_prompt(
             params.request_id.clone(),
             params.text.clone(),
+            params.if_draft_empty,
             Duration::from_millis(timeout),
         )
     }

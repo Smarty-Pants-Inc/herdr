@@ -41,6 +41,7 @@ impl App {
             }
             Method::AgentPrompt(params) => params.allow_cross_pane,
             Method::AgentPromptGuarded(params) => params.allow_cross_pane,
+            Method::AgentDraftState(params) => params.allow_cross_pane,
             Method::AgentSendKeys(params) => params.allow_cross_pane,
             Method::PaneReportAgent(params) => params.allow_cross_pane,
             Method::PaneReportAgentSession(params) => params.allow_cross_pane,
@@ -60,6 +61,9 @@ impl App {
             }
             Method::AgentPrompt(params) => self.resolve_agent_target(&params.target).ok(),
             Method::AgentPromptGuarded(params) => self.resolve_terminal_target(&params.target).ok(),
+            // Not a write, but it observes another pane's private editor state, so it is
+            // authorized exactly like agent.prompt rather than treated as a public read.
+            Method::AgentDraftState(params) => self.resolve_terminal_target(&params.target).ok(),
             Method::AgentSendKeys(params) => self.resolve_agent_target(&params.target).ok(),
             Method::PaneSendText(params) => self.pane_target(&params.pane_id),
             Method::PaneSendKeys(params) => self.pane_target(&params.pane_id),
@@ -660,6 +664,36 @@ mod tests {
 
         assert!(fixture.source_rx.try_recv().is_err());
         assert!(fixture.target_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn draft_state_query_uses_agent_prompt_caller_policy() {
+        let fixture = attributed_agent_fixture();
+        let query = |pane_id: &str, allow_cross_pane| Request {
+            id: "draft-query".into(),
+            method: Method::AgentDraftState(crate::api::schema::AgentDraftStateParams {
+                target: pane_id.into(),
+                allow_cross_pane,
+            }),
+        };
+        let denial =
+            |request: &Request, context| fixture.app.cross_pane_input_denial(request, context);
+        // Another pane's private editor state needs the same explicit opt-in as a prompt.
+        assert_denied(
+            &denial(&query(&fixture.target_pane_id, false), attributed_context())
+                .expect("cross-pane draft query denied"),
+        );
+        assert_unknown(
+            &denial(
+                &query(&fixture.target_pane_id, false),
+                ApiRequestContext::default(),
+            )
+            .expect("unknown origin denied"),
+        );
+        assert!(denial(&query(&fixture.source_pane_id, false), attributed_context()).is_none());
+        for context in [attributed_context(), ApiRequestContext::default()] {
+            assert!(denial(&query(&fixture.target_pane_id, true), context).is_none());
+        }
     }
 
     #[tokio::test]

@@ -321,7 +321,7 @@ herdr agent list
 herdr agent get <target>
 herdr agent read <target> [--source visible|recent|recent-unwrapped|detection] [--lines N] [--format text|ansi] [--ansi]
 herdr agent send-keys <target> <key> [key ...]
-herdr agent prompt <target> <text> [--wait] [--until STATUS]... [--timeout MS]
+herdr agent prompt <target> <text> [--if-draft-empty | --wait [--until STATUS]... [--timeout MS]] [--allow-cross-pane]
 herdr agent rename <target> <name>|--clear
 herdr agent focus <target>
 herdr agent wait <target> [--until STATUS]... [--timeout MS]
@@ -337,7 +337,7 @@ herdr agent explain --file PATH --agent LABEL [--json|--verbose]
 
 成功的 start 只有在预期智能体占用同一终端并可接受交互输入后才返回。如果启动期间检测到 `blocked`,命令会立即返回 `agent_not_ready`。该名称仍可用于 `agent read` 和 `agent send-keys`,检测变为 `idle` 后即可用于发送提示。默认启动超时是 30000 毫秒;显式值必须大于 3000 且不超过 300000。
 
-`agent prompt` 遵循当前的 bracketed paste 模式，即使智能体处于 working，也会将文本和延迟的 Enter 作为一次有序提交写入。不带 `--wait` 时，成功只确认写入完成，不代表轮次已经开始。在 Windows 上，Codex 在 Enter 前会收到粘贴边界，因此提交不依赖提示大小；调用方的超时包含提交时间。如果智能体已经是 `blocked`,它不会发送输入,而是返回 `agent_blocked`。使用 `--wait` 时,从其他非 working 状态接受的提示必须在提交后的最多五秒内产生可观察的 `working` 或 `blocked` 状态，否则 Herdr 返回 `agent_prompt_stalled`；如果调用方的超时先到期，则返回普通的 `timeout` 错误。这可防止无关的 `idle`、`done` 或会话变化错误地完成等待。观察到活动后，它会等待请求的第一个稳定状态。它不会跟踪单独的轮次。如果智能体已经处于 working，当前轮次的完成可能满足等待。`--until` 用于缩小匹配状态，不带 `--wait` 时会被拒绝。独立的 `agent wait` 在当前状态匹配时立即返回。两者默认匹配 `idle`、`done` 或 `blocked`；需要 `unknown` 时请明确使用 `--until unknown`。
+不带 `--if-draft-empty` 时，`agent prompt` 保留原有行为，遵循当前的 bracketed paste 模式，即使智能体处于 working，也会将文本和延迟的 Enter 作为一次有序提交写入。不带 `--wait` 时，成功只确认写入完成，不代表轮次已经开始。在 Windows 上，Codex 在 Enter 前会收到粘贴边界，因此提交不依赖提示大小；调用方的超时包含提交时间。如果智能体已经是 `blocked`,它不会发送输入,而是返回 `agent_blocked`。使用 `--wait` 时,从其他非 working 状态接受的提示必须在提交后的最多五秒内产生可观察的 `working` 或 `blocked` 状态，否则 Herdr 返回 `agent_prompt_stalled`；如果调用方的超时先到期，则返回普通的 `timeout` 错误。这可防止无关的 `idle`、`done` 或会话变化错误地完成等待。观察到活动后，它会等待请求的第一个稳定状态。它不会跟踪单独的轮次。如果智能体已经处于 working，当前轮次的完成可能满足等待。`--until` 用于缩小匹配状态，不带 `--wait` 时会被拒绝。独立的 `agent wait` 在当前状态匹配时立即返回。两者默认匹配 `idle`、`done` 或 `blocked`；需要 `unknown` 时请明确使用 `--until unknown`。
 
 `idle` 和 `done` 都表示可以接受输入。CLI/API 使用服务器的已查看状态：`done` 表示尚未标记为已查看的 idle；显式 `pane focus` / `agent focus` 会标记目标，读取不会。每个 TUI 客户端独立记录它已显示的完成状态，因此其 Done 标记可能与 CLI 或其他客户端不同。`blocked` 表示 Herdr 识别到审批或提问界面。`unknown` 表示智能体存在但无法可靠分类,不代表工作成功。
 
@@ -351,10 +351,12 @@ herdr agent explain --file PATH --agent LABEL [--json|--verbose]
 
 ```bash
 herdr agent channel-info <target>
-herdr agent prompt-guarded <target> <text> --expected-terminal TERMINAL_ID --expected-registration-epoch EPOCH --request-id ID [--timeout-ms MS] [--allow-cross-pane]
+herdr agent draft-state <target> [--allow-cross-pane]
+herdr agent prompt <target> <text> --if-draft-empty [--allow-cross-pane]
+herdr agent prompt-guarded <target> <text> --expected-terminal TERMINAL_ID --expected-registration-epoch EPOCH --request-id ID [--timeout-ms MS] [--allow-cross-pane] [--if-draft-empty]
 ```
 
-这些命令不依赖智能体屏幕检测来解析终端。请使用明确的窗格 ID、不透明的终端 ID 或唯一的实时智能体名称。`channel-info` 返回 `terminal_id` 和 `ready`；就绪时还包含 `registration_epoch` 和 `session_generation`。查询不会注册智能体。请从同一个就绪响应复制终端和 epoch，不要根据名称或窗格位置推导：
+这些命令不依赖智能体屏幕检测来解析终端。请使用明确的窗格 ID、不透明的终端 ID 或唯一的实时智能体名称。`channel-info` 返回 `terminal_id` 和 `ready`；就绪时还包含 `registration_epoch` 和 `session_generation`，能力已知时还会返回布尔值 `draft_guard`。`draft_guard` 缺失或为 `false` 表示不支持草稿守卫。查询不会注册智能体。请从同一个就绪响应复制终端和 epoch，不要根据名称或窗格位置推导：
 
 ```bash
 herdr agent channel-info w1:p1
@@ -365,13 +367,21 @@ herdr agent prompt-guarded w1:p1 "Review this change" \
   --request-id review-1 --timeout-ms 10000
 ```
 
-`prompt-guarded` 只通过智能体已注册的 socket 通道发送字面文本，绝不向 PTY 写入提示文本、准备字节或 Enter，不改变输入焦点，也不回退到 `agent prompt`。现有 `agent prompt` 命令保持不变。目标、文本、两个固定标识和请求 ID 都不能为空。`--timeout-ms` 等待的是接纳回执，而非轮次完成；默认 10000，允许 1–300000 毫秒。`--allow-cross-pane` 显式允许现有跨窗格输入策略中的操作，但不会绕过通道或身份检查。
+`prompt-guarded` 只通过智能体已注册的 socket 通道发送字面文本，绝不向 PTY 写入提示文本、准备字节或 Enter，不改变输入焦点，也不回退到 `agent prompt`。不带 `--if-draft-empty` 时，现有 `agent prompt` 行为保持不变。目标、文本、两个固定标识和请求 ID 都不能为空。`--timeout-ms` 等待的是接纳回执，而非轮次完成；默认 10000，允许 1–300000 毫秒。`--allow-cross-pane` 显式允许现有跨窗格输入策略中的操作，但不会绕过通道或身份检查。
 
-成功返回 `status: "accepted"`（已接纳到活动会话的输入）或 `"queued"`（已进入该会话的后续消息队列），以及固定的终端、epoch、请求 ID 和会话代数。两种状态都不保证模型轮次已完成或成功。同一 epoch 中，相同请求 ID 和完全相同文本共享首次结果，不会再次提交；改变文本返回 `payload_mismatch`。新 ID 表示新请求，不是安全重试。
+`agent prompt --if-draft-empty` 是已注册通道的便捷入口：它在发送前要求 `draft_guard: true`，复制当前终端/epoch 标识并生成请求 ID，然后以 `if_draft_empty: true` 调用 `agent.prompt_guarded`。绝不回退到键入或原有提示投递。此标志不能与原有的 `--wait`、`--until`、`--timeout` 组合；这类组合在发送前即被拒绝。要指定接纳回执期限，请用 `prompt-guarded --timeout-ms`。
+
+`prompt-guarded` 上的 `--if-draft-empty` 也会预检能力，并保留调用方的显式标识。Pi 在调用带回执的 submit API 前同步检查编辑器草稿和 UI hold，检查与调用之间没有 await 或调度间隙。它保留草稿，绝不清除、替换或向编辑器键入。非空草稿返回 `agent_prompt_rejected`，其 `error.reason` 为 `"draft_present"`；任何非 `undefined` 的 `holdState()` 值都以 `"ui_hold"` 拒绝，包括 `dialog`、`custom`、`editor`；无法获取或读取的状态以 `"unknown"` 拒绝。无注册通道为 `"unregistered"`，不支持草稿守卫为 `"unsupported"`。这些拒绝不会提交提示。守卫检查的是接纳，而非轮次完成。
+
+守卫帧带有期限；Pi 在上述检查和调用前同步拒绝已过期帧，原因为 `expired`，不提交提示也不修改编辑器。守卫期限缺失或无效时以 `unknown` 拒绝。在 socket 发送前发生的类型化失败表示没有发送；可能已接纳后的回执丢失仍是 `delivery_unknown`，绝不重放。
+
+`agent draft-state` 通过注册通道执行只读、隐藏文本的观察，默认查询超时为两秒。known 结果只报告草稿是否为空以及 UI hold（`null`、`"dialog"`、`"custom"` 或 `"editor"`）；绝不返回草稿文本或字符数。否则返回 `{status: "unknown", reason}`，原因为 `unregistered`（无通道）、`unsupported`（无能力）、`timeout`（未及时回复）或 `unknown`（状态不可观察）。unknown 不代表草稿为空。智能体默认可查询自己的窗格；查询其他窗格需要 `--allow-cross-pane`。普通外部操作员遵循与 `agent.prompt` 相同的策略。授权在预留或发送帧之前检查。查询不是后续发送的授权；守卫提示会在接纳时重新检查。
+
+成功返回 `status: "accepted"`（已接纳到活动会话的输入）或 `"queued"`（已进入该会话的后续消息队列），以及固定的终端、epoch、请求 ID 和会话代数。两种状态都不保证模型轮次已完成或成功。同一 epoch 中，相同请求 ID、完全相同文本和相同 `if_draft_empty` 值共享首次结果，不会再次提交；改变文本或守卫值返回 `payload_mismatch`。新 ID 表示新请求，不是安全重试。
 
 通道缺失或断开、固定标识过期、服务器不支持时，会拒绝操作且不写入 PTY。如果可能已接纳但回执丢失，返回 `delivery_unknown`：**绝不自动重试，不要更换 ID/epoch 重放，也不要回退到终端输入**。传输失败也可能使接纳结果未知。
 
-通道仅支持 Linux 和 macOS。Windows 的注册和守卫提示能力为 `false`，`channel-info` 返回 `ready: false`。托管 Pi 集成仅在 TUI 模式且同时提供 `pi.submitUserMessage` 和 `ctx.userMessageSessionGeneration` 时直接注册；缺少任一项就不注册通道，守卫投递会拒绝，旧的 `sendUserMessage` API 不是回退路径。没有注册 CLI。
+通道仅支持 Linux 和 macOS。Windows 的注册和守卫提示能力为 `false`，`channel-info` 返回 `ready: false`。托管 Pi 集成仅在 TUI 模式且同时提供 `pi.submitUserMessage` 和 `ctx.userMessageSessionGeneration` 时直接注册；缺少任一项就不注册通道，守卫投递会拒绝，旧的 `sendUserMessage` API 不是回退路径。Pi 只有在带回执的提交之外，还提供同步的 `ctx.ui.getEditorText` 和 `ctx.ui.holdState` 时才声明 `draft_guard: true`；已注册的旧集成仍可能缺少此能力。没有注册 CLI。
 
 重连、集成重载或智能体会话替换需要新的注册 epoch。排队输入绑定到捕获的智能体会话；替换时取消，而不转移。服务器重启、恢复、实时交接或终端/根进程替换不会保留通道或旧标识，未知投递绝不重放。注册在合作的同用户信任边界内标识内核 socket 对端，并不认证 Pi 应用身份。直接注册协议及所有者生命周期见[已注册智能体通道](/zh-cn/docs/socket-api/#已注册智能体通道未发布)。
 

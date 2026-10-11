@@ -796,12 +796,16 @@ fn handle_request_with_context(
                 let supported = crate::platform::capabilities().registered_agent_channel;
                 response["result"]["capabilities"]["agent_registration_channel"] = supported.into();
                 response["result"]["capabilities"]["guarded_agent_prompt"] = supported.into();
+                response["result"]["capabilities"]["guarded_agent_prompt_if_draft_empty"] =
+                    supported.into();
                 response["result"]["capabilities"]["agent_channel_info"] = true.into();
+                response["result"]["capabilities"]["agent_draft_state"] = supported.into();
                 response["result"]["capabilities"]["agent_channel_methods"] = if supported {
                     serde_json::json!([
                         "agent.register_self",
                         "agent.channel_info",
-                        "agent.prompt_guarded"
+                        "agent.prompt_guarded",
+                        "agent.draft_state"
                     ])
                 } else {
                     serde_json::json!(["agent.channel_info"])
@@ -855,6 +859,15 @@ fn handle_request_with_context(
         );
     }
 
+    if matches!(&request.method, Method::AgentDraftState(_)) {
+        return dispatch_draft_state_with_timeout(
+            request,
+            api_tx,
+            context,
+            response_write_complete,
+            crate::api::agent_channel::DRAFT_STATE_TIMEOUT,
+        );
+    }
     dispatch_to_app(
         request,
         api_tx,
@@ -863,6 +876,41 @@ fn handle_request_with_context(
         response_write_complete,
         None,
     )
+}
+
+// Bound the entire App round trip, not just the channel receipt after App service.
+// A late queued observation remains read-only and has its own finite channel budget.
+fn dispatch_draft_state_with_timeout(
+    request: Request,
+    api_tx: &ApiRequestSender,
+    context: ApiRequestContext,
+    response_write_complete: Option<std::sync::mpsc::Receiver<()>>,
+    timeout: Duration,
+) -> String {
+    let id = request.id.clone();
+    let response = dispatch_to_app(
+        request,
+        api_tx,
+        Some(timeout),
+        context,
+        response_write_complete,
+        Some(("timeout", "draft observation timed out")),
+    );
+    let reason = serde_json::from_str::<serde_json::Value>(&response)
+        .ok()
+        .and_then(|value| match value["error"]["code"].as_str() {
+            Some("timeout") => Some(crate::api::schema::DraftStateUnknownReason::Timeout),
+            Some("server_unavailable") => {
+                Some(crate::api::schema::DraftStateUnknownReason::Unknown)
+            }
+            _ => None,
+        });
+    match reason {
+        Some(reason) => {
+            crate::api::agent_channel::Outcome::draft_unknown(reason).response(id, false)
+        }
+        None => response, // Preserve typed results and actual target-resolution errors.
+    }
 }
 
 pub(crate) fn api_method_name(method: &Method) -> &'static str {
@@ -922,6 +970,7 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::AgentPrompt(_) => "agent.prompt",
         Method::AgentRegisterSelf(_) => "agent.register_self",
         Method::AgentChannelInfo(_) => "agent.channel_info",
+        Method::AgentDraftState(_) => "agent.draft_state",
         Method::AgentPromptGuarded(_) => "agent.prompt_guarded",
         Method::AgentWait(_) => "agent.wait",
         Method::PaneSplit(_) => "pane.split",
