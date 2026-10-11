@@ -590,22 +590,51 @@ fn server_survives_hangup_and_logs_why_it_stops() {
     assert_eq!(unsafe { libc::kill(pid, libc::SIGHUP) }, 0);
     // Closing the terminal hangs up the server's whole session too.
     spawned.close_master();
-    assert!(
-        !wait_for_exit(&mut spawned.child, Duration::from_millis(500)),
-        "server must not stop on SIGHUP"
-    );
-    assert!(ping_socket(&api_socket).contains("pong"));
+    // The API socket (and ping) are served before the app loop installs its
+    // SIGTERM handler. An app-dispatched reply proves both that SIGHUP did not
+    // stop the server and that shutdown signals are now handled; elapsed time
+    // since the socket appeared proves neither under load.
+    let mut stream = UnixStream::connect(&api_socket).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    writeln!(
+        stream,
+        r#"{{"id":"ready-after-hangup","method":"workspace.list","params":{{}}}}"#
+    )
+    .unwrap();
+    let mut response = String::new();
+    BufReader::new(stream).read_line(&mut response).unwrap();
+    let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+    assert!(response.get("result").is_some(), "{response}");
 
     assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+    let mut killer = spawned.child.clone_killer();
+    let status = thread::scope(|scope| {
+        let (exited_tx, exited_rx) = std::sync::mpsc::channel();
+        let child = &mut spawned.child;
+        scope.spawn(move || {
+            let _ = exited_tx.send(child.wait());
+        });
+        match exited_rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(status) => status.expect("wait for server exit"),
+            Err(err) => {
+                killer.kill().expect("stop hung server");
+                panic!("server must stop on SIGTERM: {err}");
+            }
+        }
+    });
     assert!(
-        wait_for_exit(&mut spawned.child, Duration::from_secs(10)),
-        "server must stop on SIGTERM"
+        status.success(),
+        "server must shut down gracefully: {status:?}"
     );
-    let line = wait_for_log_line(
-        &server_log_path(&config_home),
-        "server shutdown initiated",
-        Duration::from_secs(5),
-    );
+    // Logging is synchronous, so child exit orders the final log read without
+    // a filesystem polling loop or another timing allowance.
+    let log = fs::read_to_string(server_log_path(&config_home)).unwrap();
+    let line = log
+        .lines()
+        .find(|line| line.contains("server shutdown initiated"))
+        .unwrap_or_else(|| panic!("missing shutdown reason:\n{log}"));
     assert!(line.contains("reason=SIGTERM"), "{line}");
 
     cleanup_spawned_herdr(spawned, base);
