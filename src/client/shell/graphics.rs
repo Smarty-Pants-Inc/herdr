@@ -45,6 +45,11 @@ impl ClientShellState {
         self.graphics.retire_direct_image(image_id);
     }
 
+    /// Commits graphics-cache changes once their frame is presented, or undoes them.
+    pub(crate) fn finish_graphics_delivery(&mut self, delivery: Option<u64>, presented: bool) {
+        self.graphics.finish_delivery(delivery, presented);
+    }
+
     pub(crate) fn take_pending_graphics_cleanup(&mut self) -> Vec<u8> {
         self.graphics.take_pending_cleanup()
     }
@@ -60,7 +65,7 @@ impl ClientShellState {
         &mut self,
         layout: ClientShellLayout,
         occlusion: &crate::kitty_graphics::surface::Occlusion,
-    ) -> crate::kitty_graphics::GraphicsOutput {
+    ) -> (crate::kitty_graphics::GraphicsOutput, Option<u64>) {
         let visibility = if self.endpoint_error.is_some() {
             crate::kitty_graphics::surface::Visibility::Hidden
         } else if self.hits.popup.is_some() {
@@ -73,7 +78,7 @@ impl ClientShellState {
             .popup
             .as_ref()
             .map(|popup| (popup.inner_rect.x, popup.inner_rect.y));
-        self.graphics.encode_output(
+        self.graphics.encode_delivery(
             visibility,
             (layout.pane_surface.x, layout.pane_surface.y),
             popup_origin,

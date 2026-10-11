@@ -739,8 +739,12 @@ impl ClientShellState {
             self.hits.pane_splits.clear();
             self.hits.popup = None;
         }
-        let graphics = self.compose_graphics(layout, &occlusion);
-        Some(crate::client::frame_output::ComposedFrame { frame, graphics })
+        let (graphics, graphics_delivery) = self.compose_graphics(layout, &occlusion);
+        Some(crate::client::frame_output::ComposedFrame {
+            frame,
+            graphics,
+            graphics_delivery,
+        })
     }
 }
 

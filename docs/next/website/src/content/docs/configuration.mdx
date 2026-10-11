@@ -573,7 +573,7 @@ startup_per_agent_delay_ms = 100
 
 Automatic restores start one agent at a time, 100 milliseconds apart by default, to reduce startup contention. The first eligible agent starts immediately. Set `startup_per_agent_delay_ms = 0` to disable spacing. Manual launches and explicit terminal attaches are unaffected. Restart the Herdr server to apply changes.
 
-Only panes with a valid native session reference from an official integration can resume; other panes restore as normal shells. See [Session state and restore](/docs/session-state/) for supported Agents and persistence behavior.
+Herdr resumes an agent pane in one of two ways. If the agent reported its own resume command (see [Add Herdr support to your agent](/docs/add-herdr-support/)) and the saved command is still valid, Herdr runs that command in the pane's directory. Otherwise, Herdr uses a valid native session reference from an official integration. `resume_agents_on_restore` controls both paths. Other panes restore as normal shells. See [Session state and restore](/docs/session-state/) for supported Agents and persistence behavior.
 
 ## IME cursor tracking
 
