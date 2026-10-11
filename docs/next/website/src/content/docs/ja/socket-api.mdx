@@ -620,7 +620,7 @@ action = "bootstrap"
 {"id":"req_plugin_invoke","method":"plugin.action.invoke","params":{"action_id":"example.worktree-bootstrap.bootstrap","context":{"invocation_source":"keybinding"}}}
 ```
 
-`plugin.action.invoke` はマニフェストのアクションを解決し、マニフェストのコマンドを起動し、Herdr が構築した呼び出しコンテキストと、開始されたコマンドのログレコードを返します。`context.focused_pane_id` に呼び出し元のペインを指定すると、Herdr は UI のフォーカスではなく、そのペインからワークスペース、タブ、cwd、エージェント、worktree のフィールドを構築します。不明なペインは `pane_not_found` を返します。呼び出し元のペインを省略したグローバルなアクションには、ペインのフィールドやフォーカス中のワークスペースの暗黙的な情報は渡されません。明示的なワークスペース・タブのコンテキストと呼び出しメタデータは使用できます。無効化されたプラグインのアクションの呼び出しは `plugin_disabled` エラーを返します。
+`plugin.action.invoke` はマニフェストのアクションを解決し、マニフェストのコマンドを起動し、Herdr が構築した呼び出しコンテキストと、開始されたコマンドのログレコードを返します。呼び出し元のペインは、リクエストの ID や UI のフォーカスではなく、Herdr が検証した呼び出し元プロセスのペインへの帰属から決まります。ペイン ID を省略しても、そのペインからワークスペース、タブ、cwd、エージェント、worktree のフィールドを構築します。ペインに帰属する呼び出しでは、`context.focused_pane_id` は検証対象の指定にすぎず、呼び出し元自身のペインに解決されない ID は `invoking_pane_mismatch` を返します。ペインへの帰属がない呼び出しは、指定されたペイン ID にかかわらずグローバルなアクションとなり、ペイン、ワークスペース、タブのフィールドは渡されません。呼び出し元が指定した派生フィールドは無視されますが、呼び出しメタデータは使用できます。無効化されたプラグインのアクションの呼び出しは `plugin_disabled` エラーを返します。
 
 Herdr は `HERDR_SOCKET_PATH`、`HERDR_BIN_PATH`、`HERDR_ENV=1`、`HERDR_PLUGIN_ID`、`HERDR_PLUGIN_ROOT`、`HERDR_PLUGIN_CONFIG_DIR`、`HERDR_PLUGIN_STATE_DIR`、`HERDR_PLUGIN_CONTEXT_JSON`、そして利用可能な `HERDR_WORKSPACE_ID`、`HERDR_TAB_ID`、`HERDR_PANE_ID` の値を注入します。アクションコマンドは加えて `HERDR_PLUGIN_ACTION_ID` を受け取ります。イベントフックは `HERDR_PLUGIN_EVENT` と `HERDR_PLUGIN_EVENT_JSON` を、ペインコマンドは `HERDR_PLUGIN_ENTRYPOINT_ID` を受け取ります。
 

@@ -2,32 +2,39 @@ use crate::api::schema::{EventData, PluginInvocationContext};
 use crate::app::App;
 
 impl App {
-    /// Builds an API invocation context from the caller's invoking pane, never
-    /// from UI focus. A provided `focused_pane_id` names the invoking pane and
-    /// its workspace, tab, cwd and agent are rebuilt from that real pane; caller
-    /// claims about those fields are ignored. Without one the invocation is
-    /// global: no pane fields, and only caller-supplied workspace/tab fields.
+    /// Builds a public API invocation context from the caller's trusted
+    /// invoking pane (its live peer attribution), never from UI focus or a
+    /// request claim. With an invoker, workspace, tab, cwd and agent are
+    /// rebuilt from that real pane, and a provided `focused_pane_id` is only
+    /// validated: it must resolve (aliases included) to the invoker, else
+    /// `invoking_pane_mismatch` before anything else is built. Without an
+    /// invoker the invocation is global: any pane claim is ignored and all
+    /// pane, workspace and tab fields are absent, including caller-supplied
+    /// ones. Caller-own fields (selection, source, correlation, URL, handler)
+    /// are kept as the caller's input.
     pub(super) fn merge_plugin_context(
         &self,
         provided: Option<PluginInvocationContext>,
         correlation_id: &str,
+        invoker: Option<(usize, crate::layout::PaneId)>,
     ) -> Result<PluginInvocationContext, (&'static str, String)> {
-        let mut context = empty_plugin_context(correlation_id);
+        if let (Some(claim), Some(invoker)) = (
+            provided
+                .as_ref()
+                .and_then(|provided| provided.focused_pane_id.as_deref()),
+            invoker,
+        ) {
+            if self.parse_pane_id(claim) != Some(invoker) {
+                return Err((
+                    super::super::INVOKING_PANE_MISMATCH,
+                    super::super::INVOKING_PANE_MISMATCH_MESSAGE.to_owned(),
+                ));
+            }
+        }
+        let mut context = self.invoking_plugin_context(invoker, correlation_id);
         let Some(provided) = provided else {
             return Ok(context);
         };
-        if let Some(pane_id) = provided.focused_pane_id.as_deref() {
-            context = self
-                .plugin_context_for_public_pane_id(pane_id, correlation_id)
-                .ok_or_else(|| ("pane_not_found", format!("pane not found: {pane_id}")))?;
-        } else {
-            context.workspace_id = provided.workspace_id;
-            context.workspace_label = provided.workspace_label;
-            context.workspace_cwd = provided.workspace_cwd;
-            context.worktree = provided.worktree;
-            context.tab_id = provided.tab_id;
-            context.tab_label = provided.tab_label;
-        }
         context.selected_text = provided.selected_text;
         context.invocation_source = provided.invocation_source.or(context.invocation_source);
         context.correlation_id = provided.correlation_id.or(context.correlation_id);
