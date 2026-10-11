@@ -8201,6 +8201,70 @@ fn agent_session_replacement_that_resets_seen_requests_a_render() {
     );
 }
 
+fn agent_session_changed_events(
+    server: &HeadlessServer,
+    after: u64,
+) -> Vec<(String, String, Option<String>)> {
+    server
+        .app
+        .event_hub
+        .events_after(after)
+        .into_iter()
+        .filter_map(|(_, event)| match event.data {
+            crate::api::schema::EventData::PaneAgentSessionChanged {
+                pane_id,
+                session_id,
+                previous_session_id,
+                ..
+            } => {
+                assert_eq!(
+                    event.event,
+                    crate::api::schema::EventKind::PaneAgentSessionChanged
+                );
+                Some((pane_id, session_id, previous_session_id))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// smarty-dev#9124: a session report emits `pane.agent_session_changed` only
+/// when the pane's session id changes, never for a repeat of the same id.
+#[test]
+fn agent_session_report_emits_session_changed_only_for_a_new_session() {
+    let (writer, _control_rx, _render_rx) = test_client_writer();
+    let (mut server, pane_id) = completion_guard_server(writer);
+    let public_pane_id = server.app.public_pane_id(0, pane_id).unwrap();
+
+    let start = server.app.event_hub.current_sequence();
+    report_agent_session_changed(&mut server, &public_pane_id, "session-a", "startup", 1);
+    assert_eq!(
+        agent_session_changed_events(&server, start),
+        vec![(public_pane_id.clone(), "session-a".to_string(), None)],
+        "the first session has no previous id"
+    );
+
+    let repeat = server.app.event_hub.current_sequence();
+    report_agent_session_changed(&mut server, &public_pane_id, "session-a", "resume", 2);
+    assert!(
+        agent_session_changed_events(&server, repeat).is_empty(),
+        "reporting the current session again emits nothing"
+    );
+
+    let replace = server.app.event_hub.current_sequence();
+    report_agent_session_changed(&mut server, &public_pane_id, "session-b", "clear", 3);
+    report_agent_session_changed(&mut server, &public_pane_id, "session-b", "clear", 4);
+    assert_eq!(
+        agent_session_changed_events(&server, replace),
+        vec![(
+            public_pane_id.clone(),
+            "session-b".to_string(),
+            Some("session-a".to_string())
+        )],
+        "A then B emits exactly one change, and the repeat of B none"
+    );
+}
+
 #[test]
 fn api_report_agent_stores_valid_resume_argv_and_rejects_invalid() {
     let (writer, _control_rx, _render_rx) = test_client_writer();

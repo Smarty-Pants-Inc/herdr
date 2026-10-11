@@ -710,6 +710,38 @@
             },
             {
               "properties": {
+                "agent": {
+                  "type": "string"
+                },
+                "pane_id": {
+                  "type": "string"
+                },
+                "previous_session_id": {
+                  "type": "string"
+                },
+                "session_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "pane_agent_session_changed",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "pane_id",
+                "workspace_id",
+                "agent",
+                "session_id",
+                "previous_session_id"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
                 "layout": {
                   "$ref": "#/schemas/event/$defs/PaneLayoutSnapshot"
                 },
@@ -753,6 +785,7 @@
             "pane_exited",
             "pane_agent_detected",
             "pane_agent_status_changed",
+            "pane_agent_session_changed",
             "layout_updated"
           ],
           "type": "string"
@@ -4615,6 +4648,22 @@
                   "type": "string"
                 },
                 "type": {
+                  "const": "pane.agent_session_changed",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "pane_id"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "pane_id": {
+                  "type": "string"
+                },
+                "type": {
                   "const": "pane.scroll_changed",
                   "type": "string"
                 }
@@ -7240,6 +7289,35 @@
           ],
           "type": "string"
         },
+        "PaneAgentSessionChangedEvent": {
+          "description": "The agent in a pane reported a session id different from the pane's\nprevious one. A repeated report of the current session emits nothing.",
+          "properties": {
+            "agent": {
+              "type": "string"
+            },
+            "pane_id": {
+              "type": "string"
+            },
+            "previous_session_id": {
+              "description": "`null` when the pane had no reported session before.",
+              "type": "string"
+            },
+            "session_id": {
+              "type": "string"
+            },
+            "workspace_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pane_id",
+            "workspace_id",
+            "agent",
+            "session_id",
+            "previous_session_id"
+          ],
+          "type": "object"
+        },
         "PaneAgentStatusChangedEvent": {
           "properties": {
             "agent": {
@@ -7413,6 +7491,9 @@
             },
             {
               "$ref": "#/schemas/subscription_event/$defs/PaneScrollChangedEvent"
+            },
+            {
+              "$ref": "#/schemas/subscription_event/$defs/PaneAgentSessionChangedEvent"
             }
           ]
         },
@@ -7420,6 +7501,7 @@
           "enum": [
             "pane.output_matched",
             "pane.agent_status_changed",
+            "pane.agent_session_changed",
             "pane.scroll_changed"
           ],
           "type": "string"
@@ -8326,6 +8408,38 @@
             },
             {
               "properties": {
+                "agent": {
+                  "type": "string"
+                },
+                "pane_id": {
+                  "type": "string"
+                },
+                "previous_session_id": {
+                  "type": "string"
+                },
+                "session_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "pane_agent_session_changed",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "pane_id",
+                "workspace_id",
+                "agent",
+                "session_id",
+                "previous_session_id"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
                 "layout": {
                   "$ref": "#/schemas/success_response/$defs/PaneLayoutSnapshot"
                 },
@@ -8384,6 +8498,7 @@
             "pane_exited",
             "pane_agent_detected",
             "pane_agent_status_changed",
+            "pane_agent_session_changed",
             "layout_updated"
           ],
           "type": "string"

@@ -354,3 +354,105 @@ fn lagging_subscription_closes_without_interrupting_other_clients() {
     assert_eq!(response["id"], "ordinary");
     assert_eq!(response["result"]["type"], "workspace_list");
 }
+
+fn session_changed_event(pane_id: &str, session_id: &str, previous: Option<&str>) -> EventEnvelope {
+    EventEnvelope {
+        event: EventKind::PaneAgentSessionChanged,
+        data: EventData::PaneAgentSessionChanged {
+            pane_id: pane_id.into(),
+            workspace_id: "workspace_1".into(),
+            agent: "pi".into(),
+            session_id: session_id.into(),
+            previous_session_id: previous.map(str::to_string),
+        },
+    }
+}
+
+/// smarty-dev#9124: `pane.agent_session_changed` is scoped by `pane_id` like
+/// `pane.agent_status_changed`, and streams under its dotted event name.
+#[test]
+fn agent_session_changed_subscription_filters_by_pane() {
+    let mut test = SocketTest::new();
+    let mut client = test.connect();
+    client.subscribe(
+        "sessions",
+        json!([
+            {"type": "pane.agent_session_changed", "pane_id": "pane_1"},
+            {"type": "workspace.renamed"}
+        ]),
+    );
+    // Hold the pane probe after the server pins its cursor, so all three events
+    // are drained in the first batch: session entry first, then the sentinel.
+    let probe = test.app_request();
+    assert_eq!(probe.request.id, "sessions:sub:0:probe");
+    test.hub
+        .push(session_changed_event("pane_2", "other", None));
+    test.hub.push(session_changed_event(
+        "pane_1",
+        "session-b",
+        Some("session-a"),
+    ));
+    test.hub.push(renamed_event(0));
+    reply_to_probe(probe);
+    client.assert_started("sessions");
+
+    let event = client.response();
+    assert_eq!(
+        event,
+        json!({
+            "event": "pane.agent_session_changed",
+            "data": {
+                "pane_id": "pane_1",
+                "workspace_id": "workspace_1",
+                "agent": "pi",
+                "session_id": "session-b",
+                "previous_session_id": "session-a"
+            }
+        })
+    );
+    // The pane_2 event was filtered out: the next line is the sentinel.
+    client.assert_renames(0..1, Instant::now() + RESPONSE_TIMEOUT);
+}
+
+/// smarty-dev#9124: a refused `events.subscribe` carries a stable `error.code`
+/// and closes the connection; it never starts a partial stream.
+#[test]
+fn refused_subscriptions_carry_stable_error_codes() {
+    let mut test = SocketTest::new();
+
+    // A subscription type this server does not know (an older Herdr).
+    let mut unknown = test.connect();
+    unknown.subscribe(
+        "unknown",
+        json!([{"type": "pane.not_an_event", "pane_id": "pane_1"}]),
+    );
+    let response = unknown.response();
+    assert_eq!(response["id"], "unknown");
+    assert_eq!(response["error"]["code"], "invalid_request", "{response}");
+    assert_eq!(unknown.next_line(Instant::now() + RESPONSE_TIMEOUT), None);
+
+    // A pane that does not exist.
+    let mut missing = test.connect();
+    missing.subscribe(
+        "missing",
+        json!([{"type": "pane.agent_session_changed", "pane_id": "pane_9"}]),
+    );
+    let probe = test.app_request();
+    probe
+        .respond_to
+        .send(
+            serde_json::to_string(&ErrorResponse {
+                id: probe.request.id.clone(),
+                error: ErrorBody {
+                    code: "pane_not_found".into(),
+                    message: "pane pane_9 not found".into(),
+                },
+            })
+            .unwrap(),
+        )
+        .unwrap();
+    let response = missing.response();
+    assert_eq!(response["id"], "missing");
+    assert_eq!(response["error"]["code"], "pane_not_found", "{response}");
+    assert_eq!(missing.next_line(Instant::now() + RESPONSE_TIMEOUT), None);
+}
