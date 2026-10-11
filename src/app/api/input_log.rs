@@ -252,35 +252,48 @@ fn rotated_log_path(path: &std::path::Path) -> std::path::PathBuf {
     path.with_file_name(name)
 }
 
-/// [`append_line`] with an explicit cap (tests pass a small one). While holding the lock on a
-/// log at or above `cap`, renames it to `<name>.1` (replacing an older `.1`) and appends to a
-/// fresh private log. Rotation never fails the write: if the rename or the fresh open fails,
-/// the record is appended to the file already open, as before rotation existed.
+/// [`append_line`] with an explicit cap (tests pass a small one).
+///
+/// Identity rule: the log path is renamed only after it was checked, under the lock of the file
+/// held, to name that same file (same dev and inode, a regular file owned by this user). If it
+/// names another file (a writer rotated while this one waited), that file is opened privately
+/// and locked in turn and the check repeats; an open that refuses it refuses the write.
+///
+/// A verified log at or above `cap` is renamed to `<name>.1` (replacing an older `.1`) and the
+/// record goes to a fresh private log. Rotation itself never fails the write: if the rename or
+/// the fresh open fails, the record is appended to the file already open.
 fn append_line_capped(path: &std::path::Path, line: &str, cap: u64) -> std::io::Result<()> {
     use std::io::{Read, Seek, SeekFrom};
+    /// Live-path changes followed before appending to the file last locked.
+    const MAX_LIVE_REOPENS: usize = 8;
+    let open_locked = || {
+        let file = crate::platform::open_private_append_file(path)?;
+        file.lock()?;
+        Ok::<_, std::io::Error>(file)
+    };
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let mut file = crate::platform::open_private_append_file(path)?;
-    file.lock()?;
-    let held = file.metadata()?.len();
-    if held >= cap {
-        // Another writer may have rotated while this one waited for the lock: the file held is
-        // then `.1`, and the live path is a fresh, shorter log. Append there; never rotate twice.
-        let live_is_held = std::fs::symlink_metadata(path).is_ok_and(|live| live.len() == held);
-        let replacement = if live_is_held {
-            std::fs::rename(path, rotated_log_path(path))
-                .and_then(|()| crate::platform::open_private_append_file(path))
-        } else {
-            crate::platform::open_private_append_file(path)
-        };
-        match replacement.and_then(|fresh| fresh.lock().map(|()| fresh)) {
-            Ok(fresh) => file = fresh,
-            Err(err) => tracing::warn!(
-                err = %err,
-                path = %path.display(),
-                "log rotation failed; appending to the file already open"
-            ),
+    let mut file = open_locked()?;
+    after_first_lock();
+    for _ in 0..MAX_LIVE_REOPENS {
+        match crate::platform::path_names_open_file(path, &file) {
+            Some(false) => file = open_locked()?,
+            Some(true) if file.metadata()?.len() >= cap => {
+                match std::fs::rename(path, rotated_log_path(path)).and_then(|()| open_locked()) {
+                    Ok(fresh) => file = fresh,
+                    Err(err) => {
+                        tracing::warn!(
+                            err = %err,
+                            path = %path.display(),
+                            "log rotation failed; appending to the file already open"
+                        );
+                        break;
+                    }
+                }
+            }
+            // `None`: this platform does not check identity, so it never rotates (Windows).
+            Some(true) | None => break,
         }
     }
     let mut record = Vec::with_capacity(line.len() + 2);
@@ -299,6 +312,23 @@ fn append_line_capped(path: &std::path::Path, line: &str, cap: u64) -> std::io::
     file.write_all(&record)?;
     file.sync_data()?;
     publish_directories(path)
+}
+
+#[cfg(not(test))]
+fn after_first_lock() {}
+
+#[cfg(test)]
+thread_local! {
+    /// Runs once after the first lock, standing in for a writer that held the lock first.
+    static AFTER_FIRST_LOCK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn after_first_lock() {
+    if let Some(hook) = AFTER_FIRST_LOCK.take() {
+        hook();
+    }
 }
 
 fn publish_directories(path: &std::path::Path) -> std::io::Result<()> {
@@ -688,6 +718,8 @@ mod tests {
             .collect()
     }
 
+    // Rotation needs the Unix identity check; on Windows it is a documented no-op.
+    #[cfg(unix)]
     #[tokio::test]
     async fn crossing_the_cap_rotates_once_and_keeps_the_new_record() {
         const CAP: u64 = 64;
@@ -717,6 +749,7 @@ mod tests {
         let _ = std::fs::remove_file(&rotated);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_second_crossing_replaces_the_rotated_generation() {
         const CAP: u64 = 64;
@@ -768,6 +801,106 @@ mod tests {
         assert!(rotated.join("occupied").is_dir());
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir_all(&rotated);
+    }
+
+    /// herdr#225 review: two writers race across one rotation, many times over.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn racing_writers_rotate_once_and_lose_no_record() {
+        const CAP: u64 = 64;
+        let (path, rotated) = rotation_paths("rotate-race");
+        for round in 0..40 {
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(&rotated);
+            fill_to_cap(&path, "old", CAP);
+            let previous = std::fs::read(&path).unwrap();
+            let start = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let writers: Vec<_> = ["a", "b"]
+                .into_iter()
+                .map(|writer| {
+                    let (path, start) = (path.clone(), start.clone());
+                    std::thread::spawn(move || {
+                        start.wait();
+                        let line = format!("{{\"{writer}\":{round}}}");
+                        super::append_line_capped(&path, &line, CAP).unwrap();
+                        line
+                    })
+                })
+                .collect();
+            let mut expected: Vec<String> =
+                writers.into_iter().map(|w| w.join().unwrap()).collect();
+            expected.sort();
+            let mut live = read_lines(&path);
+            live.sort();
+            assert_eq!(live, expected, "round {round}");
+            assert_eq!(
+                std::fs::read(&rotated).unwrap(),
+                previous,
+                "round {round}: .1 is exactly the previous generation"
+            );
+        }
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&rotated);
+    }
+
+    /// A writer that waited while another rotated holds `.1`: it appends to the live log
+    /// instead, and `.1` keeps exactly the previous generation.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_stale_waiter_appends_to_the_live_log_without_rotating_again() {
+        const CAP: u64 = 64;
+        let (path, rotated) = rotation_paths("rotate-stale");
+        fill_to_cap(&path, "old", CAP);
+        let previous = std::fs::read(&path).unwrap();
+        let (hook_path, hook_rotated) = (path.clone(), rotated.clone());
+        super::AFTER_FIRST_LOCK.set(Some(Box::new(move || {
+            std::fs::rename(&hook_path, &hook_rotated).unwrap();
+            super::append_line_capped(&hook_path, "{\"other\":0}", CAP).unwrap();
+        })));
+        super::append_line_capped(&path, "{\"mine\":0}", CAP).unwrap();
+        assert_eq!(std::fs::read(&rotated).unwrap(), previous);
+        assert_eq!(read_lines(&path), ["{\"other\":0}", "{\"mine\":0}"]);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&rotated);
+    }
+
+    /// herdr#225 review: an entry at the live path with the held file's length but another
+    /// identity (here a symlink, as a foreign file would be) is never moved into `.1`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_same_size_foreign_replacement_is_refused_not_rotated() {
+        const CAP: u64 = 64;
+        let (path, rotated) = rotation_paths("rotate-foreign");
+        fill_to_cap(&path, "old", CAP);
+        let previous = std::fs::read(&path).unwrap();
+        // A symlink's own length is its target's: give it exactly the held file's length.
+        let mut target = String::from("rotate-foreign-decoy-");
+        while target.len() < previous.len() {
+            target.push('x');
+        }
+        assert_eq!(target.len(), previous.len());
+        let decoy = path.with_file_name(&target);
+        std::fs::write(&decoy, b"decoy\n").unwrap();
+        let (hook_path, hook_rotated, hook_target) =
+            (path.clone(), rotated.clone(), target.clone());
+        super::AFTER_FIRST_LOCK.set(Some(Box::new(move || {
+            std::fs::rename(&hook_path, &hook_rotated).unwrap();
+            std::os::unix::fs::symlink(&hook_target, &hook_path).unwrap();
+        })));
+        assert!(super::append_line_capped(&path, "{\"mine\":0}", CAP).is_err());
+        assert_eq!(
+            std::fs::symlink_metadata(&path).unwrap().len(),
+            previous.len() as u64
+        );
+        assert!(std::fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read(&rotated).unwrap(), previous, ".1 kept");
+        assert_eq!(std::fs::read(&decoy).unwrap(), b"decoy\n");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&rotated);
+        let _ = std::fs::remove_file(&decoy);
     }
 
     #[tokio::test]
