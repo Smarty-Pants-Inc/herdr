@@ -212,12 +212,16 @@ impl App {
         }
     }
 
+    fn target_is_input_agent(&self, target: &TerminalTarget) -> bool {
+        self.target_is_agent(target) || self.terminal_has_registered_owner(&target.terminal_id)
+    }
+
     pub(crate) fn input_origin_for_peer_identity(
         &self,
         peer_identity: crate::platform::ProcessIdentity,
     ) -> InputOrigin {
         match self.checked_pane_target_for_peer_identity(peer_identity) {
-            Ok(Some(target)) if self.target_is_agent(&target) => InputOrigin::Agent(target),
+            Ok(Some(target)) if self.target_is_input_agent(&target) => InputOrigin::Agent(target),
             Ok(_) => InputOrigin::Ordinary,
             Err(()) => InputOrigin::Unknown,
         }
@@ -247,7 +251,9 @@ impl App {
             crate::platform::PeerPaneOrigin::Absent => self.input_origin_for_peer_identity(peer),
             crate::platform::PeerPaneOrigin::HasPane => {
                 match self.checked_pane_target_for_peer_identity_with_outside_proof(peer, false) {
-                    Ok(Some(target)) if self.target_is_agent(&target) => InputOrigin::Agent(target),
+                    Ok(Some(target)) if self.target_is_input_agent(&target) => {
+                        InputOrigin::Agent(target)
+                    }
                     Ok(Some(_)) => InputOrigin::Ordinary,
                     Ok(None) | Err(()) => InputOrigin::Unknown,
                 }
@@ -264,7 +270,7 @@ impl App {
         peer_identity: crate::platform::ProcessIdentity,
     ) -> InputOrigin {
         match self.checked_pane_target_for_peer_identity_with_outside_proof(peer_identity, false) {
-            Ok(Some(target)) if self.target_is_agent(&target) => InputOrigin::Agent(target),
+            Ok(Some(target)) if self.target_is_input_agent(&target) => InputOrigin::Agent(target),
             Ok(_) | Err(()) => InputOrigin::Unknown,
         }
     }

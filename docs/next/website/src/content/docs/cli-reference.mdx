@@ -372,6 +372,34 @@ A successful start returns only after the expected agent owns the same terminal 
 
 Use `pane send-text`, `pane send-keys`, `pane run`, and `terminal attach` for ordinary terminals, servers, tests, shells, or low-level terminal control. Use `pane run` when you want to submit a command with Enter.
 
+### Registered-channel prompts (unreleased)
+
+```bash
+herdr agent channel-info <target>
+herdr agent prompt-guarded <target> <text> --expected-terminal TERMINAL_ID --expected-registration-epoch EPOCH --request-id ID [--timeout-ms MS] [--allow-cross-pane]
+```
+
+These commands resolve a terminal without requiring agent screen detection. Use an explicit pane ID, opaque terminal ID, or unique live agent name. `channel-info` returns `terminal_id` and `ready`; a ready channel also includes `registration_epoch` and `session_generation`. The query does not register an agent. Copy the terminal and epoch from the same ready response, rather than deriving them from a name or pane position:
+
+```bash
+herdr agent channel-info w1:p1
+# Set these variables from result.terminal_id and result.registration_epoch.
+herdr agent prompt-guarded w1:p1 "Review this change" \
+  --expected-terminal "$terminal_id" \
+  --expected-registration-epoch "$registration_epoch" \
+  --request-id review-1 --timeout-ms 10000
+```
+
+`prompt-guarded` sends literal text over the agent's registered socket channel only. It never writes prompt text, preparatory bytes, or Enter to the PTY, changes input focus, or falls back to `agent prompt`. The existing `agent prompt` command is unchanged. Target, text, both pins, and request ID must be nonempty. `--timeout-ms` waits for an admission receipt, not turn completion; it defaults to 10000 and accepts 1–300000 milliseconds. `--allow-cross-pane` explicitly opts into the existing cross-pane input policy; it does not bypass the channel or identity checks.
+
+Success returns `status: "accepted"` (admitted to the active session's input) or `"queued"` (admitted to that session's follow-up queue), plus the pinned terminal, epoch, request ID, and session generation. Neither status promises that a model turn finished or succeeded. Within one epoch, the same request ID and exact text share the first outcome without another submission; changing the text returns `payload_mismatch`. A new ID is a new request, not a safe retry.
+
+Missing/disconnected channels, stale pins, and unsupported servers refuse without PTY input. If admission may have occurred but the receipt is lost, the result is `delivery_unknown`: **never automatically retry, change the ID/epoch to replay, or fall back to terminal input**. A transport failure can also leave admission unknown.
+
+Channels are supported on Linux and macOS only; Windows advertises registration and guarded-prompt capabilities as `false`, and `channel-info` returns `ready: false`. The managed Pi integration registers directly from TUI mode only when both `pi.submitUserMessage` and `ctx.userMessageSessionGeneration` are available. If either is missing, no channel is registered and guarded delivery refuses; the old `sendUserMessage` API is not a fallback. There is no registration CLI.
+
+Reconnect, integration reload, or agent-session replacement requires a fresh registration epoch. Queued input belongs to its captured agent session and is cancelled rather than moved to a replacement session. Server restart, restore, live handoff, or terminal/root replacement does not preserve channels or old pins; uncertain deliveries are never replayed. Registration identifies a kernel socket peer under a cooperative same-user trust boundary, not authenticated Pi application identity. See [Registered agent channels](/docs/socket-api/#registered-agent-channels-unreleased) for the direct registration protocol and owner lifecycle.
+
 ## Direct terminal attach
 
 ```bash

@@ -103,10 +103,54 @@ herdr pane read w1:p2 --source recent --lines 50
 | 入力コンシューマー（ローカル JSON 専用） | `pane.input_consumer.enroll`、`pane.input_consumer.cut`、`pane.input_consumer.release` |
 | ポップアップ | `popup.close` |
 | レイアウト | `layout.export`、`layout.apply`、`layout.apply_restorable`、`layout.set_split_ratio` |
-| エージェント | `agent.list`、`agent.get`、`agent.read`、`agent.explain`、`agent.send_keys`、`agent.prompt`、`agent.wait`、`agent.rename`、`agent.focus`、`agent.start`、`agent.start_guarded` |
+| エージェント | `agent.list`、`agent.get`、`agent.read`、`agent.explain`、`agent.send_keys`、`agent.prompt`、`agent.register_self`、`agent.channel_info`、`agent.prompt_guarded`、`agent.wait`、`agent.rename`、`agent.focus`、`agent.start`、`agent.start_guarded` |
 | イベント | `events.subscribe`、`events.wait` |
 | インテグレーション | `integration.install`、`integration.uninstall` |
 | プラグイン | `plugin.link`、`plugin.list`、`plugin.unlink`、`plugin.enable`、`plugin.disable`、`plugin.action.list`、`plugin.action.invoke`、`plugin.log.list`、`plugin.pane.open`、`plugin.pane.focus`、`plugin.pane.close` |
+
+### 登録済みエージェントチャネル（未リリース）
+
+登録済みチャネルはソケット専用のプロンプト配信経路です。PTY テキスト、準備用バイト、入力フォーカスイベント、エスケープシーケンス、Enter を送らず、`agent.prompt` にフォールバックしません。登録用 CLI はなく、インテグレーションが持続的なローカルソケットで直接登録します。
+
+使用前に `ping.result.capabilities.agent_channel_methods` を確認してください。対応する Linux/macOS サーバーでは `agent.register_self`、`agent.channel_info`、`agent.prompt_guarded` を含みます。Windows では `agent_registration_channel` と `guarded_agent_prompt` は `false` です。`agent.channel_info` は問い合わせ可能ですが `ready: false` を返し、配信は試みません。
+
+#### 登録と検出
+
+`agent.register_self` は持続的な直接ローカルソケットの最初のリクエストとしてのみ受け付けます。カーネルの識別情報と検証した祖先プロセスから、対端をちょうど 1 つのライブペインに帰属させます。呼び出し元が指定する PID、実行ファイル名、タイトル、スクリプト、エージェント検出は登録の根拠になりません。
+
+```json
+{"id":"register","method":"agent.register_self","params":{"session_generation":"pi-session-token","pane_id":"w1:p1"}}
+{"id":"register","result":{"terminal_id":"term_opaque","registration_epoch":"epoch_opaque","session_generation":"pi-session-token","ready":true}}
+```
+
+任意の `pane_id` は対端の現在のペインを確認するだけで、ペインの選択には使いません。成功は配信を受信できることを示し、プロンプトの受け入れを意味しません。`agent.channel_info` に `target` を渡すと、スクリーン検出なしで現在のチャネルを問い合わせられます。準備完了時の `terminal_id`、`registration_epoch`、`session_generation` のうち、ターミナルと epoch を配信時に固定してください。欠落、失効、切断、未対応、未登録の場合は `ready: false` です。
+
+同じライブ対端の再登録は古い epoch を取り消してから新しい epoch を有効にし、異なるライブ対端は拒否します。切断で準備完了状態は取り消しますが、生存する所有者の予約は保持します。予約の解除にはプロセスの死亡確認が必要で、生存が不明なら接管を拒否します。ターミナル/ルートの置換、ハンドオフ、復元、ワークスペースの終了でもチャネルを取り消します。
+
+登録後もソケットは開いたままです。配信と確認は、サイズに上限がある改行区切り JSON フレームです。
+
+```json
+{"type":"deliver","registration_epoch":"epoch_opaque","request_id":"caller-key","session_generation":"pi-session-token","text":"literal message"}
+{"type":"ack","registration_epoch":"epoch_opaque","request_id":"caller-key","session_generation":"pi-session-token","status":"accepted"}
+```
+
+ACK は接続、epoch、リクエスト ID、セッション世代と一致する必要があります。`status` は `accepted`、`queued`、`rejected` で、`rejected` は型付きの `reason` が必須、`duplicate: true` は任意です。拒否は成功ではなく、その `reason` を持つ `agent_prompt_rejected` エラーになります。完全なフレームだけを送信します。フレーム、処理中リクエスト、確認待ち、epoch ごとの重複排除台帳には上限があり、容量不足では再利用可能なキーを追い出さず拒否します。配信前に `(registration_epoch, request_id, exact text)` を予約し、同じ内容の重複は最初の確認を共有して `duplicate` を付けます。内容の変更は `payload_mismatch` で拒否し、新しい ID を自動再試行として扱いません。
+
+#### ガード付き配信と受け入れ
+
+`agent.prompt_guarded` は対象、リテラルの `text`、`expected_terminal`、`expected_registration_epoch`、呼び出し元で一意な `request_id` が必須です。`timeout_ms` の既定値は 10000、範囲は 1〜300000 です。任意の `allow_cross_pane` はチャネル検証を回避しません。
+
+```json
+{"id":"deliver-1","method":"agent.prompt_guarded","params":{"target":"w1:p1","text":"Review this change","expected_terminal":"term_opaque","expected_registration_epoch":"epoch_opaque","request_id":"review-1","timeout_ms":10000}}
+```
+
+サーバーはターミナルの接続、ペインの祖先関係、所有者の生存、フォアグラウンドの条件、epoch、ソケット書き込み境界を再検証し、固定したチャネルが有効な場合だけフレームを送ります。成功レスポンスはターミナル、epoch、リクエスト ID、セッション世代と `status` を含む受け入れ確認です。`accepted` は活動中 Pi セッションの入力への受け入れ、`queued` はそのセッションの後続キューへの受け入れで、モデルターンの完了や成功ではありません。
+
+管理された Pi インテグレーションは TUI モードでのみ登録し、`pi.submitUserMessage` と `ctx.userMessageSessionGeneration` の両方を確認します。どちらかがない場合やヘッドレスセッションでは登録せず、配信を拒否します。旧 `sendUserMessage` API は使いません。Pi の確認を返す入力 API には `registrationEpoch`、`requestId`、`sessionGeneration`、リテラルの `text`、`deliverAs: "followUp"`、`expandPromptTemplates: false` を渡します。結果は `accepted`、`queued`、または型付き理由を伴う `rejected` です。入力フックが消費・拒否した入力は受け入れ済みメッセージではありません。キューは取得時のセッション世代に固定し、セッション置換時は別セッションへ移さずキャンセルします。
+
+配信可能になる前の切断やタイムアウトでは操作を拒否します。受け入れられた可能性があるのに ACK が失われた場合は `delivery_unknown` で、成功でも未配信の証明でもありません。自動再試行、古い epoch の再利用、新しい ID による再送、PTY 入力へのフォールバックは行わないでください。保持された epoch 台帳では重複送信を防ぎますが、クラッシュ時の exactly-once は保証しません。
+
+信頼境界は協調的な同一ユーザーです。カーネルの対端識別はプロセスとペインへの帰属を示すだけで、Pi の認証や同一ユーザーによるプロトコル偽装への防御ではありません。所有者の競合チェックは意図しない接管を防ぎます。再接続、リロード、セッション置換には新しい登録が必要です。サーバーの再起動、復元、ハンドオフ、ターミナル/ルートの置換ではチャネルや固定識別子を保持しません。新しい epoch とセッション世代の検証で古いフレームや ACK が境界を越えることを防ぎ、不確実な配信は再送しません。
 
 `agent.wait` はサーバー所有でイベント駆動です。解決したペイン占有者に固定されるため、置換されたエージェントが待機を満たすことはありません。`agent.prompt` は `until` と `timeout_ms` を持つ省略可能な `wait` オブジェクトを受け付けます。これにより、プロンプト送信と待機開始を 1 つのリクエストで行い、別々の呼び出し間の競合を避けられます。解決したエージェントがすでに `blocked` の場合、`agent.prompt` は入力を送信せず、待機も開始せずに `agent_blocked` を返します。
 

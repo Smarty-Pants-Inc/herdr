@@ -1226,6 +1226,8 @@ impl App {
             Err(message) => return encode_error(id, "project_change_refused", message),
         };
 
+        // The pin belongs to this attachment, never to the moved pane's successor location.
+        self.revoke_agent_channels_for_terminals([source_terminal_id.clone()]);
         let previous_focus = self.state.current_pane_focus_target();
         let taken = match self
             .state
@@ -2154,6 +2156,11 @@ impl App {
             .map_err(|message| encode_error(id.clone(), "project_change_refused", message))?;
         let workspace_snapshot = self.workspace_info(ws_idx);
         let terminal_id = self.state.terminal_id_for_pane(ws_idx, pane_id);
+        if self.state.close_pane_would_close_workspace(ws_idx, pane_id) {
+            self.revoke_agent_channels_for_workspace_close(ws_idx);
+        } else {
+            self.revoke_agent_channels_for_terminals(terminal_id.clone());
+        }
         let should_close_workspace = {
             let Some(ws) = self.state.workspaces.get_mut(ws_idx) else {
                 return Err(pane_not_found(id, &target.pane_id));
