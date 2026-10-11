@@ -670,6 +670,30 @@ struct ProcessProbeInput {
     pending_foreground_shell_clear: bool,
     pending_restore_probe: bool,
     elapsed_since_process_check: std::time::Duration,
+    /// An unidentified pane's screen changed after the last process probe.
+    unidentified_output_since_process_check: bool,
+}
+
+fn unidentified_output_since(
+    last_content_change_at: Option<std::time::Instant>,
+    last_process_check: std::time::Instant,
+) -> bool {
+    // Equal: this pass probed before it read the frame, so the probe may predate it.
+    last_content_change_at.is_some_and(|changed| changed >= last_process_check)
+}
+
+fn process_probe_deadline_after_scan(
+    content_changed: bool,
+    last_content_change_at: Option<std::time::Instant>,
+    last_process_check: std::time::Instant,
+    now: std::time::Instant,
+) -> Option<std::time::Instant> {
+    // Both loops decide before scanning. Re-evaluate a newly observed frame
+    // immediately if its throttle already expired; never re-arm on a quiet pass.
+    (content_changed
+        && unidentified_output_since(last_content_change_at, last_process_check)
+        && now.duration_since(last_process_check) >= PROCESS_RECHECK_IDENTIFIED)
+        .then_some(now)
 }
 
 fn foreground_group_changed(
@@ -745,8 +769,14 @@ fn should_probe_foreground_job(input: ProcessProbeInput) -> bool {
     }
 
     if input.current_agent.is_none() {
+        // An exec in place (a launcher that becomes the agent) keeps the PGID,
+        // and output that never pauses keeps one acquisition window from
+        // re-arming. Output arms one trailing-edge probe at most once per 5 s;
+        // a quiet pane schedules nothing (#3261).
         return !input.has_process_probe
             || foreground_group_changed
+            || (input.unidentified_output_since_process_check
+                && input.elapsed_since_process_check >= PROCESS_RECHECK_IDENTIFIED)
             || (input.foreground_pgid.is_none()
                 && input.elapsed_since_process_check >= PROCESS_RECHECK_MISSING_FOREGROUND_GROUP);
     }
@@ -934,11 +964,14 @@ fn probe_foreground_process(pid: u32, foreground_pgid: Option<u32>) -> ProcessPr
 
 // These are state-specific transient/safety deadlines, not a pane fallback
 // interval. Stable panes wait only for parsed output/reset and the shared clock.
+// Keep each independent deadline source explicit, shared by both detector loops.
+#[allow(clippy::too_many_arguments)]
 fn detection_deadline(
     pending_idle: &PendingIdleConfirmation,
     startup_grace_until: Option<std::time::Instant>,
     pending_release: &Mutex<Option<PendingAgentRelease>>,
     acquisition_started_at: Option<std::time::Instant>,
+    last_content_change_at: Option<std::time::Instant>,
     last_process_check: std::time::Instant,
     self_reported_active: bool,
     last_self_reported_check: Option<std::time::Instant>,
@@ -974,6 +1007,13 @@ fn detection_deadline(
             };
             include((last_process_check + interval > now).then_some(last_process_check + interval));
         }
+    }
+    if unidentified_output_since(last_content_change_at, last_process_check) {
+        // Event-triggered debounce, not polling: no wake without prior output.
+        // A throttled frame gets one trailing-edge probe even if output stops;
+        // advancing last_process_check consumes it until another frame arrives.
+        let trailing_edge = last_process_check + PROCESS_RECHECK_IDENTIFIED;
+        include((trailing_edge > now).then_some(trailing_edge));
     }
     if self_reported_active {
         include(Some(
@@ -1030,18 +1070,22 @@ fn spawn_basic_detection_task(
         let mut last_self_reported_shell_check = None;
         let mut wake = DetectionWake::new(detection_notify);
         let mut agent_job = AgentJobTracker::default();
+        let mut post_scan_process_deadline = None;
 
         loop {
-            let deadline = detection_deadline(
-                &pending_idle,
-                agent_startup_grace_until,
-                &pending_release_for_task,
-                acquisition_started_at,
-                last_process_check,
-                child_pid.load(Ordering::Acquire) > 0
-                    && self_reported_agent_active.load(Ordering::Acquire),
-                last_self_reported_shell_check,
-            );
+            let deadline = post_scan_process_deadline.take().or_else(|| {
+                detection_deadline(
+                    &pending_idle,
+                    agent_startup_grace_until,
+                    &pending_release_for_task,
+                    acquisition_started_at,
+                    last_content_change_at,
+                    last_process_check,
+                    child_pid.load(Ordering::Acquire) > 0
+                        && self_reported_agent_active.load(Ordering::Acquire),
+                    last_self_reported_shell_check,
+                )
+            });
             if wake.wait(&detect_reset, deadline).await {
                 publish_codex_prompt_observation(
                     &state_events,
@@ -1115,6 +1159,10 @@ fn spawn_basic_detection_task(
                     pending_foreground_shell_clear,
                     pending_restore_probe: false,
                     elapsed_since_process_check: now.duration_since(last_process_check),
+                    unidentified_output_since_process_check: unidentified_output_since(
+                        last_content_change_at,
+                        last_process_check,
+                    ),
                 };
                 should_check_foreground_process(
                     lifecycle_authority_active,
@@ -1288,6 +1336,12 @@ fn spawn_basic_detection_task(
                 now,
                 &mut acquisition_started_at,
                 &mut last_content_change_at,
+            );
+            post_scan_process_deadline = process_probe_deadline_after_scan(
+                content_changed,
+                last_content_change_at,
+                last_process_check,
+                now,
             );
             match decide_screen_detection_publish(
                 ScreenDetectionPublishInput {
@@ -3135,20 +3189,24 @@ impl PaneRuntime {
                 let mut last_self_reported_shell_check = None;
                 let mut wake = DetectionWake::new(detection_notify);
                 let mut agent_job = AgentJobTracker::default();
+                let mut post_scan_process_deadline = None;
 
                 tokio::time::sleep(Duration::from_millis(50)).await;
 
                 loop {
-                    let deadline = detection_deadline(
-                        &pending_idle,
-                        agent_startup_grace_until,
-                        &pending_release_for_task,
-                        acquisition_started_at,
-                        last_process_check,
-                        child_pid.load(Ordering::Acquire) > 0
-                            && self_reported_agent_active_for_task.load(Ordering::Acquire),
-                        last_self_reported_shell_check,
-                    );
+                    let deadline = post_scan_process_deadline.take().or_else(|| {
+                        detection_deadline(
+                            &pending_idle,
+                            agent_startup_grace_until,
+                            &pending_release_for_task,
+                            acquisition_started_at,
+                            last_content_change_at,
+                            last_process_check,
+                            child_pid.load(Ordering::Acquire) > 0
+                                && self_reported_agent_active_for_task.load(Ordering::Acquire),
+                            last_self_reported_shell_check,
+                        )
+                    });
                     if wake.wait(&detect_reset, deadline).await {
                         publish_codex_prompt_observation(
                             &state_events,
@@ -3217,6 +3275,10 @@ impl PaneRuntime {
                         pending_foreground_shell_clear,
                         pending_restore_probe,
                         elapsed_since_process_check: now.duration_since(last_process_check),
+                        unidentified_output_since_process_check: unidentified_output_since(
+                            last_content_change_at,
+                            last_process_check,
+                        ),
                     };
                     #[cfg(windows)]
                     let content_seq = detection_content_seq.load(Ordering::Relaxed);
@@ -3470,6 +3532,12 @@ impl PaneRuntime {
                         now,
                         &mut acquisition_started_at,
                         &mut last_content_change_at,
+                    );
+                    post_scan_process_deadline = process_probe_deadline_after_scan(
+                        content_changed,
+                        last_content_change_at,
+                        last_process_check,
+                        now,
                     );
                     match decide_screen_detection_publish(
                         ScreenDetectionPublishInput {
@@ -6765,6 +6833,7 @@ mod tests {
             pending_foreground_shell_clear: false,
             pending_restore_probe: false,
             elapsed_since_process_check: std::time::Duration::from_secs(1),
+            unidentified_output_since_process_check: false,
         }
     }
 
@@ -7182,6 +7251,244 @@ mod tests {
     }
 
     #[test]
+    fn unidentified_output_rechecks_process_after_acquisition_window() {
+        let changed = ProcessProbeInput {
+            unidentified_output_since_process_check: true,
+            elapsed_since_process_check: PROCESS_RECHECK_IDENTIFIED,
+            ..process_probe_input()
+        };
+        assert!(should_probe_foreground_job(changed));
+        assert!(!should_probe_foreground_job(ProcessProbeInput {
+            elapsed_since_process_check: PROCESS_RECHECK_IDENTIFIED
+                - std::time::Duration::from_millis(1),
+            ..changed
+        }));
+        assert!(!should_probe_foreground_job(ProcessProbeInput {
+            unidentified_output_since_process_check: false,
+            ..changed
+        }));
+
+        let checked = std::time::Instant::now();
+        assert!(unidentified_output_since(Some(checked), checked));
+        assert!(!unidentified_output_since(
+            Some(checked - std::time::Duration::from_millis(1)),
+            checked
+        ));
+        assert!(!unidentified_output_since(None, checked));
+    }
+
+    #[tokio::test]
+    async fn detector_loops_post_scan_late_single_frame_gets_immediate_probe() {
+        // The imported/basic and main loops share this post-scan handoff, with
+        // different initial screen states. Neither may need a second frame.
+        for state in [AgentState::Unknown, AgentState::Idle] {
+            for elapsed in [
+                PROCESS_RECHECK_IDENTIFIED,
+                PROCESS_RECHECK_IDENTIFIED + std::time::Duration::from_secs(1),
+            ] {
+                let now = std::time::Instant::now();
+                let checked = now - elapsed;
+                let mut acquisition_started_at = Some(now - std::time::Duration::from_secs(20));
+                let mut last_content_change_at =
+                    Some(checked - std::time::Duration::from_millis(1));
+                let mut input = ProcessProbeInput {
+                    elapsed_since_process_check: elapsed,
+                    ..process_probe_input()
+                };
+                assert!(!should_probe_foreground_job(input), "pre-scan {state:?}");
+                assert_eq!(
+                    decide_detection_screen_read(DetectionScreenReadInput {
+                        state,
+                        agent: None,
+                        pending_idle_active: false,
+                        agent_changed: false,
+                        process_exited: false,
+                        current_detection_content_seq: Some(2),
+                        last_screen_scan_detection_content_seq: Some(1),
+                    }),
+                    DetectionScreenReadDecision::Read,
+                    "both loops must scan the single changed frame"
+                );
+                sync_content_change_acquisition(
+                    None,
+                    None,
+                    false,
+                    true,
+                    now,
+                    &mut acquisition_started_at,
+                    &mut last_content_change_at,
+                );
+                let mut post_scan_deadline =
+                    process_probe_deadline_after_scan(true, last_content_change_at, checked, now);
+                assert_eq!(post_scan_deadline, Some(now), "{state:?}");
+                let mut wake = DetectionWake::new(Arc::new(Notify::new()));
+                assert!(
+                    !wake.wait(&Notify::new(), post_scan_deadline.take()).await,
+                    "the updated timestamp must be re-evaluated without another output event"
+                );
+                assert_eq!(post_scan_deadline, None, "the handoff is one-shot");
+                input.unidentified_output_since_process_check =
+                    unidentified_output_since(last_content_change_at, checked);
+                assert!(should_probe_foreground_job(input), "post-scan {state:?}");
+                let probe = probe_foreground_process_from_jobs(
+                    42,
+                    Some(42),
+                    None,
+                    || {
+                        Some(crate::platform::ForegroundJob {
+                            process_group_id: 42,
+                            processes: vec![foreground_process(42, "synthetic-launcher")],
+                        })
+                    },
+                    |pid| (pid == 42).then_some(Agent::Pi),
+                );
+                assert_eq!(probe.agent, Some(Agent::Pi));
+                assert_eq!(
+                    process_probe_deadline_after_scan(false, last_content_change_at, now, now),
+                    None,
+                    "silence must not re-arm the immediate handoff"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn detector_loops_post_scan_quiet_pane_has_no_immediate_probe() {
+        let now = std::time::Instant::now();
+        let checked = now - PROCESS_RECHECK_IDENTIFIED - std::time::Duration::from_secs(1);
+        for last_content_change_at in [None, Some(checked - std::time::Duration::from_millis(1))] {
+            assert_eq!(
+                process_probe_deadline_after_scan(false, last_content_change_at, checked, now),
+                None
+            );
+            assert_eq!(
+                detection_deadline(
+                    &PendingIdleConfirmation::default(),
+                    None,
+                    &Mutex::new(None),
+                    None,
+                    last_content_change_at,
+                    checked,
+                    false,
+                    None,
+                ),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn detection_deadline_unidentified_single_frame_gets_one_trailing_edge_probe() {
+        let changed = std::time::Instant::now();
+        let checked = changed - std::time::Duration::from_secs(1);
+        let mut acquisition_started_at =
+            Some(changed - PROCESS_ACQUISITION_WINDOW - PROCESS_ACQUISITION_IDLE_RESET);
+        let mut last_content_change_at = Some(changed - std::time::Duration::from_millis(200));
+        sync_content_change_acquisition(
+            None,
+            None,
+            false,
+            true,
+            changed,
+            &mut acquisition_started_at,
+            &mut last_content_change_at,
+        );
+        let input = ProcessProbeInput {
+            acquisition_age: acquisition_started_at.map(|started| changed.duration_since(started)),
+            elapsed_since_process_check: changed.duration_since(checked),
+            unidentified_output_since_process_check: unidentified_output_since(
+                last_content_change_at,
+                checked,
+            ),
+            ..process_probe_input()
+        };
+        assert!(!should_probe_foreground_job(input), "frame is throttled");
+        assert_eq!(
+            process_probe_deadline_after_scan(true, last_content_change_at, checked, changed),
+            None,
+            "both loops must keep a throttled frame on its existing trailing deadline"
+        );
+        let deadline = detection_deadline(
+            &PendingIdleConfirmation::default(),
+            None,
+            &Mutex::new(None),
+            acquisition_started_at,
+            last_content_change_at,
+            checked,
+            false,
+            None,
+        );
+        let trailing_edge = checked + PROCESS_RECHECK_IDENTIFIED;
+        assert_eq!(deadline, Some(trailing_edge));
+        assert!(should_probe_foreground_job(ProcessProbeInput {
+            acquisition_age: acquisition_started_at
+                .map(|started| trailing_edge.duration_since(started)),
+            elapsed_since_process_check: PROCESS_RECHECK_IDENTIFIED,
+            ..input
+        }));
+        assert_eq!(
+            detection_deadline(
+                &PendingIdleConfirmation::default(),
+                None,
+                &Mutex::new(None),
+                acquisition_started_at,
+                last_content_change_at,
+                trailing_edge,
+                false,
+                None,
+            ),
+            None,
+            "the trailing-edge probe consumes the frame; silence must not re-arm it"
+        );
+    }
+
+    #[test]
+    fn detection_deadline_unidentified_quiet_pane_has_no_trailing_edge_probe() {
+        let checked = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        for last_content_change_at in [None, Some(checked - std::time::Duration::from_millis(1))] {
+            assert_eq!(
+                detection_deadline(
+                    &PendingIdleConfirmation::default(),
+                    None,
+                    &Mutex::new(None),
+                    None,
+                    last_content_change_at,
+                    checked,
+                    false,
+                    None,
+                ),
+                None,
+                "no output since the probe must not schedule a wake"
+            );
+        }
+    }
+
+    #[test]
+    fn unidentified_continuous_output_probes_at_most_once_per_five_seconds() {
+        let started = std::time::Instant::now();
+        let mut checked = started;
+        let mut probes = 0;
+        // Continuous changed frames after acquisition, with an unchanged PGID.
+        for frame in 1..=300 {
+            let changed = started + std::time::Duration::from_millis(frame * 100);
+            let elapsed = changed.duration_since(checked);
+            if should_probe_foreground_job(ProcessProbeInput {
+                elapsed_since_process_check: elapsed,
+                unidentified_output_since_process_check: unidentified_output_since(
+                    Some(changed),
+                    checked,
+                ),
+                ..process_probe_input()
+            }) {
+                assert!(elapsed >= PROCESS_RECHECK_IDENTIFIED);
+                checked = changed;
+                probes += 1;
+            }
+        }
+        assert_eq!(probes, 6, "one probe per 5 s over 30 s of output");
+    }
+
+    #[test]
     fn release_expiry_can_force_reacquire_probe_by_resetting_probe_state() {
         assert!(should_probe_foreground_job(ProcessProbeInput {
             current_agent: None,
@@ -7331,6 +7638,7 @@ mod tests {
             None,
             &pending_release,
             None,
+            None,
             before,
             false,
             None,
@@ -7351,6 +7659,7 @@ mod tests {
                 &pending_idle,
                 None,
                 &pending_release,
+                None,
                 None,
                 after,
                 false,
@@ -7376,6 +7685,7 @@ mod tests {
                 &pending_idle,
                 None,
                 &pending_release,
+                None,
                 None,
                 now,
                 false,
@@ -7483,6 +7793,7 @@ mod tests {
                 &pending_idle,
                 None,
                 &runtime.pending_release,
+                None,
                 None,
                 started,
                 false,

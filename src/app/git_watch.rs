@@ -469,22 +469,49 @@ fn native_target(target: WatchTarget) -> WatchTarget {
     }
 }
 
-/// Exact sentinel for the consumer's raw git dir pointer while that path is a
-/// symlink alias or missing, watching the nearest existing ancestor of its
-/// parent non-recursively. A real directory needs none: its Metadata watch
+/// Exact sentinels for the consumer's raw git dir pointer: while that path is
+/// a symlink alias or missing, the nearest existing ancestor of its parent;
+/// and, for each symlinked PARENT component of the raw path as written, that
+/// component's parent directory. Retargeting such a parent alias changes
+/// discovery while both resolved git dirs stay intact (#7259), and
+/// follow_symlinks=false cannot observe it through the target directories.
+/// A real directory reached without aliases needs none: its Metadata watch
 /// sees removal, and a Restore sentinel sees recreation.
-// ponytail: at most one per root, filtered to the exact path, as missing
-// config dependencies already do.
-fn pointer_sentinel(root: &Path) -> Option<WatchTarget> {
-    let file = current_git_dir_pointer(root)?;
-    if std::fs::symlink_metadata(&file).is_ok_and(|metadata| !metadata.file_type().is_symlink()) {
-        return None;
+// ponytail: one per raw-path alias component, non-recursive and filtered to
+// the exact path, as symlinked config dependencies already do.
+fn pointer_sentinel(root: &Path) -> Vec<WatchTarget> {
+    let Some(file) = current_git_dir_pointer(root) else {
+        return Vec::new();
+    };
+    let mut sentinels = Vec::new();
+    if !std::fs::symlink_metadata(&file).is_ok_and(|metadata| !metadata.file_type().is_symlink()) {
+        if let Some(directory) = file
+            .parent()
+            .and_then(|parent| parent.ancestors().find(|path| path.is_dir()))
+        {
+            sentinels.push(WatchTarget::Pointer {
+                file: file.clone(),
+                directory: directory.to_path_buf(),
+            });
+        }
     }
-    let directory = file
-        .parent()
-        .and_then(|parent| parent.ancestors().find(|path| path.is_dir()))?
-        .to_path_buf();
-    Some(WatchTarget::Pointer { file, directory })
+    // Aliases as written, including ones shared with the consumer's own CWD:
+    // retargeting a shared alias still changes the resolved git dir.
+    for ancestor in file.ancestors().skip(1) {
+        if std::fs::symlink_metadata(ancestor)
+            .is_ok_and(|metadata| metadata.file_type().is_symlink())
+        {
+            if let Some(parent) = ancestor.parent() {
+                // The full raw pointer is the filter: an event on the alias
+                // component itself is a prefix of it, siblings are not.
+                sentinels.push(WatchTarget::Pointer {
+                    file: file.clone(),
+                    directory: parent.to_path_buf(),
+                });
+            }
+        }
+    }
+    sentinels
 }
 
 /// The consumer's raw git dir pointer, neither normalized nor canonicalized:

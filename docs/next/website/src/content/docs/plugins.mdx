@@ -283,10 +283,13 @@ under `HERDR_PLUGIN_CONFIG_DIR`, and put local runtime state under
 but it does not validate, sync, or delete their contents. The plugin owns the
 file format and lifecycle.
 
-`HERDR_PLUGIN_CONTEXT_JSON` can include workspace, tab, focused pane, worktree,
+`HERDR_PLUGIN_CONTEXT_JSON` can include workspace, tab, invoking pane, worktree,
 agent, selected text, clicked URL, and link handler fields when they are
-available for that invocation. Shell plugins can read the individual env vars
-for common ids, or parse the context JSON for the full shape.
+available for that invocation. The existing `focused_pane_*` field names refer
+to the invoking pane, not UI focus. Pane actions and link handlers receive that
+pane's ids, cwd, and agent. Global actions receive no pane fields or implicit
+focused-workspace context. Shell plugins can read the individual env vars for
+common ids, or parse the context JSON for the full shape.
 
 Use `HERDR_BIN_PATH` when a plugin needs to call Herdr portably from Node,
 PowerShell, Bash, or another runtime. The raw socket transport behind

@@ -232,6 +232,7 @@ impl App {
         #[cfg(test)]
         let git_test_homes =
             ["HOME", "XDG_CONFIG_HOME"].map(|key| (key, crate::environment::var_os(key)));
+        let generation = self.git_refresh_generation + 1;
         let spawned = crate::thread_spawn::spawn_named("herdr-git-refresh", move || {
             // Test scopes do not implicitly cross threads. Pass only this
             // worker's Git fixture homes explicitly; production is unchanged.
@@ -250,6 +251,7 @@ impl App {
             let output =
                 refresh_workspace_git_statuses_with_cache_and_demand(workspaces, &cache, demand);
             let _ = event_tx.blocking_send(AppEvent::GitStatusRefreshed {
+                generation,
                 results: output.results,
                 cache_updates: output.cache_updates,
             });
@@ -262,6 +264,7 @@ impl App {
             return;
         }
         self.git_refresh_spawn_retry_pending = false;
+        self.git_refresh_generation = generation;
         self.git_refresh_in_flight = true;
         self.git_identity_refresh_requested = false;
         // Explicit/native identity hints must not move the independent safety
@@ -274,6 +277,9 @@ impl App {
 
     pub(crate) fn request_git_identity_refresh(&mut self, now: Instant) {
         self.git_identity_refresh_requested = true;
+        // Only a worker started after this request observes the new identity;
+        // an in-flight worker's result (e.g. a missing-HEAD negative) is stale.
+        self.git_identity_refresh_floor = self.git_refresh_generation + 1;
         self.mark_git_status_refresh_due(now);
     }
 
@@ -994,6 +1000,7 @@ mod tests {
         assert!(app.git_refresh_due_after_in_flight);
 
         app.handle_internal_event(AppEvent::GitStatusRefreshed {
+            generation: 0,
             results: Vec::new(),
             cache_updates: Vec::new(),
         });
@@ -1225,6 +1232,7 @@ mod tests {
             std::thread::sleep(delay);
             sender
                 .blocking_send(AppEvent::GitStatusRefreshed {
+                    generation: 0,
                     results: Vec::new(),
                     cache_updates: Vec::new(),
                 })
@@ -1465,6 +1473,7 @@ mod tests {
         assert_eq!(app.git_refresh_deadline(), None);
         let deadline = app.git_watch_refresh_deadline.unwrap();
         app.handle_internal_event(AppEvent::GitStatusRefreshed {
+            generation: 0,
             results: Vec::new(),
             cache_updates: Vec::new(),
         });
@@ -1487,6 +1496,130 @@ mod tests {
         app.state.workspaces.clear();
         app.sync_git_watches();
         assert!(app.git_watches.is_none());
+    }
+
+    /// Workspace-only sidebar: no native watches or branch demand, so the only
+    /// refreshes are the explicit identity/ordinary requests made by the test.
+    fn stale_identity_app(repo: &GitWatchRepo) -> App {
+        let mut config = crate::config::Config::default();
+        config.ui.sidebar.spaces.rows = vec![vec![crate::config::SpaceSidebarToken::Workspace]];
+        let mut app = test_app(&config);
+        let mut ws = Workspace::test_new("stale-identity");
+        ws.tabs.clear();
+        ws.identity_cwd = repo.0.clone();
+        app.state.workspaces.push(ws);
+        app
+    }
+
+    /// Start the real worker now and wait (10 s hang watchdog, event-driven)
+    /// for its completion without applying it.
+    #[track_caller]
+    fn start_and_capture_git_completion(app: &mut App) -> AppEvent {
+        let now = Instant::now();
+        app.start_git_status_refresh_if_due(now);
+        assert!(
+            app.git_refresh_in_flight,
+            "refresh worker must be in flight"
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            tokio::time::timeout(GIT_WATCH_HANG_WATCHDOG, async {
+                loop {
+                    let event = app.event_rx.recv().await.expect("Git worker completion");
+                    if matches!(event, AppEvent::GitStatusRefreshed { .. }) {
+                        return event;
+                    }
+                }
+            })
+            .await
+            .expect("git refresh worker hang watchdog")
+        })
+    }
+
+    #[test]
+    fn stale_missing_head_identity_completion_is_dropped_after_restore() {
+        let repo = GitWatchRepo::new("stale-missing-head");
+        repo.init();
+        let mut app = stale_identity_app(&repo);
+        app.request_git_identity_refresh(Instant::now());
+        let initial = start_and_capture_git_completion(&mut app);
+        assert!(app.handle_internal_event_with_render_impact(initial));
+        assert_eq!(
+            app.state.workspaces[0].cached_git_branch.as_deref(),
+            Some("main")
+        );
+        let space_before = app.state.workspaces[0].cached_git_space.clone();
+        assert!(space_before.is_some());
+
+        // Worker observes a checkout whose HEAD is absent (not discoverable).
+        let head = repo.0.join(".git/HEAD");
+        let parked = repo.0.join(".git/HEAD.parked");
+        std::fs::rename(&head, &parked).unwrap();
+        app.request_git_identity_refresh(Instant::now());
+        let stale = start_and_capture_git_completion(&mut app);
+
+        // HEAD is restored and a newer identity refresh is requested while the
+        // old worker is still logically in flight.
+        std::fs::rename(&parked, &head).unwrap();
+        app.request_git_identity_refresh(Instant::now());
+
+        let changed = app.handle_internal_event_with_render_impact(stale);
+        assert!(
+            !changed,
+            "stale negative identity completion must not be published"
+        );
+        assert_eq!(
+            app.state.workspaces[0].cached_git_branch.as_deref(),
+            Some("main"),
+            "stale negative identity completion must not be applied"
+        );
+        assert_eq!(app.state.workspaces[0].cached_git_space, space_before);
+        assert!(
+            app.git_status_cache
+                .values()
+                .all(|entry| entry.fingerprint.is_some()),
+            "stale negative cache entry must not be stored"
+        );
+        // Completion still releases the worker and runs the newer request.
+        assert!(!app.git_refresh_in_flight);
+        assert!(app.git_identity_refresh_requested);
+        assert!(app
+            .git_refresh_deadline()
+            .is_some_and(|due| due <= Instant::now()));
+        let newer = start_and_capture_git_completion(&mut app);
+        app.handle_internal_event_with_render_impact(newer);
+        assert!(!app.git_refresh_in_flight);
+        assert_eq!(
+            app.state.workspaces[0].cached_git_branch.as_deref(),
+            Some("main")
+        );
+        assert_eq!(app.state.workspaces[0].cached_git_space, space_before);
+        assert_eq!(app.git_refresh_deadline(), None);
+    }
+
+    #[test]
+    fn ordinary_refresh_request_during_flight_keeps_useful_completion() {
+        let repo = GitWatchRepo::new("ordinary-in-flight");
+        repo.init();
+        let mut app = stale_identity_app(&repo);
+        app.request_git_identity_refresh(Instant::now());
+        let useful = start_and_capture_git_completion(&mut app);
+
+        // An ordinary HEAD write plus a non-identity refresh request.
+        repo.git(&["switch", "-c", "feature/ordinary"]);
+        app.mark_git_status_refresh_due(Instant::now());
+        assert!(app.git_refresh_due_after_in_flight);
+
+        assert!(app.handle_internal_event_with_render_impact(useful));
+        assert_eq!(
+            app.state.workspaces[0].cached_git_branch.as_deref(),
+            Some("main")
+        );
+        assert!(app.state.workspaces[0].cached_git_space.is_some());
+        assert!(!app.git_refresh_in_flight);
     }
 
     include!("git_refresh_regression_tests.rs");

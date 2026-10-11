@@ -12,6 +12,10 @@ fn repository(name: &str) -> PathBuf {
             .as_nanos()
     ));
     std::fs::create_dir_all(&root).unwrap();
+    // Native root on Unix so fixtures never sit under a system alias such as
+    // macOS /var; Windows keeps plain paths (no \\?\ prefix for git args).
+    #[cfg(unix)]
+    let root = root.canonicalize().unwrap();
     let output = std::process::Command::new("git")
         .arg("-C")
         .arg(&root)
@@ -532,11 +536,19 @@ fn git_watch_directory_aliases_share_registration_after_partial_removal() {
         alias.clone(),
         canonical.clone(),
     ]));
-    let expected_watches = if cfg!(windows) { 2 } else { 3 };
-    assert_eq!(watches.watched.len(), expected_watches);
-    let registrations = watches.watched.clone();
+    // The canonical root, its .git and .git/refs, plus the alias consumer's
+    // legitimate exact watch on the alias parent (retargeting the alias
+    // changes discovery).
+    let alias_parent = alias.parent().unwrap().to_path_buf();
+    assert_eq!(watches.watched.len(), 4, "{:?}", watches.watched);
+    assert!(watches.watched.contains_key(&alias_parent));
+    let mut registrations = watches.watched.clone();
     watches.sync(HashSet::from([canonical.clone()]));
+    // Removing the alias consumer retires only its alias-parent watch; the
+    // shared canonical Git-dir registrations are retained untouched.
+    registrations.remove(&alias_parent);
     assert_eq!(watches.watched, registrations);
+    assert!(watches.watched.contains_key(&canonical.join(".git")));
     std::fs::write(canonical.join(".git/HEAD.new"), "ref: refs/heads/other\n").unwrap();
     std::fs::rename(canonical.join(".git/HEAD.new"), canonical.join(".git/HEAD")).unwrap();
     wait_for_native_event(&rx);
@@ -1113,4 +1125,361 @@ fn git_watch_retargeted_commondir_keeps_restore_sentinels_bounded() {
     for path in commons.into_iter().chain([root, linked]) {
         std::fs::remove_dir_all(path).unwrap();
     }
+}
+
+/// Event-driven App fixture and refresh wait, used instead of the polling
+/// legacy helpers. Each wait blocks on the App event channel, waking early
+/// only at the App's own debounce deadline (armed by a received native hint),
+/// exactly as the App loop schedules it; there is no sleep and no fixed
+/// short timeout. It returns at the first completed worker apply whose branch
+/// is `expected`, so leftover hints from an earlier step need no quiet
+/// window. The 10 s hang watchdog stays far below the 60 s safety refresh,
+/// which is asserted not to have produced the result.
+#[cfg(unix)]
+#[track_caller]
+fn event_refresh_until(app: &mut crate::app::App, require_discovery: bool, expected: &str) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    let hang = tokio::time::Instant::now() + NATIVE_EVENT_DEADLINE;
+    let safety = app.last_git_repo_discovery_refresh;
+    let mut discovery_seen = false;
+    // Absolute watchdog: checked at every iteration and before returning, so
+    // a perpetually ready event stream cannot run the wait past the deadline.
+    let watchdog = |app: &crate::app::App| {
+        assert!(
+            tokio::time::Instant::now() < hang,
+            "native event/refresh to {expected:?} not observed within \
+             {NATIVE_EVENT_DEADLINE:?} (require_discovery={require_discovery}, \
+             branch={:?})",
+            app.state.workspaces[0].cached_git_branch
+        );
+    };
+    loop {
+        watchdog(app);
+        app.sync_git_watches();
+        app.start_git_status_refresh_if_due(std::time::Instant::now());
+        let wake = app
+            .git_watch_refresh_deadline
+            .filter(|_| !app.git_refresh_in_flight)
+            .map(tokio::time::Instant::from_std)
+            .map_or(hang, |deadline| deadline.min(hang));
+        let event =
+            runtime.block_on(async { tokio::time::timeout_at(wake, app.event_rx.recv()).await });
+        let Ok(event) = event else {
+            watchdog(app);
+            continue; // The armed debounce deadline is due.
+        };
+        let event = event.expect("App event channel closed");
+        if matches!(event, AppEvent::GitFilesChanged) {
+            discovery_seen |= app
+                .git_watches
+                .as_ref()
+                .unwrap()
+                .discovery_dirty
+                .load(Ordering::Acquire);
+        }
+        let completed = matches!(event, AppEvent::GitStatusRefreshed { .. });
+        app.handle_internal_event(event);
+        if completed && app.state.workspaces[0].cached_git_branch.as_deref() == Some(expected) {
+            watchdog(app);
+            assert_eq!(
+                app.last_git_repo_discovery_refresh, safety,
+                "safety discovery cannot satisfy native regression"
+            );
+            assert!(
+                !require_discovery || discovery_seen,
+                "the change must invalidate discovery, not only wake the app"
+            );
+            return;
+        }
+    }
+}
+
+#[cfg(unix)]
+#[track_caller]
+fn event_watched_app(root: &Path, expected: &str) -> crate::app::App {
+    let mut config = crate::config::Config::default();
+    config.ui.sidebar.spaces.rows = vec![vec![
+        crate::config::SpaceSidebarToken::Branch,
+        crate::config::SpaceSidebarToken::GitStatus,
+    ]];
+    let mut app = crate::app::App::new(
+        &config,
+        crate::app::AppPolicy::TEST,
+        None,
+        mpsc::unbounded_channel().1,
+        crate::api::EventHub::default(),
+    );
+    let mut workspace = crate::workspace::Workspace::test_new("restoration");
+    workspace.tabs.clear();
+    workspace.identity_cwd = root.to_path_buf();
+    app.state.workspaces.push(workspace);
+    app.mark_git_status_refresh_due(std::time::Instant::now());
+    event_refresh_until(&mut app, false, expected);
+    app
+}
+
+#[cfg(unix)]
+fn unique_base(name: &str) -> PathBuf {
+    let base = std::env::temp_dir().join(format!(
+        "herdr-git-watch-registry-{name}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&base).unwrap();
+    // Native base: no accidental dependence on a system alias (macOS /var).
+    base.canonicalize().unwrap()
+}
+
+/// #6260 N4-alias: G/commondir names a symlink alias that is retargeted N
+/// times (atomically and through a dangling gap, with the previous common
+/// dir intact or missing its HEAD). Retained sentinels are keyed on the
+/// canonical common dir: at most one Restore per canonical dir, never one for
+/// a retired common, and no growth across retargets.
+#[cfg(unix)]
+#[test]
+fn git_watch_retargeted_commondir_alias_keeps_one_sentinel_per_canonical_dir() {
+    for (dangling_gap, remove_old_head) in
+        [(false, false), (false, true), (true, false), (true, true)]
+    {
+        let root = repository("commondir-alias-retarget");
+        fixture_commit(&root);
+        let linked = root.with_extension("linked");
+        fixture_git(
+            &root,
+            &["worktree", "add", "-b", "linked", linked.to_str().unwrap()],
+        );
+        let git_dir = PathBuf::from(fixture_git(&linked, &["rev-parse", "--absolute-git-dir"]));
+        let store = root.with_extension("store");
+        std::fs::create_dir_all(&store).unwrap();
+        // The raw commondir content never changes; only the alias target does.
+        let alias = store.join(".git");
+        std::os::unix::fs::symlink(root.join(".git"), &alias).unwrap();
+        std::fs::write(git_dir.join("commondir"), format!("{}\n", alias.display())).unwrap();
+        let commons: Vec<_> = (1..=6)
+            .map(|i| {
+                let common = repository(&format!("commondir-alias-target-{i}"));
+                fixture_commit(&common);
+                common
+            })
+            .collect();
+        let (tx, _rx) = mpsc::channel(256);
+        let mut watches = GitWatches::new(tx).unwrap();
+        watches.sync(HashSet::from([linked.clone()]));
+        let mut previous = root.join(".git");
+        let mut baseline = None;
+        let canonical_git_dir = git_dir.canonicalize().unwrap();
+        for (i, common) in commons.iter().enumerate() {
+            let next = common.join(".git");
+            if dangling_gap {
+                std::fs::remove_file(&alias).unwrap();
+                if remove_old_head {
+                    std::fs::remove_file(previous.join("HEAD")).unwrap();
+                }
+                watches.topology_dirty = true;
+                watches.sync(HashSet::from([linked.clone()]));
+                std::os::unix::fs::symlink(&next, &alias).unwrap();
+            } else {
+                let staged = store.join("alias.tmp");
+                std::os::unix::fs::symlink(&next, &staged).unwrap();
+                std::fs::rename(&staged, &alias).unwrap();
+                if remove_old_head {
+                    std::fs::remove_file(previous.join("HEAD")).unwrap();
+                }
+            }
+            watches.topology_dirty = true;
+            watches.sync(HashSet::from([linked.clone()]));
+            let canonical_common = next.canonicalize().unwrap();
+            assert_eq!(
+                crate::workspace::git_worktree_info(&linked)
+                    .unwrap()
+                    .git_common_dir,
+                canonical_common
+            );
+            let sentinels = &watches.root_markers[&linked];
+            let restore_dirs: Vec<_> = sentinels
+                .iter()
+                .filter_map(|target| match target {
+                    WatchTarget::Restore { file, .. } => {
+                        let parent = file.parent().unwrap();
+                        Some(
+                            parent
+                                .canonicalize()
+                                .unwrap_or_else(|_| parent.to_path_buf()),
+                        )
+                    }
+                    _ => None,
+                })
+                .collect();
+            let unique: HashSet<_> = restore_dirs.iter().cloned().collect();
+            let case = format!("gap={dangling_gap} removed={remove_old_head} retarget {i}");
+            assert_eq!(unique.len(), restore_dirs.len(), "{case}: {sentinels:?}");
+            assert_eq!(
+                unique,
+                HashSet::from([canonical_git_dir.clone(), canonical_common.clone()]),
+                "{case}: {sentinels:?}"
+            );
+            let counts = (sentinels.len(), watches.watched.len());
+            assert_eq!(
+                *baseline.get_or_insert(counts),
+                counts,
+                "{case}: {sentinels:?}"
+            );
+            previous = next;
+        }
+        drop(watches);
+        for path in commons.into_iter().chain([root, linked, store]) {
+            std::fs::remove_dir_all(path).unwrap();
+        }
+    }
+}
+
+/// #7259: the raw `.git` pointer names `store/link/real.git`, where `link` is
+/// a symlinked PARENT directory and `real.git` itself is a real directory.
+/// Retargeting `link` while BOTH git dirs remain intact changes discovery,
+/// so the alias parent must be watched with an exact filter as written.
+#[cfg(unix)]
+#[test]
+fn git_watch_gap_pointer_through_symlinked_parent_retarget_is_native() {
+    let base = unique_base("pointer-parent-alias");
+    let store = base.join("store");
+    let consumer = base.join("consumer");
+    std::fs::create_dir_all(&consumer).unwrap();
+    let side = |name: &str, branch: &str| {
+        let dir = store.join(name);
+        let scratch = base.join(format!("scratch-{name}"));
+        std::fs::create_dir_all(&scratch).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        fixture_git(
+            &scratch,
+            &[
+                "init",
+                &format!("--separate-git-dir={}", dir.join("real.git").display()),
+            ],
+        );
+        fixture_git(&scratch, &["switch", "-c", branch]);
+        fixture_commit(&scratch);
+        (dir, scratch)
+    };
+    let (first, _) = side("a", "first");
+    let (second, second_scratch) = side("b", "second");
+    let link = store.join("link");
+    std::os::unix::fs::symlink(&first, &link).unwrap();
+    std::fs::write(
+        consumer.join(".git"),
+        format!("gitdir: {}\n", link.join("real.git").display()),
+    )
+    .unwrap();
+    let retarget = |target: &Path| {
+        let staged = store.join("link.tmp");
+        std::os::unix::fs::symlink(target, &staged).unwrap();
+        std::fs::rename(&staged, &link).unwrap();
+    };
+    let mut app = event_watched_app(&consumer, "first");
+
+    retarget(&second);
+    event_refresh_until(&mut app, true, "second");
+    assert!(first.join("real.git/HEAD").exists() && second.join("real.git/HEAD").exists());
+
+    // Counterexamples: content writes inside either existing dir, or beside
+    // the alias, are not the alias; only the alias entry itself is structural.
+    let native_store = store.canonicalize().unwrap();
+    {
+        use notify::event::{DataChange, ModifyKind, RenameMode};
+        let watches = app.git_watches.as_ref().unwrap();
+        let targets = watches.targets.read().unwrap().clone();
+        assert!(watches.watched.contains_key(&native_store));
+        for path in [
+            native_store.join("a/real.git/HEAD"),
+            native_store.join("a/real.git/description"),
+            native_store.join("a/unrelated"),
+            native_store.join("unrelated"),
+            native_store.clone(),
+        ] {
+            let event = Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Any)))
+                .add_path(path.clone());
+            assert!(!structural_event(&event, &targets), "{path:?}");
+        }
+        std::fs::write(first.join("real.git/description"), "old dir content\n").unwrap();
+        std::fs::write(store.join("unrelated"), "sibling\n").unwrap();
+        let rename = Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::To)))
+            .add_path(native_store.join("link"));
+        assert!(relevant_event(&rename, &targets));
+        assert!(structural_event(&rename, &targets));
+    }
+
+    // Ordinary update in the current target stays a non-discovery refresh.
+    fixture_git(&second_scratch, &["switch", "-c", "second-next"]);
+    event_refresh_until(&mut app, false, "second-next");
+
+    // The alias watch survives further retargets, both dirs still intact.
+    retarget(&first);
+    event_refresh_until(&mut app, true, "first");
+    retarget(&second);
+    event_refresh_until(&mut app, true, "second-next");
+    assert!(first.join("real.git/HEAD").exists() && second.join("real.git/HEAD").exists());
+    drop(app);
+    std::fs::remove_dir_all(base).unwrap();
+}
+
+/// #7259 shared alias: the consumer's logical root `store/link/consumer` and
+/// its raw pointer `store/link/real.git` share the symlinked `link` alias.
+/// Both git dirs stay intact; retargeting `link` changes discovery, so the
+/// alias parent must be watched even though the root also sits under it.
+#[cfg(unix)]
+#[test]
+fn git_watch_gap_shared_root_and_pointer_alias_retarget_is_native() {
+    let base = unique_base("shared-root-pointer-alias");
+    let store = base.join("store");
+    let link = store.join("link");
+    let side = |name: &str, branch: &str| {
+        let dir = store.join(name);
+        let consumer = dir.join("consumer");
+        std::fs::create_dir_all(&consumer).unwrap();
+        fixture_git(
+            &consumer,
+            &[
+                "init",
+                &format!("--separate-git-dir={}", dir.join("real.git").display()),
+            ],
+        );
+        fixture_git(&consumer, &["switch", "-c", branch]);
+        fixture_commit(&consumer);
+        // Raw pointer goes through the shared alias.
+        std::fs::write(
+            consumer.join(".git"),
+            format!("gitdir: {}\n", link.join("real.git").display()),
+        )
+        .unwrap();
+        dir
+    };
+    let first = side("a", "first");
+    let second = side("b", "second");
+    std::os::unix::fs::symlink(&first, &link).unwrap();
+    let retarget = |target: &Path| {
+        let staged = store.join("link.tmp");
+        std::os::unix::fs::symlink(target, &staged).unwrap();
+        std::fs::rename(&staged, &link).unwrap();
+    };
+    let logical_root = link.join("consumer");
+    let mut app = event_watched_app(&logical_root, "first");
+
+    retarget(&second);
+    event_refresh_until(&mut app, true, "second");
+    assert!(first.join("real.git/HEAD").exists() && second.join("real.git/HEAD").exists());
+    assert!(app
+        .git_watches
+        .as_ref()
+        .unwrap()
+        .watched
+        .contains_key(&store.canonicalize().unwrap()));
+    retarget(&first);
+    event_refresh_until(&mut app, true, "first");
+    drop(app);
+    std::fs::remove_dir_all(base).unwrap();
 }
