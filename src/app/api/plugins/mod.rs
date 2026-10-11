@@ -178,7 +178,13 @@ impl App {
         &mut self,
         id: String,
         params: PluginActionInvokeParams,
+        caller: crate::api::ApiRequestContext,
     ) -> String {
+        // The invoking pane is the caller's own live-attributed pane, never a
+        // request claim and never UI focus.
+        let invoker = self
+            .trusted_invoking_pane(caller)
+            .map(|target| (target.ws_idx, target.pane_id));
         if let Err(err) = self.refresh_installed_plugins() {
             return encode_error(id, "plugin_registry_load_failed", err.to_string());
         }
@@ -200,7 +206,10 @@ impl App {
         ) {
             return encode_error(id, code, message);
         }
-        let context = self.merge_plugin_context(params.context, &id);
+        let context = match self.merge_plugin_context(params.context, &id, invoker) {
+            Ok(context) => context,
+            Err((code, message)) => return encode_error(id, code, message),
+        };
         let log = match self.start_plugin_command(
             &plugin,
             Some(action.action_id.clone()),
@@ -226,6 +235,7 @@ impl App {
         &mut self,
         action_id: String,
         selected_text: Option<String>,
+        invoking_pane: Option<(usize, crate::layout::PaneId)>,
     ) -> Result<(), String> {
         self.refresh_installed_plugins()
             .map_err(|err| format!("failed to load plugin registry: {err}"))?;
@@ -240,7 +250,9 @@ impl App {
             &action.qualified_id(),
         )
         .map_err(|(_, message)| message)?;
-        let mut context = self.current_plugin_context("keybinding");
+        // A keybinding pressed in a pane binds to that pane; a global one has
+        // no pane and must not borrow whatever pane holds UI focus.
+        let mut context = self.invoking_plugin_context(invoking_pane, "keybinding");
         context.invocation_source = Some("keybinding".to_string());
         context.selected_text = selected_text;
         self.start_plugin_command(
@@ -326,10 +338,34 @@ impl App {
         }
     }
 
+    /// Public JSON API link activation. Reading the URL and reporting an
+    /// unhandled link keep the ordinary API behavior; only a matched plugin
+    /// handler is bound to the caller's own attributed pane (see
+    /// [`LinkInvoker::PublicCaller`]).
+    pub(in crate::app) fn handle_public_pane_link_activate(
+        &mut self,
+        id: String,
+        params: PaneLinkActivateParams,
+        caller: crate::api::ApiRequestContext,
+    ) -> String {
+        self.activate_pane_link(id, params, LinkInvoker::PublicCaller(caller))
+    }
+
+    /// Trusted client endpoint link click: the handler runs with the
+    /// server-resolved clicked pane.
     pub(super) fn handle_pane_link_activate(
         &mut self,
         id: String,
         params: PaneLinkActivateParams,
+    ) -> String {
+        self.activate_pane_link(id, params, LinkInvoker::ClickedPane)
+    }
+
+    fn activate_pane_link(
+        &mut self,
+        id: String,
+        params: PaneLinkActivateParams,
+        invoker: LinkInvoker,
     ) -> String {
         let (pane_id, url) =
             match self.read_checked_pane_link(&id, &params, "activation", |runtime, col, row| {
@@ -341,11 +377,11 @@ impl App {
                 Err(error) => return error,
             };
         let handled = match url.as_deref() {
-            Some(url) => match self.invoke_plugin_link_handler_for_url(url, pane_id) {
+            Some(url) => match self.invoke_plugin_link_handler_for_url(url, pane_id, invoker) {
                 Ok(handled) => handled,
-                Err(err) => {
+                Err((code, err)) => {
                     tracing::warn!(err = %err, url = %url, "failed to invoke plugin link handler");
-                    return encode_error(id, "plugin_link_failed", err);
+                    return encode_error(id, code, err);
                 }
             },
             None => false,
@@ -353,13 +389,17 @@ impl App {
         encode_success(id, ResponseResult::PaneLinkActivated { url, handled })
     }
 
+    /// Runs the first matching, platform-enabled plugin link handler for a
+    /// URL clicked in `pane_id`, with the context `invoker` is entitled to.
     pub(crate) fn invoke_plugin_link_handler_for_url(
         &mut self,
         url: &str,
         pane_id: crate::layout::PaneId,
-    ) -> Result<bool, String> {
+        invoker: LinkInvoker,
+    ) -> Result<bool, (&'static str, String)> {
+        let failed = |message: String| ("plugin_link_failed", message);
         self.refresh_installed_plugins()
-            .map_err(|err| format!("failed to load plugin registry: {err}"))?;
+            .map_err(|err| failed(format!("failed to load plugin registry: {err}")))?;
         let Some((plugin, handler)) = self.find_plugin_link_handler(url) else {
             return Ok(false);
         };
@@ -377,20 +417,36 @@ impl App {
             .find(|action| action.id == handler.action)
             .cloned()
             .ok_or_else(|| {
-                format!(
+                failed(format!(
                     "plugin {} link handler {} references missing action {}",
                     plugin.plugin_id, handler.id, handler.action
-                )
+                ))
             })?;
         ensure_platform_supported(
             &effective_platforms(&action.platforms, &plugin.platforms).clone(),
             &action.id,
         )
-        .map_err(|(_, message)| message)?;
-        let Some(ws_idx) = self.state.active else {
-            return Ok(false);
+        .map_err(|(_, message)| failed(message))?;
+        let mut context = match invoker {
+            LinkInvoker::ClickedPane => {
+                let Some((ws_idx, _)) = self.find_pane(pane_id) else {
+                    return Ok(false);
+                };
+                self.plugin_context_for_pane(ws_idx, pane_id, "link_click")
+            }
+            LinkInvoker::PublicCaller(caller) => {
+                let invoker = self
+                    .trusted_invoking_pane(caller)
+                    .map(|target| (target.ws_idx, target.pane_id));
+                if invoker.is_some_and(|(_, invoker_pane)| invoker_pane != pane_id) {
+                    return Err((
+                        super::INVOKING_PANE_MISMATCH,
+                        super::INVOKING_PANE_MISMATCH_MESSAGE.to_owned(),
+                    ));
+                }
+                self.invoking_plugin_context(invoker, "link_click")
+            }
         };
-        let mut context = self.plugin_context_for_pane(ws_idx, pane_id, "link_click");
         context.invocation_source = Some("link_click".to_string());
         context.clicked_url = Some(url.to_string());
         context.link_handler_id = Some(handler.id);
@@ -403,7 +459,7 @@ impl App {
             None,
         )
         .map(|_| true)
-        .map_err(|(_, message)| message)
+        .map_err(|(_, message)| failed(message))
     }
 
     pub(super) fn handle_plugin_log_list(
@@ -742,6 +798,18 @@ impl App {
             encode_success(id, ResponseResult::PluginDisabled { plugin })
         }
     }
+}
+
+/// Whose context a matched plugin link handler runs with. Server-resolved
+/// dispatch origin only; never derived from request fields.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum LinkInvoker {
+    /// Trusted client endpoint click: the server-resolved clicked pane.
+    ClickedPane,
+    /// Public API caller. Resolved only once a handler matches: its own live
+    /// attributed pane must be the clicked pane, else `invoking_pane_mismatch`;
+    /// without attribution the handler runs global.
+    PublicCaller(crate::api::ApiRequestContext),
 }
 
 fn invalid_plugin_id(id: String) -> String {
@@ -1846,7 +1914,7 @@ command = ["sh", "-c", '"$HERDR_BIN_PATH" --list >/dev/null; printf "%s\n" "$?" 
 "#,
             );
             link_manifest(&mut app, &plugin_root);
-            app.invoke_plugin_action_from_keybind("example.update.probe".into(), None)
+            app.invoke_plugin_action_from_keybind("example.update.probe".into(), None, None)
                 .unwrap();
             let action_status = read_capture_when_ready(&plugin_root.join("action-status"), || {
                 app.drain_all_internal_events();
@@ -2564,7 +2632,9 @@ command = ["sh", "-c", "printf %s ${{HERDR_PANE_ID-unset}} > '{}'; sleep 1"]
         assert_eq!(action.command, ["bun", "run", "bootstrap.ts"]);
         assert_eq!(log.plugin_id, "example.worktree-bootstrap");
         assert_eq!(log.action_id.as_deref(), Some("bootstrap"));
-        assert_eq!(context.workspace_id.as_deref(), Some("1"));
+        // An unattributed caller's workspace/tab claims are sanitized away;
+        // its own source and correlation fields remain its input.
+        assert_eq!(context.workspace_id, None);
         assert_eq!(context.invocation_source.as_deref(), Some("test"));
         assert_eq!(
             context.correlation_id.as_deref(),
@@ -2673,7 +2743,7 @@ command = ["sh", "-c", "printf %s ${{HERDR_PANE_ID-unset}} > '{}'; sleep 1"]
 
         make_stale(&mut app);
         assert!(app
-            .invoke_plugin_action_from_keybind("bootstrap".into(), None)
+            .invoke_plugin_action_from_keybind("bootstrap".into(), None, None)
             .unwrap_err()
             .contains("disabled"));
 
@@ -2682,6 +2752,7 @@ command = ["sh", "-c", "printf %s ${{HERDR_PANE_ID-unset}} > '{}'; sleep 1"]
             .invoke_plugin_link_handler_for_url(
                 "https://github.com/herdrdev/herdr/issues/1174",
                 pane_id,
+                LinkInvoker::ClickedPane,
             )
             .unwrap());
 
@@ -3285,6 +3356,7 @@ action = "open"
             .invoke_plugin_link_handler_for_url(
                 "https://github.com/herdrdev/herdr/issues/398",
                 pane_id,
+                LinkInvoker::ClickedPane,
             )
             .expect("link handler should invoke");
         assert!(handled);
@@ -3509,13 +3581,41 @@ command = ["show-ctx"]
         .unwrap();
         link_manifest(&mut app, &root);
 
-        let invoke = app.handle_api_request(Request {
-            id: "invoke-context".into(),
+        // `contexts = ["pane"]` is listing/availability metadata only; the
+        // server has never enforced it. An outside caller naming the pane
+        // still gets a global context, never a focus-borrowed one.
+        let request = |id: &str| Request {
+            id: id.into(),
             method: Method::PluginActionInvoke(PluginActionInvokeParams {
                 plugin_id: Some("example.context".into()),
                 action_id: "show".into(),
-                context: None,
+                context: Some(invoking_pane_context(&pane_public)),
             }),
+        };
+        let outside = app.handle_api_request(request("invoke-outside"));
+        let ResponseResult::PluginActionInvoked { context, .. } = response_result(&outside) else {
+            panic!("expected plugin action invocation: {outside}");
+        };
+        assert_global_context(&context);
+
+        // The pane's own live caller (scoped existing OS-observation hooks).
+        let peer = crate::platform::process_identity(std::process::id()).expect("live peer");
+        let tokio_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        {
+            let _enter = tokio_runtime.enter();
+            let (runtime, _rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+            runtime.test_set_child_pid(peer.pid);
+            app.state.insert_test_runtime(pane_id, runtime);
+        }
+        let caller = crate::api::ApiRequestContext {
+            local_peer_identity: Some(peer),
+            local_peer_pane_origin: crate::platform::PeerPaneOrigin::Absent,
+        };
+        let invoke = as_pane_a(peer, || {
+            app.handle_api_request_with_context(request("invoke-context"), caller)
         });
 
         let ResponseResult::PluginActionInvoked { context, .. } = response_result(&invoke) else {
@@ -3549,6 +3649,812 @@ command = ["show-ctx"]
         assert!(worktree.is_linked_worktree);
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn invoking_pane_context(pane_id: &str) -> PluginInvocationContext {
+        PluginInvocationContext {
+            workspace_id: None,
+            workspace_label: None,
+            workspace_cwd: None,
+            worktree: None,
+            tab_id: None,
+            tab_label: None,
+            focused_pane_id: Some(pane_id.into()),
+            focused_pane_cwd: None,
+            focused_pane_agent: None,
+            focused_pane_status: None,
+            selected_text: None,
+            invocation_source: None,
+            correlation_id: None,
+            clicked_url: None,
+            link_handler_id: None,
+        }
+    }
+
+    struct PrivacyFixture {
+        app: App,
+        root: std::path::PathBuf,
+        a_pane: crate::layout::PaneId,
+        a_pane_public: String,
+        b_pane_public: String,
+        /// Live peer pinned as pane A's process root (A's real caller).
+        a_peer: crate::platform::ProcessIdentity,
+        _runtime: tokio::runtime::Runtime,
+        a_tab_public: String,
+        a_workspace_public: String,
+    }
+
+    /// Pane A (workspace Alpha, codex) is the invoker; pane B (workspace
+    /// Bravo, claude) holds UI focus. Nothing of B may reach A's invocation.
+    fn privacy_fixture(name: &str) -> PrivacyFixture {
+        let mut app = test_app();
+        app.state.workspaces = vec![
+            crate::workspace::Workspace::test_new("alpha"),
+            crate::workspace::Workspace::test_new("bravo"),
+        ];
+        app.state.workspaces[0].identity_cwd = "/tmp/alpha-cwd".into();
+        app.state.workspaces[0].custom_name = Some("Alpha".into());
+        app.state.workspaces[1].identity_cwd = "/tmp/bravo-cwd".into();
+        app.state.workspaces[1].custom_name = Some("Bravo Secret".into());
+        app.state.ensure_test_terminals();
+        app.state.active = Some(1);
+        app.state.selected = 1;
+        let a_pane = app.state.workspaces[0].tabs[0].root_pane;
+        let b_pane = app.state.workspaces[1].tabs[0].root_pane;
+        let a_pane_public = app.public_pane_id(0, a_pane).unwrap();
+        let b_pane_public = app.public_pane_id(1, b_pane).unwrap();
+        for (pane_id, agent) in [(&a_pane_public, "codex"), (&b_pane_public, "claude")] {
+            let _ = app.handle_pane_report_agent(
+                "report".into(),
+                crate::api::schema::PaneReportAgentParams {
+                    allow_cross_pane: true,
+                    pane_id: pane_id.clone(),
+                    source: "test".into(),
+                    agent: agent.into(),
+                    state: crate::api::schema::PaneAgentState::Working,
+                    message: None,
+                    seq: None,
+                    agent_session_id: None,
+                    agent_session_path: None,
+                    resume_argv: None,
+                },
+            );
+        }
+        let root = unique_temp_path(name);
+        write_manifest_content(
+            &root,
+            r#"
+id = "example.privacy"
+name = "Privacy"
+version = "0.1.0"
+min_herdr_version = "0.6.10"
+platforms = ["linux", "macos", "windows"]
+
+[[actions]]
+id = "dump"
+title = "Dump context"
+command = ["sh", "-c", 'printf "%s|%s|%s|%s" "${HERDR_PANE_ID-unset}" "${HERDR_WORKSPACE_ID-unset}" "${HERDR_TAB_ID-unset}" "$HERDR_PLUGIN_CONTEXT_JSON" > dump.tmp && mv dump.tmp dump.txt']
+
+[[link_handlers]]
+id = "privacy-link"
+title = "Privacy link"
+pattern = '^https://handled\.example/'
+action = "dump"
+
+[[startup]]
+command = ["sh", "-c", 'printf "%s|%s|%s|%s" "${HERDR_PANE_ID-unset}" "${HERDR_WORKSPACE_ID-unset}" "${HERDR_TAB_ID-unset}" "$HERDR_PLUGIN_CONTEXT_JSON" > startup.tmp && mv startup.tmp startup.txt']
+"#,
+        );
+        link_manifest(&mut app, &root);
+        let a_tab_public = app.public_tab_id(0, 0).unwrap();
+        let a_workspace_public = app.public_workspace_id(0);
+        // Only pane A has an observable live root: this test process. The
+        // existing scoped OS-observation hooks below then attribute it to A
+        // through the real live-ancestry check, never via request identity.
+        let a_peer = crate::platform::process_identity(std::process::id()).expect("live peer");
+        let tokio_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        {
+            let _enter = tokio_runtime.enter();
+            let (runtime, _rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+            runtime.test_set_child_pid(a_peer.pid);
+            app.state.insert_test_runtime(a_pane, runtime);
+        }
+        PrivacyFixture {
+            _runtime: tokio_runtime,
+            app,
+            root,
+            a_pane,
+            a_pane_public,
+            b_pane_public,
+            a_peer,
+            a_tab_public,
+            a_workspace_public,
+        }
+    }
+
+    fn assert_no_focused_b_fields(text: &str) {
+        for leaked in ["Bravo Secret", "bravo-cwd", "claude"] {
+            assert!(
+                !text.contains(leaked),
+                "focused pane B leaked {leaked}: {text}"
+            );
+        }
+    }
+
+    fn assert_global_context(context: &PluginInvocationContext) {
+        assert_eq!(context.workspace_id, None);
+        assert_eq!(context.workspace_label, None);
+        assert_eq!(context.workspace_cwd, None);
+        assert_eq!(context.worktree, None);
+        assert_eq!(context.tab_id, None);
+        assert_eq!(context.tab_label, None);
+        assert_eq!(context.focused_pane_id, None);
+        assert_eq!(context.focused_pane_cwd, None);
+        assert_eq!(context.focused_pane_agent, None);
+        assert_eq!(context.focused_pane_status, None);
+    }
+
+    #[cfg(unix)]
+    fn take_dump(app: &mut App, path: &std::path::Path) -> (String, String, String, String) {
+        let dump = read_capture_when_ready(path, || {
+            app.drain_all_internal_events();
+        });
+        let _ = std::fs::remove_file(path);
+        let mut parts = dump.splitn(4, '|').map(str::to_owned);
+        (
+            parts.next().unwrap(),
+            parts.next().unwrap(),
+            parts.next().unwrap(),
+            parts.next().unwrap(),
+        )
+    }
+
+    /// Pane A's own live peer, under the same accept-time policy the socket
+    /// captures (no launch marker), with the existing scoped OS-observation
+    /// hooks: the peer reaches this server and is a member of A's pane only.
+    fn as_pane_a<T>(a_peer: crate::platform::ProcessIdentity, run: impl FnOnce() -> T) -> T {
+        crate::platform::with_server_ancestry_for_test(a_peer, Some(false), || {
+            crate::platform::with_ancestry_membership_for_test(Some(true), run)
+        })
+    }
+
+    fn a_peer_context(fixture: &PrivacyFixture) -> crate::api::ApiRequestContext {
+        crate::api::ApiRequestContext {
+            local_peer_identity: Some(fixture.a_peer),
+            local_peer_pane_origin: crate::platform::PeerPaneOrigin::Absent,
+        }
+    }
+
+    fn invoke_dump(
+        app: &mut App,
+        id: &str,
+        context: Option<PluginInvocationContext>,
+        caller: crate::api::ApiRequestContext,
+    ) -> String {
+        app.handle_api_request_with_context(
+            Request {
+                id: id.into(),
+                method: Method::PluginActionInvoke(PluginActionInvokeParams {
+                    plugin_id: Some("example.privacy".into()),
+                    action_id: "dump".into(),
+                    context,
+                }),
+            },
+            caller,
+        )
+    }
+
+    fn assert_error_code(response: &str, code: &str) {
+        let value: serde_json::Value = serde_json::from_str(response).unwrap();
+        assert_eq!(value["error"]["code"], code, "{response}");
+    }
+
+    #[test]
+    fn api_action_context_rebuilds_invoking_pane_not_focused_pane() {
+        let mut fixture = privacy_fixture("plugin-privacy-api");
+        let alias = "w99:pOLD".to_owned();
+        fixture
+            .app
+            .state
+            .public_pane_id_aliases
+            .insert(alias.clone(), fixture.a_pane);
+        let mut provided = invoking_pane_context(&fixture.a_pane_public);
+        // Caller claims about pane-derived fields are ignored, not mixed in.
+        provided.workspace_label = Some("spoofed".into());
+        provided.workspace_id = Some("w_spoofed".into());
+        provided.tab_label = Some("spoofed-tab".into());
+        provided.focused_pane_cwd = Some("/spoofed".into());
+        provided.focused_pane_agent = Some("spoofed-agent".into());
+        provided.invocation_source = Some("cli".into());
+        let mut no_claim = invoking_pane_context("unused");
+        no_claim.focused_pane_id = None;
+        no_claim.workspace_id = Some("w_spoofed".into());
+        let mut alias_claim = invoking_pane_context(&alias);
+        alias_claim.invocation_source = Some("cli".into());
+        let caller = a_peer_context(&fixture);
+        for (id, provided) in [
+            ("invoke-a", Some(provided)),
+            ("invoke-a-none", None),
+            ("invoke-a-no-claim", Some(no_claim)),
+            ("invoke-a-alias", Some(alias_claim)),
+        ] {
+            let invoke = as_pane_a(fixture.a_peer, || {
+                invoke_dump(&mut fixture.app, id, provided, caller)
+            });
+            let ResponseResult::PluginActionInvoked { context, .. } = response_result(&invoke)
+            else {
+                panic!("expected plugin action invocation: {invoke}");
+            };
+            assert_eq!(fixture.app.state.active, Some(1), "focus untouched");
+            assert_eq!(
+                context.focused_pane_id.as_deref(),
+                Some(fixture.a_pane_public.as_str())
+            );
+            assert_eq!(
+                context.workspace_id.as_deref(),
+                Some(fixture.a_workspace_public.as_str())
+            );
+            assert_eq!(
+                context.tab_id.as_deref(),
+                Some(fixture.a_tab_public.as_str())
+            );
+            assert_eq!(context.workspace_label.as_deref(), Some("Alpha"));
+            assert_eq!(context.workspace_cwd.as_deref(), Some("/tmp/alpha-cwd"));
+            assert_ne!(context.focused_pane_cwd.as_deref(), Some("/spoofed"));
+            assert_eq!(context.focused_pane_agent.as_deref(), Some("codex"));
+            let text = serde_json::to_string(&context).unwrap();
+            assert!(!text.contains("spoofed"), "{text}");
+            assert_no_focused_b_fields(&text);
+
+            #[cfg(unix)]
+            {
+                let (pane, workspace, tab, json) =
+                    take_dump(&mut fixture.app, &fixture.root.join("dump.txt"));
+                assert_eq!(pane, fixture.a_pane_public);
+                assert_eq!(workspace, fixture.a_workspace_public);
+                assert_eq!(tab, fixture.a_tab_public);
+                assert_no_focused_b_fields(&json);
+                assert!(!json.contains("spoofed"), "{json}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(fixture.root);
+    }
+
+    #[test]
+    fn api_action_attributed_caller_naming_another_pane_is_refused() {
+        let mut fixture = privacy_fixture("plugin-privacy-mismatch");
+        let caller = a_peer_context(&fixture);
+        let b_claim = fixture.b_pane_public.clone();
+        for claim in [b_claim.as_str(), "p_999", "w99:p77"] {
+            let invoke = as_pane_a(fixture.a_peer, || {
+                invoke_dump(
+                    &mut fixture.app,
+                    "invoke-b",
+                    Some(invoking_pane_context(claim)),
+                    caller,
+                )
+            });
+            assert_error_code(&invoke, "invoking_pane_mismatch");
+            assert!(!invoke.contains(claim), "claim echoed: {invoke}");
+            assert_no_focused_b_fields(&invoke);
+            assert!(fixture.app.state.plugin_command_logs.is_empty());
+            assert_eq!(fixture.app.state.active, Some(1));
+        }
+        #[cfg(unix)]
+        {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            fixture.app.drain_all_internal_events();
+            assert!(!fixture.root.join("dump.txt").exists(), "no child spawned");
+        }
+        let _ = std::fs::remove_dir_all(fixture.root);
+    }
+
+    #[test]
+    fn api_action_without_invoking_pane_is_global() {
+        let mut fixture = privacy_fixture("plugin-privacy-global");
+        let mut cli = invoking_pane_context("unused");
+        cli.focused_pane_id = None;
+        cli.invocation_source = Some("cli".into());
+        // An outside caller naming B (or anything) with spoofed metadata.
+        let mut b_claim = invoking_pane_context(&fixture.b_pane_public);
+        b_claim.workspace_id = Some("w_spoofed".into());
+        b_claim.workspace_label = Some("spoofed".into());
+        b_claim.workspace_cwd = Some("/spoofed".into());
+        b_claim.tab_id = Some("t_spoofed".into());
+        b_claim.tab_label = Some("spoofed".into());
+        b_claim.focused_pane_agent = Some("spoofed".into());
+        let mut a_claim = invoking_pane_context(&fixture.a_pane_public);
+        a_claim.selected_text = Some("caller own text".into());
+        let live = fixture.a_peer;
+        let stale = crate::platform::ProcessIdentity {
+            pid: live.pid,
+            start_time: live.start_time.wrapping_add(1),
+        };
+        let outside = crate::api::ApiRequestContext::default();
+        let stale_peer = crate::api::ApiRequestContext {
+            local_peer_identity: Some(stale),
+            local_peer_pane_origin: crate::platform::PeerPaneOrigin::Absent,
+        };
+        let marked_unknown = crate::api::ApiRequestContext {
+            local_peer_identity: Some(live),
+            local_peer_pane_origin: crate::platform::PeerPaneOrigin::Unknown,
+        };
+        let mut cases = vec![
+            ("global-none", None, outside, false),
+            ("global-cli", Some(cli), outside, false),
+            ("global-b-claim", Some(b_claim.clone()), outside, false),
+            ("global-a-claim", Some(a_claim), outside, false),
+            ("global-stale", Some(b_claim.clone()), stale_peer, true),
+        ];
+        // Unobservable peer: only Darwin's existing live known-agent recovery
+        // may attribute it (A runs codex); elsewhere it fails closed to global.
+        if !cfg!(target_os = "macos") {
+            cases.push(("global-unknown", Some(b_claim), marked_unknown, true));
+        }
+        for (id, context, caller, hooked) in cases {
+            let invoke = if hooked {
+                as_pane_a(fixture.a_peer, || {
+                    invoke_dump(&mut fixture.app, id, context, caller)
+                })
+            } else {
+                invoke_dump(&mut fixture.app, id, context, caller)
+            };
+            let ResponseResult::PluginActionInvoked { context, .. } = response_result(&invoke)
+            else {
+                panic!("expected plugin action invocation: {invoke}");
+            };
+            assert_global_context(&context);
+            assert!(!invoke.contains("spoofed"), "{invoke}");
+            assert_no_focused_b_fields(&invoke);
+            assert!(!invoke.contains(&fixture.b_pane_public), "{invoke}");
+            if id == "global-a-claim" {
+                assert_eq!(context.selected_text.as_deref(), Some("caller own text"));
+            }
+            #[cfg(unix)]
+            {
+                let (pane, workspace, tab, json) =
+                    take_dump(&mut fixture.app, &fixture.root.join("dump.txt"));
+                assert_eq!(
+                    (pane.as_str(), workspace.as_str(), tab.as_str()),
+                    ("unset", "unset", "unset")
+                );
+                assert_no_focused_b_fields(&json);
+                assert!(!json.contains("spoofed"), "{json}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(fixture.root);
+    }
+
+    fn privacy_command_id(fixture: &mut PrivacyFixture) -> String {
+        fixture.app.endpoint_commands =
+            crate::app::custom_commands::EndpointCommandRegistry::new(&[
+                crate::config::CustomCommandKeybind {
+                    bindings: crate::config::ActionKeybinds::prefix("z"),
+                    label: "prefix+z".into(),
+                    command: "example.privacy.dump".into(),
+                    action: crate::config::CustomCommandAction::PluginAction,
+                    description: None,
+                    width: None,
+                    height: None,
+                },
+            ]);
+        fixture.app.client_shell_command_manifest()[0]
+            .command_id
+            .clone()
+    }
+
+    fn command_request(
+        command_id: &str,
+        pane_id: Option<&str>,
+        selection_pane: Option<&str>,
+    ) -> Request {
+        Request {
+            id: "cmd".into(),
+            method: Method::CommandInvoke(crate::api::schema::CommandInvokeParams {
+                command_id: command_id.into(),
+                workspace_id: None,
+                tab_id: None,
+                pane_id: pane_id.map(str::to_owned),
+                selection: selection_pane.map(|pane_id| {
+                    serde_json::from_value(serde_json::json!({
+                        "pane_id": pane_id,
+                        "anchor": {"row": 0, "col": 0},
+                        "cursor": {"row": 0, "col": 1},
+                    }))
+                    .expect("selection params")
+                }),
+            }),
+        }
+    }
+
+    #[test]
+    fn public_command_invoke_cannot_claim_another_pane_or_its_selection() {
+        let mut fixture = privacy_fixture("plugin-privacy-public-command");
+        let command_id = privacy_command_id(&mut fixture);
+        let caller = a_peer_context(&fixture);
+        let a = fixture.a_pane_public.clone();
+        let b = fixture.b_pane_public.clone();
+        fixture.app.state.switch_workspace(1);
+        let refused = [
+            (Some(b.as_str()), None, caller),
+            (Some(a.as_str()), Some(b.as_str()), caller),
+            (None, Some(b.as_str()), caller),
+            (Some(b.as_str()), Some(b.as_str()), caller),
+            (
+                Some(a.as_str()),
+                None,
+                crate::api::ApiRequestContext::default(),
+            ),
+            (
+                Some(b.as_str()),
+                None,
+                crate::api::ApiRequestContext::default(),
+            ),
+        ];
+        for (pane, selection, caller) in refused {
+            let focus_before = (
+                fixture.app.state.active,
+                fixture.app.state.workspaces[1].focused_pane_id(),
+            );
+            let response = as_pane_a(fixture.a_peer, || {
+                fixture.app.handle_api_request_with_context(
+                    command_request(&command_id, pane, selection),
+                    caller,
+                )
+            });
+            assert_error_code(&response, "invoking_pane_mismatch");
+            assert!(!response.contains(&b), "{response}");
+            assert_eq!(
+                (
+                    fixture.app.state.active,
+                    fixture.app.state.workspaces[1].focused_pane_id()
+                ),
+                focus_before,
+                "no focus mutation before validation"
+            );
+            assert!(fixture.app.state.plugin_command_logs.is_empty());
+        }
+
+        // Pane A's own caller, naming A or nothing, binds A while B is focused.
+        for pane in [Some(a.as_str()), None] {
+            let response = as_pane_a(fixture.a_peer, || {
+                fixture.app.handle_api_request_with_context(
+                    command_request(&command_id, pane, None),
+                    caller,
+                )
+            });
+            assert_eq!(response_result(&response), ResponseResult::Ok {});
+            #[cfg(unix)]
+            {
+                let (pane, workspace, _, json) =
+                    take_dump(&mut fixture.app, &fixture.root.join("dump.txt"));
+                assert_eq!(pane, fixture.a_pane_public);
+                assert_eq!(workspace, fixture.a_workspace_public);
+                assert_no_focused_b_fields(&json);
+            }
+            fixture.app.state.switch_workspace(1);
+        }
+        let _ = std::fs::remove_dir_all(fixture.root);
+    }
+
+    #[test]
+    fn public_non_plugin_command_keeps_its_existing_target_semantics() {
+        // Shell/pane/popup commands never read plugin context or a selection;
+        // their focus-following HERDR_ACTIVE_* env is reachable publicly via
+        // pane.focus anyway. An outside caller naming B keeps the old result.
+        let mut fixture = privacy_fixture("plugin-privacy-public-shell");
+        fixture.app.endpoint_commands =
+            crate::app::custom_commands::EndpointCommandRegistry::new(&[
+                crate::config::CustomCommandKeybind {
+                    bindings: crate::config::ActionKeybinds::prefix("x"),
+                    label: "prefix+x".into(),
+                    command: "exit 0".into(),
+                    action: crate::config::CustomCommandAction::Shell,
+                    description: None,
+                    width: None,
+                    height: None,
+                },
+            ]);
+        let command_id = fixture.app.client_shell_command_manifest()[0]
+            .command_id
+            .clone();
+        fixture.app.state.switch_workspace(0);
+        let b = fixture.b_pane_public.clone();
+        let response = fixture
+            .app
+            .handle_api_request(command_request(&command_id, Some(&b), None));
+        assert!(!response.contains("invoking_pane_mismatch"), "{response}");
+        assert_eq!(fixture.app.state.active, Some(1), "existing focus target");
+        assert!(fixture.app.state.plugin_command_logs.is_empty());
+        let _ = std::fs::remove_dir_all(fixture.root);
+    }
+
+    #[test]
+    fn trusted_client_shell_command_keeps_its_server_resolved_pane() {
+        let mut fixture = privacy_fixture("plugin-privacy-trusted-command");
+        let command_id = privacy_command_id(&mut fixture);
+        let a = fixture.a_pane_public.clone();
+        // The client endpoint carries no peer attribution; its client-resolved
+        // key-press pane is trusted only on this server-internal route.
+        fixture.app.drain_all_internal_events();
+        let response = fixture
+            .app
+            .handle_trusted_client_shell_api_request_after_internal_events_drained(
+                command_request(&command_id, Some(&a), None),
+                crate::api::ApiRequestContext::default(),
+            );
+        assert_eq!(response_result(&response), ResponseResult::Ok {});
+        #[cfg(unix)]
+        {
+            let (pane, workspace, _, json) =
+                take_dump(&mut fixture.app, &fixture.root.join("dump.txt"));
+            assert_eq!(pane, fixture.a_pane_public);
+            assert_eq!(workspace, fixture.a_workspace_public);
+            assert!(json.contains("keybinding"), "{json}");
+            assert_no_focused_b_fields(&json);
+        }
+        // The same request on the public dispatch from an outside caller is refused.
+        let response = fixture
+            .app
+            .handle_api_request(command_request(&command_id, Some(&a), None));
+        assert_error_code(&response, "invoking_pane_mismatch");
+        let _ = std::fs::remove_dir_all(fixture.root);
+    }
+
+    fn link_request(pane_id: &str) -> Request {
+        Request {
+            id: "link".into(),
+            method: Method::PaneLinkActivate(PaneLinkActivateParams {
+                pane_id: pane_id.into(),
+                col: 1,
+                viewport_row: 0,
+                offset_from_bottom: None,
+                content_revision: None,
+            }),
+        }
+    }
+
+    /// Shows `url` as a hyperlink at row 0 of the pane's live runtime.
+    fn show_link(fixture: &mut PrivacyFixture, pane_public: &str, url: &str) {
+        let (ws_idx, pane_id) = fixture.app.parse_pane_id(pane_public).expect("pane");
+        if fixture
+            .app
+            .state
+            .runtime_for_pane_in_workspace(&fixture.app.terminal_runtimes, ws_idx, pane_id)
+            .is_none()
+        {
+            let _enter = fixture._runtime.enter();
+            let (runtime, _rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 4);
+            fixture.app.state.insert_test_runtime(pane_id, runtime);
+        }
+        fixture
+            .app
+            .state
+            .runtime_for_pane_in_workspace(&fixture.app.terminal_runtimes, ws_idx, pane_id)
+            .expect("runtime")
+            .test_process_pty_bytes(
+                format!("\x1b[2J\x1b[H\x1b]8;;{url}\x1b\\link\x1b]8;;\x1b\\").as_bytes(),
+            );
+    }
+
+    #[test]
+    fn public_link_activation_without_a_handler_keeps_ordinary_behavior() {
+        let mut fixture = privacy_fixture("plugin-privacy-public-link-plain");
+        let b = fixture.b_pane_public.clone();
+        let url = "https://plain.example/x";
+        show_link(&mut fixture, &b, url);
+        // No matching handler: an outside operator (or pane A naming B) gets
+        // the ordinary URL with handled=false, no ancestry requirement.
+        for caller in [
+            crate::api::ApiRequestContext::default(),
+            a_peer_context(&fixture),
+        ] {
+            let response = as_pane_a(fixture.a_peer, || {
+                fixture
+                    .app
+                    .handle_api_request_with_context(link_request(&b), caller)
+            });
+            assert_eq!(
+                response_result(&response),
+                ResponseResult::PaneLinkActivated {
+                    url: Some(url.into()),
+                    handled: false,
+                }
+            );
+            assert!(fixture.app.state.plugin_command_logs.is_empty());
+        }
+        let _ = std::fs::remove_dir_all(fixture.root);
+    }
+
+    #[test]
+    fn public_link_handler_binds_only_the_callers_own_pane_or_global() {
+        let mut fixture = privacy_fixture("plugin-privacy-public-link");
+        let a = fixture.a_pane_public.clone();
+        let b = fixture.b_pane_public.clone();
+        let url = "https://handled.example/b";
+        show_link(&mut fixture, &b, url);
+        show_link(&mut fixture, &a, "https://handled.example/a");
+        let a_caller = a_peer_context(&fixture);
+
+        // Pane A's caller naming B with a matching handler: refused before
+        // plugin log or spawn, without B context or claim echo.
+        let response = as_pane_a(fixture.a_peer, || {
+            fixture
+                .app
+                .handle_api_request_with_context(link_request(&b), a_caller)
+        });
+        assert_error_code(&response, "invoking_pane_mismatch");
+        assert!(!response.contains(&b), "{response}");
+        assert_no_focused_b_fields(&response);
+        assert!(fixture.app.state.plugin_command_logs.is_empty());
+        #[cfg(unix)]
+        {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            fixture.app.drain_all_internal_events();
+            assert!(!fixture.root.join("dump.txt").exists(), "no child spawned");
+        }
+
+        // An outside caller naming B: the handler runs global, with only the
+        // caller-visible URL and handler id.
+        let response = fixture.app.handle_api_request_with_context(
+            link_request(&b),
+            crate::api::ApiRequestContext::default(),
+        );
+        assert_eq!(
+            response_result(&response),
+            ResponseResult::PaneLinkActivated {
+                url: Some(url.into()),
+                handled: true,
+            }
+        );
+        assert_eq!(fixture.app.state.plugin_command_logs.len(), 1);
+        #[cfg(unix)]
+        {
+            let (pane, workspace, tab, json) =
+                take_dump(&mut fixture.app, &fixture.root.join("dump.txt"));
+            assert_eq!(
+                (pane.as_str(), workspace.as_str(), tab.as_str()),
+                ("unset", "unset", "unset")
+            );
+            let context: PluginInvocationContext = serde_json::from_str(&json).unwrap();
+            assert_global_context(&context);
+            assert_eq!(context.clicked_url.as_deref(), Some(url));
+            assert_eq!(context.link_handler_id.as_deref(), Some("privacy-link"));
+            assert_no_focused_b_fields(&json);
+            assert!(!json.contains(&b), "{json}");
+        }
+
+        // Pane A's caller activating its own link gets its own context.
+        fixture.app.state.switch_workspace(0);
+        let response = as_pane_a(fixture.a_peer, || {
+            fixture
+                .app
+                .handle_api_request_with_context(link_request(&a), a_caller)
+        });
+        assert!(
+            matches!(
+                response_result(&response),
+                ResponseResult::PaneLinkActivated { handled: true, .. }
+            ),
+            "{response}"
+        );
+        #[cfg(unix)]
+        {
+            let (pane, workspace, tab, json) =
+                take_dump(&mut fixture.app, &fixture.root.join("dump.txt"));
+            assert_eq!(pane, fixture.a_pane_public);
+            assert_eq!(workspace, fixture.a_workspace_public);
+            assert_eq!(tab, fixture.a_tab_public);
+            assert_no_focused_b_fields(&json);
+        }
+
+        // The trusted client click keeps its server-resolved clicked pane.
+        fixture.app.state.switch_workspace(1);
+        let response = fixture.app.handle_pane_link_activate(
+            "click".into(),
+            match link_request(&b).method {
+                Method::PaneLinkActivate(params) => params,
+                _ => unreachable!(),
+            },
+        );
+        assert!(
+            matches!(
+                response_result(&response),
+                ResponseResult::PaneLinkActivated { handled: true, .. }
+            ),
+            "{response}"
+        );
+        #[cfg(unix)]
+        {
+            let (pane, _, _, json) = take_dump(&mut fixture.app, &fixture.root.join("dump.txt"));
+            assert_eq!(pane, b);
+            assert!(json.contains("\"link_click\""), "{json}");
+        }
+        let _ = std::fs::remove_dir_all(fixture.root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn keybinding_binds_its_pane_and_global_binding_and_startup_bind_none() {
+        let mut fixture = privacy_fixture("plugin-privacy-keybinding");
+        let dump = fixture.root.join("dump.txt");
+
+        // Direct receiver: pane A named while B keeps UI focus.
+        fixture
+            .app
+            .invoke_plugin_action_from_keybind(
+                "example.privacy.dump".into(),
+                None,
+                Some((0, fixture.a_pane)),
+            )
+            .unwrap();
+        assert_eq!(fixture.app.state.active, Some(1));
+        let (pane, workspace, _, json) = take_dump(&mut fixture.app, &dump);
+        assert_eq!(pane, fixture.a_pane_public);
+        assert_eq!(workspace, fixture.a_workspace_public);
+        assert!(
+            json.contains("codex") && json.contains("keybinding"),
+            "{json}"
+        );
+        assert_no_focused_b_fields(&json);
+
+        // Client command path: in-pane binding names A; global names nothing.
+        fixture.app.endpoint_commands =
+            crate::app::custom_commands::EndpointCommandRegistry::new(&[
+                crate::config::CustomCommandKeybind {
+                    bindings: crate::config::ActionKeybinds::prefix("z"),
+                    label: "prefix+z".into(),
+                    command: "example.privacy.dump".into(),
+                    action: crate::config::CustomCommandAction::PluginAction,
+                    description: None,
+                    width: None,
+                    height: None,
+                },
+            ]);
+        let command_id = fixture.app.client_shell_command_manifest()[0]
+            .command_id
+            .clone();
+        let invoke = |app: &mut App, pane_id: Option<String>| {
+            app.handle_command_invoke(
+                "cmd".into(),
+                crate::api::schema::CommandInvokeParams {
+                    command_id: command_id.clone(),
+                    workspace_id: None,
+                    tab_id: None,
+                    pane_id,
+                    selection: None,
+                },
+            )
+        };
+        let response = invoke(&mut fixture.app, Some(fixture.a_pane_public.clone()));
+        assert_eq!(response_result(&response), ResponseResult::Ok {});
+        let (pane, _, _, json) = take_dump(&mut fixture.app, &dump);
+        assert_eq!(pane, fixture.a_pane_public);
+        assert_no_focused_b_fields(&json);
+
+        fixture.app.state.switch_workspace(1);
+        let response = invoke(&mut fixture.app, None);
+        assert_eq!(response_result(&response), ResponseResult::Ok {});
+        let (pane, workspace, tab, json) = take_dump(&mut fixture.app, &dump);
+        assert_eq!(
+            (pane.as_str(), workspace.as_str(), tab.as_str()),
+            ("unset", "unset", "unset")
+        );
+        assert_no_focused_b_fields(&json);
+        assert!(!json.contains("focused_pane_id\":\""), "{json}");
+
+        fixture.app.run_plugin_startup_hooks();
+        let (pane, workspace, tab, json) =
+            take_dump(&mut fixture.app, &fixture.root.join("startup.txt"));
+        assert_eq!(
+            (pane.as_str(), workspace.as_str(), tab.as_str()),
+            ("unset", "unset", "unset")
+        );
+        assert_no_focused_b_fields(&json);
+        let _ = std::fs::remove_dir_all(fixture.root);
     }
 
     #[test]

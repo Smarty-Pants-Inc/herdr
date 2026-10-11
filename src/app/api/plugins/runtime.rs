@@ -121,12 +121,14 @@ impl App {
         let spawned = crate::thread_spawn::spawn_named("herdr-plugin-command", move || {
             // The worker may outlive App during normal server teardown.
             let _installation_lease = installation_lease;
-            let child =
-                crate::plugin_command::command_for_argv_in_dir(&program, &args, &plugin_root)
-                    .envs(env)
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn();
+            let mut command =
+                crate::plugin_command::command_for_argv_in_dir(&program, &args, &plugin_root);
+            scrub_inherited_invocation_env(&mut command, std::env::vars_os().map(|(key, _)| key));
+            let child = command
+                .envs(env)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn();
             let finished = match child {
                 Ok(child) => finish_plugin_child(log_id, child),
                 Err(err) => crate::events::AppEvent::PluginCommandFinished {
@@ -166,7 +168,8 @@ impl App {
                 tracing::warn!(%err, "plugin cleanup deferred");
             }
         }
-        let mut context = self.current_plugin_context("plugin.startup");
+        // Startup has no invoking pane; it must not see the focused pane.
+        let mut context = self.invoking_plugin_context(None, "plugin.startup");
         context.invocation_source = Some("startup".to_string());
         let mut plugins = self
             .state
@@ -255,6 +258,30 @@ impl App {
         if self.state.plugin_command_logs.len() > PLUGIN_COMMAND_LOG_LIMIT {
             let extra = self.state.plugin_command_logs.len() - PLUGIN_COMMAND_LOG_LIMIT;
             self.state.plugin_command_logs.drain(0..extra);
+        }
+    }
+}
+
+/// The server may itself run inside a Herdr pane, or inherit another plugin's
+/// invocation env. Only ids Herdr sets for this invocation may reach the child.
+fn scrub_inherited_invocation_env(
+    command: &mut std::process::Command,
+    inherited_keys: impl Iterator<Item = std::ffi::OsString>,
+) {
+    for key in [
+        "HERDR_WORKSPACE_ID",
+        "HERDR_TAB_ID",
+        "HERDR_PANE_ID",
+        "HERDR_ACTIVE_WORKSPACE_ID",
+        "HERDR_ACTIVE_TAB_ID",
+        "HERDR_ACTIVE_PANE_ID",
+        "HERDR_ACTIVE_PANE_CWD",
+    ] {
+        command.env_remove(key);
+    }
+    for key in inherited_keys {
+        if key.to_string_lossy().starts_with("HERDR_PLUGIN_") {
+            command.env_remove(key);
         }
     }
 }
@@ -366,6 +393,39 @@ pub(super) fn read_capped_plugin_output(mut reader: impl Read, cap: usize) -> St
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inherited_invocation_identity_env_is_scrubbed() {
+        let mut command = std::process::Command::new("true");
+        scrub_inherited_invocation_env(
+            &mut command,
+            ["HERDR_PLUGIN_CLICKED_URL", "HERDR_PLUGIN_ACTION_ID", "PATH"]
+                .into_iter()
+                .map(std::ffi::OsString::from),
+        );
+        let removed = command
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(key, _)| key.to_string_lossy().into_owned())
+            .collect::<std::collections::BTreeSet<_>>();
+        for key in [
+            "HERDR_PANE_ID",
+            "HERDR_TAB_ID",
+            "HERDR_WORKSPACE_ID",
+            "HERDR_ACTIVE_PANE_ID",
+            "HERDR_PLUGIN_CLICKED_URL",
+            "HERDR_PLUGIN_ACTION_ID",
+        ] {
+            assert!(removed.contains(key), "{key} not scrubbed");
+        }
+        assert!(!removed.contains("PATH"));
+
+        // Values Herdr sets for this invocation still win over the scrub.
+        command.env("HERDR_PANE_ID", "p_1");
+        assert!(command
+            .get_envs()
+            .any(|(key, value)| key == "HERDR_PANE_ID" && value.is_some()));
+    }
 
     #[test]
     fn plugin_output_reader_spawn_failure_stops_the_command() {
