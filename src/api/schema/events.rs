@@ -78,6 +78,8 @@ pub enum Subscription {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent_status: Option<AgentStatus>,
     },
+    #[serde(rename = "pane.agent_session_changed")]
+    PaneAgentSessionChanged { pane_id: String },
     #[serde(rename = "pane.scroll_changed")]
     PaneScrollChanged { pane_id: String },
     #[serde(rename = "layout.updated")]
@@ -217,6 +219,7 @@ pub enum EventKind {
     PaneExited,
     PaneAgentDetected,
     PaneAgentStatusChanged,
+    PaneAgentSessionChanged,
     LayoutUpdated,
 }
 
@@ -248,6 +251,7 @@ impl EventKind {
             EventKind::PaneExited => "pane.exited",
             EventKind::PaneAgentDetected => "pane.agent_detected",
             EventKind::PaneAgentStatusChanged => "pane.agent_status_changed",
+            EventKind::PaneAgentSessionChanged => "pane.agent_session_changed",
             EventKind::LayoutUpdated => "layout.updated",
         }
     }
@@ -280,6 +284,7 @@ pub const KNOWN_EVENT_KINDS: &[EventKind] = &[
     EventKind::PaneExited,
     EventKind::PaneAgentDetected,
     EventKind::PaneAgentStatusChanged,
+    EventKind::PaneAgentSessionChanged,
     EventKind::LayoutUpdated,
 ];
 
@@ -370,6 +375,8 @@ pub enum SubscriptionEventKind {
     PaneOutputMatched,
     #[serde(rename = "pane.agent_status_changed")]
     PaneAgentStatusChanged,
+    #[serde(rename = "pane.agent_session_changed")]
+    PaneAgentSessionChanged,
     #[serde(rename = "pane.scroll_changed")]
     ScrollChanged,
 }
@@ -386,6 +393,7 @@ pub enum SubscriptionEventData {
     PaneOutputMatched(PaneOutputMatchedEvent),
     PaneAgentStatusChanged(PaneAgentStatusChangedEvent),
     ScrollChanged(PaneScrollChangedEvent),
+    PaneAgentSessionChanged(PaneAgentSessionChangedEvent),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -408,6 +416,19 @@ pub struct PaneAgentStatusChangedEvent {
     pub display_agent: Option<String>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub state_labels: HashMap<String, String>,
+}
+
+/// The agent in a pane reported a session id different from the pane's
+/// previous one. A repeated report of the current session emits nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneAgentSessionChangedEvent {
+    pub pane_id: String,
+    pub workspace_id: String,
+    pub agent: String,
+    pub session_id: String,
+    /// `null` when the pane had no reported session before.
+    #[schemars(required, schema_with = "super::common::nullable_string_schema")]
+    pub previous_session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -549,6 +570,14 @@ pub enum EventData {
         display_agent: Option<String>,
         #[serde(default, skip_serializing_if = "HashMap::is_empty")]
         state_labels: HashMap<String, String>,
+    },
+    PaneAgentSessionChanged {
+        pane_id: String,
+        workspace_id: String,
+        agent: String,
+        session_id: String,
+        #[schemars(required, schema_with = "super::common::nullable_string_schema")]
+        previous_session_id: Option<String>,
     },
     LayoutUpdated {
         layout: super::panes::PaneLayoutSnapshot,

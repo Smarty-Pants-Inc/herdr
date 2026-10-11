@@ -365,6 +365,89 @@ fn bundled_protocol_schema_refs_resolve_inside_bundle() {
 }
 
 #[test]
+fn first_agent_session_event_with_null_previous_session_matches_schema() {
+    // The first reported session has no predecessor, so the event carries an
+    // explicit `"previous_session_id": null`. Every schema that declares the
+    // field must keep it required and accept null.
+    fn collect_session_changed_schemas<'a>(
+        value: &'a serde_json::Value,
+        found: &mut Vec<&'a serde_json::Value>,
+    ) {
+        match value {
+            serde_json::Value::Object(object) => {
+                if object
+                    .get("properties")
+                    .and_then(|properties| properties.get("previous_session_id"))
+                    .is_some()
+                {
+                    found.push(value);
+                }
+                for child in object.values() {
+                    collect_session_changed_schemas(child, found);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    collect_session_changed_schemas(item, found);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let document = protocol_schema_document();
+    let mut schemas = Vec::new();
+    collect_session_changed_schemas(&document, &mut schemas);
+    assert!(
+        schemas.len() >= 3,
+        "expected event, subscription event and struct schemas, found {}",
+        schemas.len()
+    );
+    for schema in schemas {
+        let required = schema["required"].as_array().unwrap();
+        assert!(required.contains(&serde_json::json!("previous_session_id")));
+        assert_eq!(
+            schema["properties"]["previous_session_id"]["type"],
+            serde_json::json!(["string", "null"]),
+            "previous_session_id must be nullable in {schema}"
+        );
+    }
+
+    let first_session = EventEnvelope {
+        event: EventKind::PaneAgentSessionChanged,
+        data: EventData::PaneAgentSessionChanged {
+            pane_id: "p_1".into(),
+            workspace_id: "w_1".into(),
+            agent: "pi".into(),
+            session_id: "session-a".into(),
+            previous_session_id: None,
+        },
+    };
+    let json = serde_json::to_value(&first_session).unwrap();
+    assert_eq!(
+        json["data"].get("previous_session_id"),
+        Some(&serde_json::Value::Null)
+    );
+    assert_eq!(
+        serde_json::from_value::<EventEnvelope>(json).unwrap(),
+        first_session
+    );
+
+    let standalone = serde_json::to_value(PaneAgentSessionChangedEvent {
+        pane_id: "p_1".into(),
+        workspace_id: "w_1".into(),
+        agent: "pi".into(),
+        session_id: "session-a".into(),
+        previous_session_id: None,
+    })
+    .unwrap();
+    assert_eq!(
+        standalone.get("previous_session_id"),
+        Some(&serde_json::Value::Null)
+    );
+}
+
+#[test]
 fn generated_protocol_schema_artifact_is_current() {
     let actual = format!(
         "{}\n",

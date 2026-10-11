@@ -407,8 +407,19 @@ impl App {
                 None
             };
         let terminal_cwd_reported = matches!(ev, AppEvent::TerminalCwdReported { .. });
+        // Both report methods apply an agent's session through these events.
+        let session_report = match &ev {
+            AppEvent::AgentSessionReported { pane_id, .. }
+            | AppEvent::HookStateReported { pane_id, .. } => {
+                Some((*pane_id, self.pane_agent_session_info(*pane_id)))
+            }
+            _ => None,
+        };
         let previous_toast = self.state.toast.clone();
         let mut pane_updates = self.state.handle_app_event(ev);
+        if let Some((pane_id, previous_session)) = session_report {
+            self.emit_pane_agent_session_changed(pane_id, previous_session);
+        }
         if update_ready.is_some() {
             self.state.latest_release_notes = crate::release_notes::load_latest();
         }
@@ -847,6 +858,47 @@ impl App {
                 }
             }
         }
+    }
+
+    fn pane_agent_session_info(
+        &self,
+        pane_id: crate::layout::PaneId,
+    ) -> Option<crate::api::schema::AgentSessionInfo> {
+        let (_, pane) = self.find_pane(pane_id)?;
+        let terminal = self.state.terminals.get(&pane.attached_terminal_id)?;
+        super::creation::terminal_agent_session_info(terminal)
+    }
+
+    /// Emits `pane.agent_session_changed` when a session report left the pane
+    /// with a different session id. Repeated reports of one session emit nothing.
+    fn emit_pane_agent_session_changed(
+        &mut self,
+        pane_id: crate::layout::PaneId,
+        previous: Option<crate::api::schema::AgentSessionInfo>,
+    ) {
+        let Some(current) = self.pane_agent_session_info(pane_id) else {
+            return;
+        };
+        let previous_session_id = previous.map(|session| session.value);
+        if previous_session_id.as_deref() == Some(current.value.as_str()) {
+            return;
+        }
+        let Some((ws_idx, _)) = self.find_pane(pane_id) else {
+            return;
+        };
+        let Some(public_pane_id) = self.public_pane_id(ws_idx, pane_id) else {
+            return;
+        };
+        self.emit_event(crate::api::schema::EventEnvelope {
+            event: crate::api::schema::EventKind::PaneAgentSessionChanged,
+            data: crate::api::schema::EventData::PaneAgentSessionChanged {
+                pane_id: public_pane_id,
+                workspace_id: self.public_workspace_id(ws_idx),
+                agent: current.agent,
+                session_id: current.value,
+                previous_session_id,
+            },
+        });
     }
 
     pub(super) fn emit_event(&mut self, event: crate::api::schema::EventEnvelope) {
