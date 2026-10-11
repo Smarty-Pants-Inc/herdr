@@ -1,3 +1,4 @@
+pub(crate) mod agent_channel;
 pub mod client;
 mod event_hub;
 pub mod schema;

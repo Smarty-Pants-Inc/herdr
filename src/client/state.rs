@@ -578,13 +578,27 @@ impl ClientState {
         writer: &mut impl io::Write,
         frame_data: impl Into<frame_output::ComposedFrame>,
     ) -> bool {
+        let frame_output::ComposedFrame {
+            frame: frame_data,
+            graphics,
+            graphics_delivery,
+        } = frame_data.into();
+        let presented = self.write_presented_frame(writer, frame_data, graphics);
+        if let Some(shell) = self.shell.as_mut() {
+            shell.finish_graphics_delivery(graphics_delivery, presented);
+        }
+        presented
+    }
+
+    fn write_presented_frame(
+        &mut self,
+        writer: &mut impl io::Write,
+        mut frame_data: crate::protocol::FrameData,
+        graphics: crate::kitty_graphics::GraphicsOutput,
+    ) -> bool {
         if self.presentation_frozen {
             return false;
         }
-        let frame_output::ComposedFrame {
-            frame: mut frame_data,
-            graphics,
-        } = frame_data.into();
         // With capture enabled, host OSC 8 can intercept Ctrl-click before plugins.
         // Keep semantic links internally and restore native links when capture is off.
         if self.shell_mouse_capture_preference {
@@ -615,6 +629,37 @@ impl ClientState {
 #[cfg(all(test, unix))]
 mod native_cleanup_tests {
     use super::*;
+
+    #[test]
+    fn failed_frame_write_keeps_fresh_image_upload_for_successful_retry() {
+        struct Broken;
+        impl io::Write for Broken {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::Error::other("terminal write failure"))
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let uploads = shell::ClientShellState::test_uploads_image;
+        let mut state = ClientState::test_new();
+        state.kitty_graphics_enabled = true;
+        state.shell = Some(shell::ClientShellState::test_with_fresh_image());
+        let compose =
+            |state: &mut ClientState| state.shell.as_mut().unwrap().compose(106, 20).unwrap();
+
+        let failed = compose(&mut state);
+        assert!(uploads(&failed));
+        assert!(!state.try_present_frame_to(&mut Broken, failed));
+
+        let retry = compose(&mut state);
+        assert!(uploads(&retry), "retry must upload the missing pixels");
+        assert!(state.try_present_frame_to(&mut Vec::new(), retry));
+
+        let steady = compose(&mut state);
+        assert!(!uploads(&steady), "a presented upload is not repeated");
+    }
 
     #[test]
     fn direct_graphics_same_id_replacement_flush_failure_retains_cleanup() {

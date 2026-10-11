@@ -239,6 +239,12 @@ impl ClientControlWriter {
     pub(crate) fn send(&self, data: Vec<u8>) -> Result<(), SendError<Vec<u8>>> {
         self.queue.send_control(data)
     }
+
+    /// Queues a health response. A probe that arrives while one response is
+    /// still unread is coalesced: clients only need one pong per probe window.
+    fn send_health(&self, data: Vec<u8>) -> Result<(), SendError<Vec<u8>>> {
+        self.queue.send_health(data)
+    }
 }
 
 impl ClientRenderWriter {
@@ -264,15 +270,24 @@ impl ClientRenderWriter {
     }
 }
 
+/// Unread control bytes that close a client writer. Healthy clients drain
+/// control frames promptly; this only stops a client that never reads.
+const MAX_CONTROL_QUEUE_BYTES: usize = 4 * MAX_GRAPHICS_FRAME_SIZE;
+
 #[derive(Debug)]
 struct ClientWriterQueue {
     state: Mutex<ClientWriterQueueState>,
     ready: Condvar,
+    control_limit: usize,
+    #[cfg(any(unix, windows))]
+    overflow_stream: std::sync::OnceLock<LocalStream>,
 }
 
 #[derive(Debug, Default)]
 struct ClientWriterQueueState {
     control: VecDeque<Vec<u8>>,
+    control_bytes: usize,
+    health: Option<Vec<u8>>,
     ordered: VecDeque<Vec<u8>>,
     render: Option<Vec<u8>>,
     senders: usize,
@@ -287,12 +302,26 @@ enum ClientWriteItem {
 
 impl ClientWriterQueue {
     fn new() -> Arc<Self> {
+        Self::with_control_limit(MAX_CONTROL_QUEUE_BYTES)
+    }
+
+    /// Lets an overflow end the connection even while the writer thread is
+    /// blocked writing to a client that stopped reading.
+    #[cfg(any(unix, windows))]
+    fn set_overflow_stream(&self, stream: LocalStream) {
+        let _ = self.overflow_stream.set(stream);
+    }
+
+    fn with_control_limit(control_limit: usize) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(ClientWriterQueueState {
                 writer_alive: true,
                 ..ClientWriterQueueState::default()
             }),
             ready: Condvar::new(),
+            control_limit,
+            #[cfg(any(unix, windows))]
+            overflow_stream: std::sync::OnceLock::new(),
         })
     }
 
@@ -312,8 +341,33 @@ impl ClientWriterQueue {
         if !state.writer_alive {
             return Err(SendError(data));
         }
+        let bytes = state.control_bytes.saturating_add(data.len());
+        if bytes > self.control_limit {
+            warn!(bytes, "client control queue overflow, closing writer");
+            Self::close_state(&mut state);
+            drop(state);
+            self.ready.notify_all();
+            #[cfg(any(unix, windows))]
+            if let Some(stream) = self.overflow_stream.get() {
+                let _ = crate::platform::shutdown_client_stream(stream);
+            }
+            return Err(SendError(data));
+        }
+        state.control_bytes = bytes;
         state.control.push_back(data);
         self.ready.notify_one();
+        Ok(())
+    }
+
+    fn send_health(&self, data: Vec<u8>) -> Result<(), SendError<Vec<u8>>> {
+        let mut state = self.lock_state();
+        if !state.writer_alive {
+            return Err(SendError(data));
+        }
+        if state.health.is_none() {
+            state.health = Some(data);
+            self.ready.notify_one();
+        }
         Ok(())
     }
 
@@ -356,7 +410,14 @@ impl ClientWriterQueue {
     fn recv(&self) -> Option<ClientWriteItem> {
         let mut state = self.lock_state();
         loop {
+            if !state.writer_alive {
+                return None;
+            }
             if let Some(data) = state.control.pop_front() {
+                state.control_bytes = state.control_bytes.saturating_sub(data.len());
+                return Some(ClientWriteItem::Control(data));
+            }
+            if let Some(data) = state.health.take() {
                 return Some(ClientWriteItem::Control(data));
             }
             if let Some(data) = state.ordered.pop_front() {
@@ -377,11 +438,17 @@ impl ClientWriterQueue {
     }
 
     fn close_writer(&self) {
-        let mut state = self.lock_state();
+        Self::close_state(&mut self.lock_state());
+        self.ready.notify_all();
+    }
+
+    fn close_state(state: &mut ClientWriterQueueState) {
         state.writer_alive = false;
+        state.control.clear();
+        state.control_bytes = 0;
+        state.health = None;
         state.render = None;
         state.ordered.clear();
-        self.ready.notify_all();
     }
 
     fn lock_state(&self) -> std::sync::MutexGuard<'_, ClientWriterQueueState> {
@@ -886,6 +953,8 @@ pub(crate) fn handle_client_handshake(
 
     // Spawn a writer thread that forwards messages from the channels to the stream.
     let write_stream = stream.try_clone()?;
+    #[cfg(any(unix, windows))]
+    writer_queue.set_overflow_stream(stream.try_clone()?);
     let writer_event_tx = server_event_tx.clone();
     crate::thread_spawn::spawn_named("herdr-client-writer", move || {
         client_writer_loop(write_stream, client_id, writer_queue, writer_event_tx);
@@ -1007,11 +1076,32 @@ fn client_writer_loop(
     debug!("client writer thread exiting");
 }
 
+#[cfg(test)]
+thread_local! {
+    // Optional, writer-thread-local observer: no other connection/test can
+    // advance this counter. Odd means the transport write has not returned.
+    static TEST_CLIENT_WRITE_PROGRESS: std::cell::RefCell<Option<Arc<std::sync::atomic::AtomicUsize>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn record_client_write_progress_for_test() {
+    TEST_CLIENT_WRITE_PROGRESS.with(|progress| {
+        if let Some(progress) = &*progress.borrow() {
+            progress.fetch_add(1, Ordering::Release);
+        }
+    });
+}
+
 fn write_framed_bytes(stream: &mut LocalStream, data: &[u8]) -> bool {
+    #[cfg(test)]
+    record_client_write_progress_for_test();
     #[cfg(unix)]
     let result = crate::platform::write_client_stream(stream, data);
     #[cfg(windows)]
     let result = stream.write_all(data);
+    #[cfg(test)]
+    record_client_write_progress_for_test();
     if let Err(err) = result {
         debug!(err = %err, "client write failed, closing writer");
         return false;
@@ -1407,7 +1497,7 @@ fn client_read_loop_with_endpoint_controls(
                 };
                 let mut framed = Vec::new();
                 if protocol::write_message(&mut framed, &response).is_err()
-                    || writer.send(framed).is_err()
+                    || writer.send_health(framed).is_err()
                 {
                     break;
                 }
@@ -2179,6 +2269,175 @@ mod tests {
             .expect("read thread join")
             .expect("read thread result");
         assert!(server_event_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn health_ping_flood_coalesces_pongs_and_keeps_shutdown_first() {
+        let (mut client_stream, server_stream, _path) = local_stream_pair("client-health-flood");
+        let (writer, queue) = test_queue_writer();
+        let control = writer.control.clone();
+        let (server_event_tx, mut server_event_rx) = mpsc::channel(4);
+        let should_quit = Arc::new(AtomicBool::new(false));
+        let read_quit = should_quit.clone();
+        let handle = std::thread::spawn(move || {
+            client_read_loop_with_endpoint_controls(
+                server_stream,
+                7,
+                &server_event_tx,
+                &read_quit,
+                Some(&control),
+            )
+        });
+
+        // The client floods probes and never reads the echoed responses.
+        for n in 0..1000 {
+            protocol::write_message(
+                &mut client_stream,
+                &ClientMessage::EndpointControl {
+                    kind: crate::protocol::endpoint::HEALTH_PING_KIND.into(),
+                    data: format!("probe-{n}"),
+                },
+            )
+            .unwrap();
+        }
+        protocol::write_message(&mut client_stream, &ClientMessage::Detach).unwrap();
+        assert!(matches!(
+            recv_server_event(&mut server_event_rx, "detach after health flood"),
+            ServerEvent::ClientDetach { client_id: 7 }
+        ));
+        handle
+            .join()
+            .expect("read thread join")
+            .expect("read thread result");
+
+        let shutdown = frame_server_message(&ServerMessage::ServerShutdown { reason: None });
+        writer
+            .control
+            .send(shutdown.clone())
+            .expect("shutdown still queues");
+        drop(writer);
+        let mut queued = Vec::new();
+        while let Some(item) = queue.recv() {
+            queued.push(item);
+        }
+        assert!(queued.len() <= 2, "queued {} frames", queued.len());
+        assert_eq!(queued.first(), Some(&ClientWriteItem::Control(shutdown)));
+        assert_eq!(
+            queued.len(),
+            2,
+            "one coalesced pong still answers the probe"
+        );
+    }
+
+    #[test]
+    fn control_queue_overflow_closes_the_writer() {
+        let queue = ClientWriterQueue::with_control_limit(8);
+        let control = ClientControlWriter::queue(queue.clone());
+        control.send(vec![0; 4]).expect("within bound");
+        assert_eq!(queue.recv(), Some(ClientWriteItem::Control(vec![0; 4])));
+        control
+            .send(vec![1; 8])
+            .expect("drained bytes free the bound");
+        assert!(control.send(vec![2]).is_err(), "overflow must fail");
+        assert!(
+            control.send(vec![3]).is_err(),
+            "overflowed writer stays closed"
+        );
+        assert_eq!(queue.recv(), None, "writer thread stops after overflow");
+    }
+
+    // herdr#189 accepts cancelling a blocked Windows named-pipe write as a
+    // follow-up; only bounded memory and dropping the client are guaranteed there.
+    // The cross-platform control_queue_overflow_closes_the_writer test covers the bound.
+    #[cfg(unix)]
+    #[test]
+    fn control_overflow_unblocks_a_writer_stuck_on_a_non_reading_client() {
+        let (mut client_stream, server_stream, capacity) =
+            crate::platform::blocked_client_stream_pair_for_test().unwrap();
+        let probe_stream = server_stream.try_clone().unwrap();
+        assert!(!crate::platform::client_stream_buffer_full_for_test(
+            &client_stream,
+            &probe_stream,
+            capacity,
+        )
+        .unwrap());
+        let queue = ClientWriterQueue::with_control_limit(1 << 20);
+        queue.set_overflow_stream(server_stream.try_clone().unwrap());
+        let control = ClientControlWriter::queue(queue.clone());
+        let (server_event_tx, mut server_event_rx) = mpsc::channel(4);
+        // The server read loop is blocked too: this client never sends anything.
+        let read_stream = server_stream.try_clone().unwrap();
+        let read_events = server_event_tx.clone();
+        let (read_tx, read_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let quit = Arc::new(AtomicBool::new(false));
+            let _ = client_read_loop(read_stream, 8, &read_events, &quit);
+            let _ = read_tx.send(());
+        });
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let writer_queue = queue.clone();
+        let write_progress = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let writer_progress = write_progress.clone();
+        std::thread::spawn(move || {
+            TEST_CLIENT_WRITE_PROGRESS.with(|progress| {
+                *progress.borrow_mut() = Some(writer_progress);
+            });
+            client_writer_loop(server_stream, 9, writer_queue, server_event_tx);
+            let _ = done_tx.send(());
+        });
+
+        // Only ONE frame is sent to this fresh stream. A full kernel buffer
+        // therefore proves this write entered the transport, not merely that
+        // the writer popped a frame. It cannot return: the frame exceeds the
+        // configured capacity and the client never consumes any bytes.
+        let frame_len = 512 * 1024;
+        assert!(capacity < frame_len, "frame must exceed transport capacity");
+        control.send(vec![0; frame_len]).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let full = crate::platform::client_stream_buffer_full_for_test(
+                &client_stream,
+                &probe_stream,
+                capacity,
+            )
+            .unwrap();
+            if full && write_progress.load(Ordering::Acquire) == 1 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the first write must enter the transport and fill its buffer before overflow"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(done_rx.try_recv().is_err(), "the write has not returned");
+        assert!(
+            control.send(vec![0; (1 << 20) + 1]).is_err(),
+            "unread control bytes must overflow"
+        );
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("overflow unblocks the writer thread");
+        assert_eq!(write_progress.load(Ordering::Acquire), 2, "write returned");
+        // Keep the write-failure assertion as well as the kernel-full and
+        // in-flight preconditions; the reader's distinct ID cannot satisfy it.
+        let mut write_failed = false;
+        while let Ok(event) = server_event_rx.try_recv() {
+            write_failed |= matches!(event, ServerEvent::ClientDisconnected { client_id: 9 });
+        }
+        assert!(write_failed, "overflow must cancel the pending write");
+        read_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("overflow ends the server read loop");
+        // The client sees the connection end (end of stream or a pipe error).
+        let (end_tx, end_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut sink = Vec::new();
+            let _ = end_tx.send(io::Read::read_to_end(&mut client_stream, &mut sink));
+        });
+        let _end_of_stream_or_pipe_error = end_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("overflow ends the connection");
     }
 
     #[test]

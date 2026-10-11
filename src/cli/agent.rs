@@ -6,6 +6,10 @@ use crate::api::schema::{
     ErrorResponse, Method, PaneProcessInfoParams, PaneTarget, ReadFormat, ReadSource, Request,
 };
 
+mod channel;
+
+pub(crate) use channel::literal_slots as agent_channel_literal_slots;
+
 const AGENT_START_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const PANE_SHELL_READINESS_RETRY_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -18,6 +22,8 @@ pub(super) fn run_agent_command(args: &[String]) -> std::io::Result<i32> {
     match subcommand {
         "list" => agent_list(&args[1..]),
         "get" => agent_get(&args[1..]),
+        "channel-info" => channel::channel_info(&args[1..]),
+        "prompt-guarded" => channel::prompt_guarded(&args[1..]),
         "read" => agent_read(&args[1..]),
         "send-keys" => agent_send_keys(&args[1..]),
         "prompt" => agent_prompt(&args[1..]),
@@ -883,7 +889,9 @@ fn agent_send_keys(args: &[String]) -> std::io::Result<i32> {
 
 fn agent_read(args: &[String]) -> std::io::Result<i32> {
     let Some(target) = args.first() else {
-        eprintln!("usage: herdr agent read <target> [--source visible|recent|recent-unwrapped] [--lines N] [--format text|ansi] [--ansi]");
+        eprintln!(
+            "usage: herdr agent read <target> [--source visible|recent|recent-unwrapped] [--lines N] [--format text|ansi] [--ansi]"
+        );
         return Ok(2);
     };
 
@@ -949,9 +957,17 @@ fn print_agent_help() {
     eprintln!("herdr agent commands:");
     eprintln!("  herdr agent list");
     eprintln!("  herdr agent get <target>");
-    eprintln!("  herdr agent read <target> [--source visible|recent|recent-unwrapped|detection] [--lines N] [--format text|ansi] [--ansi]");
+    eprintln!("  herdr agent channel-info <target>");
+    eprintln!(
+        "  herdr agent prompt-guarded <target> <text> --expected-terminal TERMINAL_ID --expected-registration-epoch EPOCH --request-id ID [--timeout-ms MS] [--allow-cross-pane]"
+    );
+    eprintln!(
+        "  herdr agent read <target> [--source visible|recent|recent-unwrapped|detection] [--lines N] [--format text|ansi] [--ansi]"
+    );
     eprintln!("  herdr agent send-keys <target> [--allow-cross-pane] <key> [key ...]");
-    eprintln!("  herdr agent prompt <target> <text> [--wait] [--until STATUS]... [--timeout MS] [--allow-cross-pane]");
+    eprintln!(
+        "  herdr agent prompt <target> <text> [--wait] [--until STATUS]... [--timeout MS] [--allow-cross-pane]"
+    );
     eprintln!("  herdr agent rename <target> <name>|--clear");
     eprintln!("  herdr agent focus <target>");
     eprintln!("  herdr agent wait <target> [--until STATUS]... [--timeout MS]");
@@ -964,6 +980,9 @@ fn print_agent_help() {
         "  herdr agent explain --file PATH --agent LABEL [--json|--format text|json] [--verbose]"
     );
     eprintln!("  targets accept unique agent names and pane ids that currently host agents");
+    eprintln!(
+        "  channel-info and prompt-guarded also accept terminal targets without agent detection"
+    );
     eprintln!("  kinds: {}", super::spec::agent_kind_values().join("|"));
 }
 
