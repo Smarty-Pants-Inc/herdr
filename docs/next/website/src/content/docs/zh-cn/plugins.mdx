@@ -243,8 +243,11 @@ Herdr 恢复会话且 API socket 就绪后,会为每个已启用插件运行一�
 同步或删除其中的内容。文件格式和生命周期归插件所有。
 
 `HERDR_PLUGIN_CONTEXT_JSON` 在本次调用可用时,可以包含工作区、标签页、
-聚焦窗格、worktree、智能体、选中文本、点击的 URL 和链接处理器字段。
-shell 插件可以从各个环境变量读取常用 id,或解析上下文 JSON 获取完整结构。
+调用窗格、worktree、智能体、选中文本、点击的 URL 和链接处理器字段。
+现有的 `focused_pane_*` 字段表示调用窗格,而不是 UI 焦点。窗格动作和链接
+处理器接收该窗格的 id、cwd 和智能体。全局动作不接收窗格字段,也不会隐式
+接收聚焦工作区的上下文。shell 插件可以从各个环境变量读取常用 id,
+或解析上下文 JSON 获取完整结构。
 
 当插件需要从 Node、PowerShell、Bash 或其他运行时可移植地调用 Herdr 时,
 使用 `HERDR_BIN_PATH`。`HERDR_SOCKET_PATH` 背后的原始 socket 传输是

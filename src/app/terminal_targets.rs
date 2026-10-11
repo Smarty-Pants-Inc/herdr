@@ -255,6 +255,36 @@ impl App {
         }
     }
 
+    /// The pane a public API caller is invoking from, derived only from its
+    /// accept-time pinned peer identity and live pane ancestry, under the same
+    /// marker policy as the input guard. Request fields, inherited
+    /// `HERDR_PANE_ID` text and request ids are never authority. Unknown,
+    /// stale, outside or broken peers have no invoker (fail closed), and this
+    /// never falls back to UI focus.
+    pub(crate) fn trusted_invoking_pane(
+        &self,
+        context: crate::api::ApiRequestContext,
+    ) -> Option<TerminalTarget> {
+        let peer = context.local_peer_identity?;
+        let allow_outside_proof = match context.local_peer_pane_origin {
+            crate::platform::PeerPaneOrigin::Unknown => {
+                // Same as the input guard: only Darwin's positive live
+                // known-agent recovery attributes an unobservable peer.
+                #[cfg(target_os = "macos")]
+                if let InputOrigin::Agent(target) = self.input_origin_for_unknown_pane_origin(peer)
+                {
+                    return Some(target);
+                }
+                return None;
+            }
+            crate::platform::PeerPaneOrigin::Absent => true,
+            crate::platform::PeerPaneOrigin::HasPane => false,
+        };
+        self.checked_pane_target_for_peer_identity_with_outside_proof(peer, allow_outside_proof)
+            .ok()
+            .flatten()
+    }
+
     /// Darwin recovery for protected executables whose initial environment is
     /// unobservable: a live, checked pane link may still positively attribute a
     /// known agent. Never infer ordinary origin from this path.

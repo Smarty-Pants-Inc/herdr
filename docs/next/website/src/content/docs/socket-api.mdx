@@ -800,9 +800,15 @@ Invoke an action by its qualified id or bare action id:
 
 `plugin.action.invoke` resolves the manifest action, starts the manifest
 command, and returns the Herdr-built invocation context plus the started command
-log record. Missing context fields are filled from the active workspace, tab,
-focused pane, worktree provenance, and request id. Invoking an action from a
-disabled plugin returns a `plugin_disabled` error.
+log record. The invoking pane comes from Herdr's verified attribution of the
+calling process, not request IDs or UI focus. Herdr rebuilds its workspace, tab,
+cwd, agent, and worktree fields from that pane, even when no pane ID is supplied.
+For a pane-attributed caller, `context.focused_pane_id` is only a claim to validate:
+an ID that does not resolve to the caller's own pane returns `invoking_pane_mismatch`.
+An unattributed caller gets a global action regardless of any supplied pane ID,
+with no pane, workspace, or tab fields. Caller-supplied derived fields are ignored;
+invocation metadata remains available. Invoking an action from a disabled plugin
+returns a `plugin_disabled` error.
 
 Herdr injects `HERDR_SOCKET_PATH`, `HERDR_BIN_PATH`, `HERDR_ENV=1`,
 `HERDR_PLUGIN_ID`, `HERDR_PLUGIN_ROOT`, `HERDR_PLUGIN_CONFIG_DIR`,
