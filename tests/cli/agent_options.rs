@@ -161,6 +161,79 @@ fn agent_prompt_flag_text_before_an_option_stays_literal() {
     assert_ne!(request["params"]["allow_cross_pane"], true);
 }
 
+// smarty-dev#9677 review trace 3, as on master: without an opt-in the first two
+// argv are the literal TARGET and TEXT, so `--session=work` there is the TEXT
+// and selects no session, and `--wait --timeout 1000` stay options. A session
+// after TEXT is still applied.
+#[test]
+fn agent_prompt_global_in_the_text_slot_is_literal_text_as_on_master() {
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let app_dir = if cfg!(debug_assertions) {
+        "herdr-dev"
+    } else {
+        "herdr"
+    };
+    let session_dir = config_home.join(app_dir).join("sessions").join("work");
+    fs::create_dir_all(&session_dir).unwrap();
+    let default_socket = base.join("herdr.sock");
+    let session_socket = session_dir.join("herdr.sock");
+    let prompted = serde_json::json!({"result": {"type": "agent_prompted"}});
+    for (args, socket, text) in [
+        (
+            &[
+                "agent",
+                "prompt",
+                "w1:p1",
+                "--session=work",
+                "--wait",
+                "--timeout",
+                "1000",
+            ][..],
+            &default_socket,
+            "--session=work",
+        ),
+        (
+            &[
+                "agent",
+                "prompt",
+                "w1:p1",
+                "hi",
+                "--session=work",
+                "--wait",
+                "--timeout",
+                "1000",
+            ][..],
+            &session_socket,
+            "hi",
+        ),
+    ] {
+        let server = scripted_server(socket, prompted.clone());
+        let mut command = crate::test_command::herdr_command();
+        command
+            .args(args)
+            .env("HERDR_SOCKET_PATH", &default_socket)
+            .env("XDG_CONFIG_HOME", &config_home);
+        let output = command.output().unwrap();
+        let request = server.join().unwrap();
+        fs::remove_file(socket).unwrap();
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(request["method"], "agent.prompt", "{args:?}");
+        assert_eq!(request["params"]["target"], "w1:p1", "{args:?}");
+        assert_eq!(request["params"]["text"], text, "{args:?}");
+        assert_eq!(
+            request["params"]["wait"]["timeout_ms"], 1000,
+            "{args:?}: {request}"
+        );
+        assert_ne!(request["params"]["allow_cross_pane"], true, "{args:?}");
+    }
+    cleanup_test_base(&base);
+}
+
 // smarty-dev#9677 review trace 2: globals around a leading opt-in are applied
 // (--remote then refuses a subcommand), and TARGET is never shifted onto them.
 #[test]

@@ -48,16 +48,14 @@ pub(crate) fn extract_remote_args(
     let mut index = 1;
     while index < args.len() {
         let arg = &args[index];
-        // Like the session extractor, never look past a separator, even a
-        // literal one, so both agree with `agent prompt`'s argv classification.
-        if arg == "--" {
-            cleaned.extend_from_slice(&args[index..]);
-            break;
-        }
         if literal_slots.contains(&index) {
             cleaned.push(arg.clone());
             index += 1;
             continue;
+        }
+        if arg == "--" {
+            cleaned.extend_from_slice(&args[index..]);
+            break;
         }
         if arg == "--handoff" {
             live_handoff = true;
