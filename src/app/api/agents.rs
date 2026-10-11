@@ -88,6 +88,7 @@ impl App {
         if matches!(
             request.method,
             crate::api::schema::Method::AgentPromptGuarded(_)
+                | crate::api::schema::Method::AgentDraftState(_)
         ) {
             return self.handle_deferred_guarded_agent_prompt(request, context, respond_to);
         }
