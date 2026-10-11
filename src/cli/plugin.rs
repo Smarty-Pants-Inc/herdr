@@ -644,24 +644,30 @@ fn plugin_action_invoke(args: &[String]) -> std::io::Result<i32> {
     print_plugin_response(Method::PluginActionInvoke(PluginActionInvokeParams {
         action_id: action_id.clone(),
         plugin_id,
-        context: Some(PluginInvocationContext {
-            workspace_id: None,
-            workspace_label: None,
-            workspace_cwd: None,
-            worktree: None,
-            tab_id: None,
-            tab_label: None,
-            focused_pane_id: None,
-            focused_pane_cwd: None,
-            focused_pane_agent: None,
-            focused_pane_status: None,
-            selected_text: None,
-            invocation_source: Some("cli".into()),
-            correlation_id: None,
-            clicked_url: None,
-            link_handler_id: None,
-        }),
+        context: Some(cli_invocation_context(super::target::caller_pane_id())),
     }))
+}
+
+/// Run inside a pane, the CLI names that pane as the invoker and the server
+/// rebuilds and validates its context; outside a pane the action is global.
+fn cli_invocation_context(caller_pane_id: Option<String>) -> PluginInvocationContext {
+    PluginInvocationContext {
+        workspace_id: None,
+        workspace_label: None,
+        workspace_cwd: None,
+        worktree: None,
+        tab_id: None,
+        tab_label: None,
+        focused_pane_id: caller_pane_id,
+        focused_pane_cwd: None,
+        focused_pane_agent: None,
+        focused_pane_status: None,
+        selected_text: None,
+        invocation_source: Some("cli".into()),
+        correlation_id: None,
+        clicked_url: None,
+        link_handler_id: None,
+    }
 }
 
 fn run_plugin_pane_command(args: &[String]) -> std::io::Result<i32> {
@@ -1840,6 +1846,22 @@ fn print_plugin_pane_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cli_action_invocation_names_only_the_calling_pane() {
+        let inside = cli_invocation_context(Some("p_1_2".into()));
+        assert_eq!(inside.focused_pane_id.as_deref(), Some("p_1_2"));
+        assert_eq!(inside.invocation_source.as_deref(), Some("cli"));
+        let outside = cli_invocation_context(None);
+        assert_eq!(outside.focused_pane_id, None);
+        for context in [inside, outside] {
+            // Everything else is rebuilt by the server from the pane, if any.
+            assert_eq!(context.workspace_id, None);
+            assert_eq!(context.tab_id, None);
+            assert_eq!(context.focused_pane_cwd, None);
+            assert_eq!(context.focused_pane_agent, None);
+        }
+    }
 
     #[test]
     fn machine_plugin_connection_errors_never_use_local_offline_state() {
