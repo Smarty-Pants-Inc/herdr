@@ -3613,6 +3613,7 @@ command = ["show-ctx"]
         let caller = crate::api::ApiRequestContext {
             local_peer_identity: Some(peer),
             local_peer_pane_origin: crate::platform::PeerPaneOrigin::Absent,
+            plugin_action: crate::plugin_action_origin::PluginActionClaim::Absent,
         };
         let invoke = as_pane_a(peer, || {
             app.handle_api_request_with_context(request("invoke-context"), caller)
@@ -3825,6 +3826,7 @@ command = ["sh", "-c", 'printf "%s|%s|%s|%s" "${HERDR_PANE_ID-unset}" "${HERDR_W
         crate::api::ApiRequestContext {
             local_peer_identity: Some(fixture.a_peer),
             local_peer_pane_origin: crate::platform::PeerPaneOrigin::Absent,
+            plugin_action: crate::plugin_action_origin::PluginActionClaim::Absent,
         }
     }
 
@@ -3977,10 +3979,12 @@ command = ["sh", "-c", 'printf "%s|%s|%s|%s" "${HERDR_PANE_ID-unset}" "${HERDR_W
         let stale_peer = crate::api::ApiRequestContext {
             local_peer_identity: Some(stale),
             local_peer_pane_origin: crate::platform::PeerPaneOrigin::Absent,
+            plugin_action: crate::plugin_action_origin::PluginActionClaim::Absent,
         };
         let marked_unknown = crate::api::ApiRequestContext {
             local_peer_identity: Some(live),
             local_peer_pane_origin: crate::platform::PeerPaneOrigin::Unknown,
+            plugin_action: crate::plugin_action_origin::PluginActionClaim::Absent,
         };
         let mut cases = vec![
             ("global-none", None, outside, false),
@@ -5122,7 +5126,9 @@ command = ["act.exe"]
     /// herdr-8592: only a user action child receives a grant; hooks never do.
     /// The grant binds plugin/action/invoking pane and the log id, and is
     /// revoked when the recorded child exits even while a descendant still
-    /// holds its stdout/stderr pipes open.
+    /// holds its stdout/stderr pipes open. The invoking pane comes from the
+    /// caller's live peer attribution (pane A's own peer), and a valid grant
+    /// presented by an outside caller never lends it that invoking pane.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn action_grant_is_bound_and_revoked_at_child_exit_but_hooks_get_none() {
@@ -5155,13 +5161,21 @@ command = ["sh", "-c", 'printf %s "${HERDR_PLUGIN_ACTION_TOKEN-none}" > hook.tmp
         });
         assert_eq!(hook, "none", "startup hooks never receive a grant");
 
-        let invoke = fixture.app.handle_api_request(Request {
-            id: "invoke-hold".into(),
+        let hold_request = |id: &str| Request {
+            id: id.into(),
             method: Method::PluginActionInvoke(PluginActionInvokeParams {
                 plugin_id: Some("example.grant".into()),
                 action_id: "hold".into(),
                 context: Some(invoking_pane_context(&fixture.a_pane_public)),
             }),
+        };
+        // Pane A's own live peer: the invoker is derived from attribution.
+        let a_caller = a_peer_context(&fixture);
+        let a_peer = fixture.a_peer;
+        let invoke = as_pane_a(a_peer, || {
+            fixture
+                .app
+                .handle_api_request_with_context(hold_request("invoke-hold"), a_caller)
         });
         let ResponseResult::PluginActionInvoked { log, .. } = response_result(&invoke) else {
             panic!("expected plugin action invocation: {invoke}");
@@ -5190,6 +5204,51 @@ command = ["sh", "-c", 'printf %s "${HERDR_PLUGIN_ACTION_TOKEN-none}" > hook.tmp
         assert!(!format!("{grant:?}").contains(&hex));
         let logs = serde_json::to_string(&fixture.app.state.plugin_command_logs).unwrap();
         assert!(!logs.contains(&hex), "command log never records the token");
+
+        // A valid grant is not request authority: an outside caller (no peer)
+        // presenting A's live token while claiming pane A gets a global
+        // context, and the child it starts is not bound to any pane.
+        std::fs::remove_file(root.join("tok.txt")).unwrap();
+        let outside_with_token = crate::api::ApiRequestContext::default().with_plugin_action(claim);
+        let outside = as_pane_a(a_peer, || {
+            fixture
+                .app
+                .handle_api_request_with_context(hold_request("invoke-outside"), outside_with_token)
+        });
+        let ResponseResult::PluginActionInvoked {
+            context: outside_context,
+            ..
+        } = response_result(&outside)
+        else {
+            panic!("expected global plugin action invocation: {outside}");
+        };
+        assert_global_context(&outside_context);
+        let app = &mut fixture.app;
+        let outside_hex = read_capture_when_ready(&root.join("tok.txt"), || {
+            app.drain_all_internal_events();
+        });
+        assert_ne!(outside_hex, hex, "each action child gets its own grant");
+        let outside_grant = fixture
+            .app
+            .plugin_action_grants
+            .resolve(PluginActionClaim::Presented(
+                PluginActionToken::parse(&outside_hex).expect("token"),
+            ))
+            .expect("live grant")
+            .expect("granted");
+        assert_eq!(outside_grant.invoking_pane, None);
+        // The presented token still resolves to A's own unchanged grant.
+        assert_eq!(
+            fixture
+                .app
+                .plugin_action_grants
+                .resolve(claim)
+                .expect("live grant")
+                .expect("granted")
+                .invoking_pane
+                .as_deref(),
+            Some(fixture.a_pane_public.as_str())
+        );
 
         let released = std::time::Instant::now();
         std::fs::write(root.join("release"), b"").unwrap();
