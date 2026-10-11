@@ -5002,6 +5002,7 @@ fn unchanged_git_refresh_does_not_request_headless_render() {
     server.app.state.workspaces.push(workspace);
 
     let changed = server.handle_internal_event_with_forwarding(AppEvent::GitStatusRefreshed {
+        generation: 0,
         results: vec![crate::workspace::WorkspaceGitStatus {
             workspace_id,
             resolved_identity_cwd: cwd.clone(),
@@ -5060,6 +5061,7 @@ fn changed_git_refresh_requests_headless_render() {
     server.app.state.workspaces.push(workspace);
 
     let changed = server.handle_internal_event_with_forwarding(AppEvent::GitStatusRefreshed {
+        generation: 0,
         results: vec![crate::workspace::WorkspaceGitStatus {
             workspace_id,
             resolved_identity_cwd: cwd.clone(),
@@ -5074,6 +5076,48 @@ fn changed_git_refresh_requests_headless_render() {
     });
 
     assert!(changed);
+}
+
+#[test]
+fn stale_identity_git_refresh_is_not_forwarded_and_releases_worker() {
+    let mut server = test_headless_server();
+    let mut workspace = crate::workspace::Workspace::test_new("one");
+    workspace.cached_git_branch = Some("main".into());
+    let workspace_id = workspace.id.clone();
+    let cwd = workspace.identity_cwd.clone();
+    server.app.state.workspaces.push(workspace);
+    // Worker generation 1 is in flight when a newer identity request arrives.
+    server.app.git_refresh_generation = 1;
+    server.app.git_refresh_in_flight = true;
+    server.app.request_git_identity_refresh(Instant::now());
+    assert!(server.app.git_refresh_due_after_in_flight);
+
+    let changed = server.handle_internal_event_with_forwarding(AppEvent::GitStatusRefreshed {
+        generation: 1,
+        results: vec![crate::workspace::WorkspaceGitStatus {
+            workspace_id,
+            resolved_identity_cwd: cwd.clone(),
+            status_cache_key: cwd,
+            demand: crate::workspace::GitStatusRefreshDemand::ALL,
+            auto_label: "one".into(),
+            branch: None,
+            ahead_behind: None,
+            space: None,
+        }],
+        cache_updates: Vec::new(),
+    });
+
+    assert!(!changed);
+    assert_eq!(
+        server.app.state.workspaces[0].cached_git_branch.as_deref(),
+        Some("main")
+    );
+    assert!(!server.app.git_refresh_in_flight);
+    assert!(server.app.git_identity_refresh_requested);
+    assert!(server
+        .app
+        .git_refresh_deadline()
+        .is_some_and(|due| due <= Instant::now()));
 }
 
 #[tokio::test]

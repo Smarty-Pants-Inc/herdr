@@ -40,9 +40,10 @@ impl App {
                 false
             }
             AppEvent::GitStatusRefreshed {
+                generation,
                 results,
                 cache_updates,
-            } => self.handle_git_status_refreshed(results, cache_updates),
+            } => self.handle_git_status_refreshed(generation, results, cache_updates),
             AppEvent::TabBarCommandFinished {
                 generation,
                 segment_index,
@@ -71,10 +72,19 @@ impl App {
 
     fn handle_git_status_refreshed(
         &mut self,
+        generation: u64,
         results: Vec<crate::workspace::WorkspaceGitStatus>,
         cache_updates: Vec<(std::path::PathBuf, crate::workspace::GitStatusCacheEntry)>,
     ) -> bool {
         self.git_refresh_in_flight = false;
+        if generation < self.git_identity_refresh_floor {
+            // A newer identity request arrived after this worker started (for
+            // example HEAD restored while the worker saw it missing). Drop its
+            // workspace and cache results; only release the worker and run the
+            // pending newer refresh.
+            self.mark_git_status_refresh_due(Instant::now());
+            return false;
+        }
         for (key, entry) in cache_updates {
             self.git_status_cache.insert(key, entry);
         }
@@ -153,11 +163,12 @@ impl App {
         }
 
         if let AppEvent::GitStatusRefreshed {
+            generation,
             results,
             cache_updates,
         } = ev
         {
-            self.handle_git_status_refreshed(results, cache_updates);
+            self.handle_git_status_refreshed(generation, results, cache_updates);
             return Vec::new();
         }
 
