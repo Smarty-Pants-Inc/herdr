@@ -190,6 +190,8 @@ fn apply_pane_launch_env(cmd: &mut CommandBuilder, launch_env: &PaneLaunchEnv) {
     crate::platform::ssh_agent::apply_pane_env(cmd);
     // A new pane is not a child agent of the process that started the server.
     // Explicit launch env below can opt back into an intentional child session.
+    // Nor is it the plugin action child: an inherited action grant would make
+    // its ordinary CLI writes present a claim this server rejects.
     for key in [
         "CODEX_THREAD_ID",
         "OMPCODE",
@@ -197,6 +199,8 @@ fn apply_pane_launch_env(cmd: &mut CommandBuilder, launch_env: &PaneLaunchEnv) {
         "CLAUDE_CODE_CHILD_SESSION",
         "CLAUDE_CODE_SESSION_ID",
         "CLAUDE_CODE_MESSAGING_TOKEN",
+        crate::plugin_action_origin::TOKEN_ENV_VAR,
+        "HERDR_PLUGIN_ACTION_ID",
     ] {
         cmd.env_remove(key);
     }
@@ -4704,6 +4708,8 @@ mod tests {
             "CLAUDE_CODE_CHILD_SESSION",
             "CLAUDE_CODE_SESSION_ID",
             "CLAUDE_CODE_MESSAGING_TOKEN",
+            crate::plugin_action_origin::TOKEN_ENV_VAR,
+            "HERDR_PLUGIN_ACTION_ID",
         ];
         let mut cmd = CommandBuilder::new("shell");
         for key in keys {
@@ -4815,6 +4821,11 @@ mod tests {
             ("CLAUDE_CODE_SESSION_ID".into(), "intentional-child".into()),
             ("CLAUDE_CODE_MESSAGING_TOKEN".into(), "fake-token".into()),
             ("ITERM_SESSION_ID".into(), "intentional-host".into()),
+            (
+                crate::plugin_action_origin::TOKEN_ENV_VAR.into(),
+                "explicit-token".into(),
+            ),
+            ("HERDR_PLUGIN_ACTION_ID".into(), "explicit-action".into()),
         ];
         let mut cmd = CommandBuilder::new("shell");
         apply_pane_terminal_env(&mut cmd);
@@ -4823,6 +4834,21 @@ mod tests {
         for (key, value) in extra {
             assert_eq!(cmd.get_env(key), Some(OsStr::new(&value)));
         }
+    }
+
+    #[test]
+    fn pane_launch_env_explicit_plugin_action_vars_replace_inherited_ones() {
+        let token = crate::plugin_action_origin::TOKEN_ENV_VAR;
+        let mut cmd = CommandBuilder::new("shell");
+        cmd.env(token, "inherited-token");
+        cmd.env("HERDR_PLUGIN_ACTION_ID", "inherited-action");
+        apply_pane_launch_env(
+            &mut cmd,
+            &PaneLaunchEnv::from_extra(vec![(token.into(), "explicit-token".into())]),
+        );
+
+        assert_eq!(cmd.get_env(token), Some(OsStr::new("explicit-token")));
+        assert!(cmd.get_env("HERDR_PLUGIN_ACTION_ID").is_none());
     }
 
     #[tokio::test]
