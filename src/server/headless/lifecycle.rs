@@ -95,6 +95,8 @@ impl HeadlessServer {
             }
         }
 
+        // Channels/epochs are not handoff state. Revoke before any runtime transfer.
+        self.app.revoke_agent_channels();
         self.handoff_in_progress = true;
         self.disconnect_all_clients_for_handoff();
         let _ = reject_pending_client_connections(&self.client_listener);

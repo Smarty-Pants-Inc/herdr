@@ -1,0 +1,572 @@
+use crate::api::schema::{AgentChannelInfoParams, AgentPromptGuardedParams, Method, Request};
+
+const GUARDED_USAGE: &str = "usage: herdr agent prompt-guarded <target> <text> --expected-terminal TERMINAL_ID --expected-registration-epoch EPOCH --request-id ID [--timeout-ms MS] [--allow-cross-pane]";
+
+// These are command-owned values, not global launch options. Keep this list in
+// sync with the guarded parser so the session/remote extractors cannot consume
+// an opaque identity that happens to look like a global option.
+fn value_option(arg: &str) -> Option<&str> {
+    let name = arg.split_once('=').map_or(arg, |(name, _)| name);
+    matches!(
+        name,
+        "--expected-terminal" | "--expected-registration-epoch" | "--request-id" | "--timeout-ms"
+    )
+    .then_some(name)
+}
+
+fn skip_launch_options(args: &[String], mut index: usize) -> usize {
+    while let Some(arg) = args.get(index) {
+        match arg.as_str() {
+            "--session" | "--remote" | "--remote-keybindings" => index += 2,
+            "--handoff" => index += 1,
+            value
+                if value.starts_with("--session=")
+                    || value.starts_with("--remote=")
+                    || value.starts_with("--remote-keybindings=") =>
+            {
+                index += 1;
+            }
+            _ => break,
+        }
+    }
+    index
+}
+
+/// Locate literal command data before global session/remote extraction. This
+/// deliberately does not change extraction for unrelated command paths.
+pub(crate) fn literal_slots(args: &[String]) -> Vec<usize> {
+    let mut index = skip_launch_options(args, 1);
+    if args.get(index).map(String::as_str) != Some("agent") {
+        return Vec::new();
+    }
+    index = skip_launch_options(args, index + 1);
+    let Some(command) = args.get(index).map(String::as_str) else {
+        return Vec::new();
+    };
+    index += 1;
+    // Preserve the existing prompt parser's exact first-two-argv contract.
+    if command == "prompt" {
+        return (index..(index + 2).min(args.len())).collect();
+    }
+    let positional_count = match command {
+        "channel-info" => 1,
+        "prompt-guarded" => 2,
+        _ => return Vec::new(),
+    };
+    let mut slots = Vec::new();
+    let mut positionals = 0;
+    while let Some(arg) = args.get(index) {
+        if arg == "--" {
+            // Both global extractors preserve everything after the separator.
+            break;
+        }
+        // Once TARGET is present, the next argv is literal TEXT, even if it
+        // matches a known command option. Use -- to make a flag-shaped TARGET
+        // that matches one of the guarded options literal as well.
+        if positionals == 1 && positional_count == 2 {
+            slots.push(index);
+            positionals += 1;
+        } else if command == "prompt-guarded" && value_option(arg).is_some() {
+            if !arg.contains('=') && index + 1 < args.len() {
+                slots.push(index + 1);
+                index += 1;
+            }
+        } else if command == "prompt-guarded" && arg == "--allow-cross-pane" {
+            // This flag has no value.
+        } else if positionals < positional_count {
+            slots.push(index);
+            positionals += 1;
+        }
+        index += 1;
+    }
+    slots
+}
+
+fn parse_channel_info_args(args: &[String]) -> Result<AgentChannelInfoParams, i32> {
+    let target = match args {
+        [target] if target != "--" => target,
+        [separator, target] if separator == "--" => target,
+        _ => {
+            eprintln!("usage: herdr agent channel-info <target>");
+            return Err(2);
+        }
+    };
+    if target.is_empty() {
+        eprintln!("agent channel-info requires a nonempty target");
+        return Err(2);
+    }
+    Ok(AgentChannelInfoParams {
+        target: target.clone(),
+    })
+}
+
+pub(super) fn channel_info(args: &[String]) -> std::io::Result<i32> {
+    let params = match parse_channel_info_args(args) {
+        Ok(params) => params,
+        Err(code) => return Ok(code),
+    };
+    // Query the terminal directly; agent.get would incorrectly require agent
+    // detection and would hide an undetected terminal's missing channel.
+    super::super::print_response(&super::super::send_request(&Request {
+        id: "cli:agent:channel-info".into(),
+        method: Method::AgentChannelInfo(params),
+    })?)
+}
+
+fn parse_prompt_guarded_args(args: &[String]) -> Result<AgentPromptGuardedParams, i32> {
+    let mut target = None;
+    let mut text = None;
+    let mut expected_terminal = None;
+    let mut expected_registration_epoch = None;
+    let mut request_id = None;
+    let mut timeout_ms = None;
+    let mut allow_cross_pane = false;
+    let mut options_ended = false;
+    let mut index = 0;
+    while let Some(arg) = args.get(index) {
+        if target.is_some() && text.is_none() {
+            text = Some(arg.clone());
+        } else if !options_ended && arg == "--" {
+            options_ended = true;
+        } else if !options_ended && value_option(arg).is_some() {
+            let (option, value) = if let Some((option, value)) = arg.split_once('=') {
+                (option, value)
+            } else {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("missing value for {arg}");
+                    return Err(2);
+                };
+                index += 1;
+                (arg.as_str(), value.as_str())
+            };
+            if value.is_empty() {
+                eprintln!("{option} requires a nonempty value");
+                return Err(2);
+            }
+            let duplicate = match option {
+                "--expected-terminal" => expected_terminal.replace(value.to_owned()).is_some(),
+                "--expected-registration-epoch" => expected_registration_epoch
+                    .replace(value.to_owned())
+                    .is_some(),
+                "--request-id" => request_id.replace(value.to_owned()).is_some(),
+                "--timeout-ms" => {
+                    let Ok(value) = value.parse::<u64>() else {
+                        eprintln!("--timeout-ms must be an integer between 1 and 300000");
+                        return Err(2);
+                    };
+                    if !(1..=300_000).contains(&value) {
+                        eprintln!("--timeout-ms must be an integer between 1 and 300000");
+                        return Err(2);
+                    }
+                    timeout_ms.replace(value).is_some()
+                }
+                _ => unreachable!("value_option only returns known guarded options"),
+            };
+            if duplicate {
+                eprintln!("{option} may only be specified once");
+                return Err(2);
+            }
+        } else if !options_ended && arg == "--allow-cross-pane" {
+            allow_cross_pane = true;
+        } else if target.is_none() {
+            target = Some(arg.clone());
+        } else {
+            eprintln!("unknown option or extra argument: {arg}");
+            return Err(2);
+        }
+        index += 1;
+    }
+    let (
+        Some(target),
+        Some(text),
+        Some(expected_terminal),
+        Some(expected_registration_epoch),
+        Some(request_id),
+    ) = (
+        target,
+        text,
+        expected_terminal,
+        expected_registration_epoch,
+        request_id,
+    )
+    else {
+        eprintln!("{GUARDED_USAGE}");
+        return Err(2);
+    };
+    if target.is_empty() || text.is_empty() {
+        eprintln!("agent prompt-guarded requires a nonempty target and text");
+        return Err(2);
+    }
+    Ok(AgentPromptGuardedParams {
+        target,
+        text,
+        expected_terminal,
+        expected_registration_epoch,
+        request_id,
+        timeout_ms,
+        allow_cross_pane,
+    })
+}
+
+pub(super) fn prompt_guarded(args: &[String]) -> std::io::Result<i32> {
+    let params = match parse_prompt_guarded_args(args) {
+        Ok(params) => params,
+        Err(code) => return Ok(code),
+    };
+    // A distinct method fails closed on old/replaced servers. Never turn this
+    // into agent.prompt, PTY input, or an automatic retry after lost transport.
+    super::super::print_response(&super::super::send_request(&Request {
+        id: "cli:agent:prompt-guarded".into(),
+        method: Method::AgentPromptGuarded(params),
+    })?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    fn guarded_args(target: &str, text: &str) -> Vec<String> {
+        args(&[
+            target,
+            text,
+            "--expected-terminal",
+            "opaque:λ/42",
+            "--expected-registration-epoch",
+            "epoch=日本語",
+            "--request-id",
+            "caller:key",
+        ])
+    }
+
+    #[test]
+    fn guarded_preserves_literal_target_text_and_exact_pins() {
+        for target in ["w1:p2", "--session=target", "--remote", "--handoff"] {
+            for text in [
+                "--help",
+                "--",
+                "-h",
+                "--session=payload",
+                "--remote",
+                "--allow-cross-pane",
+                "--expected-terminal=payload",
+                "$(touch /tmp/not-run);\nλ 日本語",
+            ] {
+                let parsed = parse_prompt_guarded_args(&guarded_args(target, text)).unwrap();
+                assert_eq!(parsed.target, target);
+                assert_eq!(parsed.text, text);
+                assert_eq!(parsed.expected_terminal, "opaque:λ/42");
+                assert_eq!(parsed.expected_registration_epoch, "epoch=日本語");
+                assert_eq!(parsed.request_id, "caller:key");
+                assert_eq!(parsed.timeout_ms, None);
+                assert!(!parsed.allow_cross_pane);
+            }
+        }
+    }
+
+    #[test]
+    fn guarded_accepts_equals_options_and_option_first_separator() {
+        let parsed = parse_prompt_guarded_args(&args(&[
+            "--expected-terminal=term=opaque",
+            "--expected-registration-epoch=epoch=opaque",
+            "--request-id=req=opaque",
+            "--timeout-ms=300000",
+            "--allow-cross-pane",
+            "--",
+            "--expected-terminal",
+            "--session=literal",
+        ]))
+        .unwrap();
+        assert_eq!(parsed.target, "--expected-terminal");
+        assert_eq!(parsed.text, "--session=literal");
+        assert_eq!(parsed.expected_terminal, "term=opaque");
+        assert_eq!(parsed.expected_registration_epoch, "epoch=opaque");
+        assert_eq!(parsed.request_id, "req=opaque");
+        assert_eq!(parsed.timeout_ms, Some(300_000));
+        assert!(parsed.allow_cross_pane);
+    }
+
+    #[test]
+    fn guarded_requires_each_pin_and_rejects_duplicate_or_invalid_options() {
+        for option in [
+            "--expected-terminal",
+            "--expected-registration-epoch",
+            "--request-id",
+        ] {
+            let valid = guarded_args("worker", "text");
+            let mut missing = valid.clone();
+            let index = missing.iter().position(|value| value == option).unwrap();
+            missing.drain(index..index + 2);
+            assert!(parse_prompt_guarded_args(&missing).is_err());
+            let mut empty = valid.clone();
+            empty[index + 1].clear();
+            assert!(parse_prompt_guarded_args(&empty).is_err());
+            let mut duplicate = valid.clone();
+            duplicate.extend(args(&[option, "other"]));
+            assert!(parse_prompt_guarded_args(&duplicate).is_err());
+            let mut no_value = valid;
+            no_value.push(option.to_owned());
+            assert!(parse_prompt_guarded_args(&no_value).is_err());
+        }
+        for timeout in ["", "0", "300001", "-1", "many", "18446744073709551616"] {
+            let mut input = guarded_args("worker", "text");
+            input.extend(args(&["--timeout-ms", timeout]));
+            assert!(parse_prompt_guarded_args(&input).is_err(), "{timeout}");
+        }
+        for extra in ["--wait", "--timeout=1", "--bogus", "extra-text"] {
+            let mut input = guarded_args("worker", "text");
+            input.push(extra.to_owned());
+            assert!(parse_prompt_guarded_args(&input).is_err(), "{extra}");
+        }
+        assert!(parse_prompt_guarded_args(&guarded_args("", "text")).is_err());
+        assert!(parse_prompt_guarded_args(&guarded_args("worker", "")).is_err());
+    }
+
+    #[test]
+    fn guarded_separator_does_not_reenable_options() {
+        let mut input = args(&[
+            "--expected-terminal",
+            "term",
+            "--expected-registration-epoch",
+            "epoch",
+            "--request-id",
+            "request",
+            "--",
+            "worker",
+            "--timeout-ms=1",
+        ]);
+        let parsed = parse_prompt_guarded_args(&input).unwrap();
+        assert_eq!(parsed.text, "--timeout-ms=1");
+        assert_eq!(parsed.timeout_ms, None);
+        input.push("--allow-cross-pane".into());
+        assert!(parse_prompt_guarded_args(&input).is_err());
+    }
+
+    #[test]
+    fn channel_info_accepts_literal_terminal_target_without_agent_lookup() {
+        for target in [
+            "undetected-terminal",
+            "--session=literal",
+            "--remote",
+            "--handoff",
+        ] {
+            assert_eq!(
+                parse_channel_info_args(&args(&[target])).unwrap().target,
+                target
+            );
+            assert_eq!(
+                parse_channel_info_args(&args(&["--", target]))
+                    .unwrap()
+                    .target,
+                target
+            );
+        }
+        for invalid in [&[][..], &[""][..], &["--"][..], &["one", "two"][..]] {
+            assert!(parse_channel_info_args(&args(invalid)).is_err());
+        }
+    }
+
+    #[test]
+    fn channel_literals_survive_session_and_remote_extractors() {
+        let env = crate::environment::test_env();
+        env.remove(crate::session::SESSION_ENV_VAR);
+        for target in ["worker", "--session=target", "--remote=target", "--handoff"] {
+            for text in ["--session", "--session=payload", "--remote", "--handoff"] {
+                let mut input = args(&["herdr", "agent", "prompt-guarded"]);
+                input.extend(args(&[
+                    target,
+                    text,
+                    "--expected-terminal",
+                    "--session=terminal",
+                    "--expected-registration-epoch",
+                    "--session=epoch",
+                    "--request-id",
+                    "--session=request",
+                ]));
+                let cleaned = crate::session::configure_from_args(&input).unwrap();
+                assert_eq!(cleaned, input);
+                let (cleaned, remote) = crate::remote::extract_remote_args(&cleaned).unwrap();
+                assert_eq!(cleaned, input);
+                assert!(remote.is_none());
+                let parsed = parse_prompt_guarded_args(&cleaned[3..]).unwrap();
+                assert_eq!(parsed.target, target);
+                assert_eq!(parsed.text, text);
+                assert_eq!(parsed.expected_terminal, "--session=terminal");
+                assert_eq!(parsed.expected_registration_epoch, "--session=epoch");
+                assert_eq!(parsed.request_id, "--session=request");
+                assert_eq!(crate::session::active_name(), None);
+            }
+            let input = args(&["herdr", "agent", "channel-info", target]);
+            assert_eq!(crate::session::configure_from_args(&input).unwrap(), input);
+        }
+    }
+
+    #[test]
+    fn channel_literal_slots_cover_prefix_and_option_first_identity_values() {
+        let input = args(&[
+            "herdr",
+            "--session",
+            "server",
+            "agent",
+            "prompt-guarded",
+            "--expected-terminal",
+            "--session=terminal",
+            "--expected-registration-epoch",
+            "--remote=epoch",
+            "--request-id",
+            "--handoff",
+            "--allow-cross-pane",
+            "--session=target",
+            "--remote=text",
+        ]);
+        assert_eq!(literal_slots(&input), [6, 8, 10, 12, 13]);
+        for command in ["prompt", "prompt-guarded"] {
+            let input = args(&[
+                "herdr",
+                "agent",
+                command,
+                "--session=target",
+                "--remote=text",
+            ]);
+            assert_eq!(literal_slots(&input), [3, 4]);
+        }
+        assert!(literal_slots(&args(&["herdr", "pane", "run", "w1:p1", "text"])).is_empty());
+    }
+
+    fn command_with_mock_server(
+        command: &str,
+        leaf_args: &[String],
+        reply: serde_json::Value,
+    ) -> (i32, Vec<serde_json::Value>) {
+        use crate::api::client::{ApiClient, ConnectionTarget};
+        use interprocess::local_socket::traits::Listener as _;
+        use std::io::{BufRead, BufReader, Write};
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static NEXT_SOCKET: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "herdr-cli-channel-{}-{}.sock",
+            std::process::id(),
+            NEXT_SOCKET.fetch_add(1, Ordering::Relaxed)
+        ));
+        let listener = crate::ipc::bind_private_local_listener(&path).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for step in 0..2 {
+                let stream = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                let mut response = if step == 0 {
+                    assert_eq!(request["method"], "ping");
+                    serde_json::json!({"result": {
+                        "type": "pong", "version": "test", "protocol": crate::protocol::PROTOCOL_VERSION,
+                        "capabilities": null,
+                    }})
+                } else {
+                    reply.clone()
+                };
+                response["id"] = request["id"].clone();
+                writeln!(reader.get_mut(), "{response}").unwrap();
+                requests.push(request);
+            }
+            requests
+        });
+        let client = ApiClient::for_target(ConnectionTarget::SocketPath(path.clone()));
+        let mut command_args = args(&[command]);
+        command_args.extend_from_slice(leaf_args);
+        let exit_code = crate::cli::target::with_test_client(client, || {
+            super::super::run_agent_command(&command_args)
+        })
+        .unwrap();
+        let requests = server.join().unwrap();
+        // Named-pipe platforms do not create a filesystem socket.
+        let _ = std::fs::remove_file(path);
+        (exit_code, requests)
+    }
+
+    #[test]
+    fn channel_info_transport_queries_undetected_terminal_directly() {
+        let (code, requests) = command_with_mock_server(
+            "channel-info",
+            &args(&["undetected-terminal"]),
+            serde_json::json!({
+                "result": {"terminal_id": "undetected-terminal", "ready": false},
+            }),
+        );
+        assert_eq!(code, 0);
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1]["method"], "agent.channel_info");
+        assert_eq!(
+            requests[1]["params"],
+            serde_json::json!({"target": "undetected-terminal"})
+        );
+    }
+
+    #[test]
+    fn guarded_transport_carries_exact_pins_and_never_falls_back_or_retries() {
+        let mut input = guarded_args("worker", "--session=literal\n$(echo no-shell)");
+        input.extend(args(&["--timeout-ms", "1234", "--allow-cross-pane"]));
+        for error in [
+            "delivery_unknown",
+            "method_not_found",
+            "agent_prompt_rejected",
+        ] {
+            let (code, requests) = command_with_mock_server(
+                "prompt-guarded",
+                &input,
+                serde_json::json!({
+                    "error": {"code": error, "message": "not acknowledged"},
+                }),
+            );
+            assert_eq!(code, 1);
+            assert_eq!(requests.len(), 2);
+            assert_eq!(requests[1]["method"], "agent.prompt_guarded");
+            assert_eq!(
+                requests[1]["params"],
+                serde_json::json!({
+                    "target": "worker", "text": "--session=literal\n$(echo no-shell)",
+                    "expected_terminal": "opaque:λ/42", "expected_registration_epoch": "epoch=日本語",
+                    "request_id": "caller:key", "timeout_ms": 1234, "allow_cross_pane": true,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn channel_requests_serialize_as_distinct_flat_protocol_methods() {
+        let params =
+            parse_prompt_guarded_args(&guarded_args("worker", "--session=literal")).unwrap();
+        let request = Request {
+            id: "cli:agent:prompt-guarded".into(),
+            method: Method::AgentPromptGuarded(params),
+        };
+        let wire = serde_json::to_value(request).unwrap();
+        assert_eq!(wire["method"], "agent.prompt_guarded");
+        assert_eq!(wire["params"]["target"], "worker");
+        assert_eq!(wire["params"]["text"], "--session=literal");
+        assert_eq!(wire["params"]["expected_terminal"], "opaque:λ/42");
+        assert_eq!(
+            wire["params"]["expected_registration_epoch"],
+            "epoch=日本語"
+        );
+        assert_eq!(wire["params"]["request_id"], "caller:key");
+        assert!(wire["params"].get("prompt").is_none());
+        let request = Request {
+            id: "cli:agent:channel-info".into(),
+            method: Method::AgentChannelInfo(
+                parse_channel_info_args(&args(&["undetected-terminal"])).unwrap(),
+            ),
+        };
+        let wire = serde_json::to_value(request).unwrap();
+        assert_eq!(wire["method"], "agent.channel_info");
+        assert_eq!(
+            wire["params"],
+            serde_json::json!({"target": "undetected-terminal"})
+        );
+    }
+}
