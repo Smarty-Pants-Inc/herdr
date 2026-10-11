@@ -774,7 +774,48 @@ fn agent_rename(args: &[String]) -> std::io::Result<i32> {
     })?)
 }
 
+const ALLOW_CROSS_PANE: &str = "--allow-cross-pane";
+const PROMPT_POSITIONALS: usize = 2;
+
+/// Cross-pane opt-in rule for `agent prompt` (smarty-dev#9677): an argument
+/// exactly equal to `--allow-cross-pane` may appear anywhere in argv (before
+/// TARGET, between TARGET and TEXT, or after TEXT). It sets the opt-in and is
+/// removed before positional parsing, EXCEPT when removing it would leave fewer
+/// positionals than the two required (TARGET, TEXT). In that case it is the
+/// literal TARGET or TEXT, so `agent prompt <pane> --allow-cross-pane` still
+/// sends that text without the opt-in. After removal the first two remaining
+/// argv are TARGET and TEXT, literally, and every other option keeps its
+/// current position after them.
+///
+/// Returns, per argv entry, whether it is a removed opt-in.
+fn prompt_cross_pane_opt_ins(args: &[&str]) -> Vec<bool> {
+    let mut later_positionals = args.iter().filter(|arg| **arg != ALLOW_CROSS_PANE).count();
+    let mut kept = 0;
+    args.iter()
+        .map(|arg| {
+            if *arg == ALLOW_CROSS_PANE {
+                if kept + later_positionals >= PROMPT_POSITIONALS {
+                    return true;
+                }
+            } else {
+                later_positionals -= 1;
+            }
+            kept += 1;
+            false
+        })
+        .collect()
+}
+
 fn agent_prompt(args: &[String]) -> std::io::Result<i32> {
+    let as_str: Vec<&str> = args.iter().map(String::as_str).collect();
+    let opt_ins = prompt_cross_pane_opt_ins(&as_str);
+    let cross_pane_opt_in = opt_ins.contains(&true);
+    let args: Vec<String> = args
+        .iter()
+        .zip(&opt_ins)
+        .filter(|(_, removed)| !**removed)
+        .map(|(arg, _)| arg.clone())
+        .collect();
     let Some(target) = args.first() else {
         eprintln!(
             "usage: herdr agent prompt <target> <text> [--if-draft-empty | --wait [--until STATUS]... [--timeout MS]] [--allow-cross-pane]"
@@ -785,16 +826,14 @@ fn agent_prompt(args: &[String]) -> std::io::Result<i32> {
         eprintln!("agent prompt requires text");
         return Ok(2);
     };
-    // The first two argv remain literal target/text, including flag-shaped text.
+    // The first two remaining argv are literal target/text, including flag-shaped text.
     // Select the guarded route before parsing any legacy wait options so it can
     // never accidentally reach the typing path or turn-completion machinery.
     if args[2..].iter().any(|arg| arg == "--if-draft-empty") {
         let mut if_draft_empty = false;
-        let mut allow_cross_pane = false;
         for option in &args[2..] {
             match option.as_str() {
                 "--if-draft-empty" if !if_draft_empty => if_draft_empty = true,
-                "--allow-cross-pane" => allow_cross_pane = true,
                 _ => {
                     eprintln!(
                         "agent prompt --if-draft-empty only supports --allow-cross-pane; --wait, --until, --timeout, duplicate guards, and extra arguments are refused before sending"
@@ -803,12 +842,12 @@ fn agent_prompt(args: &[String]) -> std::io::Result<i32> {
                 }
             }
         }
-        return channel::prompt_if_draft_empty(target, text, allow_cross_pane);
+        return channel::prompt_if_draft_empty(target, text, cross_pane_opt_in);
     }
     let mut wait = false;
     let mut until = Vec::new();
     let mut timeout_ms = None;
-    let mut allow_cross_pane = false;
+    let allow_cross_pane = cross_pane_opt_in;
     let mut index = 2;
     while index < args.len() {
         match args[index].as_str() {
@@ -842,11 +881,6 @@ fn agent_prompt(args: &[String]) -> std::io::Result<i32> {
                 };
                 index += 2;
             }
-            "--allow-cross-pane" => {
-                allow_cross_pane = true;
-                index += 1;
-            }
-
             option => {
                 eprintln!("unknown option: {option}");
                 return Ok(2);
@@ -1027,12 +1061,35 @@ mod tests {
     fn send_keys_accepts_option_first_and_trailing_override() {
         for values in [
             &["--allow-cross-pane", "reviewer", "enter"][..],
+            &["reviewer", "--allow-cross-pane", "enter"][..],
             &["reviewer", "enter", "--allow-cross-pane"][..],
         ] {
             let params = parse_agent_send_keys_args(&args(values)).unwrap();
             assert_eq!(params.target, "reviewer");
             assert_eq!(params.keys, ["enter"]);
             assert!(params.allow_cross_pane);
+        }
+    }
+
+    #[test]
+    fn prompt_cross_pane_opt_in_is_removed_anywhere_unless_it_is_needed_as_text() {
+        const FLAG: &str = "--allow-cross-pane";
+        for (input, removed) in [
+            (&[FLAG, "w1:p2", "hi"][..], &[true, false, false][..]),
+            (&["w1:p2", FLAG, "hi"][..], &[false, true, false][..]),
+            (&["w1:p2", "hi", FLAG][..], &[false, false, true][..]),
+            (
+                &["w1:p2", "hi", FLAG, "--wait"][..],
+                &[false, false, true, false][..],
+            ),
+            // Too few positionals: the flag is literal TEXT (or TARGET).
+            (&["w1:p2", FLAG][..], &[false, false][..]),
+            (&[FLAG, "w1:p2"][..], &[false, false][..]),
+            (&[FLAG][..], &[false][..]),
+            // Only as many occurrences as needed stay literal.
+            (&["w1:p2", FLAG, FLAG][..], &[false, false, true][..]),
+        ] {
+            assert_eq!(prompt_cross_pane_opt_ins(input), removed, "{input:?}");
         }
     }
 

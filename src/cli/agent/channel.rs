@@ -46,9 +46,10 @@ pub(crate) fn literal_slots(args: &[String]) -> Vec<usize> {
         return Vec::new();
     };
     index += 1;
-    // Preserve the existing prompt parser's exact first-two-argv contract.
+    // Preserve the prompt parser's literal TARGET/TEXT contract: protect the
+    // first two argv that are not removed `--allow-cross-pane` opt-ins.
     if command == "prompt" {
-        return (index..(index + 2).min(args.len())).collect();
+        return prompt_literal_slots(args, index);
     }
     let positional_count = match command {
         "channel-info" | "draft-state" => 1,
@@ -85,6 +86,38 @@ pub(crate) fn literal_slots(args: &[String]) -> Vec<usize> {
         index += 1;
     }
     slots
+}
+
+/// Apply the `agent prompt` opt-in rule (`super::prompt_cross_pane_opt_ins`) to
+/// the argv the prompt parser will see once global launch options are
+/// extracted, then protect the first two argv that are not removed opt-ins.
+fn prompt_literal_slots(args: &[String], start: usize) -> Vec<usize> {
+    let mut visible = Vec::new();
+    let mut index = start;
+    while index < args.len() {
+        if args[index] == "--" {
+            // Extractors keep the separator and everything after it.
+            visible.extend(index..args.len());
+            break;
+        }
+        let next = skip_launch_options(args, index);
+        if next == index {
+            visible.push(index);
+            index += 1;
+        } else {
+            index = next;
+        }
+    }
+    let visible_args: Vec<&str> = visible.iter().map(|&i| args[i].as_str()).collect();
+    let removed: Vec<usize> = visible
+        .iter()
+        .zip(super::prompt_cross_pane_opt_ins(&visible_args))
+        .filter_map(|(&i, removed)| removed.then_some(i))
+        .collect();
+    (start..args.len())
+        .filter(|i| !removed.contains(i))
+        .take(super::PROMPT_POSITIONALS)
+        .collect()
 }
 
 fn parse_terminal_target(args: &[String], command: &str) -> Result<String, i32> {
@@ -804,6 +837,24 @@ mod tests {
             assert_eq!(literal_slots(&input), [3, 4]);
         }
         assert!(literal_slots(&args(&["herdr", "pane", "run", "w1:p1", "text"])).is_empty());
+    }
+
+    #[test]
+    fn prompt_literal_slots_skip_a_removed_cross_pane_opt_in() {
+        let prompt = |rest: &[&str]| {
+            let mut input = args(&["herdr", "--session", "s", "agent", "prompt"]);
+            input.extend(args(rest));
+            literal_slots(&input)
+        };
+        let flag = "--allow-cross-pane";
+        assert_eq!(prompt(&[flag, "--remote=t", "--session=x"]), [5, 6]);
+        assert_eq!(prompt(&[flag, "w1", "--remote=x", "hi"]), [6, 7]);
+        assert_eq!(prompt(&["w1", flag, "--session=x"]), [5, 6]);
+        assert_eq!(prompt(&["w1", flag, "hi", "--session", "y"]), [5, 7]);
+        assert_eq!(prompt(&["w1", "hi", flag]), [5, 6]);
+        // Global options extracted elsewhere do not count as TEXT, so the
+        // flag stays literal TEXT exactly as the prompt parser will see it.
+        assert_eq!(prompt(&["w1", flag, "--session", "y"]), [5, 6]);
     }
 
     fn command_with_mock_server(
