@@ -286,11 +286,12 @@ terminals it created. For example, an action can split a pane and then run a
 command in the new pane; `pane run` itself does not create a terminal.
 `--allow-cross-pane` remains a separate explicit override. The token is bound
 to one action on one server, expires after at most ten minutes, and stops
-authorizing input when the action process exits. If Herdr cannot issue a token
-because too many grants are still active, the action runs without one and
-follows the ordinary input rules. On cap exhaustion, a global action runs as
-an ordinary client, as before action tokens were introduced; those rules allow
-writes to existing panes. Startup and event hooks receive no action token.
+authorizing input when the action process exits. If Herdr cannot issue a
+security grant for a user-invoked action, because too many grants are still
+active, secure random generation is unavailable, or the invoking terminal
+cannot be bound, the action does not launch. This applies to global and pane
+actions alike. Herdr shows an error saying the action could not get a security
+grant; try again. Startup and event hooks receive no action token.
 Treat it as a secret: do not print it or include it in logs. Processes running as the
 same operating-system user may read each other's environment; this token is
 not an isolation boundary between those processes.
