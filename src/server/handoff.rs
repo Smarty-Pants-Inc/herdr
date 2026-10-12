@@ -758,8 +758,31 @@ pub(crate) fn wait_owned_ack(stream: &mut UnixStream) {
 
 #[cfg(unix)]
 pub(crate) fn receive(socket_path: &Path, token: &str) -> io::Result<ReceivedHandoff> {
+    // A push source is our spawning parent, named by the token.
     let expected_source = spawning_source_identity(token);
-    receive_on(UnixStream::connect(socket_path)?, token, expected_source)
+    receive_on(
+        UnixStream::connect(socket_path)?,
+        token,
+        ImportPath::Push { expected_source },
+    )
+}
+
+/// How this importer reached its source, which decides whether agent session
+/// ids may be carried across.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ImportPath {
+    /// The source spawned this importer and is proven as its live parent, so
+    /// there is continuity with the originally intended server from the start.
+    Push {
+        expected_source: Option<crate::platform::ProcessIdentity>,
+    },
+    /// The importer finds the source through its pid and API socket, sampled
+    /// only at the time of the pull. If the intended source exited, its pid was
+    /// reused and the socket path replaced before that, the replacement would
+    /// become the expected source; there is no earlier anchor, so a pull never
+    /// carries agent session ids.
+    Pull,
 }
 
 /// The server that spawned this import (push handoff): our live parent, whose
@@ -790,8 +813,16 @@ pub(crate) fn pull(
             "--import-from-running needs --expect-source-pid",
         ));
     };
-    // The named running server, pinned before it is asked to hand off.
-    let expected_source = crate::platform::process_identity(source_pid);
+    // Hardening: pin the inode of the exact API socket the request goes to;
+    // the source refuses unless it owns that socket and the public path still
+    // names it. It does not make agent session ids carriable: a pull drops
+    // them regardless (see `ImportPath::Pull`).
+    let client = crate::api::client::ApiClient::local();
+    if params.expected_socket_inode.is_none() {
+        params.expected_socket_inode = crate::ipc::socket_file_identity(&client.socket_path())
+            .ok()
+            .map(|identity| identity.inode());
+    }
     let token = format!(
         "pull-{}-{}",
         std::process::id(),
@@ -809,7 +840,7 @@ pub(crate) fn pull(
     // on its own thread; an early answer is an error before we could connect.
     let (answer_tx, answer) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let _ = answer_tx.send(crate::api::client::ApiClient::local().request_value(&request));
+        let _ = answer_tx.send(client.request_value(&request));
     });
     let socket_path = crate::session::data_dir().join(format!("herdr-handoff-{source_pid}.sock"));
     let deadline = std::time::Instant::now() + READY_TIMEOUT;
@@ -832,7 +863,7 @@ pub(crate) fn pull(
             // A leftover socket file from another handoff refuses the
             // connection; a live source listener with a stranger's token
             // fails validation, and the source rolls back.
-            return receive_on(stream, &token, expected_source);
+            return receive_on(stream, &token, ImportPath::Pull);
         }
         if std::time::Instant::now() >= deadline {
             return Err(io::Error::new(
@@ -848,13 +879,13 @@ pub(crate) fn pull(
 fn receive_on(
     mut stream: UnixStream,
     token: &str,
-    expected_source: Option<crate::platform::ProcessIdentity>,
+    path: ImportPath,
 ) -> io::Result<ReceivedHandoff> {
     // Pinned by the kernel at connect, before anything is read from the peer.
     let peer = crate::platform::proven_local_socket_peer_identity(stream.as_raw_fd());
     match receive_parts(&mut stream, token) {
         Ok((mut manifest, fds, report_bound_sockets)) => {
-            drop_unproven_agent_session_bindings(&mut manifest, peer, expected_source);
+            drop_unproven_agent_session_bindings(&mut manifest, peer, path);
             Ok(ReceivedHandoff {
                 manifest,
                 fds,
@@ -878,17 +909,24 @@ fn receive_on(
 
 /// The token authenticates this importer to the source, not the source to us:
 /// any same-user process could pose as the source. Agent session IDs are kept
-/// only when the kernel proves the peer is the expected source server instance;
-/// otherwise they are dropped and the rest of the handoff goes on.
+/// only on the push path, when the kernel proves the peer is the spawning
+/// source server instance; a pull never carries them. Otherwise they are
+/// dropped and the rest of the handoff goes on.
 #[cfg(unix)]
 fn drop_unproven_agent_session_bindings(
     manifest: &mut HandoffManifest,
     peer: Option<crate::platform::ProcessIdentity>,
-    expected_source: Option<crate::platform::ProcessIdentity>,
+    path: ImportPath,
 ) {
-    if peer.is_some() && peer == expected_source {
-        return;
-    }
+    let (reason, expected_source) = match path {
+        ImportPath::Pull => ("pull path does not carry them", None),
+        ImportPath::Push { expected_source } => {
+            if peer.is_some() && peer == expected_source {
+                return;
+            }
+            ("source unproven", expected_source)
+        }
+    };
     let dropped = manifest
         .panes
         .iter_mut()
@@ -899,7 +937,7 @@ fn drop_unproven_agent_session_bindings(
             dropped,
             peer_pid = ?peer.map(|peer| peer.pid),
             expected_source_pid = ?expected_source.map(|source| source.pid),
-            "dropped handoff agent session ids: source unproven"
+            "dropped handoff agent session ids: {reason}"
         );
     }
 }
@@ -1578,7 +1616,7 @@ mod tests {
     /// Imports from a fake source at the other end of a socketpair, which is
     /// this test process itself, and returns the imported panes.
     fn import_from_fake_source(
-        expected_source: Option<crate::platform::ProcessIdentity>,
+        path: ImportPath,
     ) -> Vec<crate::handoff_runtime::HandoffRuntimeState> {
         let (mut source, importer) = UnixStream::pair().unwrap();
         let manifest = manifest_with_agent_session_binding();
@@ -1593,7 +1631,7 @@ mod tests {
             send_fds(&source, &[pty.as_raw_fd()]).unwrap();
             source
         });
-        let received = receive_on(importer, "1-1", expected_source).expect("handoff received");
+        let received = receive_on(importer, "1-1", path).expect("handoff received");
         let _source = sender.join().unwrap();
         close_raw_fds(&received.fds);
         assert_eq!(received.fds.len(), 1);
@@ -1609,7 +1647,7 @@ mod tests {
         };
         let other_process = crate::platform::parent_process_identity(own);
         for expected_source in [None, Some(reused_pid), other_process] {
-            let panes = import_from_fake_source(expected_source);
+            let panes = import_from_fake_source(ImportPath::Push { expected_source });
             // The rest of the handoff is untouched.
             assert_eq!(panes.len(), 1);
             assert_eq!(panes[0].pane_id, 7);
@@ -1623,12 +1661,27 @@ mod tests {
     #[test]
     fn handoff_session_ids_from_the_proven_source_are_kept() {
         let own = crate::platform::process_identity(std::process::id()).expect("own identity");
-        let panes = import_from_fake_source(Some(own));
+        let panes = import_from_fake_source(ImportPath::Push {
+            expected_source: Some(own),
+        });
         // Only Linux pins the peer strongly enough; elsewhere it stays unproven.
         assert_eq!(
             panes[0].agent_session_binding.is_some(),
             cfg!(target_os = "linux")
         );
+    }
+
+    /// #252 review: a pull samples the source pid and socket only at the time
+    /// of the pull, with no earlier anchor to the intended server, so it drops
+    /// agent session ids even from the same kernel-proven peer whose ids the
+    /// push path keeps above.
+    #[test]
+    fn handoff_pull_session_ids_are_dropped_even_from_a_proven_peer() {
+        let panes = import_from_fake_source(ImportPath::Pull);
+        // The rest of the handoff is untouched.
+        assert_eq!(panes.len(), 1);
+        assert_eq!(panes[0].pane_id, 7);
+        assert!(panes[0].agent_session_binding.is_none());
     }
 
     #[test]
