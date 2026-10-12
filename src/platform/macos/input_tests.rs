@@ -94,7 +94,7 @@ fn start_request(pane_id: &str, argument: &str) -> Request {
             expected_terminal: None,
             args: vec!["resume".into(), argument.into()],
             timeout_ms: Some(10_000),
-            allow_cross_pane: false,
+            allow_cross_pane: true,
         }),
     }
 }
@@ -107,7 +107,7 @@ fn pane_request(pane_id: &str, text: &str) -> Request {
             expected_terminal: None,
             text: text.into(),
             keys: vec!["enter".into()],
-            allow_cross_pane: false,
+            allow_cross_pane: true,
         }),
     }
 }
