@@ -3125,6 +3125,8 @@ fn live_handoff_keeps_a_live_reporters_agent_session_id() {
         .collect();
     assert_eq!(drops.len(), 1, "{drops:?}");
     assert!(drops[0].contains("ReporterGone"), "{drops:?}");
+    // The spawning server is the proven source: its bindings were not dropped.
+    assert!(!log.contains("source unproven"), "{log}");
     thread::sleep(Duration::from_millis(300));
     assert!(
         !fs::read_to_string(&exited_prompts)

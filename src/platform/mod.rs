@@ -1746,6 +1746,21 @@ pub(crate) fn local_socket_peer_identity(fd: std::os::fd::RawFd) -> Option<Proce
     }
 }
 
+/// The process at the other end of `fd`, pinned strongly enough to trust data
+/// it sends: Linux's socket-bound pidfd, or SO_PEERCRED plus a start-time pin.
+/// Other platforms return `None`, so that data stays unproven.
+#[cfg(unix)]
+pub(crate) fn proven_local_socket_peer_identity(fd: std::os::fd::RawFd) -> Option<ProcessIdentity> {
+    #[cfg(target_os = "linux")]
+    return linux::local_socket_peer_identity_platform(fd);
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = fd;
+        None
+    }
+}
+
 /// Returns the PID connected to a Unix-domain socket when the platform exposes
 /// it. Unsupported or unavailable attribution deliberately returns `None`.
 #[cfg(all(unix, test))]
