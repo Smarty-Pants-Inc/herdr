@@ -2804,6 +2804,56 @@ fn live_handoff_bad_expected_protocol_rolls_back_old_server() {
     cleanup_test_base(&base);
 }
 
+#[test]
+fn live_handoff_version_mismatch_logs_import_rejection() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+
+    let spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    register_runtime_dir(&runtime_dir);
+
+    let failed = request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:bad-version-handoff",
+            "method": "server.live_handoff",
+            "params": {"expected_version": "0.0.0-mismatch"}
+        }),
+    );
+    assert!(
+        failed.get("error").is_some(),
+        "version-mismatched handoff should fail: {failed}"
+    );
+    wait_for_api(&api_socket, Duration::from_secs(5));
+
+    // The importer, not the source, knows why; it must log the reason.
+    let log = wait_for_file_contains(
+        &config_home.join("herdr-dev/herdr-server.log"),
+        "handoff import rejected",
+        Duration::from_secs(5),
+    );
+    let line = log
+        .lines()
+        .find(|line| line.contains("handoff import rejected"))
+        .unwrap();
+    eprintln!("rejection log line: {line}");
+    assert!(
+        line.contains("handoff expected herdr v0.0.0-mismatch, but this server is v"),
+        "rejection reason missing from log line: {line}"
+    );
+
+    let _ = request(
+        &api_socket,
+        serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
+    );
+    drop(spawned);
+    cleanup_test_base(&base);
+}
+
 fn live_handoff_import_failure_rolls_back_old_server_at(failure_point: &str) {
     let _lock = test_lock();
     let base = unique_test_dir();

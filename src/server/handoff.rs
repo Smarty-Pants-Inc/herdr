@@ -828,11 +828,32 @@ pub(crate) fn pull(
 
 #[cfg(unix)]
 fn receive_on(mut stream: UnixStream, token: &str) -> io::Result<ReceivedHandoff> {
+    match receive_parts(&mut stream, token) {
+        Ok((manifest, fds, report_bound_sockets)) => Ok(ReceivedHandoff {
+            manifest,
+            fds,
+            stream,
+            report_bound_sockets,
+        }),
+        Err(err) => {
+            // The source discards this process's stderr and kills it as soon
+            // as the stream closes, so log the reason before dropping it.
+            warn!(error = %err, "handoff import rejected");
+            Err(err)
+        }
+    }
+}
+
+#[cfg(unix)]
+fn receive_parts(
+    stream: &mut UnixStream,
+    token: &str,
+) -> io::Result<(HandoffManifest, Vec<RawFd>, bool)> {
     stream.write_all(token.as_bytes())?;
     stream.write_all(b"\n")?;
     stream.flush()?;
 
-    let manifest_line = read_line_unbuffered(&mut stream)?;
+    let manifest_line = read_line_unbuffered(&mut *stream)?;
     let manifest: HandoffManifest =
         serde_json::from_str(&manifest_line).map_err(io::Error::other)?;
     validate_manifest_version(&manifest)?;
@@ -864,13 +885,8 @@ fn receive_on(mut stream: UnixStream, token: &str) -> io::Result<ReceivedHandoff
         stream.write_all(b"validated\n")?;
     }
     stream.flush()?;
-    let fds = recv_fds(&stream, manifest.panes.len())?;
-    Ok(ReceivedHandoff {
-        manifest,
-        fds,
-        stream,
-        report_bound_sockets,
-    })
+    let fds = recv_fds(stream, manifest.panes.len())?;
+    Ok((manifest, fds, report_bound_sockets))
 }
 
 /// Debug builds let tests run a replacement that behaves like a build from
