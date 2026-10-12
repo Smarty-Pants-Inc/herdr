@@ -4565,6 +4565,79 @@ fn pull_import_takes_over_the_running_server_with_its_panes() {
     cleanup_test_base(&base);
 }
 
+/// Astra P3 on #252: a pull keeps a live reporter's agent session id only with
+/// the source's API socket inode pinned. Given just the source pid, the
+/// importer pins the inode of the socket it sends the request to itself.
+#[cfg(target_os = "linux")]
+#[test]
+fn pull_import_with_the_source_socket_pinned_keeps_agent_session_ids() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let mut spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    register_runtime_dir(&runtime_dir);
+    let source_pid = spawned.child.process_id().unwrap();
+    let created = request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:workspace:create",
+            "method": "workspace.create",
+            "params": {"cwd": "/tmp", "focus": true}
+        }),
+    );
+    let pane = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (session_id, prompts) = start_reporting_pi(&base, &api_socket, &pane, "pulled", true);
+    wait_for_pane(&base, &api_socket, &pane, "before the pull", |got| {
+        got["agent"] == "pi" && got["agent_session_id"] == session_id.as_str()
+    });
+
+    let mut importer = spawn_pull_importer(
+        &base,
+        &api_socket,
+        &["--expect-source-pid".into(), source_pid.to_string()],
+        &[],
+    );
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while spawned.child.try_wait().unwrap().is_none() {
+        assert!(Instant::now() < deadline, "source server did not hand over");
+        thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        importer.0.try_wait().unwrap().is_none(),
+        "importer exited: {}",
+        stderr_of(&mut importer.0)
+    );
+    wait_for_api(&api_socket, Duration::from_secs(5));
+
+    // The same id, with no new report, and the #211 guard still accepts it.
+    let pulled = pane_get(&base, &api_socket, &pane);
+    assert_eq!(pulled["agent_session_id"], session_id.as_str(), "{pulled}");
+    let after = guarded_prompt(&base, &api_socket, &pane, "after-pull", &session_id);
+    assert!(
+        after.status.success(),
+        "guarded prompt after the pull: {}",
+        String::from_utf8_lossy(&after.stderr)
+    );
+    wait_for_file_contains(&prompts, "after-pull", Duration::from_secs(10));
+    let log =
+        fs::read_to_string(config_home.join("herdr-dev/herdr-server.log")).unwrap_or_default();
+    assert!(!log.contains("dropped handoff agent session ids"), "{log}");
+
+    let _ = request(
+        &api_socket,
+        serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
+    );
+    assert!(wait_for_exit(&mut importer.0, Duration::from_secs(10)).success());
+    drop(spawned);
+    cleanup_test_base(&base);
+}
+
 // Linux pidfds let the source stop even an importer that never reads EOF.
 #[cfg(target_os = "linux")]
 #[test]
