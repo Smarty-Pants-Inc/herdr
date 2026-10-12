@@ -2,9 +2,10 @@
 // managed by herdr; reinstalling or updating the integration overwrites this file.
 // add custom hooks/plugins beside this file instead of editing it.
 // HERDR_INTEGRATION_ID=pi
-// HERDR_INTEGRATION_VERSION=10
+// HERDR_INTEGRATION_VERSION=11
 // @ts-nocheck
 
+import { AsyncResource } from "node:async_hooks";
 import net from "node:net";
 import path from "node:path";
 
@@ -116,23 +117,18 @@ function updateSessionRef(ctx: any): void {
 }
 
 function withSessionRef(params: Record<string, unknown>): Record<string, unknown> {
-  if (currentAgentSessionPath) {
-    return { ...params, agent_session_path: currentAgentSessionPath };
-  }
-  if (currentAgentSessionId) {
-    return { ...params, agent_session_id: currentAgentSessionId };
-  }
-  return params;
+  const sessionRef = currentSessionRef();
+  return sessionRef ? { ...params, ...sessionRef } : params;
 }
 
 function currentSessionRef(): Record<string, unknown> | undefined {
-  if (currentAgentSessionPath) {
-    return { agent_session_path: currentAgentSessionPath };
+  if (!currentAgentSessionId && !currentAgentSessionPath) {
+    return undefined;
   }
-  if (currentAgentSessionId) {
-    return { agent_session_id: currentAgentSessionId };
-  }
-  return undefined;
+  return {
+    ...(currentAgentSessionId ? { agent_session_id: currentAgentSessionId } : {}),
+    ...(currentAgentSessionPath ? { agent_session_path: currentAgentSessionPath } : {}),
+  };
 }
 
 function reportSession(sessionStartSource?: string): Promise<void> {
@@ -228,10 +224,21 @@ export default function (pi) {
   let lastMessage: string | undefined;
   let rootSession = false;
 
-  // The receiver is deliberately owned by one session_start lifecycle. A new connection gets a
-  // new registration and never replays a frame from the previous connection or epoch.
+  // The guarded-input channel transport is owned by this extension instance, not by a
+  // session_start callback. Pi runs session_start for a native /new, /resume or /fork inside a
+  // temporary input fence, and anything whose async context descends from such a callback is
+  // refused input permanently once that fence ends (pi#163 security r3). The channel socket, its
+  // reader and every reconnect therefore run in the async context captured here, at extension
+  // load. session_start only sends a registration over an already connected socket; it never
+  // opens one. Herdr serves exactly one registration per connection, so a new connection still
+  // gets a new registration and never replays a frame from the previous connection or epoch.
+  const channelSupported = process.platform !== "win32" && typeof pi.submitUserMessage === "function";
+  const loadScope = channelSupported ? new AsyncResource("herdr-agent-channel") : undefined;
   let channelSocket: net.Socket | undefined;
+  let channelConnected = false;
   let channelGeneration = 0;
+  let channelRegistration: { id: string; sessionGeneration: string } | undefined;
+  let channelTargetGeneration: string | undefined;
   let channelSessionGeneration: string | undefined;
   let channelEpoch: string | undefined;
   let channelReady = false;
@@ -280,13 +287,26 @@ export default function (pi) {
     }
   }
 
-  function closeChannel() {
-    clearReconnectTimer();
+  // Run fn in the extension-load async context. Timers and sockets created here never inherit
+  // a session callback's (possibly fenced) context, even when the trigger, such as a socket
+  // destroyed inside session_start, delivered its callback in that context.
+  function inLoadScope<T>(fn: () => T): T | undefined {
+    return loadScope ? loadScope.runInAsyncScope(fn) : undefined;
+  }
+
+  function wantsChannel(): boolean {
+    return channelSupported && !channelClosing && currentContext !== undefined &&
+      validChannelId(channelTargetGeneration) &&
+      currentContext?.userMessageSessionGeneration === channelTargetGeneration;
+  }
+
+  function dropConnection() {
     clearRegistrationTimer();
     channelGeneration += 1;
-    channelClosing = true;
     const socket = channelSocket;
     channelSocket = undefined;
+    channelConnected = false;
+    channelRegistration = undefined;
     channelReady = false;
     channelEpoch = undefined;
     channelSessionGeneration = undefined;
@@ -565,62 +585,85 @@ export default function (pi) {
     socket.destroy();
   }
 
-  function scheduleReconnect(ctx: any) {
-    if (channelClosing || reconnectTimer || reconnectAttempts >= MAX_RECONNECT_ATTEMPTS || currentContext !== ctx) {
-      return;
-    }
-    const expectedSessionGeneration = ctx.userMessageSessionGeneration;
-    reconnectTimer = setTimeout(() => {
+  function scheduleReconnect(initial: boolean) {
+    if (!wantsChannel() || reconnectTimer || channelSocket) return;
+    if (!initial && reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) return;
+    const expectedSessionGeneration = channelTargetGeneration;
+    // The connection is always opened from this load-scope timer, never synchronously from the
+    // caller: a session callback, or a disconnect that Pi delivered in a session callback's context.
+    const timer = inLoadScope(() => setTimeout(() => {
+      if (reconnectTimer !== timer) return;
       reconnectTimer = undefined;
-      if (channelClosing || currentContext !== ctx || ctx?.userMessageSessionGeneration !== expectedSessionGeneration) return;
-      reconnectAttempts += 1;
-      openChannel(ctx);
-    }, RECONNECT_DELAY_MS);
-    reconnectTimer.unref?.();
+      if (!wantsChannel() || channelTargetGeneration !== expectedSessionGeneration || channelSocket) return;
+      if (!initial) reconnectAttempts += 1;
+      connectChannel();
+    }, initial ? 0 : RECONNECT_DELAY_MS));
+    reconnectTimer = timer;
+    reconnectTimer?.unref?.();
   }
 
   function rejectRegistration(socket: any, token: number) {
     if (token !== channelGeneration || socket !== channelSocket) return;
-    clearRegistrationTimer();
-    channelReady = false;
-    socket.destroy();
-    channelSocket = undefined;
-    channelEpoch = undefined;
-    channelSessionGeneration = undefined;
     // A server refusal/malformed registration response is final for this session. Transport loss
     // (including a missing response) may retry a bounded fresh registration, never a delivery.
     channelClosing = true;
+    dropConnection();
   }
 
-  function openChannel(ctx: any) {
+  function sendRegistration() {
+    const socket = channelSocket;
     if (
-      channelClosing ||
-      process.platform === "win32" ||
-      typeof pi.submitUserMessage !== "function" ||
-      !validChannelId(ctx?.userMessageSessionGeneration)
+      !socket || !channelConnected || socket.destroyed || channelReady || channelRegistration ||
+      !wantsChannel()
     ) {
       return;
     }
+    const token = channelGeneration;
+    const registration = { id: randomId("register"), sessionGeneration: channelTargetGeneration! };
+    channelRegistration = registration;
+    channelSessionGeneration = registration.sessionGeneration;
+    clearRegistrationTimer();
+    registrationTimer = inLoadScope(() => setTimeout(() => {
+      if (token === channelGeneration && socket === channelSocket && !channelReady) socket.destroy();
+    }, REGISTRATION_TIMEOUT_MS));
+    registrationTimer?.unref?.();
+    try {
+      socket.write(
+        `${JSON.stringify({
+          id: registration.id,
+          method: "agent.register_self",
+          params: {
+            session_generation: registration.sessionGeneration,
+            ...(draftGuardAvailable(currentContext) ? { draft_guard: true } : {}),
+          },
+        })}\n`,
+      );
+    } catch {
+      socket.destroy();
+    }
+  }
 
-    channelClosing = false;
+  // Only called at extension load or from a load-scope timer: never from a session callback.
+  function connectChannel() {
+    if (!channelSupported || channelSocket) return;
     const token = ++channelGeneration;
-    const expectedSessionGeneration = ctx.userMessageSessionGeneration;
-    channelSessionGeneration = expectedSessionGeneration;
+    channelConnected = false;
+    channelRegistration = undefined;
     channelReady = false;
     channelEpoch = undefined;
+    channelSessionGeneration = undefined;
     let buffer = Buffer.alloc(0);
-    const registrationId = randomId("register");
     const socket = net.createConnection(socketEndpoint!);
     channelSocket = socket;
-    registrationTimer = setTimeout(() => {
-      if (token === channelGeneration && socket === channelSocket) socket.destroy();
-    }, REGISTRATION_TIMEOUT_MS);
-    registrationTimer.unref?.();
+    // A passive receiver: the TUI keeps Pi alive, this socket must not.
+    socket.unref?.();
 
     const onDisconnect = () => {
       if (token !== channelGeneration || socket !== channelSocket) return;
       clearRegistrationTimer();
       channelSocket = undefined;
+      channelConnected = false;
+      channelRegistration = undefined;
       channelReady = false;
       channelEpoch = undefined;
       channelSessionGeneration = undefined;
@@ -628,27 +671,17 @@ export default function (pi) {
       buffer = Buffer.alloc(0);
       // Socket loss is not receipt loss proof. Discard all unsent ACKs/deliveries and request a
       // fresh registration only, with a bounded total attempt budget for this session_start.
-      if (!channelClosing && ctx?.userMessageSessionGeneration === expectedSessionGeneration) scheduleReconnect(ctx);
+      // Before any session_start nothing reconnects; session_start requests the connection.
+      scheduleReconnect(false);
     };
 
     socket.on("connect", () => {
-      if (
-        token !== channelGeneration || socket !== channelSocket || channelClosing ||
-        socket.destroyed || ctx?.userMessageSessionGeneration !== expectedSessionGeneration
-      ) {
+      if (token !== channelGeneration || socket !== channelSocket || socket.destroyed) {
         socket.destroy();
         return;
       }
-      socket.write(
-        `${JSON.stringify({
-          id: registrationId,
-          method: "agent.register_self",
-          params: {
-            session_generation: expectedSessionGeneration,
-            ...(draftGuardAvailable(ctx) ? { draft_guard: true } : {}),
-          },
-        })}\n`,
-      );
+      channelConnected = true;
+      sendRegistration();
     });
     socket.on("data", (chunk: Buffer) => {
       if (token !== channelGeneration || socket !== channelSocket || channelClosing) return;
@@ -657,6 +690,11 @@ export default function (pi) {
       let offset = 0;
       while (offset < chunk.length) {
         if (token !== channelGeneration || socket !== channelSocket || socket.destroyed) return;
+        if (!channelReady && !channelRegistration) {
+          // Herdr never speaks first on an unregistered connection.
+          socket.destroy();
+          return;
+        }
         const newline = chunk.indexOf(10, offset);
         const end = newline < 0 ? chunk.length : newline;
         const part = chunk.subarray(offset, end);
@@ -677,20 +715,21 @@ export default function (pi) {
           return;
         }
         if (!channelReady) {
+          const registration = channelRegistration!;
           const result = isRecord(parsed) && isRecord(parsed.result) ? parsed.result : undefined;
           const epoch = isRecord(result) ? result.registration_epoch : undefined;
           const sessionGeneration = isRecord(result) ? result.session_generation : undefined;
           if (
             !isRecord(parsed) ||
-            parsed.id !== registrationId ||
+            parsed.id !== registration.id ||
             parsed.error !== undefined ||
             !isRecord(result) ||
             !validChannelId(result.terminal_id) ||
             result.ready !== true ||
             !validChannelId(epoch) ||
             typeof sessionGeneration !== "string" ||
-            sessionGeneration !== expectedSessionGeneration ||
-            ctx?.userMessageSessionGeneration !== expectedSessionGeneration ||
+            sessionGeneration !== registration.sessionGeneration ||
+            currentContext?.userMessageSessionGeneration !== registration.sessionGeneration ||
             usedEpochs.has(epoch)
           ) {
             rejectRegistration(socket, token);
@@ -701,6 +740,7 @@ export default function (pi) {
           recentEpochs.push(epoch);
           if (recentEpochs.length > RECENT_CHANNEL_EPOCHS) recentEpochs.shift();
           pruneEpochs();
+          channelRegistration = undefined;
           channelEpoch = epoch;
           channelSessionGeneration = sessionGeneration;
           channelReady = true;
@@ -721,25 +761,37 @@ export default function (pi) {
   }
 
   function installChannel(ctx: any) {
-    closeChannel();
+    clearReconnectTimer();
+    // A registration is bound to one session generation and one connection. A registered or
+    // registering connection is retired; its replacement is opened from the load scope.
+    if (channelReady || channelRegistration) dropConnection();
+    ledger.clear();
     channelClosing = false;
     reconnectAttempts = 0;
     currentContext = ctx;
+    channelTargetGeneration = undefined;
     // Feature detection is intentionally conjunctive. Headless sessions and old Pi builds do not
     // advertise a receiver, and there is no fallback through the void message API.
-    if (
-      typeof pi.submitUserMessage !== "function" ||
-      !validChannelId(ctx?.userMessageSessionGeneration)
-    ) {
+    if (!channelSupported || !validChannelId(ctx?.userMessageSessionGeneration)) {
       channelClosing = true;
+      dropConnection();
       return;
     }
-    openChannel(ctx);
+    channelTargetGeneration = ctx.userMessageSessionGeneration;
+    if (channelSocket) {
+      // Connected: register now over the load-time connection. Still connecting: its connect
+      // callback registers.
+      sendRegistration();
+      return;
+    }
+    scheduleReconnect(true);
   }
 
   function shutdownChannel() {
-    closeChannel();
+    clearReconnectTimer();
     channelClosing = true;
+    dropConnection();
+    channelTargetGeneration = undefined;
     currentContext = undefined;
     rootSession = false;
   }
@@ -819,4 +871,7 @@ export default function (pi) {
   });
 
   pi.on("session_shutdown", shutdownChannel);
+
+  // Open the channel connection now, at extension load, outside every session callback.
+  connectChannel();
 }

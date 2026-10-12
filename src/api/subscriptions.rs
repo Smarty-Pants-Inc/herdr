@@ -2,9 +2,9 @@ use regex::Regex;
 
 use crate::api::event_hub::EventHistoryError;
 use crate::api::schema::{
-    ErrorBody, ErrorResponse, EventKind, Method, PaneAgentStatusChangedEvent,
-    PaneOutputMatchedEvent, PaneScrollChangedEvent, PaneScrollInfo, Request, Subscription,
-    SubscriptionEventData, SubscriptionEventEnvelope, SubscriptionEventKind,
+    ErrorBody, ErrorResponse, EventKind, Method, PaneAgentSessionChangedEvent,
+    PaneAgentStatusChangedEvent, PaneOutputMatchedEvent, PaneScrollChangedEvent, PaneScrollInfo,
+    Request, Subscription, SubscriptionEventData, SubscriptionEventEnvelope, SubscriptionEventKind,
 };
 use crate::api::server::{dispatch_to_app_with_timeout, APP_RESPONSE_TIMEOUT};
 use crate::api::{ApiRequestSender, EventHub};
@@ -57,6 +57,14 @@ pub(super) struct ActiveAgentStatusChangedSubscription {
     request_prefix: String,
 }
 
+/// Replays retained `pane.agent_session_changed` history for one pane. The
+/// server emits the event only when the reported session id changes, so this
+/// needs no snapshot sampling.
+pub(super) struct ActiveAgentSessionChangedSubscription {
+    pane_id: String,
+    last_sequence: u64,
+}
+
 pub(super) struct ActiveScrollChangedSubscription {
     pane_id: String,
     last_scroll: Option<PaneScrollInfo>,
@@ -101,6 +109,7 @@ pub(super) enum ActiveSubscription {
     Event(ActiveEventSubscription),
     OutputMatched(ActiveOutputMatchedSubscription),
     AgentStatusChanged(Box<ActiveAgentStatusChangedSubscription>),
+    AgentSessionChanged(ActiveAgentSessionChangedSubscription),
     ScrollChanged(ActiveScrollChangedSubscription),
 }
 
@@ -235,6 +244,16 @@ impl ActiveSubscription {
                     },
                 )))
             }
+            Subscription::PaneAgentSessionChanged { pane_id } => {
+                let probe = pane_get(format!("{request_id}:sub:{index}:probe"), &pane_id, api_tx)?;
+
+                Ok(Self::AgentSessionChanged(
+                    ActiveAgentSessionChangedSubscription {
+                        pane_id: probe.pane_id,
+                        last_sequence: event_start_sequence,
+                    },
+                ))
+            }
             Subscription::PaneScrollChanged { pane_id } => {
                 let probe = pane_get(format!("{request_id}:sub:{index}:probe"), &pane_id, api_tx)?;
 
@@ -259,6 +278,9 @@ impl ActiveSubscription {
             }
             Self::AgentStatusChanged(subscription) => {
                 serde_json::to_value(subscription.poll(api_tx, event_hub)?).ok()
+            }
+            Self::AgentSessionChanged(subscription) => {
+                serde_json::to_value(subscription.poll(event_hub)?).ok()
             }
             Self::ScrollChanged(subscription) => {
                 serde_json::to_value(subscription.poll(api_tx)?).ok()
@@ -309,6 +331,17 @@ impl ActiveSubscription {
                     if let Some(event) =
                         subscription.poll_snapshot(api_tx, event_hub).ok().flatten()
                     {
+                        matching.push(serde_json::to_value(event).map_err(event_encoding_error)?);
+                    }
+                }
+                Ok(matching)
+            }
+            Self::AgentSessionChanged(subscription) => {
+                let events = subscription_events_after(event_hub, subscription.last_sequence)?;
+                let mut matching = Vec::new();
+                for (sequence, event) in events {
+                    subscription.last_sequence = sequence;
+                    if let Some(event) = subscription.event_from_history(event) {
                         matching.push(serde_json::to_value(event).map_err(event_encoding_error)?);
                     }
                 }
@@ -538,6 +571,47 @@ impl ActiveAgentStatusChangedSubscription {
     }
 }
 
+impl ActiveAgentSessionChangedSubscription {
+    fn poll(&mut self, event_hub: &EventHub) -> Option<SubscriptionEventEnvelope> {
+        for (sequence, event) in event_hub.events_after(self.last_sequence) {
+            self.last_sequence = sequence;
+            if let Some(event) = self.event_from_history(event) {
+                return Some(event);
+            }
+        }
+        None
+    }
+
+    fn event_from_history(
+        &self,
+        event: crate::api::schema::EventEnvelope,
+    ) -> Option<SubscriptionEventEnvelope> {
+        let crate::api::schema::EventData::PaneAgentSessionChanged {
+            pane_id,
+            workspace_id,
+            agent,
+            session_id,
+            previous_session_id,
+        } = event.data
+        else {
+            return None;
+        };
+        if event.event != EventKind::PaneAgentSessionChanged || pane_id != self.pane_id {
+            return None;
+        }
+        Some(SubscriptionEventEnvelope {
+            event: SubscriptionEventKind::PaneAgentSessionChanged,
+            data: SubscriptionEventData::PaneAgentSessionChanged(PaneAgentSessionChangedEvent {
+                pane_id,
+                workspace_id,
+                agent,
+                session_id,
+                previous_session_id,
+            }),
+        })
+    }
+}
+
 impl ActiveScrollChangedSubscription {
     fn poll(&mut self, api_tx: &ApiRequestSender) -> Option<SubscriptionEventEnvelope> {
         let pane = pane_get(
@@ -712,6 +786,7 @@ mod tests {
             state_labels: HashMap::new(),
             tokens: HashMap::new(),
             agent_session: None,
+            agent_session_id: None,
             scroll,
             revision: 0,
         }

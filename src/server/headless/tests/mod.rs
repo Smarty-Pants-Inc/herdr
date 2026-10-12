@@ -4334,6 +4334,125 @@ fn with_terminal_session_test_server(
 }
 
 #[test]
+fn poisoned_client_keystrokes_and_paste_show_pane_notice_without_writes() {
+    with_terminal_session_test_server(|server, terminal_id, terminal_id_string, pane_id| {
+        let (runtime, mut input_rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_capacity(80, 24, 8);
+        // Deterministic enqueue-boundary race: the precheck was healthy, but
+        // poison becomes visible before the real producer attempts to enqueue.
+        assert_eq!(
+            super::super::pane_input::precheck_client_input(&runtime),
+            Ok(())
+        );
+        runtime.test_set_input_poisoned(true);
+        let enqueue_error = runtime
+            .try_send_bytes_with_source(
+                Bytes::from_static(b"rejected"),
+                crate::pty::input_consumer::InputSource::Unknown,
+            )
+            .expect_err("poison rejects enqueue after healthy precheck");
+        let typed_error = super::super::pane_input::classify_client_enqueue_error(
+            &runtime,
+            format!("terminal attach input failed: {enqueue_error}"),
+        );
+        assert_eq!(
+            typed_error,
+            super::super::pane_input::ClientInputError::PaneInputPoisoned
+        );
+        server
+            .app
+            .terminal_runtimes
+            .insert(terminal_id.clone(), runtime);
+        let (writer, control_rx, _render_rx) = test_client_writer();
+        server.clients.insert(
+            1,
+            ClientConnection::new_with_mode(
+                ClientConnectionMode::ClientShell,
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                1,
+                RenderEncoding::SemanticFrame,
+                Some(writer),
+            ),
+        );
+        server.notify_client_input_error(1, &pane_id, &typed_error);
+        assert!(matches!(
+            read_server_message(control_rx.recv_timeout(Duration::from_secs(1)).expect("enqueue race notice")),
+            ServerMessage::Notify { kind: protocol::NotifyKind::Toast, message, body: Some(body) }
+                if message.contains("pane_input_poisoned") && message.contains(&pane_id)
+                && body.contains(&format!("herdr pane clear-input-poison {pane_id}"))
+        ));
+        assert!(input_rx.try_recv().is_err());
+        let key = protocol::ClientPaneInputEvent::from_terminal_key(
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('x'),
+                crossterm::event::KeyModifiers::NONE,
+            )
+            .into(),
+        )
+        .expect("pane key");
+        for event in [
+            key,
+            protocol::ClientPaneInputEvent::TextCommit("x".into()),
+            protocol::ClientPaneInputEvent::Paste("staged".into()),
+        ] {
+            assert!(
+                !server.handle_server_event(ServerEvent::ClientShellPaneInput {
+                    client_id: 1,
+                    pane_id: pane_id.clone(),
+                    events: vec![event],
+                })
+            );
+            let notice = read_server_message(
+                control_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("poison notice"),
+            );
+            assert!(
+                matches!(notice, ServerMessage::Notify { kind: protocol::NotifyKind::Toast, message, body: Some(body) }
+                if message.contains("pane_input_poisoned") && message.contains(&pane_id)
+                && body.contains("Staged text may remain on line")
+                && body.contains(&format!("herdr pane clear-input-poison {pane_id}")))
+            );
+            assert!(
+                input_rx.try_recv().is_err(),
+                "poisoned client must not write"
+            );
+        }
+        server.clients.get_mut(&1).expect("client").mode = ClientConnectionMode::TerminalAttach {
+            terminal_id: terminal_id_string,
+        };
+        for data in [b"x".to_vec(), b"\x1b[200~staged\x1b[201~".to_vec()] {
+            assert!(!server.handle_server_event(ServerEvent::ClientInput { client_id: 1, data }));
+            assert!(
+                matches!(read_server_message(control_rx.recv_timeout(Duration::from_secs(1)).expect("raw poison notice")),
+                ServerMessage::Notify { kind: protocol::NotifyKind::Toast, message, .. } if message.contains(&pane_id))
+            );
+            assert!(input_rx.try_recv().is_err());
+        }
+        let runtime = server
+            .app
+            .terminal_runtimes
+            .get(&terminal_id)
+            .expect("runtime remains open");
+        assert!(runtime.input_is_poisoned(), "input must not clear poison");
+        runtime.test_set_input_poisoned(false);
+        assert!(server.handle_server_event(ServerEvent::ClientInput {
+            client_id: 1,
+            data: b"healthy".to_vec()
+        }));
+        assert_eq!(
+            input_rx.try_recv().expect("healthy input"),
+            Bytes::from_static(b"healthy")
+        );
+        assert!(
+            control_rx.try_recv().is_err(),
+            "healthy input needs no notice"
+        );
+    });
+}
+
+#[test]
 fn terminal_observers_wait_for_synchronized_output_with_or_without_baseline() {
     with_terminal_session_test_server(|server, terminal_id, target, _| {
         let connect = |server: &mut HeadlessServer, client_id| {
@@ -4446,14 +4565,14 @@ fn explicit_agent_history_read_requires_idle_on_alternate_screen() {
             };
 
             assert_eq!(
-                    server.agent_read_not_idle_error(&request),
-                    Some(api::schema::ErrorBody {
-                        code: "agent_not_idle".into(),
-                        message: format!(
-                            "cannot read 200 lines while {public_pane_id} is working: its alternate-screen history can only be captured by scrolling while idle. Wait and retry, or use --source visible"
-                        ),
-                    })
-                );
+                server.agent_read_not_idle_error(&request),
+                Some(api::schema::ErrorBody {
+                    code: "agent_not_idle".into(),
+                    message: format!(
+                        "cannot read 200 lines while {public_pane_id} is working: its alternate-screen history can only be captured by scrolling while idle. Wait and retry, or use --source visible"
+                    ),
+                })
+            );
 
             let mut default_request = request.clone();
             let api::schema::Method::AgentRead(params) = &mut default_request.method else {
@@ -4796,11 +4915,11 @@ fn terminal_control_rejects_attach_during_alt_screen_read() {
             .contains_key(&terminal_id_string));
         let reason = read_server_shutdown_reason(control_rx.recv().expect("shutdown message"));
         assert_eq!(
-                reason,
-                Some(format!(
-                    "terminal attach failed: terminal {terminal_id_string} has a read in progress; retry"
-                ))
-            );
+            reason,
+            Some(format!(
+                "terminal attach failed: terminal {terminal_id_string} has a read in progress; retry"
+            ))
+        );
     });
 }
 
@@ -8201,6 +8320,70 @@ fn agent_session_replacement_that_resets_seen_requests_a_render() {
     );
 }
 
+fn agent_session_changed_events(
+    server: &HeadlessServer,
+    after: u64,
+) -> Vec<(String, String, Option<String>)> {
+    server
+        .app
+        .event_hub
+        .events_after(after)
+        .into_iter()
+        .filter_map(|(_, event)| match event.data {
+            crate::api::schema::EventData::PaneAgentSessionChanged {
+                pane_id,
+                session_id,
+                previous_session_id,
+                ..
+            } => {
+                assert_eq!(
+                    event.event,
+                    crate::api::schema::EventKind::PaneAgentSessionChanged
+                );
+                Some((pane_id, session_id, previous_session_id))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// smarty-dev#9124: a session report emits `pane.agent_session_changed` only
+/// when the pane's session id changes, never for a repeat of the same id.
+#[test]
+fn agent_session_report_emits_session_changed_only_for_a_new_session() {
+    let (writer, _control_rx, _render_rx) = test_client_writer();
+    let (mut server, pane_id) = completion_guard_server(writer);
+    let public_pane_id = server.app.public_pane_id(0, pane_id).unwrap();
+
+    let start = server.app.event_hub.current_sequence();
+    report_agent_session_changed(&mut server, &public_pane_id, "session-a", "startup", 1);
+    assert_eq!(
+        agent_session_changed_events(&server, start),
+        vec![(public_pane_id.clone(), "session-a".to_string(), None)],
+        "the first session has no previous id"
+    );
+
+    let repeat = server.app.event_hub.current_sequence();
+    report_agent_session_changed(&mut server, &public_pane_id, "session-a", "resume", 2);
+    assert!(
+        agent_session_changed_events(&server, repeat).is_empty(),
+        "reporting the current session again emits nothing"
+    );
+
+    let replace = server.app.event_hub.current_sequence();
+    report_agent_session_changed(&mut server, &public_pane_id, "session-b", "clear", 3);
+    report_agent_session_changed(&mut server, &public_pane_id, "session-b", "clear", 4);
+    assert_eq!(
+        agent_session_changed_events(&server, replace),
+        vec![(
+            public_pane_id.clone(),
+            "session-b".to_string(),
+            Some("session-a".to_string())
+        )],
+        "A then B emits exactly one change, and the repeat of B none"
+    );
+}
+
 #[test]
 fn api_report_agent_stores_valid_resume_argv_and_rejects_invalid() {
     let (writer, _control_rx, _render_rx) = test_client_writer();
@@ -8876,6 +9059,7 @@ async fn headless_api_dispatch_uses_origin_context_for_cross_pane_guard() {
     let response = fixture.send_attributed(
         "headless-cross-pane",
         api::schema::Method::PaneSendText(api::schema::PaneSendTextParams {
+            expected_agent_session_id: None,
             pane_id: target_pane_id,
             text: "blocked".into(),
             allow_cross_pane: false,
@@ -8892,6 +9076,8 @@ async fn headless_api_dispatch_uses_origin_context_for_cross_pane_guard() {
 async fn headless_deferred_agent_prompt_enforces_cross_pane_guard() {
     let prompt = |target: &str, allow_cross_pane| {
         api::schema::Method::AgentPrompt(api::schema::AgentPromptParams {
+            expected_agent_session_id: None,
+            expected_pane_id: None,
             target: target.into(),
             text: "hello".into(),
             wait: None,

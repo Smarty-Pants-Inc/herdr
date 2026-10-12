@@ -164,6 +164,31 @@ fn full_alive(fd: RawFd, s: &InputConsumerSnapshot) -> bool {
 pub(crate) fn unchanged(fd: RawFd, s: &InputConsumerSnapshot) -> bool {
     full_alive(fd, s) && semantic_termios(fd).ok().as_ref() == Some(&s.termios)
 }
+pub(crate) fn open_pty_slave_for_flush(master: RawFd) -> io::Result<std::fs::File> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    let flags = libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC | libc::O_NONBLOCK;
+    // SAFETY: TIOCGPTPEER takes open flags and returns a new slave descriptor.
+    let raw = unsafe { libc::ioctl(master, libc::TIOCGPTPEER, flags) };
+    if raw < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the ioctl returned a new descriptor that nothing else owns.
+    Ok(std::fs::File::from(unsafe { OwnedFd::from_raw_fd(raw) }))
+}
+
+/// Open only while cancelling: retaining a slave would suppress the master's
+/// normal last-slave-close HUP/EIO. TIOCGPTPEER avoids pathname/tty reuse races.
+pub(crate) fn flush_pty_input(master: RawFd) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let slave = open_pty_slave_for_flush(master)?;
+    // SAFETY: tcflush borrows the valid slave descriptor and changes only its
+    // terminal input queue. The descriptor is dropped immediately afterwards.
+    if unsafe { libc::tcflush(slave.as_raw_fd(), libc::TCIFLUSH) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 pub(crate) fn pane_tty_identity(master: RawFd) -> io::Result<(u64, u64)> {
     use std::os::fd::{FromRawFd, OwnedFd};
     use std::os::unix::fs::MetadataExt;

@@ -178,17 +178,41 @@ pub(super) fn wait_for_agent(
 pub(super) fn prompt_agent(
     request_id: String,
     mut params: crate::api::schema::AgentPromptParams,
+    session_checked: bool,
     context: ApiRequestContext,
     stream: &mut LocalStream,
     api_tx: &ApiRequestSender,
     event_hub: &EventHub,
     running: &Arc<AtomicBool>,
 ) -> std::io::Result<Option<String>> {
+    // --wait must not demote a fail-closed method to an ordinary prompt.
+    if session_checked
+        && params.expected_agent_session_id.is_none()
+        && params.expected_pane_id.is_none()
+    {
+        return Ok(Some(
+            serde_json::to_string(&ErrorResponse {
+                id: request_id,
+                error: ErrorBody {
+                    code: "invalid_request".into(),
+                    message: "session-checked method requires an identity expectation".into(),
+                },
+            })
+            .map_err(std::io::Error::other)?,
+        ));
+    }
+    let prompt_method = |params| {
+        if session_checked {
+            Method::AgentPromptSessionChecked(params)
+        } else {
+            Method::AgentPrompt(params)
+        }
+    };
     let Some(wait) = params.wait.clone() else {
         return Ok(Some(dispatch_to_app_with_timeout_and_context(
             Request {
                 id: request_id,
-                method: Method::AgentPrompt(params),
+                method: prompt_method(params),
             },
             api_tx,
             None,
@@ -222,7 +246,7 @@ pub(super) fn prompt_agent(
     let last_event_sequence = event_hub.current_sequence();
     let prompt_request = Request {
         id: request_id.clone(),
-        method: Method::AgentPrompt(params),
+        method: prompt_method(params),
     };
     #[cfg(windows)]
     let prompt_response = dispatch_to_app_with_caller_timeout(

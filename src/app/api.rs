@@ -1,6 +1,8 @@
 use std::time::{Duration, Instant};
 
 pub(super) mod agent_channel;
+#[cfg(all(test, target_os = "linux"))]
+mod agent_session_guard_tests;
 mod agent_view;
 mod agents;
 mod env;
@@ -405,8 +407,19 @@ impl App {
                 None
             };
         let terminal_cwd_reported = matches!(ev, AppEvent::TerminalCwdReported { .. });
+        // Both report methods apply an agent's session through these events.
+        let session_report = match &ev {
+            AppEvent::AgentSessionReported { pane_id, .. }
+            | AppEvent::HookStateReported { pane_id, .. } => {
+                Some((*pane_id, self.pane_agent_session_info(*pane_id)))
+            }
+            _ => None,
+        };
         let previous_toast = self.state.toast.clone();
         let mut pane_updates = self.state.handle_app_event(ev);
+        if let Some((pane_id, previous_session)) = session_report {
+            self.emit_pane_agent_session_changed(pane_id, previous_session);
+        }
         if update_ready.is_some() {
             self.state.latest_release_notes = crate::release_notes::load_latest();
         }
@@ -847,6 +860,47 @@ impl App {
         }
     }
 
+    fn pane_agent_session_info(
+        &self,
+        pane_id: crate::layout::PaneId,
+    ) -> Option<crate::api::schema::AgentSessionInfo> {
+        let (_, pane) = self.find_pane(pane_id)?;
+        let terminal = self.state.terminals.get(&pane.attached_terminal_id)?;
+        super::creation::terminal_agent_session_info(terminal)
+    }
+
+    /// Emits `pane.agent_session_changed` when a session report left the pane
+    /// with a different session id. Repeated reports of one session emit nothing.
+    fn emit_pane_agent_session_changed(
+        &mut self,
+        pane_id: crate::layout::PaneId,
+        previous: Option<crate::api::schema::AgentSessionInfo>,
+    ) {
+        let Some(current) = self.pane_agent_session_info(pane_id) else {
+            return;
+        };
+        let previous_session_id = previous.map(|session| session.value);
+        if previous_session_id.as_deref() == Some(current.value.as_str()) {
+            return;
+        }
+        let Some((ws_idx, _)) = self.find_pane(pane_id) else {
+            return;
+        };
+        let Some(public_pane_id) = self.public_pane_id(ws_idx, pane_id) else {
+            return;
+        };
+        self.emit_event(crate::api::schema::EventEnvelope {
+            event: crate::api::schema::EventKind::PaneAgentSessionChanged,
+            data: crate::api::schema::EventData::PaneAgentSessionChanged {
+                pane_id: public_pane_id,
+                workspace_id: self.public_workspace_id(ws_idx),
+                agent: current.agent,
+                session_id: current.value,
+                previous_session_id,
+            },
+        });
+    }
+
     pub(super) fn emit_event(&mut self, event: crate::api::schema::EventEnvelope) {
         self.run_plugin_event_hooks(&event);
         self.event_hub.push(event);
@@ -1082,6 +1136,10 @@ impl App {
         (target.terminal_id == pane.terminal_id).then_some(target.terminal_id)
     }
 
+    // Headless production dispatch intercepts all session-checked input with
+    // App::api_request_requires_deferred_input before this synchronous fallback.
+    // Private/direct pane handlers still await bounded actor completion; enqueue
+    // alone is never a successful guarded API response.
     fn handle_api_request_with_ingress(
         &mut self,
         request: crate::api::schema::Request,
@@ -1089,6 +1147,9 @@ impl App {
         ingress: ApiIngress,
     ) -> String {
         self.sync_pending_terminal_titles();
+        if let Some(response) = self.session_checked_guard_denial(&request) {
+            return response;
+        }
         if let Some(response) = self.cross_pane_input_denial_with_ancestry(&request, &mut context) {
             return response;
         }
@@ -1293,7 +1354,7 @@ impl App {
             Method::TabRename(params) => return self.handle_tab_rename(request.id, params),
             Method::TabMove(params) => return self.handle_tab_move(request.id, params),
             Method::TabMoveProjectChecked(params) => {
-                return self.handle_tab_move_project_checked(request.id, params)
+                return self.handle_tab_move_project_checked(request.id, params);
             }
             Method::TabClose(target) => return self.handle_tab_close(request.id, target),
             Method::AgentRegisterSelf(params) => {
@@ -1336,7 +1397,7 @@ impl App {
                     "input consumer operations require the asynchronous local API route",
                 );
             }
-            Method::AgentPrompt(_) => {
+            Method::AgentPrompt(_) | Method::AgentPromptSessionChecked(_) => {
                 return responses::encode_error(
                     request.id,
                     "invalid_request",
@@ -1362,17 +1423,20 @@ impl App {
             }
             Method::PaneSwap(params) => return self.handle_pane_swap(request.id, params),
             Method::PaneSwapProjectChecked(params) => {
-                return self.handle_pane_swap_project_checked(request.id, params)
+                return self.handle_pane_swap_project_checked(request.id, params);
             }
             Method::PaneMove(params) => {
                 if params.allow_project_change {
-                    return responses::encode_error(request.id, "project_change_capability_required",
-                        "allow_project_change requires pane.move_project_checked; do not fall back to pane.move");
+                    return responses::encode_error(
+                        request.id,
+                        "project_change_capability_required",
+                        "allow_project_change requires pane.move_project_checked; do not fall back to pane.move",
+                    );
                 }
                 return self.handle_pane_move(request.id, params);
             }
             Method::PaneMoveProjectChecked(params) => {
-                return self.handle_pane_move(request.id, params)
+                return self.handle_pane_move(request.id, params);
             }
             Method::PaneZoom(params) => return self.handle_pane_zoom(request.id, params),
             Method::PaneLayout(params) => return self.handle_pane_layout(request.id, params),
@@ -1385,7 +1449,7 @@ impl App {
                 return self.handle_layout_apply_restorable(request.id, params);
             }
             Method::LayoutApplyProjectChecked(params) => {
-                return self.handle_layout_apply_project_checked(request.id, params)
+                return self.handle_layout_apply_project_checked(request.id, params);
             }
             Method::LayoutSetSplitRatio(params) => {
                 return self.handle_layout_set_split_ratio(request.id, params);
@@ -1398,6 +1462,9 @@ impl App {
             Method::PaneResize(params) => return self.handle_pane_resize(request.id, params),
             Method::PaneScroll(params) => return self.handle_pane_scroll(request.id, params),
             Method::PaneClear(target) => return self.handle_pane_clear(request.id, target),
+            Method::PaneClearInputPoison(target) => {
+                return self.handle_pane_clear_input_poison(request.id, target);
+            }
             Method::PaneEditScrollback(target) => {
                 return self.handle_pane_edit_scrollback(request.id, target);
             }
@@ -1431,10 +1498,10 @@ impl App {
             Method::PaneRename(params) => return self.handle_pane_rename(request.id, params),
             Method::PaneRead(params) => return self.handle_pane_read(request.id, params),
             Method::PaneReportAgent(params) => {
-                return self.handle_pane_report_agent(request.id, params);
+                return self.handle_pane_report_agent(request.id, params, context);
             }
             Method::PaneReportAgentSession(params) => {
-                return self.handle_pane_report_agent_session(request.id, params);
+                return self.handle_pane_report_agent_session(request.id, params, context);
             }
             Method::PaneReportMetadata(params) => {
                 return self.handle_pane_report_metadata(request.id, params);
@@ -1445,7 +1512,7 @@ impl App {
             Method::PaneReleaseAgent(params) => {
                 return self.handle_pane_release_agent(request.id, params);
             }
-            Method::PaneSendText(params) => {
+            Method::PaneSendText(params) | Method::PaneSendTextSessionChecked(params) => {
                 return self.handle_pane_send_text(request.id, params, context);
             }
             Method::PaneSendInputGuarded(params) if params.expected_terminal.is_none() => {
@@ -1466,7 +1533,7 @@ impl App {
                     responses::encode_error(request.id, "popup_not_open", "no popup is open")
                 };
             }
-            Method::PaneSendKeys(params) => {
+            Method::PaneSendKeys(params) | Method::PaneSendKeysSessionChecked(params) => {
                 return self.handle_pane_send_keys(request.id, params, context);
             }
             Method::IntegrationList(_) => {

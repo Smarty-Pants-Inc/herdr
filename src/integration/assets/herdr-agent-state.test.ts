@@ -1,4 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { rm } from "node:fs/promises";
 import net, { createServer, type Server } from "node:net";
 import { tmpdir } from "node:os";
@@ -169,6 +170,111 @@ test("OpenCode stays disabled without the Herdr socket environment", async () =>
 });
 
 for (const integration of integrations) {
+  for (const phase of ["startup", "same-path ID change"] as const) {
+    test(`${integration.name} reports both session ID and path on ${phase}`, async () => {
+      const requests = await startRecordingServer(
+        `${integration.name.toLowerCase().replaceAll(" ", "-")}-session-ref`,
+      );
+      const { handlers, pi } = createExtensionHarness();
+      const { default: install } = await importFresh(integration.modulePath);
+      install(pi);
+
+      const sessionPath = "/tmp/herdr-resume-session.jsonl";
+      let sessionId = "actual-session-id";
+      const context = {
+        ...piContext(() => true),
+        sessionManager: {
+          getSessionFile: () => sessionPath,
+          getSessionId: () => sessionId,
+        },
+      };
+      await handlers.get("session_start")?.({ reason: "startup" }, context);
+      await waitFor(() => requests.length === 2);
+
+      if (phase === "same-path ID change") {
+        sessionId = "replacement-session-id";
+        await handlers.get("agent_start")?.({}, context);
+        await waitFor(() => requests.length === 4);
+      }
+
+      const phaseRequests = phase === "startup" ? requests : requests.slice(2);
+      const agent = integration.name === "Pi" ? "pi" : "omp";
+      for (const method of ["pane.report_agent_session", "pane.report_agent"]) {
+        const request = phaseRequests.find(
+          (request) => isRecord(request) && request.method === method,
+        );
+        expect(isRecord(request) && isRecord(request.params)).toBe(true);
+        if (!isRecord(request) || !isRecord(request.params)) {
+          throw new Error(`Missing ${method} parameters`);
+        }
+        expect(request.params).toMatchObject({
+          pane_id: "test:p1",
+          source: `herdr:${agent}`,
+          agent,
+          agent_session_id: sessionId,
+          agent_session_path: sessionPath,
+        });
+        if (method === "pane.report_agent") {
+          expect(request.params.state).toBe(phase === "startup" ? "idle" : "working");
+        } else {
+          expect(request.params.session_start_source).toBe(
+            phase === "startup" || agent === "omp" ? "startup" : undefined,
+          );
+        }
+      }
+      const sequences = requests.map((request) =>
+        isRecord(request) && isRecord(request.params) ? request.params.seq : undefined,
+      );
+      expect(sequences.every((seq) => typeof seq === "number")).toBe(true);
+      expect(new Set(sequences).size).toBe(requests.length);
+      if (phase === "same-path ID change") {
+        expect(Math.min(...(sequences.slice(2) as number[]))).toBeGreaterThan(
+          Math.max(...(sequences.slice(0, 2) as number[])),
+        );
+      }
+    });
+  }
+
+  for (const sessionRef of [
+    { name: "ID only", id: "actual-session-id", path: undefined },
+    { name: "path only", id: undefined, path: "/tmp/herdr-resume-session.jsonl" },
+    { name: "no reference", id: undefined, path: undefined },
+  ]) {
+    test(`${integration.name} preserves ${sessionRef.name} session reporting`, async () => {
+      const requests = await startRecordingServer(
+        `${integration.name.toLowerCase().replaceAll(" ", "-")}-partial-session-ref`,
+      );
+      const { handlers, pi } = createExtensionHarness();
+      const { default: install } = await importFresh(integration.modulePath);
+      install(pi);
+      await handlers.get("session_start")?.(
+        { reason: "startup" },
+        {
+          ...piContext(() => true),
+          sessionManager: {
+            getSessionFile: () => sessionRef.path,
+            getSessionId: () => sessionRef.id,
+          },
+        },
+      );
+      const hasRef = sessionRef.id !== undefined || sessionRef.path !== undefined;
+      await waitFor(() => requests.length === (hasRef ? 2 : 1));
+      expect(requests.map((request) => isRecord(request) ? request.method : undefined)).toEqual(
+        hasRef ? ["pane.report_agent_session", "pane.report_agent"] : ["pane.report_agent"],
+      );
+      for (const request of requests) {
+        expect(isRecord(request) && isRecord(request.params)).toBe(true);
+        if (!isRecord(request) || !isRecord(request.params)) {
+          throw new Error("Missing report parameters");
+        }
+        expect(request.params.agent_session_id).toBe(sessionRef.id);
+        expect(request.params.agent_session_path).toBe(sessionRef.path);
+        expect(Object.hasOwn(request.params, "agent_session_id")).toBe(sessionRef.id !== undefined);
+        expect(Object.hasOwn(request.params, "agent_session_path")).toBe(sessionRef.path !== undefined);
+      }
+    });
+  }
+
   test(`${integration.name} maps the Windows socket marker path to a named pipe endpoint`, async () => {
     const markerPath = `herdr-${integration.name.toLowerCase().replaceAll(" ", "-")}-${process.pid}.sock`;
     configureIntegrationEnvironment(markerPath);
@@ -865,7 +971,7 @@ for (const mode of ["rpc", "print", "json", undefined]) {
   });
 }
 
-registeredChannelTest("Pi opens registration directly in-process only at TUI session_start, with no inherited pane/pid assertion", async () => {
+registeredChannelTest("Pi opens its channel connection in-process at extension load and registers only at TUI session_start, with no inherited pane/pid assertion", async () => {
   const { connections, reports } = await startChannelServer();
   process.env.HERDR_PANE_ID = "stale:p999";
   const connectionPids: number[] = [];
@@ -876,12 +982,88 @@ registeredChannelTest("Pi opens registration directly in-process only at TUI ses
   const { handlers, calls } = await loadChannelAsset(accepted);
   handlers.get("agent_start")?.({}, channelContext());
   await Bun.sleep(30);
-  expect(connectionPids).toEqual([]);
+  expect(connectionPids).toEqual([process.pid]); // The channel connection, opened at load.
+  expect(connections).toEqual([]); // No registration before session_start.
+  expect(reports).toEqual([]);
   await handlers.get("session_start")?.({}, channelContext());
   await waitFor(() => connections.length === 1 && reports.length === 1);
+  // session_start registers over the load-time connection; only the state report connects.
   expect(connectionPids).toEqual([process.pid, process.pid]);
   expect(connections[0].registration.params).toEqual({ session_generation: "session-1" });
   expect(calls).toEqual([]); // Ready registration is not an input receipt.
+});
+
+// Pi runs a native /new, /resume or /fork session_start inside a temporary input fence. Input
+// whose async context descends from that callback is refused for good once the fence ends
+// (pi#163 security r3). This fixture models only that async-context rule, not Pi admission.
+function inputFenceFixture() {
+  const fence = new AsyncLocalStorage<{ active: boolean }>();
+  const submit = (request: AdmissionRequest): Promise<AdmissionReceipt> => {
+    const scope = fence.getStore();
+    if (scope && !scope.active) {
+      return Promise.resolve({
+        status: "rejected", reason: "session_changed", sessionGeneration: request.sessionGeneration,
+      });
+    }
+    return accepted(request);
+  };
+  const fenced = async (operation: () => unknown) => {
+    const scope = { active: true };
+    try {
+      return await fence.run(scope, async () => await operation());
+    } finally {
+      scope.active = false;
+    }
+  };
+  return { submit, fenced };
+}
+
+registeredChannelTest("Pi channel ingress never descends from a fenced session_start, across replacement and reconnect", async () => {
+  const { connections } = await startChannelServer();
+  const { submit, fenced } = inputFenceFixture();
+  const asset = await loadChannelAsset(submit);
+  await fenced(() => asset.handlers.get("session_start")?.({}, channelContext()));
+  await waitFor(() => connections.length === 1);
+  deliver(connections[0], "first");
+  await waitFor(() => connections[0].acks.length === 1);
+  expect(connections[0].acks[0]).toMatchObject({ request_id: "first", status: "accepted" });
+  // A native /new: the old registration is retired inside the fence, yet the replacement
+  // connection and its reader still run outside it.
+  await fenced(() => asset.handlers.get("session_start")?.({ reason: "new" }, channelContext("session-2")));
+  await waitFor(() => connections.length === 2 && connections[0].closed);
+  deliver(connections[1], "second");
+  await waitFor(() => connections[1].acks.length === 1);
+  expect(connections[1].acks[0]).toMatchObject({
+    request_id: "second", status: "accepted", session_generation: "session-2",
+  });
+  // Transport loss after a fenced session_start reconnects outside the fence too.
+  connections[1].socket.destroy();
+  await waitFor(() => connections.length === 3);
+  deliver(connections[2], "third");
+  await waitFor(() => connections[2].acks.length === 1);
+  expect(connections[2].acks[0]).toMatchObject({ request_id: "third", status: "accepted" });
+  expect(asset.calls.map((call) => call.requestId)).toEqual(["first", "second", "third"]);
+});
+
+registeredChannelTest("Pi reconnects outside the fence when the load-time connection closed before a fenced session_start", async () => {
+  const { connections } = await startChannelServer();
+  const clients: net.Socket[] = [];
+  net.createConnection = ((...args: unknown[]) => {
+    const socket = Reflect.apply(originalCreateConnection, net, args);
+    clients.push(socket);
+    return socket;
+  }) as typeof net.createConnection;
+  const { submit, fenced } = inputFenceFixture();
+  const asset = await loadChannelAsset(submit);
+  expect(clients).toHaveLength(1);
+  clients[0].destroy(); // e.g. Herdr's initial-request timeout before a slow startup finished.
+  await Bun.sleep(30);
+  expect(clients).toHaveLength(1); // No session wants a channel yet: nothing reconnects.
+  await fenced(() => asset.handlers.get("session_start")?.({}, channelContext()));
+  await waitFor(() => connections.length === 1);
+  deliver(connections[0], "fresh");
+  await waitFor(() => connections[0].acks.length === 1);
+  expect(connections[0].acks[0]).toMatchObject({ request_id: "fresh", status: "accepted" });
 });
 
 test("Pi Windows state reports still work but never advertise the unsupported receipt channel", async () => {

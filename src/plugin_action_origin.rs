@@ -84,6 +84,11 @@ pub(crate) fn method_carries_grant(method: &crate::api::schema::Method) -> bool 
         | Method::PaneSendKeys(_)
         | Method::PaneSendInput(_)
         | Method::PaneSendInputGuarded(_) => true,
+        // Session-checked aliases are the same content writes with an identity
+        // expectation, so they carry the claim exactly like their base methods.
+        Method::AgentPromptSessionChecked(_)
+        | Method::PaneSendTextSessionChecked(_)
+        | Method::PaneSendKeysSessionChecked(_) => true,
         // Pane creation the CLI performs, so the server can attribute the
         // created terminals to the grant (herdr#223). Carrying a claim never
         // awards rights by itself; the server registers only actually
@@ -264,7 +269,7 @@ impl PluginActionGrants {
     /// dead grants become tombstones, and, only when still full, the oldest
     /// tombstones are evicted (their attribution is then lost). If pending and
     /// live grants alone fill the cap this fails closed with an error that
-    /// carries no secret; the caller runs the action without a token.
+    /// carries no secret; the runtime refuses to launch the user action.
     pub(crate) fn mint(
         &self,
         grant: PluginActionGrant,
@@ -681,6 +686,25 @@ mod tests {
                 "params": {}
             }))
             .expect(name);
+            assert!(method_carries_grant(&method), "{name}");
+        }
+        for (name, params) in [
+            (
+                "agent.prompt_session_checked",
+                serde_json::json!({"target": "a", "text": "t", "expected_agent_session_id": "s"}),
+            ),
+            (
+                "pane.send_text_session_checked",
+                serde_json::json!({"pane_id": "w1:p1", "text": "t", "expected_agent_session_id": "s"}),
+            ),
+            (
+                "pane.send_keys_session_checked",
+                serde_json::json!({"pane_id": "w1:p1", "keys": ["enter"], "expected_agent_session_id": "s"}),
+            ),
+        ] {
+            let method: Method =
+                serde_json::from_value(serde_json::json!({"method": name, "params": params}))
+                    .expect(name);
             assert!(method_carries_grant(&method), "{name}");
         }
         let list: Method = serde_json::from_value(serde_json::json!({
