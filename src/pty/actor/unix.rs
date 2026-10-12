@@ -98,7 +98,7 @@ enum PtyIoDataCommand {
 
 enum PtyIoControlCommand {
     ClearInputPoison(std_mpsc::Sender<std::io::Result<()>>),
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     SetBeforeWrite {
         callback: Box<dyn FnMut(usize) + Send>,
         reply: std_mpsc::Sender<()>,
@@ -151,7 +151,7 @@ impl PtyIoActorHandle {
     /// callback receives a 1-based attempt count since installation. Runner-
     /// local hooks and full native chunk sizes are preserved.
     /// Acknowledgment ensures no test races callback installation with enqueue.
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn test_set_before_write(
         &self,
         callback: Box<dyn FnMut(usize) + Send>,
@@ -1219,7 +1219,7 @@ impl PtyIoActorRunner {
                 }
                 let _ = reply.send(Ok(()));
             }
-            #[cfg(test)]
+            #[cfg(all(test, target_os = "linux"))]
             PtyIoControlCommand::SetBeforeWrite {
                 mut callback,
                 reply,

@@ -1703,7 +1703,7 @@ impl PaneRuntimeIo {
             }
         }
     }
-    #[cfg(all(test, unix))]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn test_set_before_write(
         &self,
         hook: Box<dyn FnMut(usize) + Send>,
@@ -4381,7 +4381,7 @@ impl PaneRuntime {
 
 #[cfg(test)]
 impl PaneRuntime {
-    #[cfg(all(test, unix))]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn test_set_before_write(
         &self,
         hook: Box<dyn FnMut(usize) + Send>,
