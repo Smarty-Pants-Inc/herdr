@@ -682,6 +682,10 @@ fn restore_tab(
         let handoff_agent_state = imported_runtime
             .as_ref()
             .and_then(|imported| imported.state.agent_state.clone());
+        #[cfg(unix)]
+        let handoff_agent_session_binding = imported_runtime
+            .as_ref()
+            .and_then(|imported| imported.state.agent_session_binding.clone());
         let pending_native_agent_restore = if was_imported {
             None
         } else {
@@ -833,6 +837,17 @@ fn restore_tab(
                 #[cfg(unix)]
                 if let Some(agent_state) = handoff_agent_state {
                     terminal.restore_handoff_agent_state(agent_state);
+                }
+                // Last: every restored session fact above must already be in place.
+                #[cfg(unix)]
+                if let Some(binding) = handoff_agent_session_binding {
+                    if let Err(reason) = terminal.import_handoff_agent_session_binding(binding) {
+                        tracing::info!(
+                            pane_id = id.raw(),
+                            ?reason,
+                            "dropped a live handoff agent session id"
+                        );
+                    }
                 }
                 panes.insert(*id, PaneState::new(terminal_id.clone()));
                 terminal_runtimes.insert(terminal_id, runtime);
