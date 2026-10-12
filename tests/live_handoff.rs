@@ -3127,6 +3127,7 @@ fn live_handoff_keeps_a_live_reporters_agent_session_id() {
     assert!(drops[0].contains("ReporterGone"), "{drops:?}");
     // The spawning server is the proven source: its bindings were not dropped.
     assert!(!log.contains("source unproven"), "{log}");
+    assert!(!log.contains("pull path does not carry them"), "{log}");
     thread::sleep(Duration::from_millis(300));
     assert!(
         !fs::read_to_string(&exited_prompts)
@@ -4554,6 +4555,92 @@ fn pull_import_takes_over_the_running_server_with_its_panes() {
         pane_pid,
         &received_marker,
         "after-pull",
+    );
+
+    let _ = request(
+        &api_socket,
+        serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
+    );
+    assert!(wait_for_exit(&mut importer.0, Duration::from_secs(10)).success());
+    drop(spawned);
+    cleanup_test_base(&base);
+}
+
+/// #252 review: a pull has no anchor to the intended source earlier than the
+/// pull itself, so it never carries agent session ids, even from a live
+/// reporter; only the push path (`live_handoff_keeps_a_live_reporters_agent_session_id`)
+/// does. Given just the source pid, the importer still pins the inode of the
+/// API socket it sends the request to, and the pull itself succeeds.
+#[cfg(target_os = "linux")]
+#[test]
+fn pull_import_drops_handoff_agent_session_ids() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let mut spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    register_runtime_dir(&runtime_dir);
+    let source_pid = spawned.child.process_id().unwrap();
+    let created = request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:workspace:create",
+            "method": "workspace.create",
+            "params": {"cwd": "/tmp", "focus": true}
+        }),
+    );
+    let pane = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (session_id, prompts) = start_reporting_pi(&base, &api_socket, &pane, "pulled", true);
+    wait_for_pane(&base, &api_socket, &pane, "before the pull", |got| {
+        got["agent"] == "pi" && got["agent_session_id"] == session_id.as_str()
+    });
+
+    let mut importer = spawn_pull_importer(
+        &base,
+        &api_socket,
+        &["--expect-source-pid".into(), source_pid.to_string()],
+        &[],
+    );
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while spawned.child.try_wait().unwrap().is_none() {
+        assert!(Instant::now() < deadline, "source server did not hand over");
+        thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        importer.0.try_wait().unwrap().is_none(),
+        "importer exited: {}",
+        stderr_of(&mut importer.0)
+    );
+    wait_for_api(&api_socket, Duration::from_secs(5));
+
+    // The id is dropped (the pane and its agent survive), and the #211 guard
+    // refuses a prompt that expects it.
+    let pulled = pane_get(&base, &api_socket, &pane);
+    assert_eq!(
+        pulled["agent_session_id"],
+        serde_json::Value::Null,
+        "{pulled}"
+    );
+    let refused = guarded_prompt(&base, &api_socket, &pane, "after-pull", &session_id);
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(!refused.status.success(), "the guard accepted: {stderr}");
+    assert!(stderr.contains("agent_session_unknown"), "{stderr}");
+    wait_for_file_contains(
+        &config_home.join("herdr-dev/herdr-server.log"),
+        "dropped handoff agent session ids: pull path does not carry them",
+        Duration::from_secs(5),
+    );
+    thread::sleep(Duration::from_millis(300));
+    assert!(
+        !fs::read_to_string(&prompts)
+            .unwrap_or_default()
+            .contains("after-pull"),
+        "a refused prompt reached the pane"
     );
 
     let _ = request(
