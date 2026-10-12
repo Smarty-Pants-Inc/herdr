@@ -24,14 +24,10 @@ const RECENT_CHANNEL_EPOCHS = 2;
 const MAX_CHANNEL_ID = 1024;
 const RECONNECT_DELAY_MS = 250;
 const REGISTRATION_TIMEOUT_MS = 2000;
-// A native /new, /resume or /fork keeps the receiving session's input fenced until every
-// session_start handler has returned. This extension registers from its own session_start, so a
-// guarded delivery can reach Pi while a slower handler (for example an extension bootstrap) still
-// holds that fence. Pi then refuses it as session_changed without rotating the generation. Such a
-// refusal is retried, bounded by these limits and the frame's deadline.
-const MAX_FENCE_RETRIES = 12;
-const FENCE_RETRY_BASE_MS = 100;
-const FENCE_RETRY_MAX_MS = 1000;
+// A held guarded delivery (see handleDeliver) is acknowledged with its refusal this long before the
+// frame's deadline_ms. Herdr's own wait ends at that deadline as delivery_unknown, so an ACK sent
+// exactly at the deadline could lose the race and turn a definite refusal into an unknown.
+const HELD_DELIVERY_ACK_MARGIN_MS = 250;
 const CHANNEL_REASONS = new Set([
   "no_session",
   "session_changed",
@@ -243,6 +239,14 @@ export default function (pi) {
   // opens one. Herdr serves exactly one registration per connection, so a new connection still
   // gets a new registration and never replays a frame from the previous connection or epoch.
   const channelSupported = process.platform !== "win32" && typeof pi.submitUserMessage === "function";
+  // A native /new, /resume or /fork keeps the receiving session's input fenced until every
+  // session_start handler has returned. This extension registers from its own session_start, so a
+  // guarded delivery can reach Pi while a slower handler (for example an extension bootstrap)
+  // still holds that fence; Pi refuses it as session_changed without rotating the generation.
+  // A Pi that announces the lifted fence with session_ready lets such a refusal be held and
+  // re-attempted once on that event. Pi's `on` accepts any event name, so support is read from
+  // the host capability, never inferred. Without it the refusal passes through unchanged.
+  const sessionReadySupported = channelSupported && pi.hostCapabilities?.sessionReadyEvent === true;
   const loadScope = channelSupported ? new AsyncResource("herdr-agent-channel") : undefined;
   let channelSocket: net.Socket | undefined;
   let channelConnected = false;
@@ -274,6 +278,46 @@ export default function (pi) {
   // Keep unresolved calls counted across reconnect/session replacement: an old callback must not
   // free a newer request's slot, and repeated replacement cannot create unlimited pending calls.
   const inflight = new Set<LedgerEntry>();
+  // Guarded deliveries Pi refused at a replacement's lifecycle fence, waiting for session_ready.
+  // At most one per request ID; each keeps its inflight slot, so this never exceeds
+  // MAX_CHANNEL_INFLIGHT.
+  type HeldDelivery = {
+    token: number;
+    socket: any;
+    registrationEpoch: string;
+    sessionGeneration: string;
+    expiresAt: number;
+    timer?: ReturnType<typeof setTimeout>;
+    // Re-attempts admission synchronously in the caller's callback; settles the delivery.
+    retry: () => void;
+    // Settles the delivery with its original refusal receipt.
+    refuse: () => void;
+  };
+  const held = new Map<string, HeldDelivery>();
+
+  function takeHeld(requestId: string): HeldDelivery | undefined {
+    const delivery = held.get(requestId);
+    if (!delivery) return undefined;
+    held.delete(requestId);
+    if (delivery.timer) clearTimeout(delivery.timer);
+    return delivery;
+  }
+
+  // A retired connection can never ACK, so its held deliveries settle now and free their slots.
+  function releaseHeldDeliveries() {
+    for (const requestId of [...held.keys()]) takeHeld(requestId)?.refuse();
+  }
+
+  function heldDeliveryLive(delivery: HeldDelivery): boolean {
+    return delivery.token === channelGeneration &&
+      delivery.socket === channelSocket &&
+      channelReady &&
+      !channelClosing &&
+      !delivery.socket.destroyed &&
+      channelEpoch === delivery.registrationEpoch &&
+      currentContext?.userMessageSessionGeneration === delivery.sessionGeneration &&
+      typeof pi.submitUserMessage === "function";
+  }
 
   function pruneEpochs() {
     const retained = new Set(recentEpochs);
@@ -313,6 +357,7 @@ export default function (pi) {
   function dropConnection() {
     clearRegistrationTimer();
     channelGeneration += 1;
+    releaseHeldDeliveries();
     const socket = channelSocket;
     channelSocket = undefined;
     channelConnected = false;
@@ -519,7 +564,7 @@ export default function (pi) {
     }
     inflight.add(entry);
     const text = frame.text;
-    const admit = async (attempt: number) => {
+    const admit = async (redelivery: boolean) => {
       if (
         token !== channelGeneration ||
         socket !== channelSocket ||
@@ -546,9 +591,9 @@ export default function (pi) {
         // This is the receipt-returning Pi ingress. The old void API is intentionally not a
         // fallback: acknowledging socket receipt would turn an unknown delivery into success.
         const result = await pi.submitUserMessage({
-          // Pi reserves each (epoch, request) key even when it refuses, so a retry needs a fresh
-          // key. The NUL separator cannot occur in a Herdr ID, and Pi uses the epoch only as a key.
-          registrationEpoch: attempt === 0 ? registrationEpoch : `${registrationEpoch}\u0000fence-retry\u0000${attempt}`,
+          // Pi reserves each (epoch, request) key even when it refuses, so the redelivery needs a
+          // fresh key. The NUL separator cannot occur in a Herdr ID; Pi uses the epoch only as a key.
+          registrationEpoch: redelivery ? `${registrationEpoch}\u0000session-ready` : registrationEpoch,
           requestId,
           sessionGeneration: expectedSessionGeneration,
           text,
@@ -560,46 +605,62 @@ export default function (pi) {
         return undefined; // Possible admission without a usable receipt is unknown, not rejection.
       }
     };
-    // A guarded refusal is retried only while it can be a receiving-session lifecycle fence: Pi
-    // definitively refused (a typed session_changed receipt, never an exception, void or
-    // duplicate), the session generation it was bound to is still live, and this connection and
-    // epoch are still current. Pi admitted nothing, so a retry never replays an admitted message.
-    // Attempts are sequential, so at most one can be admitted. A real session change rotates
-    // the generation and is never retried.
-    const fenceRetryDelay = (receipt: Record<string, any> | undefined, attempt: number) => {
+    // A guarded refusal is held for session_ready only while it can be a receiving-session
+    // lifecycle fence: Pi definitively refused (a typed session_changed receipt, never an
+    // exception, void or duplicate), the session generation it was bound to is still live, and
+    // this connection and epoch are still current. Pi admitted nothing, so the one redelivery
+    // never replays an admitted message. A real session change rotates the generation: never held.
+    const holdForSessionReady = (
+      receipt: Record<string, any> | undefined,
+    ): Promise<Record<string, any> | undefined> | undefined => {
+      const expiresAt = Number.isSafeInteger(frame.deadline_ms)
+        ? frame.deadline_ms - HELD_DELIVERY_ACK_MARGIN_MS
+        : Number.NaN;
       if (
-        !ifDraftEmpty ||
+        !sessionReadySupported ||
         receipt?.status !== "rejected" ||
         receipt.reason !== "session_changed" ||
         receipt.duplicate === true ||
-        attempt >= MAX_FENCE_RETRIES ||
-        token !== channelGeneration ||
-        socket !== channelSocket ||
-        !channelReady ||
-        channelClosing ||
-        socket.destroyed ||
-        channelEpoch !== registrationEpoch ||
-        currentContext?.userMessageSessionGeneration !== expectedSessionGeneration
+        held.has(requestId) ||
+        held.size >= MAX_CHANNEL_INFLIGHT ||
+        !(Date.now() < expiresAt)
       ) return undefined;
-      const delay = Math.min(FENCE_RETRY_BASE_MS * 2 ** attempt, FENCE_RETRY_MAX_MS);
-      return Date.now() + delay < frame.deadline_ms ? delay : undefined;
-    };
-    const attemptAdmission = (attempt: number): Promise<Record<string, any> | undefined> =>
-      admit(attempt).then((receipt) => {
-        const delay = fenceRetryDelay(receipt, attempt);
-        if (delay === undefined) return receipt;
-        // The retry timer runs in the load scope. Its callback calls admit, which observes the
-        // editor/hold and invokes submitUserMessage synchronously, as the first attempt does.
-        return new Promise((resolve) => {
-          const timer = inLoadScope(() => setTimeout(() => resolve(attemptAdmission(attempt + 1)), delay));
-          if (!timer) resolve(receipt);
-          else timer.unref?.();
-        });
+      return new Promise((resolve) => {
+        const delivery: HeldDelivery = {
+          token,
+          socket,
+          registrationEpoch,
+          sessionGeneration: expectedSessionGeneration,
+          expiresAt,
+          // Called from the session_ready callback: admit observes the editor/hold and invokes
+          // submitUserMessage there, synchronously, exactly as the first attempt does.
+          retry: () => resolve(admit(true)),
+          refuse: () => resolve(receipt),
+        };
+        if (!heldDeliveryLive(delivery)) {
+          resolve(receipt);
+          return;
+        }
+        // The deadline needs no polling: one one-shot load-scope timer per held delivery only
+        // settles it with Pi's refusal. It never re-attempts admission.
+        const timer = inLoadScope(() => setTimeout(() => {
+          if (held.get(requestId) === delivery) takeHeld(requestId)?.refuse();
+        }, Math.max(0, expiresAt - Date.now())));
+        if (!timer) {
+          resolve(receipt);
+          return;
+        }
+        timer.unref?.();
+        delivery.timer = timer;
+        held.set(requestId, delivery);
       });
+    };
     // Guarded ingress must run in this very socket callback: no await, Promise scheduling or
     // event-loop gap between observing the editor/hold and invoking submitUserMessage. Only
     // its receipt is awaited. Preserve the existing deferred/fenced path for unguarded input.
-    const call = ifDraftEmpty ? attemptAdmission(0) : Promise.resolve().then(() => admit(0));
+    const call = ifDraftEmpty
+      ? admit(false).then((receipt) => holdForSessionReady(receipt) ?? receipt)
+      : Promise.resolve().then(() => admit(false));
     void call.then((receipt) => {
       inflight.delete(entry);
       pruneEpochs();
@@ -709,6 +770,7 @@ export default function (pi) {
     const onDisconnect = () => {
       if (token !== channelGeneration || socket !== channelSocket) return;
       clearRegistrationTimer();
+      releaseHeldDeliveries();
       channelSocket = undefined;
       channelConnected = false;
       channelRegistration = undefined;
@@ -917,6 +979,27 @@ export default function (pi) {
     agentActive = false;
     publishState();
   });
+
+  // The lifted fence: re-attempt each delivery held for this generation once, in this callback.
+  // Expired, retired or mismatched holds settle with Pi's original refusal; the post-receipt path
+  // then ACKs only on the still-current connection and generation.
+  if (sessionReadySupported) {
+    pi.on("session_ready", (event) => {
+      for (const requestId of [...held.keys()]) {
+        const delivery = takeHeld(requestId);
+        if (!delivery) continue;
+        if (
+          event?.sessionGeneration === delivery.sessionGeneration &&
+          Date.now() < delivery.expiresAt &&
+          heldDeliveryLive(delivery)
+        ) {
+          delivery.retry();
+        } else {
+          delivery.refuse();
+        }
+      }
+    });
+  }
 
   pi.on("session_shutdown", shutdownChannel);
 
