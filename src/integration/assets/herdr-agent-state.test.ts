@@ -1944,6 +1944,104 @@ registeredChannelTest("Pi guarded empty draft submits exactly once and leaves ed
   expect(mutations).toBe(0);
 });
 
+// Pi keeps a receiving session's input fenced until every session_start handler of a native
+// /new, /resume or /fork has returned, without rotating the generation captured in session_start.
+// This fixture models that admission rule: refused as session_changed while held, admitted after.
+function lifecycleFenceFixture() {
+  const state = { held: false };
+  const submit = (request: AdmissionRequest): Promise<AdmissionReceipt> => state.held
+    ? Promise.resolve({ status: "rejected", reason: "session_changed", sessionGeneration: request.sessionGeneration })
+    : accepted(request);
+  return { state, submit };
+}
+
+registeredChannelTest("Pi guarded delivery after /new waits out the receiving session's lifecycle fence and is admitted once", async () => {
+  const { connections } = await startChannelServer();
+  const { state, submit } = lifecycleFenceFixture();
+  const asset = await loadChannelAsset(submit);
+  let editor = "";
+  await asset.handlers.get("session_start")?.({}, draftContext({ getEditorText: () => editor }));
+  await waitFor(() => connections.length === 1);
+  // /new: this extension registers the new generation from its own session_start while a slower
+  // session_start handler still holds the fence.
+  state.held = true;
+  await asset.handlers.get("session_start")?.({ reason: "new" }, {
+    ...draftContext({ getEditorText: () => editor }), userMessageSessionGeneration: "session-2",
+  });
+  await waitFor(() => connections.length === 2 && connections[0].closed);
+  guardedDeliver(connections[1], "chan-3");
+  await waitFor(() => asset.calls.length >= 2);
+  expect(connections[1].acks).toEqual([]);
+  state.held = false; // The remaining session_start handlers returned; the fence lifts.
+  await waitFor(() => connections[1].acks.length === 1, 3_000);
+  expect(connections[1].acks[0]).toEqual({
+    type: "ack", registration_epoch: "epoch-2", request_id: "chan-3",
+    session_generation: "session-2", status: "accepted",
+  });
+  // Every attempt targets the live generation with a fresh Pi key; only the last was admitted.
+  const keys = asset.calls.map((call) => JSON.stringify([call.registrationEpoch, call.requestId]));
+  expect(new Set(keys).size).toBe(asset.calls.length);
+  expect(asset.calls[0].registrationEpoch).toBe("epoch-2");
+  for (const call of asset.calls) {
+    expect(call).toMatchObject({ requestId: "chan-3", sessionGeneration: "session-2", text: "remote prompt" });
+  }
+  await Bun.sleep(150);
+  expect(connections[1].acks).toHaveLength(1);
+  // The same channel keeps admitting without another registration.
+  const attempts = asset.calls.length;
+  guardedDeliver(connections[1], "chan-4");
+  await waitFor(() => connections[1].acks.length === 2);
+  expect(connections[1].acks[1]).toMatchObject({ request_id: "chan-4", status: "accepted" });
+  expect(asset.calls).toHaveLength(attempts + 1);
+  expect(connections).toHaveLength(2);
+});
+
+registeredChannelTest("Pi guarded fence retries recheck the draft, stop at the deadline, and never retry unguarded or rotated sessions", async () => {
+  const { connections } = await startChannelServer();
+  const { state, submit } = lifecycleFenceFixture();
+  const asset = await loadChannelAsset(submit);
+  let editor = "";
+  const context: Record<string, any> = draftContext({ getEditorText: () => editor });
+  await asset.handlers.get("session_start")?.({}, context);
+  await waitFor(() => connections.length === 1);
+  state.held = true;
+  // A draft typed while the fence is held refuses the next attempt; Pi is not called again.
+  guardedDeliver(connections[0], "draft");
+  await waitFor(() => asset.calls.length === 1);
+  editor = "typed meanwhile";
+  await waitFor(() => connections[0].acks.length === 1, 3_000);
+  expect(connections[0].acks[0]).toMatchObject({ request_id: "draft", status: "rejected", reason: "draft_present" });
+  expect(asset.calls).toHaveLength(1);
+  editor = "";
+  // A fence outlasting the frame's deadline ends with Pi's own refusal.
+  connections[0].socket.write(`${JSON.stringify({
+    ...delivery(connections[0], "deadline", "remote prompt"), if_draft_empty: true, deadline_ms: Date.now() + 400,
+  })}\n`);
+  await waitFor(() => connections[0].acks.length === 2, 3_000);
+  expect(connections[0].acks[1]).toMatchObject({ request_id: "deadline", status: "rejected", reason: "session_changed" });
+  const deadlineCalls = asset.calls.filter((call) => call.requestId === "deadline").length;
+  expect(deadlineCalls).toBeGreaterThan(1);
+  expect(deadlineCalls).toBeLessThanOrEqual(4);
+  // Unguarded input keeps its single deferred attempt.
+  guardedDeliver(connections[0], "unguarded", "remote prompt", false);
+  await waitFor(() => connections[0].acks.length === 3);
+  expect(connections[0].acks[2]).toMatchObject({ request_id: "unguarded", status: "rejected", reason: "session_changed" });
+  await Bun.sleep(250);
+  expect(asset.calls.filter((call) => call.requestId === "unguarded")).toHaveLength(1);
+  // A real session change rotates the generation: no retry, and no ACK for the dead generation.
+  const before = asset.calls.length;
+  asset.pi.submitUserMessage = async (request: AdmissionRequest) => {
+    asset.calls.push(request);
+    context.userMessageSessionGeneration = "session-rotated";
+    return { status: "rejected", reason: "session_changed", sessionGeneration: request.sessionGeneration };
+  };
+  guardedDeliver(connections[0], "rotated");
+  await waitFor(() => connections[0].closed);
+  await Bun.sleep(250);
+  expect(asset.calls).toHaveLength(before + 1);
+  expect(connections[0].acks).toHaveLength(3);
+});
+
 registeredChannelTest("Pi guarded checks and invokes in the same socket callback before any microtask, then waits only for receipt", async () => {
   const { connections } = await startChannelServer();
   let insideData = false;

@@ -24,6 +24,14 @@ const RECENT_CHANNEL_EPOCHS = 2;
 const MAX_CHANNEL_ID = 1024;
 const RECONNECT_DELAY_MS = 250;
 const REGISTRATION_TIMEOUT_MS = 2000;
+// A native /new, /resume or /fork keeps the receiving session's input fenced until every
+// session_start handler has returned. This extension registers from its own session_start, so a
+// guarded delivery can reach Pi while a slower handler (for example an extension bootstrap) still
+// holds that fence. Pi then refuses it as session_changed without rotating the generation. Such a
+// refusal is retried, bounded by these limits and the frame's deadline.
+const MAX_FENCE_RETRIES = 12;
+const FENCE_RETRY_BASE_MS = 100;
+const FENCE_RETRY_MAX_MS = 1000;
 const CHANNEL_REASONS = new Set([
   "no_session",
   "session_changed",
@@ -509,7 +517,7 @@ export default function (pi) {
     }
     inflight.add(entry);
     const text = frame.text;
-    const admit = async () => {
+    const admit = async (attempt: number) => {
       if (
         token !== channelGeneration ||
         socket !== channelSocket ||
@@ -536,7 +544,9 @@ export default function (pi) {
         // This is the receipt-returning Pi ingress. The old void API is intentionally not a
         // fallback: acknowledging socket receipt would turn an unknown delivery into success.
         const result = await pi.submitUserMessage({
-          registrationEpoch,
+          // Pi reserves each (epoch, request) key even when it refuses, so a retry needs a fresh
+          // key. The NUL separator cannot occur in a Herdr ID, and Pi uses the epoch only as a key.
+          registrationEpoch: attempt === 0 ? registrationEpoch : `${registrationEpoch}\u0000fence-retry\u0000${attempt}`,
           requestId,
           sessionGeneration: expectedSessionGeneration,
           text,
@@ -548,10 +558,46 @@ export default function (pi) {
         return undefined; // Possible admission without a usable receipt is unknown, not rejection.
       }
     };
+    // A guarded refusal is retried only while it can be a receiving-session lifecycle fence: Pi
+    // definitively refused (a typed session_changed receipt, never an exception, void or
+    // duplicate), the session generation it was bound to is still live, and this connection and
+    // epoch are still current. Pi admitted nothing, so a retry never replays an admitted message.
+    // Attempts are sequential, so at most one can be admitted. A real session change rotates
+    // the generation and is never retried.
+    const fenceRetryDelay = (receipt: Record<string, any> | undefined, attempt: number) => {
+      if (
+        !ifDraftEmpty ||
+        receipt?.status !== "rejected" ||
+        receipt.reason !== "session_changed" ||
+        receipt.duplicate === true ||
+        attempt >= MAX_FENCE_RETRIES ||
+        token !== channelGeneration ||
+        socket !== channelSocket ||
+        !channelReady ||
+        channelClosing ||
+        socket.destroyed ||
+        channelEpoch !== registrationEpoch ||
+        currentContext?.userMessageSessionGeneration !== expectedSessionGeneration
+      ) return undefined;
+      const delay = Math.min(FENCE_RETRY_BASE_MS * 2 ** attempt, FENCE_RETRY_MAX_MS);
+      return Date.now() + delay < frame.deadline_ms ? delay : undefined;
+    };
+    const attemptAdmission = (attempt: number): Promise<Record<string, any> | undefined> =>
+      admit(attempt).then((receipt) => {
+        const delay = fenceRetryDelay(receipt, attempt);
+        if (delay === undefined) return receipt;
+        // The retry timer runs in the load scope. Its callback calls admit, which observes the
+        // editor/hold and invokes submitUserMessage synchronously, as the first attempt does.
+        return new Promise((resolve) => {
+          const timer = inLoadScope(() => setTimeout(() => resolve(attemptAdmission(attempt + 1)), delay));
+          if (!timer) resolve(receipt);
+          else timer.unref?.();
+        });
+      });
     // Guarded ingress must run in this very socket callback: no await, Promise scheduling or
     // event-loop gap between observing the editor/hold and invoking submitUserMessage. Only
     // its receipt is awaited. Preserve the existing deferred/fenced path for unguarded input.
-    const call = ifDraftEmpty ? admit() : Promise.resolve().then(admit);
+    const call = ifDraftEmpty ? attemptAdmission(0) : Promise.resolve().then(() => admit(0));
     void call.then((receipt) => {
       inflight.delete(entry);
       pruneEpochs();
