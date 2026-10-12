@@ -3318,6 +3318,7 @@ mod tests {
         }
     }
 
+    // Not E2E: asserts the internal validity cell and original reporter stay put, which the CLI cannot observe; E2E: tests/cli/panes.rs pi_reload_cli_reports_anchor_the_pane_and_keep_the_id_end_to_end.
     #[test]
     fn reported_session_id_less_same_path_report_keeps_the_original_binding() {
         // smarty-dev#10398: pre-v11 Pis re-report the same path without an ID.
@@ -3342,6 +3343,7 @@ mod tests {
         }
     }
 
+    // Not E2E: asserts the old binding's internal validity cell is retired, which the CLI cannot observe; E2E: tests/cli/panes.rs pi_reload_cli_reports_anchor_the_pane_and_keep_the_id_end_to_end.
     #[test]
     fn reported_session_id_less_report_for_a_different_path_clears_the_binding() {
         let (mut terminal, _) = current_pi_binding();
@@ -3373,6 +3375,7 @@ mod tests {
         assert!(!original_cell.load(std::sync::atomic::Ordering::Acquire));
     }
 
+    // Not E2E: needs a report without transport-peer metadata, which a CLI report always carries; E2E: tests/cli/panes.rs pi_reload_cli_reports_anchor_the_pane_and_keep_the_id_end_to_end.
     #[test]
     fn reported_session_id_less_report_cannot_revive_a_superseded_binding() {
         // The kept binding must have been current just before the ID-less report.
@@ -4336,6 +4339,7 @@ mod tests {
         );
     }
 
+    // Not E2E: pins buffered-state and reload-before-detection orderings the CLI cannot sequence deterministically; E2E: tests/cli/panes.rs pi_reload_cli_reports_anchor_the_pane_and_keep_the_id_end_to_end.
     #[test]
     fn pi_reload_anchors_an_unanchored_pane() {
         // smarty-dev#10398: a /reload is the only report a long-running Pi sends again.
@@ -4440,6 +4444,7 @@ mod tests {
         ))
     }
 
+    // Not E2E: needs a persisted-only (restored) anchor, which the CLI cannot construct; E2E: tests/cli/panes.rs pi_reload_cli_reports_anchor_the_pane_and_keep_the_id_end_to_end.
     #[test]
     fn pi_reload_for_a_different_session_never_displaces_a_persisted_anchor() {
         // #10398 review: a reload re-runs Pi on the SAME session file, so a delayed reload for
@@ -4471,6 +4476,7 @@ mod tests {
         }
     }
 
+    // Not E2E: needs a persisted-only (restored) anchor, which the CLI cannot construct; E2E: tests/cli/panes.rs pi_reload_cli_reports_anchor_the_pane_and_keep_the_id_end_to_end.
     #[test]
     fn pi_reload_for_the_persisted_session_anchors_and_sets_the_id() {
         let anchored = test_session_path("pi-reload-persisted-same.jsonl");

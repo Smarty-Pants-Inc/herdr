@@ -780,6 +780,113 @@ fn pane_agent_reports_accept_options_before_pane() {
     drop(agent_process);
 }
 
+/// smarty-dev#10398 end to end: a real server, a real `pi` foreground process and the real
+/// `herdr pane report-agent-session` CLI. A Pi `/reload` anchors an unanchored pane, a
+/// same-path report without an id keeps the id, a reload for another session never replaces
+/// the anchor, and an explicit `new` session still does.
+#[cfg(target_os = "linux")]
+#[test]
+fn pi_reload_cli_reports_anchor_the_pane_and_keep_the_id_end_to_end() {
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+    let bin_dir = base.join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    // A process titled `pi`, so the server detects the pane as Pi.
+    let fake_pi = bin_dir.join("pi");
+    fs::copy("/bin/sleep", &fake_pi).unwrap();
+
+    let herdr = spawn_herdr(&config_home, &runtime_dir, &socket_path);
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+
+    let created = run_cli_json(
+        &socket_path,
+        &["workspace", "create", "--cwd", base.to_str().unwrap()],
+    );
+    let pane_id = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let command = format!("{} 120", fake_pi.display());
+    let started = run_cli(&socket_path, &["pane", "run", &pane_id, &command]);
+    assert!(
+        started.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let pane_get =
+        || run_cli_json(&socket_path, &["pane", "get", &pane_id])["result"]["pane"].clone();
+    let mut last = serde_json::Value::Null;
+    assert!(
+        wait_until(Duration::from_secs(10), Duration::from_millis(50), || {
+            last = pane_get();
+            last["agent"] == "pi"
+        }),
+        "pi was never detected: {last}"
+    );
+    assert_eq!(last["agent_session"], serde_json::Value::Null, "{last}");
+    assert_eq!(last["agent_session_id"], serde_json::Value::Null, "{last}");
+
+    let path_a = base.join("pi-reload-a.jsonl").to_str().unwrap().to_string();
+    let path_b = base.join("pi-reload-b.jsonl").to_str().unwrap().to_string();
+    // Returns `pane get`'s (session path, session id) right after the report: reports are
+    // applied before the reply, so no wait is needed.
+    let report = |seq: u64, start: Option<&str>, path: &str, id: Option<&str>| {
+        let seq = format!("--seq={seq}");
+        let path = format!("--agent-session-path={path}");
+        let start = start.map(|start| format!("--session-start-source={start}"));
+        let id = id.map(|id| format!("--agent-session-id={id}"));
+        let mut args = vec![
+            "pane",
+            "report-agent-session",
+            "--source=herdr:pi",
+            "--agent=pi",
+            seq.as_str(),
+            path.as_str(),
+        ];
+        args.extend(start.as_deref());
+        args.extend(id.as_deref());
+        args.push(pane_id.as_str());
+        let output = run_cli(&socket_path, &args);
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let pane = pane_get();
+        assert_eq!(pane["agent"], "pi", "{pane}");
+        (
+            pane["agent_session"]["value"].clone(),
+            pane["agent_session_id"].clone(),
+        )
+    };
+    let anchored_a = (serde_json::json!(path_a), serde_json::json!("pi-id-a"));
+
+    assert_eq!(
+        report(1, Some("reload"), &path_a, Some("pi-id-a")),
+        anchored_a,
+        "a reload anchors the unanchored pane"
+    );
+    assert_eq!(
+        report(2, None, &path_a, None),
+        anchored_a,
+        "an id-less same-path report keeps the id"
+    );
+    assert_eq!(
+        report(3, Some("reload"), &path_b, Some("pi-id-b")),
+        anchored_a,
+        "a reload for another session never replaces the anchor"
+    );
+    assert_eq!(
+        report(4, Some("new"), &path_b, Some("pi-id-b")),
+        (serde_json::json!(path_b), serde_json::json!("pi-id-b")),
+        "an explicit new session still replaces it"
+    );
+
+    cleanup_spawned_herdr(herdr, base);
+}
+
 #[test]
 fn pane_read_rejects_invalid_value_with_usage_error() {
     // Invalid option values fail as CLI usage errors before any server

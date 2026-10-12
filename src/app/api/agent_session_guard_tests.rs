@@ -1743,6 +1743,7 @@ fn pane_agent_session(f: &mut Fixture) -> (serde_json::Value, serde_json::Value)
 }
 
 /// smarty-dev#10398: a Pi /reload on a pane with no anchored session must anchor it.
+// Not E2E: forces Pi detection in-process, so it pins the API path without process-title detection timing; E2E: tests/cli/panes.rs pi_reload_cli_reports_anchor_the_pane_and_keep_the_id_end_to_end.
 #[tokio::test]
 async fn pi_reload_anchors_a_pane_without_an_agent_session() {
     let mut f = Fixture::new(Agent::Pi);
@@ -1758,6 +1759,7 @@ async fn pi_reload_anchors_a_pane_without_an_agent_session() {
 
 /// smarty-dev#10398: a reload keeps its session file, so a reload naming a DIFFERENT session
 /// than the live anchored one must not replace it.
+// Not E2E: A also holds live hook authority from a pane.report_agent state report, with Pi detection forced in-process; E2E: tests/cli/panes.rs pi_reload_cli_reports_anchor_the_pane_and_keep_the_id_end_to_end.
 #[tokio::test]
 async fn pi_reload_does_not_replace_a_different_anchored_session() {
     let mut f = Fixture::new(Agent::Pi);
@@ -1800,6 +1802,7 @@ fn report_id_less(
 /// smarty-dev#10398: an ID-less same-path report keeps the ID for discovery, but trust stays
 /// with the original reporter. Once it is dead, guarded input is refused even though a live
 /// foreground process sent the ID-less report; a different path clears the ID.
+// Not E2E: needs a dead original reporter and a chosen live replacement peer identity, which the CLI cannot construct; E2E: tests/cli/panes.rs pi_reload_cli_reports_anchor_the_pane_and_keep_the_id_end_to_end.
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn pi_id_less_same_path_report_keeps_the_id_but_never_moves_trust() {
