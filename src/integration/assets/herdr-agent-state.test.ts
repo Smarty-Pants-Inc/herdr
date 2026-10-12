@@ -953,11 +953,13 @@ function channelContext(generation = "session-1") {
 
 async function loadChannelAsset(
   submit?: (request: AdmissionRequest) => Promise<AdmissionReceipt | unknown>,
+  hostCapabilities?: Record<string, unknown>,
 ) {
   const harness = createExtensionHarness();
   const calls: AdmissionRequest[] = [];
   const pi = {
     ...harness.pi,
+    ...(hostCapabilities ? { hostCapabilities } : {}),
     submitUserMessage: submit ? async (request: AdmissionRequest) => {
       calls.push(request);
       return submit(request);
@@ -2007,6 +2009,153 @@ registeredChannelTest("Pi guarded empty draft submits exactly once and leaves ed
   expect(connections[0].acks[1]).toMatchObject({ status: "accepted", duplicate: true });
   expect(editor).toBe("");
   expect(mutations).toBe(0);
+});
+
+// Pi keeps a receiving session's input fenced until every session_start handler of a native
+// /new, /resume or /fork has returned, without rotating the generation captured in session_start.
+// This fixture models that admission rule: refused as session_changed while held, admitted after.
+function lifecycleFenceFixture() {
+  const state = { held: false };
+  const submit = (request: AdmissionRequest): Promise<AdmissionReceipt> => state.held
+    ? Promise.resolve({ status: "rejected", reason: "session_changed", sessionGeneration: request.sessionGeneration })
+    : accepted(request);
+  return { state, submit };
+}
+
+// A Pi that announces the lifted fence with session_ready advertises it as a host capability.
+const SESSION_READY_PI = { sessionReadyEvent: true };
+
+// A native /new to session-2 whose input is still fenced by a slower session_start handler, with
+// this extension already registered for session-2 on a fresh connection.
+async function guardedChannelInsideNewFence(sessionReadyPi = true) {
+  const { connections } = await startChannelServer();
+  const { state, submit } = lifecycleFenceFixture();
+  const asset = await loadChannelAsset(submit, sessionReadyPi ? SESSION_READY_PI : {});
+  const draft = { editor: "" };
+  await asset.handlers.get("session_start")?.({}, draftContext({ getEditorText: () => draft.editor }));
+  await waitFor(() => connections.length === 1);
+  state.held = true;
+  const context: Record<string, any> = {
+    ...draftContext({ getEditorText: () => draft.editor }), userMessageSessionGeneration: "session-2",
+  };
+  await asset.handlers.get("session_start")?.({ reason: "new" }, context);
+  await waitFor(() => connections.length === 2 && connections[0].closed);
+  const sessionReady = (sessionGeneration = "session-2") =>
+    asset.handlers.get("session_ready")?.({ type: "session_ready", reason: "new", sessionGeneration }, context);
+  return { connection: connections[1], connections, state, asset, draft, context, sessionReady };
+}
+
+registeredChannelTest("Pi guarded delivery refused at the /new fence is held without polling, then admitted once on session_ready", async () => {
+  const { connection, connections, state, asset, sessionReady } = await guardedChannelInsideNewFence();
+  guardedDeliver(connection, "chan-3");
+  await waitFor(() => asset.calls.length === 1);
+  // Held: no ACK and no timer re-attempt while the fence is up.
+  await Bun.sleep(400);
+  expect(asset.calls).toHaveLength(1);
+  expect(connection.acks).toEqual([]);
+  state.held = false; // The remaining session_start handlers returned; Pi lifts the fence.
+  sessionReady();
+  // Re-attempted in the session_ready callback itself, before any microtask.
+  expect(asset.calls).toHaveLength(2);
+  await waitFor(() => connection.acks.length === 1);
+  expect(connection.acks[0]).toEqual({
+    type: "ack", registration_epoch: "epoch-2", request_id: "chan-3",
+    session_generation: "session-2", status: "accepted",
+  });
+  // Both attempts target the live generation; the redelivery uses a fresh Pi key.
+  expect(asset.calls[0].registrationEpoch).toBe("epoch-2");
+  expect(asset.calls[1].registrationEpoch).not.toBe("epoch-2");
+  for (const call of asset.calls) {
+    expect(call).toMatchObject({ requestId: "chan-3", sessionGeneration: "session-2", text: "remote prompt" });
+  }
+  // Once only: a later session_ready finds nothing held.
+  sessionReady();
+  await Bun.sleep(50);
+  expect(asset.calls).toHaveLength(2);
+  expect(connection.acks).toHaveLength(1);
+  // The same channel keeps admitting without another registration.
+  guardedDeliver(connection, "chan-4");
+  await waitFor(() => connection.acks.length === 2);
+  expect(connection.acks[1]).toMatchObject({ request_id: "chan-4", status: "accepted" });
+  expect(asset.calls).toHaveLength(3);
+  expect(connections).toHaveLength(2);
+});
+
+registeredChannelTest("Pi held guarded delivery rechecks the draft at session_ready and refuses draft_present without calling Pi", async () => {
+  const { connection, state, asset, draft, sessionReady } = await guardedChannelInsideNewFence();
+  guardedDeliver(connection, "draft");
+  await waitFor(() => asset.calls.length === 1);
+  draft.editor = "typed meanwhile";
+  await Bun.sleep(300);
+  expect(connection.acks).toEqual([]);
+  state.held = false;
+  sessionReady();
+  await waitFor(() => connection.acks.length === 1);
+  expect(connection.acks[0]).toMatchObject({ request_id: "draft", status: "rejected", reason: "draft_present" });
+  expect(asset.calls).toHaveLength(1);
+});
+
+registeredChannelTest("Pi held guarded delivery gets Pi's original refusal before its deadline when session_ready never comes", async () => {
+  const { connection, asset, sessionReady } = await guardedChannelInsideNewFence();
+  const deadline = Date.now() + 700;
+  connection.socket.write(`${JSON.stringify({
+    ...delivery(connection, "deadline", "remote prompt"), if_draft_empty: true, deadline_ms: deadline,
+  })}\n`);
+  await waitFor(() => asset.calls.length === 1);
+  await Bun.sleep(200);
+  expect(connection.acks).toEqual([]);
+  await waitFor(() => connection.acks.length === 1, 2_000);
+  // Acknowledged ahead of the deadline, so Herdr's own wait cannot report it as unknown.
+  expect(Date.now()).toBeLessThan(deadline);
+  expect(connection.acks[0]).toMatchObject({ request_id: "deadline", status: "rejected", reason: "session_changed" });
+  expect(asset.calls).toHaveLength(1);
+  // An expired hold is gone: a late session_ready does not deliver it.
+  sessionReady();
+  await Bun.sleep(50);
+  expect(asset.calls).toHaveLength(1);
+  expect(connection.acks).toHaveLength(1);
+  // Unguarded input is never held: its single deferred attempt's refusal passes through.
+  guardedDeliver(connection, "unguarded", "remote prompt", false);
+  await waitFor(() => connection.acks.length === 2);
+  expect(connection.acks[1]).toMatchObject({ request_id: "unguarded", status: "rejected", reason: "session_changed" });
+  sessionReady();
+  await Bun.sleep(50);
+  expect(asset.calls).toHaveLength(2);
+});
+
+registeredChannelTest("Pi held guarded delivery is not retried on a mismatched session_ready or a rotated generation", async () => {
+  const { connection, state, asset, context, sessionReady } = await guardedChannelInsideNewFence();
+  guardedDeliver(connection, "mismatch");
+  await waitFor(() => asset.calls.length === 1);
+  state.held = false;
+  sessionReady("session-other");
+  await waitFor(() => connection.acks.length === 1);
+  expect(connection.acks[0]).toMatchObject({ request_id: "mismatch", status: "rejected", reason: "session_changed" });
+  expect(asset.calls).toHaveLength(1);
+  // A real session change rotates the generation: never held, and no ACK for the dead generation.
+  asset.pi.submitUserMessage = async (request: AdmissionRequest) => {
+    asset.calls.push(request);
+    context.userMessageSessionGeneration = "session-rotated";
+    return { status: "rejected", reason: "session_changed", sessionGeneration: request.sessionGeneration };
+  };
+  guardedDeliver(connection, "rotated");
+  await waitFor(() => connection.closed);
+  sessionReady("session-2");
+  sessionReady("session-rotated");
+  await Bun.sleep(100);
+  expect(asset.calls).toHaveLength(2);
+  expect(connection.acks).toHaveLength(1);
+});
+
+registeredChannelTest("Pi without the session_ready capability passes the fence refusal through, with no retry", async () => {
+  const { connection, asset } = await guardedChannelInsideNewFence(false);
+  expect(asset.handlers.has("session_ready")).toBe(false);
+  guardedDeliver(connection, "old-pi");
+  await waitFor(() => connection.acks.length === 1);
+  expect(connection.acks[0]).toMatchObject({ request_id: "old-pi", status: "rejected", reason: "session_changed" });
+  await Bun.sleep(400);
+  expect(asset.calls).toHaveLength(1);
+  expect(connection.acks).toHaveLength(1);
 });
 
 registeredChannelTest("Pi guarded checks and invokes in the same socket callback before any microtask, then waits only for receipt", async () => {
