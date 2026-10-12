@@ -313,14 +313,16 @@ impl App {
     pub(crate) fn handle_deferred_guarded_agent_prompt(
         &mut self,
         request: Request,
-        context: crate::api::ApiRequestContext,
+        mut context: crate::api::ApiRequestContext,
         respond_to: std::sync::mpsc::Sender<String>,
     ) -> bool {
         if let Method::AgentDraftState(params) = &request.method {
             // Same caller policy as agent.prompt, decided BEFORE any ledger reservation
             // or frame: a denied caller learns nothing and the receiver sees nothing.
             // The query never acquires a PTY writer, focus, or submission authority.
-            if let Some(response) = self.cross_pane_input_denial(&request, context) {
+            if let Some(response) =
+                self.cross_pane_input_denial_with_ancestry(&request, &mut context)
+            {
                 let _ = respond_to.send(response);
                 return true;
             }
@@ -339,14 +341,14 @@ impl App {
             ));
             return true;
         }
-        if let Some(response) = self.cross_pane_input_denial(&request, context) {
+        if let Some(response) = self.cross_pane_input_denial_with_ancestry(&request, &mut context) {
             let _ = respond_to.send(response);
             return true;
         }
         let Method::AgentPromptGuarded(params) = request.method else {
             return false;
         };
-        let reservation = self.reserve_guarded_prompt(&params);
+        let reservation = self.reserve_guarded_prompt(&params, context);
         Self::respond_channel_reservation(request.id, reservation, respond_to);
         true
     }
@@ -399,6 +401,7 @@ impl App {
     fn reserve_guarded_prompt(
         &mut self,
         params: &AgentPromptGuardedParams,
+        context: crate::api::ApiRequestContext,
     ) -> Result<Reservation, Outcome> {
         if !crate::platform::capabilities().registered_agent_channel {
             return Err(Outcome::failure(
@@ -467,11 +470,21 @@ impl App {
                 "registered owner is disconnected, stale or not foreground",
             ));
         }
-        channel.reserve_prompt(
+        channel.reserve_with_audit(
             params.request_id.clone(),
             params.text.clone(),
             params.if_draft_empty,
             Duration::from_millis(timeout),
+            || {
+                self.record_api_input(
+                    "agent.prompt_guarded",
+                    target.ws_idx,
+                    target.pane_id,
+                    context,
+                    params.text.len(),
+                )
+                .map_err(|(code, message)| Outcome::failure(code, message))
+            },
         )
     }
 }

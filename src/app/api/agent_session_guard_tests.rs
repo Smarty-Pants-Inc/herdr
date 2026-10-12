@@ -2169,3 +2169,115 @@ async fn expected_agent_session_real_pty_queued_delayed_enter_foreground_switch_
         assert!(!dir.exists());
     }
 }
+
+/// smarty-dev#931 with herdr#211: every session-checked method, on both the
+/// deferred and the synchronous route, is logged like its base method, and the
+/// log reuses the guard's request-local ancestry observation (one walk each).
+#[tokio::test]
+async fn expected_agent_session_real_pty_session_checked_inputs_log_the_guard_ancestry() {
+    let mut f = Fixture::new(Agent::Pi);
+    f.report(Some("private-session-a"), Some("/tmp/pi-log.jsonl"), 1);
+    let context = crate::api::ApiRequestContext {
+        local_peer_pane_origin: crate::platform::PeerPaneOrigin::Absent,
+        ..crate::api::ApiRequestContext::for_local_peer_pid(Some(std::process::id()))
+    };
+    let peer = context.local_peer_identity.expect("live peer");
+    let cases = [
+        ("agent.prompt", "agent.prompt", true, "p1"),
+        ("agent.prompt_session_checked", "agent.prompt", true, "p2"),
+        ("pane.send_text", "pane.send_text", true, "t1"),
+        (
+            "pane.send_text_session_checked",
+            "pane.send_text",
+            true,
+            "t2",
+        ),
+        ("pane.send_keys", "pane.send_keys", true, ""),
+        ("pane.send_keys_session_checked", "pane.send_keys", true, ""),
+        (
+            "pane.send_text_session_checked",
+            "pane.send_text",
+            false,
+            "t3",
+        ),
+        (
+            "pane.send_keys_session_checked",
+            "pane.send_keys",
+            false,
+            "",
+        ),
+    ];
+    let mut expected_bytes = Vec::new();
+    for (index, (method, logged_as, deferred, text)) in cases.into_iter().enumerate() {
+        let params = if method.starts_with("agent.") {
+            serde_json::json!({
+                "target": "sink", "text": text, "allow_cross_pane": false,
+                "expected_agent_session_id": "private-session-a",
+            })
+        } else if method.starts_with("pane.send_text") {
+            serde_json::json!({
+                "pane_id": f.pane, "text": text, "allow_cross_pane": false,
+                "expected_agent_session_id": "private-session-a",
+            })
+        } else {
+            serde_json::json!({
+                "pane_id": f.pane, "keys": ["enter"], "allow_cross_pane": false,
+                "expected_agent_session_id": "private-session-a",
+            })
+        };
+        let request: Request = serde_json::from_value(serde_json::json!({
+            "id": format!("logged-{index}"), "method": method, "params": params,
+        }))
+        .expect("request schema");
+        let before = crate::platform::server_ancestry_seam_observations_for_test();
+        // Outside proof admits this unattributed caller; the guard records it.
+        let response = crate::platform::with_server_ancestry_for_test(peer, Some(true), || {
+            if deferred {
+                let (tx, rx) = std::sync::mpsc::channel();
+                assert!(f
+                    .app
+                    .handle_deferred_agent_api_request(request, context, tx));
+                Ok(rx)
+            } else {
+                Err(f
+                    .app
+                    .handle_api_request_after_internal_events_drained_with_context(
+                        request, context,
+                    ))
+            }
+        });
+        let response = match response {
+            Ok(rx) => rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("deferred input must respond"),
+            Err(response) => response,
+        };
+        assert_ok(&response);
+        assert_eq!(
+            crate::platform::server_ancestry_seam_observations_for_test() - before,
+            1,
+            "{method}: the log must reuse the guard's walk, not repeat it"
+        );
+        if method.starts_with("agent.") {
+            expected_bytes.extend_from_slice(text.as_bytes());
+            expected_bytes.push(b'\r');
+        } else if method.starts_with("pane.send_text") {
+            expected_bytes.extend_from_slice(text.as_bytes());
+        } else {
+            expected_bytes.push(b'\r');
+        }
+        f.completed_bytes(&expected_bytes);
+        let lines: Vec<serde_json::Value> = std::fs::read_to_string(&f.app.api_input_log)
+            .expect("input log")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("json line"))
+            .collect();
+        assert_eq!(lines.len(), index + 1, "{method}: {lines:?}");
+        let line = lines.last().expect("line");
+        assert_eq!(line["method"], logged_as, "{method}: {line}");
+        assert_eq!(line["target_pane"], f.pane.as_str(), "{method}: {line}");
+        assert_eq!(line["caller"]["pid"], std::process::id(), "{method}");
+        assert_eq!(line["caller"]["ancestry"], "outside", "{method}: {line}");
+    }
+    let _ = std::fs::remove_file(&f.app.api_input_log);
+}
