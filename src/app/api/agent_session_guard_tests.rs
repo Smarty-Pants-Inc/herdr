@@ -1781,6 +1781,89 @@ async fn pi_reload_does_not_replace_a_different_anchored_session() {
     assert_eq!(id, "private-reload-a");
 }
 
+fn report_id_less(
+    f: &mut Fixture,
+    path: &str,
+    seq: u64,
+    reporter: crate::platform::ProcessIdentity,
+) {
+    assert_ok(&f.request_with_context(
+        "pane.report_agent_session",
+        serde_json::json!({
+            "pane_id": f.pane, "source": "herdr:pi", "agent": "pi", "seq": seq,
+            "agent_session_path": path,
+        }),
+        crate::api::ApiRequestContext::capture(Some(reporter)),
+    ));
+}
+
+/// smarty-dev#10398: an ID-less same-path report keeps the ID for discovery, but trust stays
+/// with the original reporter. Once it is dead, guarded input is refused even though a live
+/// foreground process sent the ID-less report; a different path clears the ID.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn pi_id_less_same_path_report_keeps_the_id_but_never_moves_trust() {
+    const PATH: &str = "/tmp/id-less-owner.jsonl";
+    let mut f = Fixture::with_job_control(Agent::Pi, true);
+    f.report(Some("private-session-a"), Some(PATH), 1);
+    let original = f.reporter;
+    report_id_less(&mut f, PATH, 2, original);
+    assert_eq!(pane_agent_session(&mut f).1, "private-session-a");
+    assert_ok(&f.request(
+        "pane.send_text",
+        serde_json::json!({
+            "pane_id": f.pane, "text": "live", "expected_agent_session_id": "private-session-a",
+        }),
+    ));
+    f.bytes(b"live");
+
+    f.control("zombie");
+    // A live foreground process with the same executable name sends the ID-less report.
+    f.control("replacement");
+    let fallback = crate::platform::process_identity(
+        std::fs::read_to_string(f.dir.join("fallback.pid"))
+            .expect("fallback PID")
+            .parse()
+            .expect("numeric fallback PID"),
+    )
+    .expect("live foreground replacement");
+    report_id_less(&mut f, PATH, 3, fallback);
+    f.control("reap");
+    assert!(crate::platform::process_identity(original.pid).is_none());
+
+    let (session, id) = pane_agent_session(&mut f);
+    assert_eq!(session["value"], PATH);
+    assert_eq!(id, "private-session-a");
+    let (ws_idx, pane_id) = f.app.parse_pane_id(&f.pane).expect("pane");
+    let terminal_id = f
+        .app
+        .state
+        .terminal_id_for_pane(ws_idx, pane_id)
+        .expect("terminal");
+    assert_eq!(
+        f.app.state.terminals[&terminal_id].reported_agent_session_reporter(),
+        Some(original)
+    );
+    for method in ["pane.send_text", "agent.prompt_session_checked"] {
+        assert_error(
+            &f.request(
+                method,
+                serde_json::json!({
+                    "pane_id": f.pane, "target": f.pane, "text": "bad",
+                    "expected_agent_session_id": "private-session-a",
+                }),
+            ),
+            "agent_session_unknown",
+        );
+    }
+    f.bytes(b"live");
+
+    report_id_less(&mut f, "/tmp/id-less-other.jsonl", 4, fallback);
+    let (session, id) = pane_agent_session(&mut f);
+    assert_eq!(session["value"], "/tmp/id-less-other.jsonl");
+    assert_eq!(id, serde_json::Value::Null);
+}
+
 #[tokio::test]
 async fn expected_agent_session_real_pty_guard_precedes_copilot_focus_event() {
     let mut f = Fixture::new(Agent::GithubCopilot);

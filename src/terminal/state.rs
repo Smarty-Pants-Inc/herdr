@@ -1646,6 +1646,7 @@ impl TerminalState {
             reference.kind,
             reference.value.clone(),
         );
+        let id_less = id.is_none();
         let binding = id
             .and_then(crate::agent_resume::AgentSessionRef::id)
             .zip(reporter)
@@ -1658,6 +1659,26 @@ impl TerminalState {
             });
         if previous.accepted != self.accepted_session_report_revision {
             if self.current_session_identity_for_persistence().as_ref() == Some(&identity) {
+                // ponytail: the ID belongs to the session file, not to one report. Pre-v11 Pis
+                // re-report the SAME path without an ID all the time, which used to wipe a
+                // correct ID within minutes (smarty-dev#10398). An ID-less report for exactly
+                // the bound identity, whose binding was current just before this report, keeps
+                // it. Only the revision moves: the ORIGINAL reporter and validity cell stay, so
+                // the ID-less sender never inherits trust, and the #211 guard still requires
+                // that original reporter to be the live foreground process (a dead one is
+                // refused as agent_session_unknown). A different path, an ID without a
+                // transport peer, or an explicit clear still clears.
+                if id_less {
+                    let accepted = self.accepted_session_report_revision;
+                    if let Some(current) =
+                        self.reported_agent_session_id.as_mut().filter(|current| {
+                            current.identity == identity && current.revision == previous.accepted
+                        })
+                    {
+                        current.revision = accepted;
+                        return;
+                    }
+                }
                 self.replace_reported_agent_session_id(binding);
             }
             return;
@@ -3258,6 +3279,75 @@ mod tests {
     }
 
     #[test]
+    fn reported_session_id_less_same_path_report_keeps_the_original_binding() {
+        // smarty-dev#10398: pre-v11 Pis re-report the same path without an ID.
+        let other = crate::platform::ProcessIdentity {
+            pid: 18,
+            start_time: 12,
+        };
+        for hook in [false, true] {
+            for id_less_reporter in [None, Some(other)] {
+                let (mut terminal, reporter) = current_pi_binding();
+                let original = terminal.reported_agent_session_validity().expect("binding");
+                for seq in 2..=3 {
+                    buffer_pi_report(&mut terminal, hook, seq, None, id_less_reporter);
+                    assert_eq!(terminal.reported_agent_session_id(), Some("original"));
+                    // Trust never moves to the ID-less sender.
+                    assert_eq!(terminal.reported_agent_session_reporter(), Some(reporter));
+                    let current = terminal.reported_agent_session_validity().expect("binding");
+                    assert!(original.ptr_eq(&current));
+                    assert!(binding_is_valid(&original));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reported_session_id_less_report_for_a_different_path_clears_the_binding() {
+        let (mut terminal, _) = current_pi_binding();
+        let original = terminal.reported_agent_session_validity().expect("binding");
+        let original_cell = original.upgrade().expect("owned current cell");
+        let other = crate::agent_resume::AgentSessionRef::path(test_temp_session_path(
+            "id-less-other.jsonl",
+        ));
+        let marker = terminal.session_report_marker();
+        terminal
+            .set_agent_session_ref_for_session_start(
+                "herdr:pi".into(),
+                "pi".into(),
+                other.clone(),
+                Some(2),
+                Some("new".into()),
+            )
+            .expect("accepted replacement");
+        terminal.retain_reported_agent_session_id(
+            (marker, Some(2)),
+            "herdr:pi",
+            "pi",
+            other.as_ref(),
+            None,
+            None,
+        );
+        assert_eq!(terminal.reported_agent_session_id(), None);
+        assert_eq!(terminal.reported_agent_session_reporter(), None);
+        assert!(!original_cell.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[test]
+    fn reported_session_id_less_report_cannot_revive_a_superseded_binding() {
+        // The kept binding must have been current just before the ID-less report.
+        let (mut terminal, _) = current_pi_binding();
+        let reference =
+            crate::agent_resume::AgentSessionRef::path(test_temp_session_path("buffered.jsonl"));
+        terminal
+            .set_agent_session_ref("herdr:pi".into(), "pi".into(), reference.clone(), Some(2))
+            .expect("accepted report without transport metadata");
+        assert_eq!(terminal.reported_agent_session_id(), None);
+        buffer_pi_report(&mut terminal, true, 3, None, None);
+        assert_eq!(terminal.reported_agent_session_id(), None);
+    }
+
+    #[test]
     fn reported_session_validity_clear_restore_exit_and_respawn_retire_cell() {
         for action in ["clear", "release", "restore", "launch", "exit", "respawn"] {
             let (mut terminal, reporter) = current_pi_binding();
@@ -3484,20 +3574,15 @@ mod tests {
 
     #[test]
     fn reported_session_validity_accepted_missing_metadata_retires_cell() {
-        for (id, reporter_present) in [(None, true), (Some("original"), false)] {
-            let (mut terminal, reporter) = current_pi_binding();
-            let original = terminal.reported_agent_session_validity().expect("binding");
-            let original_cell = original.upgrade().expect("owned current cell");
-            buffer_pi_report(
-                &mut terminal,
-                true,
-                2,
-                id,
-                reporter_present.then_some(reporter),
-            );
-            assert!(!original_cell.load(std::sync::atomic::Ordering::Acquire));
-            assert!(terminal.reported_agent_session_validity().is_none());
-        }
+        // An ID-less report for the same path now keeps the binding (smarty-dev#10398, see
+        // reported_session_id_less_same_path_report_keeps_the_original_binding); an ID without
+        // a transport peer still retires it.
+        let (mut terminal, _) = current_pi_binding();
+        let original = terminal.reported_agent_session_validity().expect("binding");
+        let original_cell = original.upgrade().expect("owned current cell");
+        buffer_pi_report(&mut terminal, true, 2, Some("original"), None);
+        assert!(!original_cell.load(std::sync::atomic::Ordering::Acquire));
+        assert!(terminal.reported_agent_session_validity().is_none());
     }
 
     #[test]
