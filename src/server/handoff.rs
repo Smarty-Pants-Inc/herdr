@@ -828,11 +828,55 @@ pub(crate) fn pull(
 
 #[cfg(unix)]
 fn receive_on(mut stream: UnixStream, token: &str) -> io::Result<ReceivedHandoff> {
+    match receive_parts(&mut stream, token) {
+        Ok((manifest, fds, report_bound_sockets)) => Ok(ReceivedHandoff {
+            manifest,
+            fds,
+            stream,
+            report_bound_sockets,
+        }),
+        Err(err) => {
+            // The source discards this process's stderr and kills it as soon
+            // as the stream closes, so log the reason before dropping it.
+            // The error can echo sender-supplied manifest text, so only the
+            // logged rendering is escaped and bounded; `err` is returned as is.
+            warn!(
+                error = %loggable_rejection(&err.to_string()),
+                "handoff import rejected"
+            );
+            Err(err)
+        }
+    }
+}
+
+/// Maximum number of source characters of a rejection reason written to the log.
+// ponytail: a longer reason is cut; the full error still reaches the caller.
+#[cfg(unix)]
+const LOGGED_REJECTION_MAX_CHARS: usize = 512;
+
+/// Escapes control characters (so CR/LF cannot forge log lines) and caps the
+/// length of an untrusted rejection reason before it is logged.
+#[cfg(unix)]
+fn loggable_rejection(reason: &str) -> String {
+    let mut chars = reason.chars();
+    let head: String = chars.by_ref().take(LOGGED_REJECTION_MAX_CHARS).collect();
+    let mut logged = head.escape_debug().to_string();
+    if chars.next().is_some() {
+        logged.push_str("...[truncated]");
+    }
+    logged
+}
+
+#[cfg(unix)]
+fn receive_parts(
+    stream: &mut UnixStream,
+    token: &str,
+) -> io::Result<(HandoffManifest, Vec<RawFd>, bool)> {
     stream.write_all(token.as_bytes())?;
     stream.write_all(b"\n")?;
     stream.flush()?;
 
-    let manifest_line = read_line_unbuffered(&mut stream)?;
+    let manifest_line = read_line_unbuffered(&mut *stream)?;
     let manifest: HandoffManifest =
         serde_json::from_str(&manifest_line).map_err(io::Error::other)?;
     validate_manifest_version(&manifest)?;
@@ -864,13 +908,8 @@ fn receive_on(mut stream: UnixStream, token: &str) -> io::Result<ReceivedHandoff
         stream.write_all(b"validated\n")?;
     }
     stream.flush()?;
-    let fds = recv_fds(&stream, manifest.panes.len())?;
-    Ok(ReceivedHandoff {
-        manifest,
-        fds,
-        stream,
-        report_bound_sockets,
-    })
+    let fds = recv_fds(stream, manifest.panes.len())?;
+    Ok((manifest, fds, report_bound_sockets))
 }
 
 /// Debug builds let tests run a replacement that behaves like a build from
@@ -1156,6 +1195,32 @@ pub(crate) fn log_import_result(panes: usize) {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loggable_rejection_escapes_controls_and_bounds_length() {
+        let reason = format!("v1\r\nFAKE-LINE{}", "x".repeat(4096));
+        let logged = loggable_rejection(&reason);
+        assert!(!logged.contains(['\r', '\n']), "{logged}");
+        assert!(logged.starts_with("v1\\r\\nFAKE-LINE"), "{logged}");
+        assert!(logged.ends_with("...[truncated]"), "{logged}");
+        assert!(
+            logged.len() < LOGGED_REJECTION_MAX_CHARS + 32,
+            "{}",
+            logged.len()
+        );
+        assert_eq!(loggable_rejection("short"), "short");
+
+        // Terminal escapes and bidi overrides cannot restyle or reorder the log.
+        let logged = loggable_rejection("v\u{1b}[31mred\u{202e}rtl");
+        assert!(!logged.contains(['\u{1b}', '\u{202e}']), "{logged}");
+        assert_eq!(logged, "v\\u{1b}[31mred\\u{202e}rtl");
+
+        // The cut counts chars, so a multi-byte char at the boundary stays whole.
+        let at_limit = format!("{}é", "a".repeat(LOGGED_REJECTION_MAX_CHARS - 1));
+        assert_eq!(loggable_rejection(&at_limit), at_limit);
+        let logged = loggable_rejection(&format!("{at_limit}é"));
+        assert_eq!(logged, format!("{at_limit}...[truncated]"));
+    }
 
     fn empty_snapshot() -> crate::persist::SessionSnapshot {
         crate::persist::SessionSnapshot {

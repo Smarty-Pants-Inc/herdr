@@ -101,8 +101,21 @@ pub fn unregister_runtime_dir(path: &Path) {
 pub fn herdr_server_pids_for_runtime_dir(runtime_dir: &Path) -> std::io::Result<Vec<u32>> {
     let mut pids = Vec::new();
     for pid in iter_worktree_server_pids()? {
-        let Some(process_runtime_dir) = process_runtime_dir(pid)? else {
-            continue;
+        // A concurrent test's server can exit between the /proc scan and this
+        // read; its environ is then gone (NotFound) or unreadable while it
+        // tears down (PermissionDenied). An exiting process serves nothing.
+        let process_runtime_dir = match process_runtime_dir(pid) {
+            Ok(Some(dir)) => dir,
+            Ok(None) => continue,
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+                ) =>
+            {
+                continue;
+            }
+            Err(err) => return Err(err),
         };
         if process_runtime_dir == runtime_dir {
             pids.push(pid);
