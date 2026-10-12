@@ -12,6 +12,22 @@ use super::responses::{encode_error, encode_error_body, encode_success};
 
 const AGENT_PROMPT_SUBMIT_DELAY: Duration = Duration::from_millis(300);
 
+/// A typed status refusal uses the same delivery/flush evidence as session loss.
+fn expected_status_mismatch_response(id: String, error: &std::io::Error) -> String {
+    let (partial, flush_failed) =
+        crate::pty::actor::agent_session_loss_details(error).unwrap_or((None, false));
+    serde_json::json!({
+        "id": id,
+        "error": {
+            "code": "expected_status_mismatch",
+            "message": error.to_string(),
+            "partial_text_consumed": partial,
+            "flush_failed": flush_failed
+        }
+    })
+    .to_string()
+}
+
 // Codex's Windows input reader does not surface bracketed paste. It detects the prompt as a
 // "paste burst" and, while that burst is buffered, rewrites a following Enter into a newline
 // instead of submitting. The burst only flushes after an idle timeout, so any size-based delay is
@@ -88,6 +104,7 @@ impl App {
         match &request.method {
             Method::AgentPrompt(_)
             | Method::AgentPromptSessionChecked(_)
+            | Method::AgentPromptStatusChecked(_)
             | Method::PaneSendTextSessionChecked(_)
             | Method::PaneSendKeysSessionChecked(_) => true,
             Method::PaneSendText(params) => params.expected_agent_session_id.is_some(),
@@ -122,7 +139,8 @@ impl App {
         }
         let params = match request.method {
             crate::api::schema::Method::AgentPrompt(params)
-            | crate::api::schema::Method::AgentPromptSessionChecked(params) => params,
+            | crate::api::schema::Method::AgentPromptSessionChecked(params)
+            | crate::api::schema::Method::AgentPromptStatusChecked(params) => params,
             crate::api::schema::Method::PaneSendText(params)
             | crate::api::schema::Method::PaneSendTextSessionChecked(params) => {
                 self.defer_session_checked_pane_input(
@@ -166,6 +184,9 @@ impl App {
             };
             let response = match completion.recv() {
                 Ok(Ok(())) => encode_success(id, ResponseResult::AgentPrompted { agent }),
+                Ok(Err(err)) if crate::pty::actor::is_expected_status_mismatch(&err) => {
+                    expected_status_mismatch_response(id, &err)
+                }
                 Ok(Err(err)) if crate::pty::actor::is_agent_session_lost(&err) => {
                     super::panes::session_loss_response(id, &err)
                 }
@@ -246,7 +267,8 @@ impl App {
         self.check_expected_pane(params.expected_pane_id.as_deref(), &resolved)
             .map_err(|error| encode_error_body(id.clone(), error))?;
         let guard = self
-            .capture_expected_agent_session(
+            .capture_expected_agent_input_guard(
+                params.expected_agent_status,
                 params.expected_agent_session_id.as_deref(),
                 resolved.ws_idx,
                 resolved.pane_id,
@@ -395,7 +417,9 @@ impl App {
             )
         }
         .map_err(|err| {
-            if crate::pty::actor::is_agent_session_lost(&err) {
+            if crate::pty::actor::is_expected_status_mismatch(&err) {
+                expected_status_mismatch_response(id.clone(), &err)
+            } else if crate::pty::actor::is_agent_session_lost(&err) {
                 super::panes::session_loss_response(id.clone(), &err)
             } else if crate::pty::actor::is_pane_input_poisoned(&err) {
                 encode_error(id.clone(), "pane_input_poisoned", err.to_string())
@@ -755,6 +779,54 @@ mod tests {
             .expect("agent prompt responds after submission")
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn expected_status_mismatch_response_preserves_native_loss_and_flush_details() {
+        let guard = crate::pty::actor::SessionInputGuard {
+            reporter: crate::platform::process_identity(std::process::id())
+                .expect("live test process"),
+            expected_agent_session_id: "private-status-session".into(),
+            expected_agent_status: Some(crate::api::schema::AgentStatus::Idle),
+            agent_status: std::sync::Weak::new(),
+            status_mismatch: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            binding_validity: std::sync::Weak::new(),
+        };
+        for (error, partial, flush_failed) in [
+            (
+                crate::pty::actor::agent_session_lost(&guard, false),
+                Some(false),
+                false,
+            ),
+            (
+                crate::pty::actor::agent_session_lost(&guard, true),
+                Some(true),
+                false,
+            ),
+            (
+                crate::pty::actor::agent_session_flush_failed(&guard),
+                None,
+                true,
+            ),
+        ] {
+            assert!(crate::pty::actor::is_expected_status_mismatch(&error));
+            assert!(!crate::pty::actor::is_agent_session_lost(&error));
+            assert_eq!(
+                crate::pty::actor::agent_session_loss_details(&error),
+                Some((partial, flush_failed))
+            );
+            let response: serde_json::Value =
+                serde_json::from_str(&expected_status_mismatch_response("status".into(), &error))
+                    .expect("status response JSON");
+            assert_eq!(response["error"]["code"], "expected_status_mismatch");
+            assert_eq!(
+                response["error"]["partial_text_consumed"],
+                serde_json::json!(partial)
+            );
+            assert_eq!(response["error"]["flush_failed"], flush_failed);
+            assert!(response.get("result").is_none());
+        }
+    }
+
     #[cfg(windows)]
     #[tokio::test]
     async fn windows_codex_prompt_flushes_paste_burst_before_enter() {
@@ -775,6 +847,7 @@ mod tests {
             AgentPromptParams {
                 expected_agent_session_id: None,
                 expected_pane_id: None,
+                expected_agent_status: None,
                 target: "reviewer".into(),
                 text: "A != B".into(),
                 wait: None,
@@ -878,6 +951,7 @@ mod tests {
             AgentPromptParams {
                 expected_agent_session_id: None,
                 expected_pane_id: None,
+                expected_agent_status: None,
                 target: public_pane_id,
                 text: "A != B".into(),
                 wait: None,
@@ -912,6 +986,7 @@ mod tests {
             AgentPromptParams {
                 expected_agent_session_id: None,
                 expected_pane_id: None,
+                expected_agent_status: None,
                 target: "reviewer".into(),
                 text: "A != B".into(),
                 wait: None,
@@ -930,6 +1005,7 @@ mod tests {
             AgentPromptParams {
                 expected_agent_session_id: None,
                 expected_pane_id: None,
+                expected_agent_status: None,
                 target: "opencode".into(),
                 text: "wrong target".into(),
                 wait: None,
@@ -961,6 +1037,7 @@ mod tests {
             AgentPromptParams {
                 expected_agent_session_id: None,
                 expected_pane_id: None,
+                expected_agent_status: None,
                 target: "reviewer".into(),
                 text: "hello".into(),
                 wait: None,
@@ -997,6 +1074,7 @@ mod tests {
             AgentPromptParams {
                 expected_agent_session_id: None,
                 expected_pane_id: None,
+                expected_agent_status: None,
                 target: "reviewer".into(),
                 text: "must not send".into(),
                 wait: None,
@@ -1040,6 +1118,7 @@ mod tests {
                 AgentPromptParams {
                     expected_agent_session_id: None,
                     expected_pane_id: None,
+                    expected_agent_status: None,
                     target: target.into(),
                     text: text.into(),
                     wait: None,
@@ -1077,6 +1156,7 @@ mod tests {
             AgentPromptParams {
                 expected_agent_session_id: None,
                 expected_pane_id: None,
+                expected_agent_status: None,
                 target: "reviewer".into(),
                 text: "unrelated prompt".into(),
                 wait: None,
@@ -1121,6 +1201,7 @@ mod tests {
             AgentPromptParams {
                 expected_agent_session_id: None,
                 expected_pane_id: None,
+                expected_agent_status: None,
                 target: "reviewer".into(),
                 text: "A != B".into(),
                 wait: None,
@@ -1208,6 +1289,7 @@ mod tests {
             AgentPromptParams {
                 expected_agent_session_id: None,
                 expected_pane_id: None,
+                expected_agent_status: None,
                 target: "reviewer".into(),
                 text: "A != B".into(),
                 wait: None,
