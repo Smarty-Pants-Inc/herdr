@@ -3113,6 +3113,7 @@ mod tests {
                 guarded_live_handoff: true,
                 expected_terminal_guard: true,
                 expected_agent_session_guard: true,
+                expected_agent_status_guard: true,
                 input_consumer: false,
             }),
         };
@@ -3183,6 +3184,7 @@ mod tests {
                 capabilities: Some(crate::api::schema::ServerCapabilities {
                     expected_terminal_guard: true,
                     expected_agent_session_guard: true,
+                    expected_agent_status_guard: true,
                     live_handoff: true,
                     detached_server_daemon: true,
                     endpoint_protocol_generation: Some(
@@ -3438,6 +3440,7 @@ mod tests {
                 capabilities: Some(crate::api::schema::ServerCapabilities {
                     expected_terminal_guard: true,
                     expected_agent_session_guard: true,
+                    expected_agent_status_guard: true,
                     live_handoff: true,
                     detached_server_daemon: true,
                     endpoint_protocol_generation: Some(

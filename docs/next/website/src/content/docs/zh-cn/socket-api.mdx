@@ -398,6 +398,20 @@ principal 由服务器解析，每个客户端连接只绑定一次。在 Linux 
 {"id":"checked_keys","method":"pane.send_keys_session_checked","params":{"pane_id":"w1:p1","keys":["Enter"],"expected_agent_session_id":"reported_id_from_pane_get"}}
 ```
 
+### 检测到的智能体状态预期守卫
+
+智能体提示 params 接受可选的 `expected_agent_status` 字段，但**必须提供 `expected_agent_session_id`**。不支持仅指定状态的守卫：状态预期没有会话预期时，返回 `invalid_request`。将状态设为 `"idle"`，可要求 Herdr 在接受请求时**检测到的**智能体状态为 idle。初始不匹配会在写入任何输入字节前返回 `expected_status_mismatch`。省略该字段会保留现有提示行为；显式 `null`、非字符串或未知状态会导致 `invalid_request`，而不是无守卫提示。
+
+请检查 `ping.result.capabilities.expected_agent_status_guard == true`，并使用 `agent.prompt_status_checked` 发送状态守卫提示。该方法要求同时提供 `expected_agent_status` 和 `expected_agent_session_id`。包括仅支持会话守卫的服务器在内，旧服务器会拒绝未知方法，而不是静默忽略状态字段。只要指定 `--expected-status`，CLI 就使用此方法；不支持时返回 `expected_agent_status_unsupported`。不会用旧方法重试；不要静默移除预期条件，也不要在拒绝后回退到其他提示方法。支持此能力的服务器也会强制执行 `agent.prompt` 或 `agent.prompt_session_checked` 上提供的该字段，但仅凭这些名称不能保证旧服务器会执行检查。
+
+```json
+{"id":"status_checked_prompt","method":"agent.prompt_status_checked","params":{"target":"worker","text":"review this change","expected_agent_session_id":"reported_id_from_agent_get","expected_agent_status":"idle"}}
+```
+
+该比较使用钩子和屏幕检测得出的有效检测状态，而非窗格的已查看状态或 `done` 显示。显示为 `done` 的 idle 智能体满足 `"idle"`。除必需的会话预期外，还可提供 `expected_pane_id` 和可选的 `wait` 对象。检测状态条件附着在现有会话／上报者守卫上，在接受请求时和 PTY 写入前检查。后续检测状态不匹配也会返回 `expected_status_mismatch`，停止请求的剩余字节，不再发送 Enter。可能已经写入部分输入；此后续错误不保证总写入字节数为零。会话所有权丢失仍是单独的 `agent_session_lost` 错误。
+
+检测到的 idle 是**最后观察到的状态**，并非实际智能体不忙的事务性证明。钩子和屏幕观察可能滞后，智能体也可能在检查后变忙。破坏性命令仍需要智能体侧的忙碌检查。这不是等待 idle 的操作，`wait` 仍观察提交后的活动和稳定状态。
+
 `pane.send_keys` 和 `pane.send_input.keys` 接受 Herdr 组合键字符串: 普通可打印键、`enter` 和 `esc` 这类特殊键、`ctrl+h`、`control+j`、`alt+x`、`shift+tab` 这类修饰组合键、`f1` 这类功能键,以及 `minus` 和 `plus` 这类命名标点。它们不接受 `prefix+` 绑定字符串。
 
 ```json
@@ -968,7 +982,7 @@ workspace 的 get/list 响应会公开生成的 `tokens` 映射,空间侧边栏�
 
 工作区事件订阅包括 `workspace.created`、`workspace.updated`、`workspace.metadata_updated`、`workspace.renamed`、`workspace.moved`、`workspace.reordered`、`workspace.closed` 和 `workspace.focused`。`workspace.metadata_updated` 报告令牌变更和 TTL 到期,但不会调用插件事件钩子。其他工作区事件描述 Herdr UI/运行时的生命周期。当工作区属于 worktree 组时,`workspace.created` 包含可选的 `workspace.worktree` 来源信息。`workspace.moved` 包含被移动的 `workspace_id`、请求的 `insert_index` 和更新后的有序 `workspaces` 列表。`workspace.reordered` 包含原子移动的 `workspace_ids`、可选的 `before_workspace_id` 和服务器确认的有序 `workspaces` 列表。在移除前 Herdr 仍能识别时,`workspace.closed` 包含最终的 `workspace` 快照。
 标签页事件订阅包括 `tab.created`、`tab.closed`、`tab.focused`、`tab.renamed` 和 `tab.moved`。`tab.moved` 包含被移动的 `tab_id`、`workspace_id`、请求的 `insert_index` 和该工作区更新后的有序 `tabs` 列表。
-窗格事件订阅包括 `pane.created`、`pane.updated`、`pane.closed`、`pane.focused`、`pane.moved`、`pane.exited`、`pane.agent_detected`、`pane.output_matched`、`pane.agent_status_changed`、`pane.agent_session_changed` 和 `pane.scroll_changed`。`pane.focused` 也会上报任意连接到此服务器的客户端手动选择窗格的变化，不会移动其他客户端的视图，且载荷不包含客户端身份。重复选择已选中的窗格不会再次发出事件。终端标题变化可能发出 `pane.updated`,但如果原始标题只有旋转指示符发生变化且 `terminal_title_stripped` 不变,则不会发出。`pane.scroll_changed` 只针对一个 `pane_id`,每当 Herdr 观察到滚动快照变化时,都会发出 `pane_id`、`workspace_id` 和当前 `scroll` 指标。`pane.agent_session_changed` 与 `pane.agent_status_changed` 一样只针对一个 `pane_id`。当该窗格中的智能体(通过 `pane.report_agent_session`,或携带会话的 `pane.report_agent`)报告的会话 id 与窗格当前会话不同时发出。再次报告当前会话不会发出事件。事件包含 `pane_id`、`workspace_id`、`agent`、`session_id` 和 `previous_session_id`;窗格之前没有会话时 `previous_session_id` 为 `null`。`session_id` 与窗格的 `agent_session.value` 一致:即报告的 `agent_session_id`,对于 Pi 和 omp,如果报告了 `agent_session_path` 则为该路径。只跟踪 Herdr 官方智能体集成报告的会话。
+窗格事件订阅包括 `pane.created`、`pane.updated`、`pane.closed`、`pane.focused`、`pane.moved`、`pane.exited`、`pane.agent_detected`、`pane.output_matched`、`pane.agent_status_changed`、`pane.agent_session_changed` 和 `pane.scroll_changed`。`pane.focused` 也会上报任意连接到此服务器的客户端手动选择窗格的变化，不会移动其他客户端的视图，且载荷不包含客户端身份。重复选择已选中的窗格不会再次发出事件。终端标题变化可能发出 `pane.updated`,但如果原始标题只有旋转指示符发生变化且 `terminal_title_stripped` 不变,则不会发出。`pane.scroll_changed` 只针对一个 `pane_id`,每当 Herdr 观察到滚动快照变化时,都会发出 `pane_id`、`workspace_id` 和当前 `scroll` 指标。`pane.agent_session_changed` 与 `pane.agent_status_changed` 一样只针对一个 `pane_id`。当该窗格中的智能体(通过 `pane.report_agent_session`,或携带会话的 `pane.report_agent`)报告的会话 id 与窗格当前会话不同时发出;同一会话以不同的实际智能体会话 id 报告时(id 被设置、清除或替换)也会发出。以相同的实际 id 再次报告当前会话不会发出事件。事件包含 `pane_id`、`workspace_id`、`agent`、`session_id`、`previous_session_id`、`agent_session_id` 和 `previous_agent_session_id`;窗格之前没有会话时 `previous_session_id` 为 `null`。`session_id` 与窗格的 `agent_session.value` 一致:即报告的 `agent_session_id`,对于 Pi 和 omp,如果报告了 `agent_session_path` 则为该路径。`agent_session_id` 是此次报告后 `pane get` 返回的 `agent_session_id` 实际 id,`previous_agent_session_id` 是报告前的实际 id;没有 id 时(例如集成只报告了会话路径)二者为 `null`。因此订阅者可以通过 `agent_session_id` 为 `null` 发现未携带实际 id 注册的会话。只跟踪 Herdr 官方智能体集成报告的会话。
 布局事件订阅包括 `layout.updated`。该事件携带一个标签页更新后的 `PaneLayoutSnapshot`。使用 `session.snapshot` 维护缓存的客户端应将该事件作为重新读取受影响布局的通知；延迟到达的载荷可能早于最新快照。
 
 Worktree 事件订阅包括 `worktree.created`、`worktree.opened` 和 `worktree.removed`。Worktree 事件描述 Git 检出的生命周期。`worktree.created` 包含打开的 `workspace` 和创建的 `worktree`。`worktree.opened` 包含目标 `workspace`、打开的 `worktree` 和 `already_open`。`worktree.removed` 包含 `workspace_id`、被移除的 `worktree` 和 `forced`。

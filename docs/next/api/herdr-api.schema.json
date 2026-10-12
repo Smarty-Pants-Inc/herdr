@@ -713,8 +713,20 @@
                 "agent": {
                   "type": "string"
                 },
+                "agent_session_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
                 "pane_id": {
                   "type": "string"
+                },
+                "previous_agent_session_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 },
                 "previous_session_id": {
                   "type": [
@@ -739,7 +751,9 @@
                 "workspace_id",
                 "agent",
                 "session_id",
-                "previous_session_id"
+                "previous_session_id",
+                "agent_session_id",
+                "previous_agent_session_id"
               ],
               "type": "object"
             },
@@ -1345,6 +1359,10 @@
             "expected_agent_session_id": {
               "description": "Refuse input unless the resolved agent still reports this session ID.",
               "type": "string"
+            },
+            "expected_agent_status": {
+              "$ref": "#/schemas/request/$defs/AgentStatus",
+              "description": "Refuse input unless the pane's detected agent status still matches.\nRequires `expected_agent_session_id`. Detection uses hooks and screen\nsignals; idle is the last observed state, not a readiness reservation."
             },
             "expected_pane_id": {
               "description": "Refuse input unless the target alias resolves to this pane.",
@@ -6182,6 +6200,23 @@
           "type": "object"
         },
         {
+          "description": "Local JSON only; requires status and session expectations. Older servers\nreject instead of silently ignoring the detected-status guard.",
+          "properties": {
+            "method": {
+              "const": "agent.prompt_status_checked",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentPromptParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
           "properties": {
             "method": {
               "const": "agent.wait",
@@ -7379,13 +7414,27 @@
           "type": "string"
         },
         "PaneAgentSessionChangedEvent": {
-          "description": "The agent in a pane reported a session id different from the pane's\nprevious one. A repeated report of the current session emits nothing.",
+          "description": "The agent in a pane reported a session different from the pane's previous\none: a new session value, or the same value with a different actual agent\nsession id (set, cleared, or replaced). A repeated report of the current\nsession with the same actual id emits nothing.",
           "properties": {
             "agent": {
               "type": "string"
             },
+            "agent_session_id": {
+              "description": "The actual agent session id from the accepted current report, the same\nvalue as `pane get`'s `agent_session_id`. `null` when the report carried\nno id (for example only a session path).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "pane_id": {
               "type": "string"
+            },
+            "previous_agent_session_id": {
+              "description": "The pane's actual agent session id before this report, or `null`.",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "previous_session_id": {
               "description": "`null` when the pane had no reported session before.",
@@ -7395,6 +7444,7 @@
               ]
             },
             "session_id": {
+              "description": "The reported session value: the agent session id or, when the report\ncarried only a path, the session path.",
               "type": "string"
             },
             "workspace_id": {
@@ -7406,7 +7456,9 @@
             "workspace_id",
             "agent",
             "session_id",
-            "previous_session_id"
+            "previous_session_id",
+            "agent_session_id",
+            "previous_agent_session_id"
           ],
           "type": "object"
         },
@@ -8510,8 +8562,20 @@
                 "agent": {
                   "type": "string"
                 },
+                "agent_session_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
                 "pane_id": {
                   "type": "string"
+                },
+                "previous_agent_session_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 },
                 "previous_session_id": {
                   "type": [
@@ -8536,7 +8600,9 @@
                 "workspace_id",
                 "agent",
                 "session_id",
-                "previous_session_id"
+                "previous_session_id",
+                "agent_session_id",
+                "previous_agent_session_id"
               ],
               "type": "object"
             },
@@ -11680,6 +11746,11 @@
             "expected_agent_session_guard": {
               "default": false,
               "description": "Supports the local JSON session-checked prompt, text and key methods.",
+              "type": "boolean"
+            },
+            "expected_agent_status_guard": {
+              "default": false,
+              "description": "Supports the detected-agent-status guard on local JSON prompts.",
               "type": "boolean"
             },
             "expected_terminal_guard": {

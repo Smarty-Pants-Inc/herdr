@@ -780,6 +780,71 @@ fn pane_agent_reports_accept_options_before_pane() {
     drop(agent_process);
 }
 
+/// A real server whose one pane runs a process titled `pi`, already detected as Pi. Shared by
+/// the smarty-dev#10398 report E2Es below.
+struct DetectedPiPane {
+    herdr: SpawnedHerdr,
+    base: PathBuf,
+    socket_path: PathBuf,
+    pane_id: String,
+}
+
+impl DetectedPiPane {
+    fn spawn() -> Self {
+        let base = unique_test_dir();
+        let config_home = base.join("config");
+        let runtime_dir = base.join("runtime");
+        let socket_path = runtime_dir.join("herdr.sock");
+        let bin_dir = base.join("bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        // A process titled `pi`, so the server detects the pane as Pi.
+        let fake_pi = bin_dir.join("pi");
+        fs::copy("/bin/sleep", &fake_pi).unwrap();
+
+        let herdr = spawn_herdr(&config_home, &runtime_dir, &socket_path);
+        wait_for_socket(&socket_path, Duration::from_secs(5));
+
+        let created = run_cli_json(
+            &socket_path,
+            &["workspace", "create", "--cwd", base.to_str().unwrap()],
+        );
+        let pane_id = created["result"]["root_pane"]["pane_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let command = format!("{} 120", fake_pi.display());
+        let started = run_cli(&socket_path, &["pane", "run", &pane_id, &command]);
+        assert!(
+            started.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&started.stderr)
+        );
+        let pi = Self {
+            herdr,
+            base,
+            socket_path,
+            pane_id,
+        };
+        let mut last = serde_json::Value::Null;
+        assert!(
+            wait_until(Duration::from_secs(10), Duration::from_millis(50), || {
+                last = pi.pane_get();
+                last["agent"] == "pi"
+            }),
+            "pi was never detected: {last}"
+        );
+        pi
+    }
+
+    fn pane_get(&self) -> serde_json::Value {
+        run_cli_json(&self.socket_path, &["pane", "get", &self.pane_id])["result"]["pane"].clone()
+    }
+
+    fn cleanup(self) {
+        cleanup_spawned_herdr(self.herdr, self.base);
+    }
+}
+
 /// smarty-dev#10398 end to end: a real server, a real `pi` foreground process and the real
 /// `herdr pane report-agent-session` CLI. A Pi `/reload` anchors an unanchored pane, a
 /// same-path report without an id keeps the id, a reload for another session never replaces
@@ -787,46 +852,19 @@ fn pane_agent_reports_accept_options_before_pane() {
 #[cfg(target_os = "linux")]
 #[test]
 fn pi_reload_cli_reports_anchor_the_pane_and_keep_the_id_end_to_end() {
-    let base = unique_test_dir();
-    let config_home = base.join("config");
-    let runtime_dir = base.join("runtime");
-    let socket_path = runtime_dir.join("herdr.sock");
-    let bin_dir = base.join("bin");
-    fs::create_dir_all(&bin_dir).unwrap();
-    // A process titled `pi`, so the server detects the pane as Pi.
-    let fake_pi = bin_dir.join("pi");
-    fs::copy("/bin/sleep", &fake_pi).unwrap();
-
-    let herdr = spawn_herdr(&config_home, &runtime_dir, &socket_path);
-    wait_for_socket(&socket_path, Duration::from_secs(5));
-
-    let created = run_cli_json(
-        &socket_path,
-        &["workspace", "create", "--cwd", base.to_str().unwrap()],
+    let pi = DetectedPiPane::spawn();
+    let (base, socket_path, pane_id) = (&pi.base, &pi.socket_path, &pi.pane_id);
+    let detected = pi.pane_get();
+    assert_eq!(
+        detected["agent_session"],
+        serde_json::Value::Null,
+        "{detected}"
     );
-    let pane_id = created["result"]["root_pane"]["pane_id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    let command = format!("{} 120", fake_pi.display());
-    let started = run_cli(&socket_path, &["pane", "run", &pane_id, &command]);
-    assert!(
-        started.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&started.stderr)
+    assert_eq!(
+        detected["agent_session_id"],
+        serde_json::Value::Null,
+        "{detected}"
     );
-    let pane_get =
-        || run_cli_json(&socket_path, &["pane", "get", &pane_id])["result"]["pane"].clone();
-    let mut last = serde_json::Value::Null;
-    assert!(
-        wait_until(Duration::from_secs(10), Duration::from_millis(50), || {
-            last = pane_get();
-            last["agent"] == "pi"
-        }),
-        "pi was never detected: {last}"
-    );
-    assert_eq!(last["agent_session"], serde_json::Value::Null, "{last}");
-    assert_eq!(last["agent_session_id"], serde_json::Value::Null, "{last}");
 
     let path_a = base.join("pi-reload-a.jsonl").to_str().unwrap().to_string();
     let path_b = base.join("pi-reload-b.jsonl").to_str().unwrap().to_string();
@@ -848,13 +886,13 @@ fn pi_reload_cli_reports_anchor_the_pane_and_keep_the_id_end_to_end() {
         args.extend(start.as_deref());
         args.extend(id.as_deref());
         args.push(pane_id.as_str());
-        let output = run_cli(&socket_path, &args);
+        let output = run_cli(socket_path, &args);
         assert!(
             output.status.success(),
             "stderr: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        let pane = pane_get();
+        let pane = pi.pane_get();
         assert_eq!(pane["agent"], "pi", "{pane}");
         (
             pane["agent_session"]["value"].clone(),
@@ -884,7 +922,149 @@ fn pi_reload_cli_reports_anchor_the_pane_and_keep_the_id_end_to_end() {
         "an explicit new session still replaces it"
     );
 
-    cleanup_spawned_herdr(herdr, base);
+    pi.cleanup();
+}
+
+/// smarty-dev#10398 end to end: a real server, a real `pi` foreground process,
+/// a real `events.subscribe` stream, and the real `herdr pane report-agent-session`
+/// CLI. The event must carry the actual id `pane get` shows and fire when only it
+/// changes. A pre-v11 Pi extension re-reports its path without an id after `/reload`;
+/// that report keeps the id (the id belongs to the session file), so it emits nothing,
+/// and the id clears only together with the path.
+#[test]
+fn agent_session_changed_cli_reports_carry_the_actual_id_end_to_end() {
+    let pi = DetectedPiPane::spawn();
+    let (base, socket_path, pane_id) = (&pi.base, &pi.socket_path, &pi.pane_id);
+
+    // The same socket path event subscribers use.
+    let mut stream = UnixStream::connect(socket_path).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    writeln!(
+        stream,
+        "{}",
+        serde_json::json!({
+            "id": "session-id-events",
+            "method": "events.subscribe",
+            "params": {"subscriptions": [
+                {"type": "pane.agent_session_changed", "pane_id": pane_id}
+            ]}
+        })
+    )
+    .unwrap();
+    let mut events = BufReader::new(stream);
+    let mut next_event = || {
+        let mut line = String::new();
+        let count = events.read_line(&mut line).unwrap();
+        assert_ne!(count, 0, "event socket closed");
+        serde_json::from_str::<serde_json::Value>(&line).unwrap()
+    };
+    let started = next_event();
+    assert_eq!(
+        started["result"]["type"], "subscription_started",
+        "{started}"
+    );
+
+    let session_path = base.join("pi-a.jsonl");
+    let path = session_path.to_str().unwrap().to_string();
+    let report = |seq: u64, id: Option<&str>, path: &str| {
+        let seq = format!("--seq={seq}");
+        let path = format!("--agent-session-path={path}");
+        let mut args = vec![
+            "pane",
+            "report-agent-session",
+            "--source=herdr:pi",
+            "--agent=pi",
+            seq.as_str(),
+            path.as_str(),
+            "--session-start-source=startup",
+        ];
+        let id = id.map(|id| format!("--agent-session-id={id}"));
+        if let Some(id) = id.as_deref() {
+            args.push(id);
+        }
+        args.push(pane_id.as_str());
+        let output = run_cli(socket_path, &args);
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // Reports are applied before the reply: `pane get` must already agree.
+        pi.pane_get()["agent_session_id"].clone()
+    };
+
+    let null = serde_json::Value::Null;
+    let id_a = serde_json::json!("pi-id-a");
+    assert_eq!(report(1, None, &path), null, "path only");
+    assert_eq!(
+        report(2, Some("pi-id-a"), &path),
+        id_a,
+        "same path with an id"
+    );
+    assert_eq!(report(3, Some("pi-id-a"), &path), id_a, "repeat");
+    // The sticky id (#247): an id-less re-report of the same path keeps the id, so
+    // neither report changes the session and neither emits.
+    assert_eq!(report(4, None, &path), id_a, "path only after /reload");
+    assert_eq!(report(5, None, &path), id_a, "repeat");
+    // A sentinel with a new path: events are ordered, so whatever arrives
+    // before it is everything the five reports emitted. A different path still
+    // clears the id, so the sentinel's own event carries that clear.
+    let sentinel = base.join("pi-sentinel.jsonl");
+    let sentinel = sentinel.to_str().unwrap().to_string();
+    assert_eq!(report(6, None, &sentinel), null, "sentinel");
+
+    let mut received = Vec::new();
+    loop {
+        let event = next_event();
+        assert_eq!(event["event"], "pane.agent_session_changed", "{event}");
+        let data = event["data"].clone();
+        assert_eq!(data["pane_id"], *pane_id, "{event}");
+        assert_eq!(data["agent"], "pi", "{event}");
+        let is_sentinel = data["session_id"] == sentinel;
+        received.push(data);
+        if is_sentinel {
+            break;
+        }
+    }
+    let fields = |data: &serde_json::Value| {
+        (
+            data["session_id"].clone(),
+            data["previous_session_id"].clone(),
+            data["agent_session_id"].clone(),
+            data["previous_agent_session_id"].clone(),
+        )
+    };
+    let path_value = serde_json::json!(path);
+    assert_eq!(
+        received.iter().map(fields).collect::<Vec<_>>(),
+        vec![
+            (path_value.clone(), null.clone(), null.clone(), null.clone()),
+            (
+                path_value.clone(),
+                path_value.clone(),
+                id_a.clone(),
+                null.clone()
+            ),
+            (
+                serde_json::json!(sentinel),
+                path_value.clone(),
+                null.clone(),
+                id_a.clone()
+            ),
+        ],
+        "exactly two events before the sentinel: path only and the id set; the \
+         same-path id-less reports keep the id and emit nothing"
+    );
+    for data in &received {
+        // Present and explicitly null, not merely absent.
+        let object = data.as_object().unwrap();
+        assert!(object.contains_key("agent_session_id"), "{data}");
+        assert!(object.contains_key("previous_agent_session_id"), "{data}");
+    }
+
+    pi.cleanup();
 }
 
 #[test]
