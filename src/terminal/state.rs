@@ -1901,6 +1901,36 @@ impl TerminalState {
         )
     }
 
+    /// ponytail: a Pi /reload re-runs the extensions on the SAME session file. It may anchor a
+    /// pane with no anchor, or re-confirm the anchor it already has (hook authority or persisted),
+    /// but a reload naming any other session is dropped before it can become a lifecycle
+    /// candidate; otherwise a delayed reload could be promoted over a persisted anchor once Pi
+    /// detection catches up (#10398 review).
+    fn reload_conflicts_with_session_anchor(
+        &self,
+        source: &str,
+        agent_label: &str,
+        session_ref: &crate::agent_resume::AgentSessionRef,
+        session_start_source: Option<&str>,
+    ) -> bool {
+        session_start_source == Some("reload")
+            && self.current_session_identity_for_persistence().is_some_and(
+                |(anchor_source, anchor_agent, anchor_kind, anchor_value)| {
+                    (
+                        anchor_source.as_str(),
+                        anchor_agent.as_str(),
+                        anchor_kind,
+                        anchor_value.as_str(),
+                    ) != (
+                        source,
+                        agent_label,
+                        session_ref.kind,
+                        session_ref.value.as_str(),
+                    )
+                },
+            )
+    }
+
     fn session_start_source_is_recognized(session_start_source: Option<&str>) -> bool {
         matches!(
             session_start_source,
@@ -2001,6 +2031,16 @@ impl TerminalState {
         let previous_session = self.current_session_identity_for_persistence();
         if full_lifecycle_source {
             self.reconcile_live_session_report(&source, &agent_label, Some(&session_ref), seq);
+        }
+        // After the reconcile, so a reload for a displaced session may still reclaim the pane,
+        // but before anything can record it as a lifecycle candidate.
+        if self.reload_conflicts_with_session_anchor(
+            &source,
+            &agent_label,
+            &session_ref,
+            session_start_source.as_deref(),
+        ) {
+            return None;
         }
         let generation_gated = self
             .suppressed_full_lifecycle_hook_reports
@@ -4374,6 +4414,109 @@ mod tests {
                 undetected,
             ))
         );
+    }
+
+    fn persisted_pi_anchor(terminal: &mut TerminalState, path: &str) {
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:pi".into(),
+            agent: "pi".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::path(path.to_string()).unwrap(),
+        });
+    }
+
+    fn pi_identity(
+        path: &str,
+    ) -> Option<(
+        String,
+        String,
+        crate::agent_resume::AgentSessionRefKind,
+        String,
+    )> {
+        Some((
+            "herdr:pi".into(),
+            "pi".into(),
+            crate::agent_resume::AgentSessionRefKind::Path,
+            path.to_string(),
+        ))
+    }
+
+    #[test]
+    fn pi_reload_for_a_different_session_never_displaces_a_persisted_anchor() {
+        // #10398 review: a reload re-runs Pi on the SAME session file, so a delayed reload for
+        // another session must never be queued and later promoted over a persisted anchor.
+        let anchored = test_session_path("pi-reload-persisted-a.jsonl");
+        let other = test_session_path("pi-reload-other-b.jsonl");
+        for detected_first in [false, true] {
+            let mut terminal = test_terminal();
+            persisted_pi_anchor(&mut terminal, &anchored);
+            if detected_first {
+                terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
+            }
+            let reload = terminal.set_agent_session_ref_for_session_start(
+                "herdr:pi".into(),
+                "pi".into(),
+                crate::agent_resume::AgentSessionRef::path(other.clone()),
+                Some(11),
+                Some("reload".into()),
+            );
+            assert!(reload.is_none(), "detected_first={detected_first}");
+            assert!(terminal.buffered_session_reports.is_empty());
+            terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
+            assert_eq!(
+                terminal.current_session_identity_for_persistence(),
+                pi_identity(&anchored),
+                "detected_first={detected_first}"
+            );
+            assert_eq!(terminal.displaced_persisted_session, None);
+        }
+    }
+
+    #[test]
+    fn pi_reload_for_the_persisted_session_anchors_and_sets_the_id() {
+        let anchored = test_session_path("pi-reload-persisted-same.jsonl");
+        let reporter = crate::platform::ProcessIdentity {
+            pid: 17,
+            start_time: 11,
+        };
+        for detected_first in [false, true] {
+            let mut terminal = test_terminal();
+            persisted_pi_anchor(&mut terminal, &anchored);
+            if detected_first {
+                terminal.set_detected_agent_process_at(Agent::Pi, Instant::now());
+            }
+            let reference = crate::agent_resume::AgentSessionRef::path(anchored.clone());
+            let marker = terminal.session_report_marker();
+            let reload = terminal.set_agent_session_ref_for_session_start(
+                "herdr:pi".into(),
+                "pi".into(),
+                reference.clone(),
+                Some(1),
+                Some("reload".into()),
+            );
+            assert_eq!(reload.is_some(), detected_first);
+            terminal.retain_reported_agent_session_id(
+                (marker, Some(1)),
+                "herdr:pi",
+                "pi",
+                reference.as_ref(),
+                Some("private-reload-a".into()),
+                Some(reporter),
+            );
+            if !detected_first {
+                terminal.set_detected_agent_process_at(Agent::Pi, Instant::now());
+            }
+            assert_eq!(
+                terminal.current_session_identity_for_persistence(),
+                pi_identity(&anchored),
+                "detected_first={detected_first}"
+            );
+            assert_eq!(
+                terminal.reported_agent_session_id(),
+                Some("private-reload-a"),
+                "detected_first={detected_first}"
+            );
+            assert_eq!(terminal.reported_agent_session_reporter(), Some(reporter));
+        }
     }
 
     #[test]
