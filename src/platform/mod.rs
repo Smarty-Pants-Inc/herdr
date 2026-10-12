@@ -593,6 +593,7 @@ pub(crate) fn process_identity_server_ancestry(peer: ProcessIdentity) -> ServerA
     #[cfg(test)]
     if let Some((expected, observation)) = TEST_SERVER_ANCESTRY.with(|value| value.get()) {
         if peer == expected {
+            TEST_SERVER_ANCESTRY_OBSERVATIONS.with(|count| count.set(count.get() + 1));
             return ServerAncestryObservation {
                 verdict: if process_identity(peer.pid) == Some(peer) {
                     observation
@@ -734,6 +735,15 @@ thread_local! {
     static TEST_MEMBERSHIP: std::cell::Cell<Option<Option<bool>>> = const { std::cell::Cell::new(None) };
     static TEST_MEMBERSHIP_ANCESTRY: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
     static TEST_SERVER_ANCESTRY: std::cell::Cell<Option<(ProcessIdentity, ServerAncestry)>> = const { std::cell::Cell::new(None) };
+    static TEST_SERVER_ANCESTRY_OBSERVATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many times this thread's server-ancestry seam answered for its peer, so a
+/// test can prove one request walks once and the input log reuses that walk.
+/// Only the Linux real-PTY session-guard tests read it.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn server_ancestry_seam_observations_for_test() -> usize {
+    TEST_SERVER_ANCESTRY_OBSERVATIONS.with(std::cell::Cell::get)
 }
 
 /// Peer-keyed, thread-local OS-observation seam; never changes other callers or
