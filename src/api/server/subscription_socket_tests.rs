@@ -365,6 +365,8 @@ fn session_changed_event(pane_id: &str, session_id: &str, previous: Option<&str>
             agent: "pi".into(),
             session_id: session_id.into(),
             previous_session_id: previous.map(str::to_string),
+            agent_session_id: Some(session_id.into()),
+            previous_agent_session_id: previous.map(str::to_string),
         },
     }
 }
@@ -407,7 +409,9 @@ fn agent_session_changed_subscription_filters_by_pane() {
                 "workspace_id": "workspace_1",
                 "agent": "pi",
                 "session_id": "session-b",
-                "previous_session_id": "session-a"
+                "previous_session_id": "session-a",
+                "agent_session_id": "session-b",
+                "previous_agent_session_id": "session-a"
             }
         })
     );

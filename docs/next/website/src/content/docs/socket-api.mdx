@@ -1256,13 +1256,21 @@ changed scroll snapshot.
 `pane.agent_session_changed` is scoped to one `pane_id`, like
 `pane.agent_status_changed`. It is emitted when the agent in that pane reports
 a session (through `pane.report_agent_session`, or a `pane.report_agent` that
-carries a session) whose id differs from the pane's current one. Reporting the
-current session again emits nothing. The event carries `pane_id`,
-`workspace_id`, `agent`, `session_id`, and `previous_session_id`, which is
-`null` when the pane had no session before. `session_id` matches the pane's
-`agent_session.value`: the reported `agent_session_id`, or for Pi and omp the
-reported `agent_session_path` when present. Only sessions reported by Herdr's
-official agent integrations are tracked.
+carries a session) whose id differs from the pane's current one, or when the
+same session is reported with a different actual agent session id (an id now
+set, cleared, or replaced). Reporting the current session again with the same
+actual id emits nothing. The event carries `pane_id`, `workspace_id`, `agent`,
+`session_id`, `previous_session_id`, `agent_session_id`, and
+`previous_agent_session_id`. `previous_session_id` is `null` when the pane had
+no session before. `session_id` matches the pane's `agent_session.value`: the
+reported `agent_session_id`, or for Pi and omp the reported
+`agent_session_path` when present. `agent_session_id` is the actual id that
+`pane get` reports as `agent_session_id` after this report, and
+`previous_agent_session_id` the one before it; each is `null` when there is
+none, for example when an integration reported only a session path. A
+subscriber can therefore detect a session registered without an actual id by
+`agent_session_id` being `null`. Only sessions reported by Herdr's official
+agent integrations are tracked.
 Layout event subscriptions include `layout.updated`. The event carries the
 updated `PaneLayoutSnapshot` for one tab. Clients maintaining a cache with
 `session.snapshot` should use this event to refresh the affected layout through

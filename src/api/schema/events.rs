@@ -418,17 +418,29 @@ pub struct PaneAgentStatusChangedEvent {
     pub state_labels: HashMap<String, String>,
 }
 
-/// The agent in a pane reported a session id different from the pane's
-/// previous one. A repeated report of the current session emits nothing.
+/// The agent in a pane reported a session different from the pane's previous
+/// one: a new session value, or the same value with a different actual agent
+/// session id (set, cleared, or replaced). A repeated report of the current
+/// session with the same actual id emits nothing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PaneAgentSessionChangedEvent {
     pub pane_id: String,
     pub workspace_id: String,
     pub agent: String,
+    /// The reported session value: the agent session id or, when the report
+    /// carried only a path, the session path.
     pub session_id: String,
     /// `null` when the pane had no reported session before.
     #[schemars(required, schema_with = "super::common::nullable_string_schema")]
     pub previous_session_id: Option<String>,
+    /// The actual agent session id from the accepted current report, the same
+    /// value as `pane get`'s `agent_session_id`. `null` when the report carried
+    /// no id (for example only a session path).
+    #[schemars(required, schema_with = "super::common::nullable_string_schema")]
+    pub agent_session_id: Option<String>,
+    /// The pane's actual agent session id before this report, or `null`.
+    #[schemars(required, schema_with = "super::common::nullable_string_schema")]
+    pub previous_agent_session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -578,6 +590,10 @@ pub enum EventData {
         session_id: String,
         #[schemars(required, schema_with = "super::common::nullable_string_schema")]
         previous_session_id: Option<String>,
+        #[schemars(required, schema_with = "super::common::nullable_string_schema")]
+        agent_session_id: Option<String>,
+        #[schemars(required, schema_with = "super::common::nullable_string_schema")]
+        previous_agent_session_id: Option<String>,
     },
     LayoutUpdated {
         layout: super::panes::PaneLayoutSnapshot,
