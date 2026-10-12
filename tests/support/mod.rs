@@ -31,6 +31,8 @@ pub const SERVER_MESSAGE_PANE_SURFACE_PATCH: u32 = 19;
 const CLIENT_MESSAGE_CLIENT_SHELL_PANE_INPUT: u32 = 13;
 const CLIENT_MESSAGE_CLIENT_SHELL_FOCUS: u32 = 18;
 const CLIENT_MESSAGE_ENDPOINT_CONTROL: u32 = 20;
+const CLIENT_MESSAGE_CLIENT_SHELL_ENDPOINT_REQUEST: u32 = 15;
+const SERVER_MESSAGE_CLIENT_SHELL_ENDPOINT_RESPONSE_CHUNK: u32 = 18;
 
 pub fn isolate_herdr_test_process(command: &mut CommandBuilder) {
     command.env_remove("HERDR_STARTUP_CWD");
@@ -1408,6 +1410,83 @@ pub fn wait_for_client_shell_bootstrap(
             "snapshot"
         }
     ))
+}
+
+/// Reads frames until the endpoint snapshot arrives and returns its boot id,
+/// which an endpoint command must echo.
+pub fn wait_for_client_shell_boot_id(
+    stream: &mut UnixStream,
+    timeout: Duration,
+) -> Result<String, String> {
+    stream
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .map_err(|e| e.to_string())?;
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if let Ok((SERVER_MESSAGE_ENDPOINT_CONTROL, payload)) = read_server_message(stream) {
+            let mut offset = 0;
+            if decode_string(&payload, &mut offset).as_deref() == Ok("shell.snapshot.v1") {
+                let data = decode_string(&payload, &mut offset)?;
+                let snapshot: serde_json::Value =
+                    serde_json::from_str(&data).map_err(|err| err.to_string())?;
+                return snapshot["boot_id"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| "endpoint snapshot omitted boot_id".to_owned());
+            }
+        }
+    }
+    Err("timed out waiting for the client shell snapshot".into())
+}
+
+/// Sends one JSON API request on the client-shell endpoint command lane
+/// (`ClientShellEndpointRequest`) and returns the reassembled JSON response.
+pub fn client_shell_endpoint_request(
+    stream: &mut UnixStream,
+    boot_id: &str,
+    request: &serde_json::Value,
+    timeout: Duration,
+) -> Result<serde_json::Value, String> {
+    let payload = encode_varint_enum(
+        CLIENT_MESSAGE_CLIENT_SHELL_ENDPOINT_REQUEST,
+        &[
+            &encode_string(boot_id),
+            &encode_string(&request.to_string()),
+        ],
+    );
+    stream
+        .write_all(&frame_message(&payload))
+        .map_err(|e| format!("write endpoint request: {e}"))?;
+    stream
+        .flush()
+        .map_err(|e| format!("flush endpoint request: {e}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .map_err(|e| e.to_string())?;
+    let deadline = Instant::now() + timeout;
+    let mut data = Vec::new();
+    while Instant::now() < deadline {
+        let Ok((SERVER_MESSAGE_CLIENT_SHELL_ENDPOINT_RESPONSE_CHUNK, payload)) =
+            read_server_message(stream)
+        else {
+            continue;
+        };
+        let mut offset = 0;
+        let _boot_id = decode_string(&payload, &mut offset)?;
+        let _request_id = decode_string(&payload, &mut offset)?;
+        let final_chunk = *payload.get(offset).ok_or("chunk omitted final flag")? != 0;
+        offset += 1;
+        let (len, consumed) = decode_varint_u32(&payload, offset)?;
+        offset += consumed;
+        let chunk = payload
+            .get(offset..offset + len as usize)
+            .ok_or("payload too short for response chunk")?;
+        data.extend_from_slice(chunk);
+        if final_chunk {
+            return serde_json::from_slice(&data).map_err(|err| err.to_string());
+        }
+    }
+    Err("timed out waiting for the endpoint response".into())
 }
 
 pub fn wait_for_disconnect(stream: &mut UnixStream, timeout: Duration) -> Result<bool, String> {

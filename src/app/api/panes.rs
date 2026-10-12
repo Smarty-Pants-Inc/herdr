@@ -104,12 +104,57 @@ fn precheck_pane_input_poison(id: &str, poisoned: bool) -> Result<(), String> {
     }
 }
 
+const OPERATOR_ORIGIN_REQUIRED_MESSAGE: &str = "only an operator can clear pane input poison: use the attached Herdr client or run the CLI outside every Herdr pane";
+const OPERATOR_ORIGIN_UNKNOWN_MESSAGE: &str = "cannot validate the caller's origin; clear pane input poison from the attached Herdr client or a terminal outside every Herdr pane";
+
 impl App {
+    /// smarty-dev#8152: clearing poison re-enables input that may still find
+    /// staged text, so it is an operator action. Every caller, on the public
+    /// API socket or the attached client's endpoint lane, is classified by the
+    /// same caller-origin policy as content writes from its accept-pinned peer;
+    /// the client lane's trusted flag alone proves nothing, because any
+    /// same-user process, also one inside a pane, can open the client socket.
+    /// A caller is an operator only with an ordinary origin and no pane of its
+    /// own (proven outside every pane). Every pane-attributed caller is
+    /// refused, including for its own pane: the poisoned pane's agent is the
+    /// party whose staged text the poison guards. An unattributable caller is
+    /// `input_origin_unknown`.
+    ///
+    /// ponytail: accepted residual. Attribution is by current ancestry, so a
+    /// pane process that strips its Herdr markers and escapes the server's
+    /// process tree (double fork + `setsid`) is classified as an ordinary
+    /// caller. That is the general ancestry-escape limit tracked in
+    /// smarty-dev#9333, not specific to this method: such a process is already
+    /// an ordinary caller for every content write (`input_guard.rs` returns
+    /// `None` for `InputOrigin::Ordinary`), so it can type into any unpoisoned
+    /// pane today. Clearing poison gives it nothing beyond that class; closing
+    /// the class (#9333) closes it here too.
     pub(super) fn handle_pane_clear_input_poison(
         &mut self,
         id: String,
         target: PaneTarget,
+        context: &mut crate::api::ApiRequestContext,
     ) -> String {
+        use crate::app::terminal_targets::InputOrigin;
+        let denial = match self.input_origin_for_context_with_ancestry(context) {
+            InputOrigin::Ordinary if self.trusted_invoking_pane(*context).is_none() => None,
+            InputOrigin::Agent(source)
+                if self
+                    .parse_pane_id(&target.pane_id)
+                    .and_then(|(ws, pane)| self.terminal_target_for_pane(ws, pane))
+                    .is_some_and(|target| target.terminal_id != source.terminal_id) =>
+            {
+                Some((
+                    "cross_pane_input_denied",
+                    "agent-originated input cannot target a different pane",
+                ))
+            }
+            InputOrigin::Unknown => Some(("input_origin_unknown", OPERATOR_ORIGIN_UNKNOWN_MESSAGE)),
+            _ => Some(("operator_origin_required", OPERATOR_ORIGIN_REQUIRED_MESSAGE)),
+        };
+        if let Some((code, message)) = denial {
+            return encode_error(id, code, message);
+        }
         let Some((ws_idx, pane_id)) = self.parse_pane_id(&target.pane_id) else {
             return pane_not_found(id, &target.pane_id);
         };
@@ -2885,12 +2930,38 @@ mod tests {
                 .unwrap()
                 .input_is_poisoned());
         }
-        let response = app.handle_api_request(crate::api::schema::Request {
+        let clear = crate::api::schema::Request {
             id: "clear".into(),
             method: crate::api::schema::Method::PaneClearInputPoison(PaneTarget {
                 pane_id: pane_id.clone(),
             }),
-        });
+        };
+        // smarty-dev#8152: a public caller whose origin cannot be proven is no
+        // operator; the poison stays.
+        let refused: ErrorResponse =
+            serde_json::from_str(&app.handle_api_request(clear.clone())).unwrap();
+        assert_eq!(refused.error.code, "input_origin_unknown");
+        assert!(app
+            .lookup_runtime_sender(0, internal_pane_id)
+            .unwrap()
+            .input_is_poisoned());
+        // The client lane's trusted flag alone is no operator proof: a
+        // client connection without a pinned peer is refused the same way.
+        let refused: ErrorResponse = serde_json::from_str(
+            &app.handle_trusted_client_shell_api_request_after_internal_events_drained(
+                clear.clone(),
+                Default::default(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(refused.error.code, "input_origin_unknown");
+        assert!(app
+            .lookup_runtime_sender(0, internal_pane_id)
+            .unwrap()
+            .input_is_poisoned());
+        // The attached client whose pinned peer is proven outside every pane
+        // is an operator.
+        let response = as_operator_client(&mut app, clear);
         let value: serde_json::Value = serde_json::from_str(&response).unwrap();
         assert_eq!(value["result"]["type"], "ok");
         assert_eq!(
@@ -2944,9 +3015,63 @@ mod tests {
                 }),
             };
             let response: ErrorResponse =
-                serde_json::from_str(&app.handle_api_request(request)).unwrap();
+                serde_json::from_str(&as_operator_client(&mut app, request)).unwrap();
             assert_eq!(response.error.code, "pane_not_found");
         }
+    }
+
+    /// smarty-dev#8152: dispatches on the client lane with an accept-pinned peer
+    /// (this process, no Herdr markers) whose ancestry is observed outside the
+    /// server, i.e. an attached client run outside every pane.
+    fn as_operator_client(app: &mut App, request: crate::api::schema::Request) -> String {
+        let context = crate::api::ApiRequestContext {
+            local_peer_pane_origin: crate::platform::PeerPaneOrigin::Absent,
+            ..crate::api::ApiRequestContext::for_local_peer_pid(Some(std::process::id()))
+        };
+        let peer = context.local_peer_identity.expect("live peer");
+        crate::platform::with_server_ancestry_for_test(peer, Some(true), || {
+            app.handle_trusted_client_shell_api_request_after_internal_events_drained(
+                request, context,
+            )
+        })
+    }
+
+    #[test]
+    fn clear_input_poison_client_lane_classifies_its_peer() {
+        let (mut app, pane_id) = app_with_test_workspace();
+        let request = crate::api::schema::Request {
+            id: "clear".into(),
+            method: crate::api::schema::Method::PaneClearInputPoison(PaneTarget { pane_id }),
+        };
+        let context = crate::api::ApiRequestContext {
+            local_peer_pane_origin: crate::platform::PeerPaneOrigin::Absent,
+            ..crate::api::ApiRequestContext::for_local_peer_pid(Some(std::process::id()))
+        };
+        let peer = context.local_peer_identity.expect("live peer");
+        // Unobservable ancestry: unknown, not ordinary, on the client lane too.
+        let response: ErrorResponse = serde_json::from_str(
+            &crate::platform::with_server_ancestry_for_test(peer, None, || {
+                app.handle_trusted_client_shell_api_request_after_internal_events_drained(
+                    request.clone(),
+                    context,
+                )
+            }),
+        )
+        .unwrap();
+        assert_eq!(response.error.code, "input_origin_unknown");
+        // A peer whose launch markers say it was started in a pane needs a
+        // live pane link; without one it is unknown, never an operator.
+        let marked = crate::api::ApiRequestContext {
+            local_peer_pane_origin: crate::platform::PeerPaneOrigin::HasPane,
+            ..context
+        };
+        let response: ErrorResponse = serde_json::from_str(
+            &app.handle_trusted_client_shell_api_request_after_internal_events_drained(
+                request, marked,
+            ),
+        )
+        .unwrap();
+        assert_eq!(response.error.code, "input_origin_unknown");
     }
 
     #[test]

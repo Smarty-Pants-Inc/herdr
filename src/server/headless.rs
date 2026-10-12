@@ -2149,6 +2149,7 @@ impl HeadlessServer {
                 surface_scroll,
                 media_capable,
                 principal,
+                peer_context,
                 writer,
             } => {
                 if self.handoff_in_progress {
@@ -2190,6 +2191,7 @@ impl HeadlessServer {
                     Some(writer),
                 );
                 connection.principal = principal;
+                connection.shell_peer_context = peer_context;
                 connection.pixel_mouse = pixel_mouse && observed.is_known();
                 connection.direct_graphics = direct_graphics;
                 connection.shell_uses_endpoint_keybindings = endpoint_keybindings;

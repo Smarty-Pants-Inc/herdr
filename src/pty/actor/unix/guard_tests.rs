@@ -650,11 +650,16 @@ fn guarded_native_flush_failure_poison_blocks_all_input_until_operator_clear() {
         .flush_pending_writes_once()
         .expect("poison refuses every write");
     assert!(runner.pending_writes.is_empty());
-    // Even a later successful flush must not clear poison.
-    runner.file.force_flush_failure = false;
-    crate::platform::flush_pty_input(runner.file.as_raw_fd())
-        .expect("operator inspected/discarded staged input");
+    // smarty-dev#8152: the operator clear drains the slave queue itself and
+    // refuses, staying poisoned, when that drain fails.
+    let (reply, cleared) = std_mpsc::channel();
+    runner.handle_control_command(PtyIoControlCommand::ClearInputPoison(reply));
+    cleared
+        .recv()
+        .expect("clear receipt")
+        .expect_err("clear refused when its drain fails");
     assert!(handle.input_is_poisoned());
+    runner.file.force_flush_failure = false;
     let (reply, cleared) = std_mpsc::channel();
     runner.handle_control_command(PtyIoControlCommand::ClearInputPoison(reply));
     cleared
@@ -667,6 +672,7 @@ fn guarded_native_flush_failure_poison_blocks_all_input_until_operator_clear() {
         .expect("explicit clear restores input");
     runner.drain_data_commands();
     pump(&mut runner);
+    // No manual flush ran: the staged text is gone only because the clear drained it.
     assert_eq!(fixture.probe_bytes(), b"healthy");
 }
 

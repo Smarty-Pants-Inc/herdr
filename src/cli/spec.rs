@@ -695,7 +695,7 @@ fn pane_command() -> Command {
         .subcommand(id_command(
             "clear-input-poison",
             "pane_id",
-            "Explicitly unblock input after inspecting or discarding staged text",
+            "Operator only: discard unread pane input, then unblock it (not from inside a pane)",
         ))
         .subcommand(
             Command::new("send-text")
