@@ -1787,6 +1787,7 @@ impl App {
             params.agent_session_id,
             params.agent_session_path,
         );
+        let previous_session = self.pane_agent_session_snapshot(pane_id);
         self.handle_internal_event(crate::events::AppEvent::HookStateReported {
             pane_id,
             session_ref: session_ref.clone(),
@@ -1805,6 +1806,8 @@ impl App {
             session_ref.as_ref(),
             (reported_id, context.local_peer_identity),
         );
+        // After the retain: only then is the report's actual id visible.
+        self.emit_pane_agent_session_changed(pane_id, previous_session);
         let applied =
             report_is_newer && self.session_report_applied(ws_idx, pane_id, session_ref.as_ref());
         self.report_agent_resume(
@@ -1847,6 +1850,7 @@ impl App {
             params.agent_session_id,
             params.agent_session_path,
         );
+        let previous_session = self.pane_agent_session_snapshot(pane_id);
         self.handle_internal_event(crate::events::AppEvent::AgentSessionReported {
             pane_id,
             session_ref: session_ref.clone(),
@@ -1866,6 +1870,8 @@ impl App {
             session_ref.as_ref(),
             (reported_id, context.local_peer_identity),
         );
+        // After the retain: only then is the report's actual id visible.
+        self.emit_pane_agent_session_changed(pane_id, previous_session);
         let applied =
             report_is_newer && self.session_report_applied(ws_idx, pane_id, session_ref.as_ref());
         self.report_agent_resume(

@@ -592,6 +592,8 @@ impl ActiveAgentSessionChangedSubscription {
             agent,
             session_id,
             previous_session_id,
+            agent_session_id,
+            previous_agent_session_id,
         } = event.data
         else {
             return None;
@@ -607,6 +609,8 @@ impl ActiveAgentSessionChangedSubscription {
                 agent,
                 session_id,
                 previous_session_id,
+                agent_session_id,
+                previous_agent_session_id,
             }),
         })
     }
