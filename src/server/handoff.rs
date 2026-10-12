@@ -838,10 +838,33 @@ fn receive_on(mut stream: UnixStream, token: &str) -> io::Result<ReceivedHandoff
         Err(err) => {
             // The source discards this process's stderr and kills it as soon
             // as the stream closes, so log the reason before dropping it.
-            warn!(error = %err, "handoff import rejected");
+            // The error can echo sender-supplied manifest text, so only the
+            // logged rendering is escaped and bounded; `err` is returned as is.
+            warn!(
+                error = %loggable_rejection(&err.to_string()),
+                "handoff import rejected"
+            );
             Err(err)
         }
     }
+}
+
+/// Maximum number of source characters of a rejection reason written to the log.
+// ponytail: a longer reason is cut; the full error still reaches the caller.
+#[cfg(unix)]
+const LOGGED_REJECTION_MAX_CHARS: usize = 512;
+
+/// Escapes control characters (so CR/LF cannot forge log lines) and caps the
+/// length of an untrusted rejection reason before it is logged.
+#[cfg(unix)]
+fn loggable_rejection(reason: &str) -> String {
+    let mut chars = reason.chars();
+    let head: String = chars.by_ref().take(LOGGED_REJECTION_MAX_CHARS).collect();
+    let mut logged = head.escape_debug().to_string();
+    if chars.next().is_some() {
+        logged.push_str("...[truncated]");
+    }
+    logged
 }
 
 #[cfg(unix)]
@@ -1172,6 +1195,21 @@ pub(crate) fn log_import_result(panes: usize) {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loggable_rejection_escapes_controls_and_bounds_length() {
+        let reason = format!("v1\r\nFAKE-LINE{}", "x".repeat(4096));
+        let logged = loggable_rejection(&reason);
+        assert!(!logged.contains(['\r', '\n']), "{logged}");
+        assert!(logged.starts_with("v1\\r\\nFAKE-LINE"), "{logged}");
+        assert!(logged.ends_with("...[truncated]"), "{logged}");
+        assert!(
+            logged.len() < LOGGED_REJECTION_MAX_CHARS + 32,
+            "{}",
+            logged.len()
+        );
+        assert_eq!(loggable_rejection("short"), "short");
+    }
 
     fn empty_snapshot() -> crate::persist::SessionSnapshot {
         crate::persist::SessionSnapshot {

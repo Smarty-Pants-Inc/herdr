@@ -2854,6 +2854,72 @@ fn live_handoff_version_mismatch_logs_import_rejection() {
     cleanup_test_base(&base);
 }
 
+#[test]
+fn live_handoff_rejection_log_escapes_and_bounds_sender_text() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+
+    let spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    register_runtime_dir(&runtime_dir);
+
+    let hostile_version = format!("0.0.0\r\nFAKE-LINE forged{}", "z".repeat(64 * 1024));
+    let failed = request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:hostile-version-handoff",
+            "method": "server.live_handoff",
+            "params": {"expected_version": hostile_version}
+        }),
+    );
+    assert!(
+        failed.get("error").is_some(),
+        "version-mismatched handoff should fail: {failed}"
+    );
+    wait_for_api(&api_socket, Duration::from_secs(5));
+
+    let log = wait_for_file_contains(
+        &config_home.join("herdr-dev/herdr-server.log"),
+        "handoff import rejected",
+        Duration::from_secs(5),
+    );
+    let rejection_lines: Vec<&str> = log
+        .lines()
+        .filter(|line| line.contains("handoff import rejected"))
+        .collect();
+    assert_eq!(rejection_lines.len(), 1, "{rejection_lines:?}");
+    let line = rejection_lines[0];
+    assert!(
+        line.contains("handoff expected herdr v0.0.0\\r\\nFAKE-LINE forged"),
+        "escaped rejection reason missing from log line: {line}"
+    );
+    assert!(line.contains("...[truncated]"), "{line}");
+    assert!(
+        line.len() < 2048,
+        "log line not bounded: {} bytes",
+        line.len()
+    );
+    assert!(
+        !log.lines().any(|l| l.trim_start().starts_with("FAKE-LINE")),
+        "sender text forged a log line"
+    );
+    assert!(
+        log.len() < 32 * 1024,
+        "log not bounded: {} bytes",
+        log.len()
+    );
+
+    let _ = request(
+        &api_socket,
+        serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
+    );
+    drop(spawned);
+    cleanup_test_base(&base);
+}
+
 fn live_handoff_import_failure_rolls_back_old_server_at(failure_point: &str) {
     let _lock = test_lock();
     let base = unique_test_dir();
