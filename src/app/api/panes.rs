@@ -1787,6 +1787,7 @@ impl App {
             params.agent_session_id,
             params.agent_session_path,
         );
+        let previous_session = self.pane_agent_session_snapshot(pane_id);
         self.handle_internal_event(crate::events::AppEvent::HookStateReported {
             pane_id,
             session_ref: session_ref.clone(),
@@ -1805,6 +1806,8 @@ impl App {
             session_ref.as_ref(),
             (reported_id, context.local_peer_identity),
         );
+        // After the retain: only then is the report's actual id visible.
+        self.emit_pane_agent_session_changed(pane_id, previous_session);
         let applied =
             report_is_newer && self.session_report_applied(ws_idx, pane_id, session_ref.as_ref());
         self.report_agent_resume(
@@ -1847,6 +1850,7 @@ impl App {
             params.agent_session_id,
             params.agent_session_path,
         );
+        let previous_session = self.pane_agent_session_snapshot(pane_id);
         self.handle_internal_event(crate::events::AppEvent::AgentSessionReported {
             pane_id,
             session_ref: session_ref.clone(),
@@ -1866,6 +1870,8 @@ impl App {
             session_ref.as_ref(),
             (reported_id, context.local_peer_identity),
         );
+        // After the retain: only then is the report's actual id visible.
+        self.emit_pane_agent_session_changed(pane_id, previous_session);
         let applied =
             report_is_newer && self.session_report_applied(ws_idx, pane_id, session_ref.as_ref());
         self.report_agent_resume(
@@ -2819,6 +2825,9 @@ mod tests {
                 start_time: 1,
             },
             expected_agent_session_id: "opaque-session".into(),
+            expected_agent_status: None,
+            agent_status: std::sync::Weak::new(),
+            status_mismatch: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             // Error classification and synthetic-channel rejection fixtures must
             // fail closed; they never authorize a native PTY write.
             binding_validity: std::sync::Weak::new(),

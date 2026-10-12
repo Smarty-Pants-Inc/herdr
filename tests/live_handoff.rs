@@ -2804,6 +2804,191 @@ fn live_handoff_bad_expected_protocol_rolls_back_old_server() {
     cleanup_test_base(&base);
 }
 
+/// Runs the real operator CLI, `herdr server live-handoff`, against the test
+/// server, the way an operator (or the fleet) runs it.
+fn run_live_handoff_cli(
+    base: &Path,
+    config_home: &Path,
+    runtime_dir: &Path,
+    api_socket: &Path,
+    expected_version: &str,
+) -> std::process::Output {
+    crate::test_command::herdr_command()
+        .args([
+            "server",
+            "live-handoff",
+            "--import-exe",
+            env!("CARGO_BIN_EXE_herdr"),
+            "--expected-version",
+            expected_version,
+        ])
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", base)
+        .env("XDG_CONFIG_HOME", config_home)
+        .env("XDG_RUNTIME_DIR", runtime_dir)
+        .env("HERDR_SOCKET_PATH", api_socket)
+        .env(
+            "HERDR_CLIENT_SOCKET_PATH",
+            runtime_dir.join("herdr-client.sock"),
+        )
+        .output()
+        .unwrap()
+}
+
+fn assert_old_server_still_serving(runtime_dir: &Path, api_socket: &Path, old_pid: u32) {
+    wait_for_api(api_socket, Duration::from_secs(5));
+    let listed = request(
+        api_socket,
+        serde_json::json!({"id":"test:workspace:list","method":"workspace.list","params":{}}),
+    );
+    assert!(
+        listed.get("result").is_some(),
+        "API request failed: {listed}"
+    );
+    assert_eq!(
+        unsafe { libc::kill(old_pid as libc::pid_t, 0) },
+        0,
+        "old server {old_pid} is gone"
+    );
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+        support::herdr_server_pids_for_runtime_dir(runtime_dir).unwrap(),
+        vec![old_pid],
+        "a different server is serving the session"
+    );
+    #[cfg(not(target_os = "linux"))]
+    let _ = runtime_dir;
+}
+
+#[test]
+fn live_handoff_cli_version_mismatch_logs_one_rejection_and_keeps_old_server() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let log_path = config_home.join("herdr-dev/herdr-server.log");
+
+    let spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    register_runtime_dir(&runtime_dir);
+    let old_pid = spawned.child.process_id().expect("old server pid");
+
+    // First run: a plain version mismatch.
+    let output = run_live_handoff_cli(
+        &base,
+        &config_home,
+        &runtime_dir,
+        &api_socket,
+        "0.0.0-mismatch",
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "stderr: {stderr}");
+    let error: serde_json::Value = serde_json::from_str(
+        stderr
+            .lines()
+            .rev()
+            .find(|line| line.starts_with('{'))
+            .unwrap_or_else(|| panic!("no JSON error on stderr: {stderr}")),
+    )
+    .unwrap();
+    assert_eq!(error["error"]["code"], "handoff_failed", "stderr: {stderr}");
+    assert_old_server_still_serving(&runtime_dir, &api_socket, old_pid);
+
+    let log = wait_for_file_contains(&log_path, "handoff import rejected", Duration::from_secs(5));
+    let rejections: Vec<&str> = log
+        .lines()
+        .filter(|line| line.contains("handoff import rejected"))
+        .collect();
+    assert_eq!(rejections.len(), 1, "{rejections:?}");
+    assert!(
+        rejections[0].contains("expected herdr v0.0.0-mismatch"),
+        "rejection reason missing: {}",
+        rejections[0]
+    );
+
+    // Second run: sender text that tries to forge a log line.
+    let output = run_live_handoff_cli(
+        &base,
+        &config_home,
+        &runtime_dir,
+        &api_socket,
+        "0.9\r\nFAKE",
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "stderr: {stderr}");
+    assert!(stderr.contains("handoff_failed"), "stderr: {stderr}");
+    assert_old_server_still_serving(&runtime_dir, &api_socket, old_pid);
+
+    let log = wait_for_file_contains(
+        &log_path,
+        "expected herdr v0.9\\r\\nFAKE",
+        Duration::from_secs(5),
+    );
+    let escaped: Vec<&str> = log
+        .lines()
+        .filter(|line| {
+            line.contains("handoff import rejected")
+                && line.contains("expected herdr v0.9\\r\\nFAKE")
+        })
+        .collect();
+    assert_eq!(escaped.len(), 1, "{escaped:?}");
+    assert!(
+        !log.lines()
+            .any(|line| line.trim_start().starts_with("FAKE")),
+        "sender text forged a log line:\n{log}"
+    );
+
+    // Third run: hostile, oversized sender text (64 KiB, within ARG_MAX).
+    let hostile_version = format!("0.0.0\r\nFAKE-LINE forged{}", "x".repeat(64 * 1024));
+    let output = run_live_handoff_cli(
+        &base,
+        &config_home,
+        &runtime_dir,
+        &api_socket,
+        &hostile_version,
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "stderr: {stderr}");
+    assert!(stderr.contains("handoff_failed"), "stderr: {stderr}");
+    assert_old_server_still_serving(&runtime_dir, &api_socket, old_pid);
+
+    let log = wait_for_file_contains(
+        &log_path,
+        "expected herdr v0.0.0\\r\\nFAKE-LINE forged",
+        Duration::from_secs(5),
+    );
+    let rejections: Vec<&str> = log
+        .lines()
+        .filter(|line| line.contains("handoff import rejected"))
+        .collect();
+    assert_eq!(rejections.len(), 3, "{rejections:?}");
+    let line = rejections[2];
+    assert!(
+        line.contains("expected herdr v0.0.0\\r\\nFAKE-LINE forged"),
+        "escaped rejection reason missing: {line}"
+    );
+    assert!(line.contains("...[truncated]"), "{line}");
+    assert!(
+        line.len() < 2048,
+        "log line not bounded: {} bytes",
+        line.len()
+    );
+    assert!(
+        !log.lines()
+            .any(|line| line.trim_start().starts_with("FAKE-LINE")),
+        "sender text forged a log line"
+    );
+
+    let _ = request(
+        &api_socket,
+        serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
+    );
+    drop(spawned);
+    cleanup_test_base(&base);
+}
+
 fn live_handoff_import_failure_rolls_back_old_server_at(failure_point: &str) {
     let _lock = test_lock();
     let base = unique_test_dir();

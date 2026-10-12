@@ -406,6 +406,61 @@ test("Pi reports a Windows session path", async () => {
   expect(requests.map(requestSessionPath)).toEqual([sessionPath, sessionPath]);
 });
 
+// smarty-dev#10398: an unset or empty HERDR_PANE_ID must not silence the extension. Herdr rebinds
+// a report with an unknown or empty pane_id to the reporting process's pane.
+for (const [label, paneIdValue] of [
+  ["unset", undefined],
+  ["empty", ""],
+] as const) {
+  test(`Pi still reports its session and state with pane_id "" when HERDR_PANE_ID is ${label}`, async () => {
+    const requests = await startRecordingServer(`pi-no-pane-id-${label}`);
+    if (paneIdValue === undefined) {
+      delete process.env.HERDR_PANE_ID;
+    } else {
+      process.env.HERDR_PANE_ID = paneIdValue;
+    }
+    const { handlers, pi } = createExtensionHarness();
+    const { default: install } = await importFresh("./pi/herdr-agent-state.ts");
+    install(pi);
+
+    await handlers.get("session_start")?.(
+      { reason: "startup" },
+      {
+        ...piContext(() => true),
+        sessionManager: {
+          getSessionFile: () => "/home/user/.pi/agent/sessions/pi-session.jsonl",
+          getSessionId: () => "pi-session",
+        },
+      },
+    );
+    await waitFor(() => requests.length === 2);
+
+    const methods = requests.map((request) => (isRecord(request) ? request.method : undefined));
+    expect(methods.sort()).toEqual(["pane.report_agent", "pane.report_agent_session"]);
+    for (const request of requests) {
+      expect(isRecord(request) && isRecord(request.params) && request.params.pane_id).toBe("");
+      expect(isRecord(request) && isRecord(request.params) && request.params.agent_session_id).toBe(
+        "pi-session",
+      );
+    }
+    expect(requestStates(requests)).toEqual(["idle"]);
+  });
+}
+
+test("Pi stays disabled without HERDR_ENV or the Herdr socket even when HERDR_PANE_ID is set", async () => {
+  const requests = await startRecordingServer("pi-disabled");
+  for (const unset of ["HERDR_ENV", "HERDR_SOCKET_PATH"]) {
+    configureIntegrationEnvironment(socketPath!);
+    delete process.env[unset];
+    const { handlers, pi } = createExtensionHarness();
+    const { default: install } = await importFresh("./pi/herdr-agent-state.ts");
+    install(pi);
+    expect(handlers.size).toBe(0);
+  }
+  await Bun.sleep(25);
+  expect(requests).toEqual([]);
+});
+
 test("Pi reports idle only after the agent settles", async () => {
   const requests = await startRecordingServer("pi-settled");
   const { handlers, pi } = createExtensionHarness();
@@ -991,6 +1046,16 @@ registeredChannelTest("Pi opens its channel connection in-process at extension l
   expect(connectionPids).toEqual([process.pid, process.pid]);
   expect(connections[0].registration.params).toEqual({ session_generation: "session-1" });
   expect(calls).toEqual([]); // Ready registration is not an input receipt.
+});
+
+registeredChannelTest("Pi registers its channel without HERDR_PANE_ID, since Herdr attributes the peer itself (smarty-dev#10398)", async () => {
+  const { connections, reports } = await startChannelServer();
+  delete process.env.HERDR_PANE_ID;
+  const { handlers, calls } = await loadChannelAsset(accepted);
+  await handlers.get("session_start")?.({}, channelContext());
+  await waitFor(() => connections.length === 1 && reports.length === 1);
+  expect(connections[0].registration.params).toEqual({ session_generation: "session-1" });
+  expect(calls).toEqual([]);
 });
 
 // Pi runs a native /new, /resume or /fork session_start inside a temporary input fence. Input

@@ -429,6 +429,10 @@ fn agent_command() -> Command {
                 .arg(expected_session_option())
                 .arg(option("expected-pane", "ID")
                     .help("Refuse unless the agent target resolves to this pane_id; requires server support"))
+                .arg(option("expected-status", "STATUS")
+                    .requires("expected-session")
+                    .value_parser(["idle", "working", "blocked", "done", "unknown"])
+                    .help("Refuse unless the detected agent status matches; requires --expected-session and server support"))
                 .arg(
                     flag("if-draft-empty")
                         .conflicts_with_all([
@@ -1350,6 +1354,11 @@ mod tests {
             assert!(long_help(path).contains("--expected-session"));
         }
         assert!(long_help(&["agent", "prompt"]).contains("--expected-pane"));
+        assert!(long_help(&["agent", "prompt"]).contains("--expected-status"));
+        assert!(has_option(
+            command_path(&cmd, &["agent", "prompt"]),
+            "expected-status"
+        ));
         for path in [
             &["agent", "send-keys"][..],
             &["agent", "start"][..],
@@ -1358,6 +1367,7 @@ mod tests {
             let leaf = command_path(&cmd, path);
             assert!(!has_option(leaf, "expected-session"));
             assert!(!has_option(leaf, "expected-pane"));
+            assert!(!has_option(leaf, "expected-status"));
         }
         for shell in [
             clap_complete::Shell::Bash,
@@ -1370,6 +1380,7 @@ mod tests {
             let output = String::from_utf8(output).unwrap();
             assert!(output.contains("expected-session"), "{shell:?}");
             assert!(output.contains("expected-pane"), "{shell:?}");
+            assert!(output.contains("expected-status"), "{shell:?}");
         }
     }
 
@@ -1520,6 +1531,52 @@ mod tests {
         }
         assert!(super::command()
             .try_get_matches_from(["herdr", "agent", "draft-state", "--", "--help"])
+            .is_ok());
+    }
+
+    #[test]
+    fn agent_prompt_expected_status_requires_session_and_strict_enum() {
+        for args in [
+            &[
+                "herdr",
+                "agent",
+                "prompt",
+                "reviewer",
+                "hello",
+                "--expected-status",
+                "idle",
+            ][..],
+            &[
+                "herdr",
+                "agent",
+                "prompt",
+                "reviewer",
+                "hello",
+                "--expected-status=idle",
+                "--expected-pane=w1:p1",
+            ][..],
+            &[
+                "herdr",
+                "agent",
+                "prompt",
+                "reviewer",
+                "hello",
+                "--expected-status=null",
+                "--expected-session=s",
+            ][..],
+        ] {
+            assert!(super::command().try_get_matches_from(args).is_err());
+        }
+        assert!(super::command()
+            .try_get_matches_from([
+                "herdr",
+                "agent",
+                "prompt",
+                "reviewer",
+                "hello",
+                "--expected-status=idle",
+                "--expected-session=s",
+            ])
             .is_ok());
     }
 

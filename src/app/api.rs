@@ -29,6 +29,14 @@ const API_NOTIFICATION_RATE_LIMIT: Duration = Duration::from_secs(1);
 #[cfg(windows)]
 const WINDOWS_POWERSHELL_AGENT_EXIT_RESPAWN_GRACE: Duration = Duration::from_secs(2);
 
+/// A pane's session before a report, compared after the report to decide
+/// whether `pane.agent_session_changed` fires.
+#[derive(Debug, Default)]
+pub(super) struct PaneAgentSessionSnapshot {
+    info: Option<crate::api::schema::AgentSessionInfo>,
+    actual_id: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RuntimeExitAction {
     RespawnShell,
@@ -407,19 +415,8 @@ impl App {
                 None
             };
         let terminal_cwd_reported = matches!(ev, AppEvent::TerminalCwdReported { .. });
-        // Both report methods apply an agent's session through these events.
-        let session_report = match &ev {
-            AppEvent::AgentSessionReported { pane_id, .. }
-            | AppEvent::HookStateReported { pane_id, .. } => {
-                Some((*pane_id, self.pane_agent_session_info(*pane_id)))
-            }
-            _ => None,
-        };
         let previous_toast = self.state.toast.clone();
         let mut pane_updates = self.state.handle_app_event(ev);
-        if let Some((pane_id, previous_session)) = session_report {
-            self.emit_pane_agent_session_changed(pane_id, previous_session);
-        }
         if update_ready.is_some() {
             self.state.latest_release_notes = crate::release_notes::load_latest();
         }
@@ -860,27 +857,46 @@ impl App {
         }
     }
 
-    fn pane_agent_session_info(
+    /// The pane's session info plus the actual agent session id that `pane get`
+    /// reports as `agent_session_id` (only from the accepted current report).
+    pub(super) fn pane_agent_session_snapshot(
         &self,
         pane_id: crate::layout::PaneId,
-    ) -> Option<crate::api::schema::AgentSessionInfo> {
-        let (_, pane) = self.find_pane(pane_id)?;
-        let terminal = self.state.terminals.get(&pane.attached_terminal_id)?;
-        super::creation::terminal_agent_session_info(terminal)
+    ) -> PaneAgentSessionSnapshot {
+        let Some((_, pane)) = self.find_pane(pane_id) else {
+            return PaneAgentSessionSnapshot::default();
+        };
+        let Some(terminal) = self.state.terminals.get(&pane.attached_terminal_id) else {
+            return PaneAgentSessionSnapshot::default();
+        };
+        PaneAgentSessionSnapshot {
+            info: super::creation::terminal_agent_session_info(terminal),
+            actual_id: terminal.reported_agent_session_id().map(str::to_owned),
+        }
     }
 
     /// Emits `pane.agent_session_changed` when a session report left the pane
-    /// with a different session id. Repeated reports of one session emit nothing.
-    fn emit_pane_agent_session_changed(
+    /// with a different session value or a different actual agent session id
+    /// (set, cleared, or replaced). Call it only after the report's id was
+    /// retained: until then the accepted report hides the actual id.
+    /// Repeated reports of one session with the same actual id emit nothing.
+    pub(super) fn emit_pane_agent_session_changed(
         &mut self,
         pane_id: crate::layout::PaneId,
-        previous: Option<crate::api::schema::AgentSessionInfo>,
+        previous: PaneAgentSessionSnapshot,
     ) {
-        let Some(current) = self.pane_agent_session_info(pane_id) else {
+        let PaneAgentSessionSnapshot {
+            info: Some(current),
+            actual_id: agent_session_id,
+        } = self.pane_agent_session_snapshot(pane_id)
+        else {
             return;
         };
-        let previous_session_id = previous.map(|session| session.value);
-        if previous_session_id.as_deref() == Some(current.value.as_str()) {
+        let previous_session_id = previous.info.map(|session| session.value);
+        let previous_agent_session_id = previous.actual_id;
+        if previous_session_id.as_deref() == Some(current.value.as_str())
+            && previous_agent_session_id == agent_session_id
+        {
             return;
         }
         let Some((ws_idx, _)) = self.find_pane(pane_id) else {
@@ -897,6 +913,8 @@ impl App {
                 agent: current.agent,
                 session_id: current.value,
                 previous_session_id,
+                agent_session_id,
+                previous_agent_session_id,
             },
         });
     }
@@ -1143,14 +1161,14 @@ impl App {
     fn handle_api_request_with_ingress(
         &mut self,
         request: crate::api::schema::Request,
-        context: crate::api::ApiRequestContext,
+        mut context: crate::api::ApiRequestContext,
         ingress: ApiIngress,
     ) -> String {
         self.sync_pending_terminal_titles();
         if let Some(response) = self.session_checked_guard_denial(&request) {
             return response;
         }
-        if let Some(response) = self.cross_pane_input_denial(&request, context) {
+        if let Some(response) = self.cross_pane_input_denial_with_ancestry(&request, &mut context) {
             return response;
         }
         let mut request = request;
@@ -1397,7 +1415,9 @@ impl App {
                     "input consumer operations require the asynchronous local API route",
                 );
             }
-            Method::AgentPrompt(_) | Method::AgentPromptSessionChecked(_) => {
+            Method::AgentPrompt(_)
+            | Method::AgentPromptSessionChecked(_)
+            | Method::AgentPromptStatusChecked(_) => {
                 return responses::encode_error(
                     request.id,
                     "invalid_request",

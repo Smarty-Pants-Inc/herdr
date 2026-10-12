@@ -45,8 +45,10 @@ const CHANNEL_REASONS = new Set([
   "expired",
 ]);
 
+// HERDR_PANE_ID is not required: when it is missing or empty, reports carry pane_id "" and
+// Herdr rebinds them to the pane whose session holds this process (smarty-dev#10398).
 function enabled() {
-  return HERDR_ENV === "1" && !!socketPath && !!paneId;
+  return HERDR_ENV === "1" && !!socketPath;
 }
 
 function sendRequestAttempt(request: unknown, timeoutMs: number): Promise<boolean> {
@@ -149,7 +151,7 @@ function reportSession(sessionStartSource?: string): Promise<void> {
     id: `${source}:session:${Date.now()}:${Math.random().toString(36).slice(2)}`,
     method: "pane.report_agent_session",
     params: {
-      pane_id: paneId,
+      pane_id: paneId || "",
       source,
       agent: "pi",
       seq: nextReportSeq(),
@@ -164,7 +166,7 @@ function sendState(state: AgentState, message?: string, seq = nextReportSeq()): 
     id: `${source}:${Date.now()}:${Math.random().toString(36).slice(2)}`,
     method: "pane.report_agent",
     params: withSessionRef({
-      pane_id: paneId,
+      pane_id: paneId || "",
       source,
       agent: "pi",
       state,

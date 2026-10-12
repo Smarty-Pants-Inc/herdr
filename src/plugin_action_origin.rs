@@ -87,6 +87,7 @@ pub(crate) fn method_carries_grant(method: &crate::api::schema::Method) -> bool 
         // Session-checked aliases are the same content writes with an identity
         // expectation, so they carry the claim exactly like their base methods.
         Method::AgentPromptSessionChecked(_)
+        | Method::AgentPromptStatusChecked(_)
         | Method::PaneSendTextSessionChecked(_)
         | Method::PaneSendKeysSessionChecked(_) => true,
         // Pane creation the CLI performs, so the server can attribute the
@@ -692,6 +693,10 @@ mod tests {
             (
                 "agent.prompt_session_checked",
                 serde_json::json!({"target": "a", "text": "t", "expected_agent_session_id": "s"}),
+            ),
+            (
+                "agent.prompt_status_checked",
+                serde_json::json!({"target": "a", "text": "t", "expected_agent_session_id": "s", "expected_agent_status": "idle"}),
             ),
             (
                 "pane.send_text_session_checked",

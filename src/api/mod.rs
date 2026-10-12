@@ -64,6 +64,7 @@ pub(crate) fn request_changes_ui(request: &Request) -> bool {
             | Method::AgentStartGuarded(_)
             | Method::AgentPrompt(_)
             | Method::AgentPromptSessionChecked(_)
+            | Method::AgentPromptStatusChecked(_)
             | Method::AgentSendKeys(_)
             | Method::PaneSplit(_)
             | Method::PaneSwap(_)
@@ -108,6 +109,9 @@ pub(crate) struct ApiRequestContext {
     /// origin. A captured marker that loses that live relationship is unknown,
     /// not ordinary.
     pub(crate) local_peer_pane_origin: crate::platform::PeerPaneOrigin,
+    /// Filled only while handling one request, never cached at accept time or
+    /// shared between requests. The input log reuses the guard's live proof.
+    pub(crate) server_ancestry: Option<crate::platform::ServerAncestryObservation>,
     /// Optional plugin action grant presented on this request line only
     /// (herdr-8592). Per-request, never sticky to the connection; Debug
     /// redacts the secret.
@@ -123,6 +127,7 @@ impl ApiRequestContext {
         Self {
             local_peer_identity,
             local_peer_pane_origin,
+            server_ancestry: None,
             plugin_action: crate::plugin_action_origin::PluginActionClaim::Absent,
         }
     }
@@ -176,6 +181,7 @@ mod context_tests {
         let captured = ApiRequestContext {
             local_peer_identity: Some(peer),
             local_peer_pane_origin: crate::platform::PeerPaneOrigin::HasPane,
+            server_ancestry: None,
             plugin_action: crate::plugin_action_origin::PluginActionClaim::Malformed,
         };
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();

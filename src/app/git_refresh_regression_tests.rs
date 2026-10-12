@@ -219,9 +219,10 @@ fn drain_git_watch_hints(app: &mut App) {
     let safety_refresh = app.last_git_repo_discovery_refresh;
     let mut quiet_since = Instant::now();
     loop {
+        // A hang watchdog: a loaded runner can stretch any refresh it starts.
         assert!(
-            start.elapsed() < std::time::Duration::from_secs(3),
-            "native git hints did not settle within 3s"
+            start.elapsed() < GIT_WATCH_HANG_WATCHDOG,
+            "native git hints did not settle within {GIT_WATCH_HANG_WATCHDOG:?}"
         );
         app.sync_git_watches();
         app.start_git_status_refresh_if_due(Instant::now());
