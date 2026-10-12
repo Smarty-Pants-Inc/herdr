@@ -1209,6 +1209,17 @@ mod tests {
             logged.len()
         );
         assert_eq!(loggable_rejection("short"), "short");
+
+        // Terminal escapes and bidi overrides cannot restyle or reorder the log.
+        let logged = loggable_rejection("v\u{1b}[31mred\u{202e}rtl");
+        assert!(!logged.contains(['\u{1b}', '\u{202e}']), "{logged}");
+        assert_eq!(logged, "v\\u{1b}[31mred\\u{202e}rtl");
+
+        // The cut counts chars, so a multi-byte char at the boundary stays whole.
+        let at_limit = format!("{}é", "a".repeat(LOGGED_REJECTION_MAX_CHARS - 1));
+        assert_eq!(loggable_rejection(&at_limit), at_limit);
+        let logged = loggable_rejection(&format!("{at_limit}é"));
+        assert_eq!(logged, format!("{at_limit}...[truncated]"));
     }
 
     fn empty_snapshot() -> crate::persist::SessionSnapshot {

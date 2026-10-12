@@ -2804,122 +2804,6 @@ fn live_handoff_bad_expected_protocol_rolls_back_old_server() {
     cleanup_test_base(&base);
 }
 
-#[test]
-fn live_handoff_version_mismatch_logs_import_rejection() {
-    let _lock = test_lock();
-    let base = unique_test_dir();
-    let config_home = base.join("config");
-    let runtime_dir = base.join("runtime");
-    let api_socket = runtime_dir.join("herdr.sock");
-
-    let spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
-    wait_for_socket(&api_socket, Duration::from_secs(10));
-    register_runtime_dir(&runtime_dir);
-
-    let failed = request(
-        &api_socket,
-        serde_json::json!({
-            "id": "test:bad-version-handoff",
-            "method": "server.live_handoff",
-            "params": {"expected_version": "0.0.0-mismatch"}
-        }),
-    );
-    assert!(
-        failed.get("error").is_some(),
-        "version-mismatched handoff should fail: {failed}"
-    );
-    wait_for_api(&api_socket, Duration::from_secs(5));
-
-    // The importer, not the source, knows why; it must log the reason.
-    let log = wait_for_file_contains(
-        &config_home.join("herdr-dev/herdr-server.log"),
-        "handoff import rejected",
-        Duration::from_secs(5),
-    );
-    let line = log
-        .lines()
-        .find(|line| line.contains("handoff import rejected"))
-        .unwrap();
-    eprintln!("rejection log line: {line}");
-    assert!(
-        line.contains("handoff expected herdr v0.0.0-mismatch, but this server is v"),
-        "rejection reason missing from log line: {line}"
-    );
-
-    let _ = request(
-        &api_socket,
-        serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
-    );
-    drop(spawned);
-    cleanup_test_base(&base);
-}
-
-#[test]
-fn live_handoff_rejection_log_escapes_and_bounds_sender_text() {
-    let _lock = test_lock();
-    let base = unique_test_dir();
-    let config_home = base.join("config");
-    let runtime_dir = base.join("runtime");
-    let api_socket = runtime_dir.join("herdr.sock");
-
-    let spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
-    wait_for_socket(&api_socket, Duration::from_secs(10));
-    register_runtime_dir(&runtime_dir);
-
-    let hostile_version = format!("0.0.0\r\nFAKE-LINE forged{}", "z".repeat(64 * 1024));
-    let failed = request(
-        &api_socket,
-        serde_json::json!({
-            "id": "test:hostile-version-handoff",
-            "method": "server.live_handoff",
-            "params": {"expected_version": hostile_version}
-        }),
-    );
-    assert!(
-        failed.get("error").is_some(),
-        "version-mismatched handoff should fail: {failed}"
-    );
-    wait_for_api(&api_socket, Duration::from_secs(5));
-
-    let log = wait_for_file_contains(
-        &config_home.join("herdr-dev/herdr-server.log"),
-        "handoff import rejected",
-        Duration::from_secs(5),
-    );
-    let rejection_lines: Vec<&str> = log
-        .lines()
-        .filter(|line| line.contains("handoff import rejected"))
-        .collect();
-    assert_eq!(rejection_lines.len(), 1, "{rejection_lines:?}");
-    let line = rejection_lines[0];
-    assert!(
-        line.contains("handoff expected herdr v0.0.0\\r\\nFAKE-LINE forged"),
-        "escaped rejection reason missing from log line: {line}"
-    );
-    assert!(line.contains("...[truncated]"), "{line}");
-    assert!(
-        line.len() < 2048,
-        "log line not bounded: {} bytes",
-        line.len()
-    );
-    assert!(
-        !log.lines().any(|l| l.trim_start().starts_with("FAKE-LINE")),
-        "sender text forged a log line"
-    );
-    assert!(
-        log.len() < 32 * 1024,
-        "log not bounded: {} bytes",
-        log.len()
-    );
-
-    let _ = request(
-        &api_socket,
-        serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
-    );
-    drop(spawned);
-    cleanup_test_base(&base);
-}
-
 /// Runs the real operator CLI, `herdr server live-handoff`, against the test
 /// server, the way an operator (or the fleet) runs it.
 fn run_live_handoff_cli(
@@ -3054,6 +2938,47 @@ fn live_handoff_cli_version_mismatch_logs_one_rejection_and_keeps_old_server() {
         !log.lines()
             .any(|line| line.trim_start().starts_with("FAKE")),
         "sender text forged a log line:\n{log}"
+    );
+
+    // Third run: hostile, oversized sender text (64 KiB, within ARG_MAX).
+    let hostile_version = format!("0.0.0\r\nFAKE-LINE forged{}", "x".repeat(64 * 1024));
+    let output = run_live_handoff_cli(
+        &base,
+        &config_home,
+        &runtime_dir,
+        &api_socket,
+        &hostile_version,
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "stderr: {stderr}");
+    assert!(stderr.contains("handoff_failed"), "stderr: {stderr}");
+    assert_old_server_still_serving(&runtime_dir, &api_socket, old_pid);
+
+    let log = wait_for_file_contains(
+        &log_path,
+        "expected herdr v0.0.0\\r\\nFAKE-LINE forged",
+        Duration::from_secs(5),
+    );
+    let rejections: Vec<&str> = log
+        .lines()
+        .filter(|line| line.contains("handoff import rejected"))
+        .collect();
+    assert_eq!(rejections.len(), 3, "{rejections:?}");
+    let line = rejections[2];
+    assert!(
+        line.contains("expected herdr v0.0.0\\r\\nFAKE-LINE forged"),
+        "escaped rejection reason missing: {line}"
+    );
+    assert!(line.contains("...[truncated]"), "{line}");
+    assert!(
+        line.len() < 2048,
+        "log line not bounded: {} bytes",
+        line.len()
+    );
+    assert!(
+        !log.lines()
+            .any(|line| line.trim_start().starts_with("FAKE-LINE")),
+        "sender text forged a log line"
     );
 
     let _ = request(
