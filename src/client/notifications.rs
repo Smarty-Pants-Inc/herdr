@@ -127,6 +127,28 @@ fn show_system_notification(
     })
 }
 
+/// Dispatches a server `Notify` received by the client loop. With a shell, the
+/// shell decides whether to show it and the returned frame must be presented;
+/// without one, the host terminal or system notifier handles it.
+pub(super) fn dispatch_server_notify(
+    state: &mut super::state::ClientState,
+    kind: NotifyKind,
+    message: &str,
+    body: Option<&str>,
+) -> Option<super::frame_output::ComposedFrame> {
+    let (cols, rows) = state.reported_size;
+    match state.shell.as_mut() {
+        Some(shell) => shell
+            .receive_server_notify(message, body)
+            .then(|| shell.compose(cols, rows))
+            .flatten(),
+        None => {
+            handle_notify(kind, message, body, &state.sound_config);
+            None
+        }
+    }
+}
+
 pub(super) fn handle_notify(
     kind: NotifyKind,
     message: &str,

@@ -121,7 +121,7 @@ use handshake::{client_shell_keybinding_source, do_handshake, is_remote_client_p
 use handshake::{
     direct_graphics_profile_values, handshake_read_timeout, REMOTE_HANDSHAKE_READ_TIMEOUT,
 };
-use notifications::{handle_notify, handle_shell_notification_effects};
+use notifications::{dispatch_server_notify, handle_shell_notification_effects};
 #[cfg(test)]
 use notifications::{handle_notify_with_notifiers, sound_from_notify_message};
 #[cfg(test)]
@@ -1784,8 +1784,10 @@ async fn run_client_loop(
                         message,
                         body,
                     } => {
-                        if state.shell.is_none() {
-                            handle_notify(kind, &message, body.as_deref(), &state.sound_config);
+                        if let Some(frame) =
+                            dispatch_server_notify(&mut state, kind, &message, body.as_deref())
+                        {
+                            state.present_frame(frame);
                         }
                     }
                     ServerMessage::SemanticNotification(event) => {

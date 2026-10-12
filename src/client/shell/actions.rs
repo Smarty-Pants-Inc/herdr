@@ -426,6 +426,21 @@ impl ClientShellState {
         )
     }
 
+    /// Shows the server's pane input poison `Notify` in the shell's notice
+    /// card. Other `Notify` messages reach the shell as semantic notifications,
+    /// so they are not shown here.
+    pub(crate) fn receive_server_notify(&mut self, message: &str, body: Option<&str>) -> bool {
+        if !crate::server::pane_input::is_input_poison_notice(message) {
+            return false;
+        }
+        self.push_endpoint_notice(
+            ClientEndpointNoticeKind::Rejected,
+            crate::server::pane_input::INPUT_POISON_NOTICE_CODE,
+            message,
+            body.unwrap_or_default(),
+        )
+    }
+
     pub(crate) fn receive_endpoint_unavailable(&mut self, message: String) -> bool {
         self.push_endpoint_notice(
             ClientEndpointNoticeKind::Unavailable,

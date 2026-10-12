@@ -13,7 +13,7 @@ pub(super) enum ClientInputError {
 impl std::fmt::Display for ClientInputError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::PaneInputPoisoned => f.write_str("pane_input_poisoned"),
+            Self::PaneInputPoisoned => f.write_str(INPUT_POISON_NOTICE_CODE),
             Self::Failed(message) => f.write_str(message),
         }
     }
@@ -48,12 +48,25 @@ pub(super) fn classify_client_enqueue_error(
     }
 }
 
-pub(super) fn input_poison_notice(pane_id: &str) -> crate::protocol::ServerMessage {
+/// Discriminator of the pane input poison `Notify`. Its message starts with
+/// this code followed by `:`; the attached client filters on it.
+pub(crate) const INPUT_POISON_NOTICE_CODE: &str = "pane_input_poisoned";
+
+/// Whether a `Notify` message is the pane input poison notice.
+pub(crate) fn is_input_poison_notice(message: &str) -> bool {
+    message
+        .strip_prefix(INPUT_POISON_NOTICE_CODE)
+        .is_some_and(|rest| rest.starts_with(':'))
+}
+
+pub(crate) fn input_poison_notice(pane_id: &str) -> crate::protocol::ServerMessage {
     crate::protocol::ServerMessage::Notify {
         kind: crate::protocol::NotifyKind::Toast,
-        message: format!("pane_input_poisoned: input blocked for {pane_id} after failed flush"),
+        message: format!(
+            "{INPUT_POISON_NOTICE_CODE}: input blocked for {pane_id} after failed flush"
+        ),
         body: Some(format!(
-            "Staged text may remain on line; inspect/discard it, then explicitly run herdr pane clear-input-poison {pane_id}."
+            "Run herdr pane clear-input-poison {pane_id} from a terminal outside Herdr panes. Staged text may remain on line; inspect it first."
         )),
     }
 }

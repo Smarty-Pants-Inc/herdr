@@ -742,6 +742,99 @@ fn generic_endpoint_failures_and_control_errors_are_visible() {
 }
 
 #[test]
+fn pane_input_poison_notify_is_shown_by_the_attached_shell() {
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_snapshot(Box::new(snapshot()));
+    // The exact message the server sends for a refused write to a poisoned pane.
+    let crate::protocol::ServerMessage::Notify { message, body, .. } =
+        crate::server::pane_input::input_poison_notice("pane_1")
+    else {
+        panic!("poison notice is a Notify");
+    };
+
+    assert!(state.receive_server_notify(&message, body.as_deref()));
+    let notice = state
+        .visible_endpoint_notice
+        .as_ref()
+        .expect("poison notice is visible");
+    assert_eq!(notice.key.code, "pane_input_poisoned");
+    assert!(notice.title.contains("input blocked for pane_1"));
+    assert_eq!(
+        notice.body,
+        "Run herdr pane clear-input-poison pane_1 from a terminal outside Herdr panes. \
+         Staged text may remain on line; inspect it first."
+    );
+
+    let frame = state.compose(160, 24).expect("poison notice frame");
+    let rows = frame_rows(&frame);
+    println!("{}", rows.join("\n"));
+    let screen = rows.join("\n");
+    assert!(screen.contains("pane_input_poisoned: input blocked for pane_1 after failed flush"));
+    assert!(screen.contains("Run herdr pane clear-input-poison pane_1 from a terminal outside"));
+    assert!(!state.hits.notification_toast.is_empty());
+
+    // Each refused keystroke resends the notice; a visible duplicate is not
+    // repainted, and typing does not dismiss it.
+    assert!(!state.receive_server_notify(&message, body.as_deref()));
+    state.handle_input_bytes(b"x");
+    assert!(state.visible_endpoint_notice.is_some());
+
+    // Other Notify messages reach the shell as semantic notifications, so the
+    // shell does not show them a second time.
+    let mut other = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    other.set_snapshot(Box::new(snapshot()));
+    assert!(!other.receive_server_notify("Agent finished", Some("pane_1 is idle")));
+    assert!(!other.receive_server_notify("Paste rejected", None));
+    assert!(other.visible_endpoint_notice.is_none());
+}
+
+#[test]
+fn client_loop_notify_dispatch_shows_pane_input_poison_notice_in_shell() {
+    // Drives the dispatch the client loop runs for `ServerMessage::Notify`.
+    let mut client = crate::client::state::ClientState::test_new();
+    let mut shell = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    shell.set_snapshot(Box::new(snapshot()));
+    client.shell = Some(shell);
+    client.reported_size = (160, 24);
+    let crate::protocol::ServerMessage::Notify {
+        kind,
+        message,
+        body,
+    } = crate::server::pane_input::input_poison_notice("pane_1")
+    else {
+        panic!("poison notice is a Notify");
+    };
+
+    let frame = crate::client::notifications::dispatch_server_notify(
+        &mut client,
+        kind.clone(),
+        &message,
+        body.as_deref(),
+    )
+    .expect("poison notice repaints the shell");
+    let screen = frame_rows(&frame.frame).join("\n");
+    assert!(screen.contains("pane_input_poisoned: input blocked for pane_1 after failed flush"));
+    assert!(screen.contains("Run herdr pane clear-input-poison pane_1 from a terminal outside"));
+    let shell = client.shell.as_ref().expect("shell mode");
+    assert_eq!(
+        shell
+            .visible_endpoint_notice
+            .as_ref()
+            .map(|notice| notice.key.code.as_str()),
+        Some(crate::server::pane_input::INPUT_POISON_NOTICE_CODE)
+    );
+
+    // A resent duplicate does not repaint.
+    assert!(crate::client::notifications::dispatch_server_notify(
+        &mut client,
+        kind,
+        &message,
+        body.as_deref(),
+    )
+    .is_none());
+}
+
+#[test]
 fn endpoint_timeout_is_a_deduplicated_server_notice() {
     let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
     state.set_snapshot(Box::new(snapshot()));
