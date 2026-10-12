@@ -1270,7 +1270,10 @@ reaches 32 MiB, herdr renames it to `api-input.jsonl.1` (replacing the previous
 generation) before appending the next line. If the log is full and that rotation fails,
 herdr refuses the input with `input_log_full`; the error names the log path and the
 rotation error. If herdr cannot write the line for any other reason, it refuses the input
-with `input_log_unavailable`.
+with `input_log_unavailable`. The session-checked forms
+(`pane.send_text_session_checked`, `pane.send_keys_session_checked`, and
+`agent.prompt_session_checked`) are logged exactly like their base methods, under the
+base method name, after their expected-session check accepts the input.
 
 On Linux and macOS, `caller.exe` and `caller.ppid` record the executable basename
 (not a mutable process label) and parent PID at write time, even when the caller is
