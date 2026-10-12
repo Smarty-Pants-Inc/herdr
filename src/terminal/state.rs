@@ -45,6 +45,31 @@ pub(crate) struct HandoffAgentState {
     acquisition_pending: bool,
 }
 
+/// The current reporter-bound agent session ID, carried across a live handoff only
+/// (never persisted to disk). It is a claim, not trust: the importer re-proves the
+/// exact reporter instance and the restored session before it binds anything.
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct HandoffAgentSessionBinding {
+    source: String,
+    agent: String,
+    kind: crate::agent_resume::AgentSessionRefKind,
+    value: String,
+    id: String,
+    reporter_pid: u32,
+    reporter_start_time: u64,
+}
+
+/// Why an imported live-handoff session binding was dropped.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HandoffAgentSessionBindingRefusal {
+    /// The pane's restored session is not the session the ID was reported for.
+    SessionMismatch,
+    /// The reporter exited, or its PID now names another process instance.
+    ReporterGone,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SuppressedFullLifecycleHookReport {
     agent_label: String,
@@ -339,6 +364,81 @@ impl TerminalState {
         self.replace_reported_agent_session_id(None);
         self.buffered_session_reports.clear();
         self.agent_process_acquisition_pending = snapshot.acquisition_pending;
+    }
+
+    /// Export only the accepted CURRENT binding whose authority was not revoked.
+    #[cfg(unix)]
+    pub(crate) fn handoff_agent_session_binding(&self) -> Option<HandoffAgentSessionBinding> {
+        let id = self.reported_agent_session_id()?;
+        let reported = self.reported_agent_session_id.as_ref()?;
+        if !reported.validity.load(Ordering::Acquire) {
+            return None;
+        }
+        let (source, agent, kind, value) = reported.identity.clone();
+        Some(HandoffAgentSessionBinding {
+            source,
+            agent,
+            kind,
+            value,
+            id: id.to_string(),
+            reporter_pid: reported.reporter.pid,
+            reporter_start_time: reported.reporter.start_time,
+        })
+    }
+
+    /// Re-import a binding after every other restored session fact is applied.
+    /// It binds only when the pane's restored session is exactly the reported one
+    /// AND the exact reporter instance (PID + start time) is still alive, proved
+    /// now with the platform identity check the input guard uses. Anything else
+    /// is dropped: trust never moves to another process. The validity cell is
+    /// fresh; the PTY actor still re-proves foreground ownership before each
+    /// guarded write.
+    #[cfg(unix)]
+    pub(crate) fn import_handoff_agent_session_binding(
+        &mut self,
+        binding: HandoffAgentSessionBinding,
+    ) -> Result<(), HandoffAgentSessionBindingRefusal> {
+        self.import_handoff_agent_session_binding_with(binding, |reporter| {
+            crate::platform::process_identity(reporter.pid) == Some(reporter)
+        })
+    }
+
+    #[cfg(unix)]
+    fn import_handoff_agent_session_binding_with(
+        &mut self,
+        binding: HandoffAgentSessionBinding,
+        reporter_is_live: impl FnOnce(crate::platform::ProcessIdentity) -> bool,
+    ) -> Result<(), HandoffAgentSessionBindingRefusal> {
+        let HandoffAgentSessionBinding {
+            source,
+            agent,
+            kind,
+            value,
+            id,
+            reporter_pid,
+            reporter_start_time,
+        } = binding;
+        let identity = (source, agent, kind, value);
+        if id.is_empty()
+            || self.current_session_identity_for_persistence().as_ref() != Some(&identity)
+        {
+            return Err(HandoffAgentSessionBindingRefusal::SessionMismatch);
+        }
+        let reporter = crate::platform::ProcessIdentity {
+            pid: reporter_pid,
+            start_time: reporter_start_time,
+        };
+        if reporter.pid == 0 || !reporter_is_live(reporter) {
+            return Err(HandoffAgentSessionBindingRefusal::ReporterGone);
+        }
+        self.replace_reported_agent_session_id(Some(ReportedAgentSessionId {
+            identity,
+            revision: self.accepted_session_report_revision,
+            id,
+            reporter,
+            validity: Arc::new(AtomicBool::new(true)),
+        }));
+        Ok(())
     }
 
     pub(crate) fn finish_agent_process_acquisition(&mut self) -> bool {
@@ -3333,6 +3433,176 @@ mod tests {
             id.map(str::to_string),
             reporter,
         );
+    }
+
+    /// smarty-dev#10527: the source side of a live handoff, bound to `reporter`.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn exported_handoff_binding(
+        reporter: crate::platform::ProcessIdentity,
+    ) -> HandoffAgentSessionBinding {
+        let mut source = test_terminal();
+        buffer_pi_report(&mut source, false, 1, Some("carried"), Some(reporter));
+        source.set_detected_agent_process_at(Agent::Pi, Instant::now());
+        assert_eq!(source.reported_agent_session_id(), Some("carried"));
+        source
+            .handoff_agent_session_binding()
+            .expect("a current binding is exported")
+    }
+
+    /// The replacement terminal after the snapshot restored the pane's session.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn restored_pi_terminal(path: &str) -> TerminalState {
+        let mut terminal = test_terminal();
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:pi".into(),
+            agent: "pi".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::path(test_temp_session_path(path))
+                .expect("session path"),
+        });
+        terminal
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn handoff_session_binding_imports_only_for_the_same_live_reporter() {
+        let reporter = crate::platform::process_identity(std::process::id()).expect("self");
+        let binding = exported_handoff_binding(reporter);
+        // Through the manifest's JSON, as the replacement receives it.
+        let binding: HandoffAgentSessionBinding =
+            serde_json::from_value(serde_json::to_value(&binding).unwrap()).unwrap();
+        let mut terminal = restored_pi_terminal("buffered.jsonl");
+        assert_eq!(terminal.reported_agent_session_id(), None);
+        assert_eq!(
+            terminal.import_handoff_agent_session_binding(binding),
+            Ok(())
+        );
+        assert_eq!(terminal.reported_agent_session_id(), Some("carried"));
+        assert_eq!(terminal.reported_agent_session_reporter(), Some(reporter));
+        let validity = terminal.reported_agent_session_validity().expect("cell");
+        assert!(binding_is_valid(&validity), "a fresh, valid cell");
+        // The first detection on the new server matches the reported agent.
+        terminal.set_detected_agent_process_at(Agent::Pi, Instant::now());
+        assert_eq!(terminal.reported_agent_session_id(), Some("carried"));
+        // A later accepted report for another session still revokes it.
+        let other = crate::platform::ProcessIdentity {
+            pid: reporter.pid,
+            start_time: reporter.start_time.wrapping_add(1),
+        };
+        let marker = terminal.session_report_marker();
+        let replacement =
+            crate::agent_resume::AgentSessionRef::path(test_temp_session_path("next.jsonl"));
+        terminal.set_agent_session_ref_for_session_start(
+            "herdr:pi".into(),
+            "pi".into(),
+            replacement.clone(),
+            Some(2),
+            Some("new".into()),
+        );
+        terminal.retain_reported_agent_session_id(
+            (marker, Some(2)),
+            "herdr:pi",
+            "pi",
+            replacement.as_ref(),
+            Some("next".into()),
+            Some(other),
+        );
+        assert_eq!(terminal.reported_agent_session_id(), Some("next"));
+        assert!(!binding_is_valid(&validity), "the imported cell is revoked");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn handoff_session_binding_is_refused_for_a_dead_reporter() {
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "read line"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .expect("reporter");
+        let reporter = crate::platform::process_identity(child.id()).expect("reporter pin");
+        let binding = exported_handoff_binding(reporter);
+        drop(child.stdin.take());
+        child.wait().expect("reap reporter");
+        let mut terminal = restored_pi_terminal("buffered.jsonl");
+        assert_eq!(
+            terminal.import_handoff_agent_session_binding(binding),
+            Err(HandoffAgentSessionBindingRefusal::ReporterGone)
+        );
+        assert_eq!(terminal.reported_agent_session_id(), None);
+        assert_eq!(terminal.reported_agent_session_reporter(), None);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn handoff_session_binding_is_refused_for_a_reused_pid() {
+        // A live process holds the numeric PID, but not the reported instance.
+        let live = crate::platform::process_identity(std::process::id()).expect("self");
+        let reporter = crate::platform::ProcessIdentity {
+            pid: live.pid,
+            start_time: live.start_time.wrapping_add(1),
+        };
+        let binding = exported_handoff_binding(reporter);
+        let mut terminal = restored_pi_terminal("buffered.jsonl");
+        assert_eq!(
+            terminal.import_handoff_agent_session_binding(binding),
+            Err(HandoffAgentSessionBindingRefusal::ReporterGone)
+        );
+        assert_eq!(terminal.reported_agent_session_id(), None);
+        assert_eq!(terminal.reported_agent_session_reporter(), None);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn handoff_session_binding_is_refused_for_a_mismatched_session() {
+        let reporter = crate::platform::process_identity(std::process::id()).expect("self");
+        let binding = exported_handoff_binding(reporter);
+        // Another session path, another owner, and no restored session at all.
+        let mut other_path = restored_pi_terminal("other.jsonl");
+        let mut other_source = test_terminal();
+        other_source.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "custom:pi".into(),
+            agent: "pi".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::path(test_temp_session_path(
+                "buffered.jsonl",
+            ))
+            .expect("session path"),
+        });
+        let mut no_session = test_terminal();
+        for terminal in [&mut other_path, &mut other_source, &mut no_session] {
+            assert_eq!(
+                terminal.import_handoff_agent_session_binding(binding.clone()),
+                Err(HandoffAgentSessionBindingRefusal::SessionMismatch)
+            );
+            assert_eq!(terminal.reported_agent_session_id(), None);
+            assert_eq!(terminal.reported_agent_session_reporter(), None);
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn handoff_session_binding_exports_only_a_current_binding() {
+        let reporter = crate::platform::process_identity(std::process::id()).expect("self");
+        let mut terminal = test_terminal();
+        assert_eq!(terminal.handoff_agent_session_binding(), None);
+        // Path-only: no ID to carry.
+        buffer_pi_report(&mut terminal, false, 1, None, Some(reporter));
+        terminal.set_detected_agent_process_at(Agent::Pi, Instant::now());
+        assert_eq!(terminal.handoff_agent_session_binding(), None);
+        // An ID without a transport-bound reporter is never bound, so never carried.
+        buffer_pi_report(&mut terminal, false, 2, Some("unbound"), None);
+        assert_eq!(terminal.handoff_agent_session_binding(), None);
+        buffer_pi_report(&mut terminal, false, 3, Some("bound"), Some(reporter));
+        assert!(terminal.handoff_agent_session_binding().is_some());
+        // The agent process exited: the binding was released, nothing is carried.
+        terminal.set_detected_state_with_screen_signals_at(
+            None,
+            AgentState::Unknown,
+            false,
+            false,
+            false,
+            true,
+            Instant::now(),
+        );
+        assert_eq!(terminal.handoff_agent_session_binding(), None);
     }
 
     fn current_pi_binding() -> (TerminalState, crate::platform::ProcessIdentity) {

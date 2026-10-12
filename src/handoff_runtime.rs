@@ -33,6 +33,12 @@ pub(crate) struct HandoffRuntimeState {
     pub initial_history_ansi: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_state: Option<crate::terminal::state::HandoffAgentState>,
+    /// The reporter-bound agent session ID current at export. Additive and
+    /// optional: older senders omit it and older receivers ignore it (no
+    /// `deny_unknown_fields` on the manifest path). The importer re-proves the
+    /// reporter and session before binding it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_session_binding: Option<crate::terminal::state::HandoffAgentSessionBinding>,
 }
 
 #[cfg(unix)]
@@ -74,6 +80,24 @@ mod tests {
             "cell_height_px": 0
         }))
         .expect("legacy handoff manifest")
+    }
+
+    #[test]
+    fn handoff_session_binding_is_optional_and_unknown_fields_are_ignored() {
+        // An older sender omits the binding.
+        let legacy = legacy_state(1);
+        assert!(legacy.agent_session_binding.is_none());
+        assert!(!serde_json::to_value(&legacy)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .contains_key("agent_session_binding"));
+        // An older receiver ignores fields it does not know: the manifest path has
+        // no `deny_unknown_fields`, which is what lets a newer sender add one.
+        let mut value = serde_json::to_value(&legacy).unwrap();
+        value["a_future_field"] = serde_json::json!({"id": "x"});
+        let imported: HandoffRuntimeState = serde_json::from_value(value).expect("tolerant");
+        assert!(imported.agent_session_binding.is_none());
     }
 
     #[test]
