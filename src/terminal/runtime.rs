@@ -513,6 +513,10 @@ impl TerminalRuntime {
         self.0
             .queue_guarded_user_input_submission_with_source(text, enter, delay, guard, source)
     }
+    pub(crate) fn validate_input_submission(&self, bytes: &[u8]) -> std::io::Result<()> {
+        self.0.validate_input_submission(bytes)
+    }
+
     pub(crate) fn queue_user_input_submission_with_source(
         &self,
         text: Bytes,
@@ -708,6 +712,11 @@ impl TerminalRuntime {
     pub(crate) fn test_with_channel(cols: u16, rows: u16) -> (Self, mpsc::Receiver<Bytes>) {
         let (runtime, rx) = crate::pane::PaneRuntime::test_with_channel(cols, rows);
         (Self(runtime), rx)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn test_with_actor(actor: crate::pty::actor::PtyIoActorHandle) -> Self {
+        Self(crate::pane::PaneRuntime::test_with_actor(actor))
     }
 
     pub(crate) fn test_with_channel_capacity(

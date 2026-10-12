@@ -274,6 +274,7 @@ impl NativePty {
             response_order: Arc::clone(&runner.response_order),
             foreground_fd: PtyForegroundObserver(Arc::downgrade(&runner.file.foreground)),
             consumer_epoch: Arc::clone(&runner.consumer_epoch),
+            input_guard: crate::platform::PtyInputGuard::new(&runner.file.foreground),
         }
     }
 

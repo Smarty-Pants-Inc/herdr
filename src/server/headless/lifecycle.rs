@@ -153,6 +153,7 @@ impl HeadlessServer {
             params.expected_protocol,
             params.expected_version,
             self.api_window_title.clone(),
+            self.host_shutdown_intent.get(),
         );
         let mut import_child = if pull {
             info!(socket = %socket_path.display(), "waiting for pulling handoff importer");
