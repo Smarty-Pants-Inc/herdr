@@ -10,7 +10,8 @@ queue_rules:
   - name: default
     batch_size: 4
     batch_max_wait_time: 2 min
-    checks_timeout: 30 min
+    # ponytail: above the fleet CI-wait p95 (151 min, 10-09); a lower value dequeued green PRs mid-run (smarty-dev#8527). Lower once queue-draft p95 < 60 min.
+    checks_timeout: 180 min
     merge_method: merge
     # The push check (scripts/conventional_commits.py) reads every new subject on master, the merge commit's
     # too; the PR title passed the same check on the PR, so it becomes the merge subject (smarty-dev#931).
@@ -41,6 +42,16 @@ queue_rules:
 # none, so the default `sender-permission >= write` restriction refused its queue commands.
 commands_restrictions:
   queue:
+    conditions:
+      - or:
+          - sender-permission >= write
+          - sender = smarty-fleet-write[bot]
+          - sender = smarty-fleet-write-leads[bot]
+          - sender = smarty-fleet-write-lanes[bot]
+          - sender = smarty-fleet-write-versehq[bot]
+  # The same allowance for `requeue` (smarty-dev#7327): without it Mergify refuses a fleet bot's requeue
+  # ('Command disallowed'), and a dequeued PR sits until someone notices (k3#958, ~18.5 h on 10-08).
+  requeue:
     conditions:
       - or:
           - sender-permission >= write

@@ -673,57 +673,27 @@ fn pane_agent_reports_accept_options_before_pane() {
         .unwrap()
         .to_string();
 
-    // A custom label is held by a live foreground job, not an idle shell:
-    // shell-return detection deliberately clears self-reported authority.
-    // This bounded job is the fixture, not a delay to make reporting pass.
-    let process_info_request = serde_json::json!({
-        "id": "req_agent_report_process",
-        "method": "pane.process_info",
-        "params": { "pane_id": pane_id },
-    })
-    .to_string();
-    assert!(
-        wait_until(Duration::from_secs(5), Duration::from_millis(25), || {
-            let response = send_request(&socket_path, &process_info_request);
-            let process_info = &response["result"]["process_info"];
-            let Some(shell_pid) = process_info["shell_pid"].as_u64() else {
-                return false;
-            };
-            process_info["foreground_process_group_id"].as_u64() == Some(shell_pid)
-                && process_info["foreground_processes"]
-                    .as_array()
-                    .is_some_and(|processes| {
-                        processes.len() == 1 && processes[0]["pid"].as_u64() == Some(shell_pid)
-                    })
-        }),
-        "pane did not reach its ordinary shell before starting the custom job"
+    // A custom report is released when the pane returns to its idle shell.
+    // Hold a real foreground process, and use its connection as the readiness
+    // event rather than racing the detector with a report over an empty shell.
+    let ready_path = base.join("agent-ready.sock");
+    let listener = UnixListener::bind(&ready_path).unwrap();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let ready_thread = thread::spawn(move || {
+        ready_tx.send(listener.accept().unwrap().0).unwrap();
+    });
+    let command = format!(
+        "python3 -c 'import socket; s = socket.socket(socket.AF_UNIX); s.connect(\"{}\"); s.recv(1)'",
+        ready_path.display()
     );
-    let started = run_cli(&socket_path, &["pane", "run", &pane_id, "sleep", "60"]);
+    let started = run_cli(&socket_path, &["pane", "run", &pane_id, &command]);
     assert!(
         started.status.success(),
         "stderr: {}",
         String::from_utf8_lossy(&started.stderr)
     );
-    assert!(
-        wait_until(Duration::from_secs(5), Duration::from_millis(25), || {
-            let response = send_request(&socket_path, &process_info_request);
-            let process_info = &response["result"]["process_info"];
-            let Some(shell_pid) = process_info["shell_pid"].as_u64() else {
-                return false;
-            };
-            process_info["foreground_process_group_id"]
-                .as_u64()
-                .is_some_and(|pgid| pgid != shell_pid)
-                && process_info["foreground_processes"]
-                    .as_array()
-                    .is_some_and(|processes| {
-                        processes
-                            .iter()
-                            .any(|process| process["argv"] == serde_json::json!(["sleep", "60"]))
-                    })
-        }),
-        "bounded custom job did not become the pane's live foreground process"
-    );
+    let agent_process = ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    ready_thread.join().unwrap();
 
     let state_report = run_cli(
         &socket_path,
@@ -795,11 +765,19 @@ fn pane_agent_reports_accept_options_before_pane() {
     assert!(resume_report.stdout.is_empty());
     assert!(resume_report.stderr.is_empty());
 
+    // Reports are applied before their replies: no wait/retry is needed for
+    // the next lookup. Prompt guards must resolve this custom agent too, then
+    // reject its unsupported process type (not claim that it was not found).
     let agent = run_cli_json(&socket_path, &["agent", "get", &pane_id]);
     assert_eq!(agent["result"]["agent"]["agent"], "cli-test");
     assert_eq!(agent["result"]["agent"]["agent_status"], "idle");
+    let prompt = run_cli(&socket_path, &["agent", "prompt", &pane_id, "probe"]);
+    assert!(!prompt.status.success());
+    let error: serde_json::Value = serde_json::from_slice(&prompt.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "agent_not_ready");
 
     cleanup_spawned_herdr(herdr, base);
+    drop(agent_process);
 }
 
 #[test]

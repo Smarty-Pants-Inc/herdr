@@ -34,6 +34,8 @@ pub(crate) enum TerminalTargetError {
 pub(crate) enum InputOrigin {
     Ordinary,
     Agent(TerminalTarget),
+    /// A live, server-minted plugin action grant: user-initiated input.
+    PluginAction(crate::plugin_action_origin::PluginActionGrant),
     Unknown,
 }
 
@@ -339,16 +341,21 @@ impl App {
     ) -> Option<TerminalTarget> {
         match self.input_origin_for_peer_identity(peer_identity) {
             InputOrigin::Agent(target) => Some(target),
-            InputOrigin::Ordinary | InputOrigin::Unknown => None,
+            InputOrigin::Ordinary | InputOrigin::PluginAction(_) | InputOrigin::Unknown => None,
         }
     }
 
+    fn target_is_input_agent(&self, target: &TerminalTarget) -> bool {
+        self.target_is_agent(target) || self.terminal_has_registered_owner(&target.terminal_id)
+    }
+
+    #[cfg(test)]
     pub(crate) fn input_origin_for_peer_identity(
         &self,
         peer_identity: crate::platform::ProcessIdentity,
     ) -> InputOrigin {
         match self.checked_pane_target_for_peer_identity(peer_identity) {
-            Ok(Some(target)) if self.target_is_agent(&target) => InputOrigin::Agent(target),
+            Ok(Some(target)) if self.target_is_input_agent(&target) => InputOrigin::Agent(target),
             Ok(_) => InputOrigin::Ordinary,
             Err(()) => InputOrigin::Unknown,
         }
@@ -357,10 +364,26 @@ impl App {
     /// Captured launch markers only remove the ordinary ancestry exemption. They
     /// never select a pane, whose public ID may have been reused or renumbered.
     /// A marked caller must still have a live, validated relationship to a pane.
+    #[cfg(test)]
     pub(crate) fn input_origin_for_context(
         &self,
-        context: crate::api::ApiRequestContext,
+        mut context: crate::api::ApiRequestContext,
     ) -> InputOrigin {
+        self.input_origin_for_context_with_ancestry(&mut context)
+    }
+
+    pub(crate) fn input_origin_for_context_with_ancestry(
+        &self,
+        context: &mut crate::api::ApiRequestContext,
+    ) -> InputOrigin {
+        // A presented grant decides alone: valid is a user-initiated plugin
+        // action; any invalid claim is unknown and never falls through to the
+        // peer's ordinary or agent attribution.
+        match self.plugin_action_grants.resolve(context.plugin_action) {
+            Ok(Some(grant)) => return InputOrigin::PluginAction(grant),
+            Ok(None) => {}
+            Err(()) => return InputOrigin::Unknown,
+        }
         let Some(peer) = context.local_peer_identity else {
             return InputOrigin::Unknown;
         };
@@ -375,15 +398,59 @@ impl App {
                     InputOrigin::Unknown
                 }
             }
-            crate::platform::PeerPaneOrigin::Absent => self.input_origin_for_peer_identity(peer),
+            crate::platform::PeerPaneOrigin::Absent => {
+                match self.checked_pane_target_for_peer_identity_with_ancestry(
+                    peer,
+                    true,
+                    &mut context.server_ancestry,
+                ) {
+                    Ok(Some(target)) if self.target_is_input_agent(&target) => {
+                        InputOrigin::Agent(target)
+                    }
+                    Ok(_) => InputOrigin::Ordinary,
+                    Err(()) => InputOrigin::Unknown,
+                }
+            }
             crate::platform::PeerPaneOrigin::HasPane => {
                 match self.checked_pane_target_for_peer_identity_with_outside_proof(peer, false) {
-                    Ok(Some(target)) if self.target_is_agent(&target) => InputOrigin::Agent(target),
+                    Ok(Some(target)) if self.target_is_input_agent(&target) => {
+                        InputOrigin::Agent(target)
+                    }
                     Ok(Some(_)) => InputOrigin::Ordinary,
                     Ok(None) | Err(()) => InputOrigin::Unknown,
                 }
             }
         }
+    }
+
+    /// The pane a public API caller is invoking from, derived only from its
+    /// accept-time pinned peer identity and live pane ancestry, under the same
+    /// marker policy as the input guard. Request fields, inherited
+    /// `HERDR_PANE_ID` text and request ids are never authority. Unknown,
+    /// stale, outside or broken peers have no invoker (fail closed), and this
+    /// never falls back to UI focus.
+    pub(crate) fn trusted_invoking_pane(
+        &self,
+        context: crate::api::ApiRequestContext,
+    ) -> Option<TerminalTarget> {
+        let peer = context.local_peer_identity?;
+        let allow_outside_proof = match context.local_peer_pane_origin {
+            crate::platform::PeerPaneOrigin::Unknown => {
+                // Same as the input guard: only Darwin's positive live
+                // known-agent recovery attributes an unobservable peer.
+                #[cfg(target_os = "macos")]
+                if let InputOrigin::Agent(target) = self.input_origin_for_unknown_pane_origin(peer)
+                {
+                    return Some(target);
+                }
+                return None;
+            }
+            crate::platform::PeerPaneOrigin::Absent => true,
+            crate::platform::PeerPaneOrigin::HasPane => false,
+        };
+        self.checked_pane_target_for_peer_identity_with_outside_proof(peer, allow_outside_proof)
+            .ok()
+            .flatten()
     }
 
     /// Darwin recovery for protected executables whose initial environment is
@@ -395,7 +462,7 @@ impl App {
         peer_identity: crate::platform::ProcessIdentity,
     ) -> InputOrigin {
         match self.checked_pane_target_for_peer_identity_with_outside_proof(peer_identity, false) {
-            Ok(Some(target)) if self.target_is_agent(&target) => InputOrigin::Agent(target),
+            Ok(Some(target)) if self.target_is_input_agent(&target) => InputOrigin::Agent(target),
             Ok(_) | Err(()) => InputOrigin::Unknown,
         }
     }
@@ -416,6 +483,7 @@ impl App {
             .flatten()
     }
 
+    #[cfg(test)]
     fn checked_pane_target_for_peer_identity(
         &self,
         peer_identity: crate::platform::ProcessIdentity,
@@ -428,6 +496,19 @@ impl App {
         peer_identity: crate::platform::ProcessIdentity,
         allow_outside_proof: bool,
     ) -> Result<Option<TerminalTarget>, ()> {
+        self.checked_pane_target_for_peer_identity_with_ancestry(
+            peer_identity,
+            allow_outside_proof,
+            &mut None,
+        )
+    }
+
+    fn checked_pane_target_for_peer_identity_with_ancestry(
+        &self,
+        peer_identity: crate::platform::ProcessIdentity,
+        allow_outside_proof: bool,
+        ancestry: &mut Option<crate::platform::ServerAncestryObservation>,
+    ) -> Result<Option<TerminalTarget>, ()> {
         // Darwin's ordinary server descendants must not need access to launchd.
         // Pin this server instance, but only stop after the complete peer-to-server
         // walk has checked every live pane at every step (including the server).
@@ -435,7 +516,9 @@ impl App {
         let server_boundary =
             Some(crate::platform::process_identity(std::process::id()).ok_or(())?);
         if allow_outside_proof {
-            match crate::platform::process_identity_server_ancestry(peer_identity) {
+            let observation = crate::platform::process_identity_server_ancestry(peer_identity);
+            *ancestry = Some(observation);
+            match observation.verdict {
                 crate::platform::ServerAncestry::Outside => return Ok(None),
                 crate::platform::ServerAncestry::Unknown => return Err(()),
                 crate::platform::ServerAncestry::NotApplicable
@@ -740,6 +823,7 @@ mod tests {
         crate::api::ApiRequestContext {
             local_peer_identity: Some(peer),
             local_peer_pane_origin: crate::platform::PeerPaneOrigin::Absent,
+            ..Default::default()
         }
     }
 

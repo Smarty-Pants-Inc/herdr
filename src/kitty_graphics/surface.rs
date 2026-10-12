@@ -219,6 +219,21 @@ pub(crate) struct ClientState {
     reset_pending: bool,
     stale_images: Vec<u32>,
     forced_delete_images: Vec<u32>,
+    /// Host-cache changes of the last encoded output, kept until it is presented.
+    undelivered: Option<(u64, Box<UndeliveredOutput>)>,
+    delivery_epoch: u64,
+}
+
+/// The cache changes one encoded output made. Undoing them is conservative:
+/// images it may have partly uploaded and images it deleted are deleted again,
+/// so a retry re-uploads and no host image is left without an owner.
+#[derive(Clone, Debug, Default)]
+struct UndeliveredOutput {
+    reset: bool,
+    uploaded: Vec<(u32, ImageSignature)>,
+    deleted: Vec<u32>,
+    placed: Vec<((u32, u32), super::PlacementSignature)>,
+    unplaced: Vec<((u32, u32), super::PlacementSignature)>,
 }
 
 impl ClientState {
@@ -464,6 +479,22 @@ impl ClientState {
         self.display_scene = next;
     }
 
+    /// Encodes and treats the output as presented.
+    #[cfg(test)]
+    pub(crate) fn encode_output(
+        &mut self,
+        visibility: Visibility,
+        main_origin: (u16, u16),
+        popup_origin: Option<(u16, u16)>,
+        cell_size: HostCellSize,
+        occlusion: &Occlusion,
+    ) -> GraphicsOutput {
+        let (output, delivery) =
+            self.encode_delivery(visibility, main_origin, popup_origin, cell_size, occlusion);
+        self.finish_delivery(delivery, true);
+        output
+    }
+
     #[cfg(test)]
     pub(crate) fn encode(
         &mut self,
@@ -477,7 +508,129 @@ impl ClientState {
             .into_inline_bytes()
     }
 
-    pub(crate) fn encode_output(
+    /// Encodes the next graphics output and returns the delivery token that
+    /// must be confirmed once the output reaches the terminal. An output that is
+    /// never confirmed (failed write, dropped frame) is undone before the next
+    /// encode or when its presentation fails.
+    pub(crate) fn encode_delivery(
+        &mut self,
+        visibility: Visibility,
+        main_origin: (u16, u16),
+        popup_origin: Option<(u16, u16)>,
+        cell_size: HostCellSize,
+        occlusion: &Occlusion,
+    ) -> (GraphicsOutput, Option<u64>) {
+        if let Some((epoch, _)) = self.undelivered {
+            self.finish_delivery(Some(epoch), false);
+        }
+        let tracked = !self.host.images.is_empty()
+            || !self.display_scene.placements.is_empty()
+            || !self.forced_delete_images.is_empty()
+            || !self.stale_images.is_empty()
+            || self.reset_pending;
+        let before = tracked.then(|| {
+            (
+                self.reset_pending,
+                self.forced_delete_images.clone(),
+                self.host.images.clone(),
+                self.host.placements.clone(),
+            )
+        });
+        let output = self.encode_output_unchecked(
+            visibility,
+            main_origin,
+            popup_origin,
+            cell_size,
+            occlusion,
+        );
+        let Some((reset, forced, images, placements)) = before else {
+            return (output, None);
+        };
+        if output.is_empty() {
+            return (output, None);
+        }
+        let mut deleted = forced;
+        deleted.extend(
+            images
+                .keys()
+                .filter(|id| !self.host.images.contains_key(id)),
+        );
+        let undelivered = UndeliveredOutput {
+            reset,
+            uploaded: self
+                .host
+                .images
+                .iter()
+                .filter(|(id, signature)| images.get(id) != Some(signature))
+                .map(|(id, signature)| (*id, *signature))
+                .collect(),
+            deleted,
+            placed: self
+                .host
+                .placements
+                .iter()
+                .filter(|(key, signature)| placements.get(key) != Some(signature))
+                .map(|(key, signature)| (*key, *signature))
+                .collect(),
+            unplaced: placements
+                .iter()
+                .filter(|(key, _)| !self.host.placements.contains_key(key))
+                .map(|(key, signature)| (*key, *signature))
+                .collect(),
+        };
+        self.delivery_epoch = self.delivery_epoch.wrapping_add(1);
+        self.undelivered = Some((self.delivery_epoch, Box::new(undelivered)));
+        (output, Some(self.delivery_epoch))
+    }
+
+    /// Commits (presented) or undoes (not presented) the output with this token.
+    pub(crate) fn finish_delivery(&mut self, delivery: Option<u64>, presented: bool) {
+        let Some(epoch) = delivery else {
+            return;
+        };
+        if self.undelivered.as_ref().map(|(current, _)| *current) != Some(epoch) {
+            return;
+        }
+        let Some((_, undo)) = self.undelivered.take() else {
+            return;
+        };
+        if presented {
+            return;
+        }
+        self.reset_pending |= undo.reset;
+        for (image_id, signature) in undo.uploaded {
+            // Leave entries alone that changed again after this output.
+            if self.host.images.get(&image_id) == Some(&signature) {
+                self.host.images.remove(&image_id);
+                self.host.placements.retain(|(id, _), _| *id != image_id);
+                self.host.sources.retain(|_, id| *id != image_id);
+                self.host
+                    .replayed_placements
+                    .retain(|(id, _)| *id != image_id);
+                self.forced_delete_images.push(image_id);
+            }
+        }
+        for image_id in undo.deleted {
+            if !self.host.images.contains_key(&image_id) {
+                self.forced_delete_images.push(image_id);
+            }
+        }
+        for (key, signature) in undo.placed {
+            if self.host.placements.get(&key) == Some(&signature) {
+                self.host.placements.remove(&key);
+                self.host.replayed_placements.remove(&key);
+            }
+        }
+        // A placement delete that did not land is emitted again by the next
+        // frame that still omits it. Deleted images take their placements along.
+        for (key, signature) in undo.unplaced {
+            if self.host.images.contains_key(&key.0) {
+                self.host.placements.entry(key).or_insert(signature);
+            }
+        }
+    }
+
+    fn encode_output_unchecked(
         &mut self,
         visibility: Visibility,
         main_origin: (u16, u16),
@@ -1131,6 +1284,43 @@ mod tests {
             },
             data,
         }
+    }
+
+    #[test]
+    fn failed_placement_delete_is_repeated_on_retry() {
+        let mut state = ClientState::new();
+        state.set_scope("failed-placement-delete");
+        let target = SurfaceGraphicsTarget::Pane {
+            pane_id: "pane_1".into(),
+        };
+        let image = asset(target, 1, vec![1, 2, 3, 255]);
+        let mut both = scene(image.clone(), 0, 0);
+        let mut second = both.placements[0].clone();
+        second.logical_placement_id = 4;
+        second.x = 2;
+        both.placements.push(second);
+        let cell = HostCellSize {
+            width_px: 8,
+            height_px: 16,
+        };
+        let encode = |state: &mut ClientState| {
+            state.encode_delivery(Visibility::Main, (0, 0), None, cell, &Occlusion::default())
+        };
+        state.set_scene(both);
+        let (_, delivery) = encode(&mut state);
+        state.finish_delivery(delivery, true);
+
+        // The frame that removes one placement never reaches the terminal.
+        state.set_scene(scene(image, 0, 0));
+        let (failed, delivery) = encode(&mut state);
+        let deletes = |output: GraphicsOutput| {
+            String::from_utf8_lossy(&output.into_inline_bytes()).contains("a=d,d=i,")
+        };
+        assert!(deletes(failed));
+        state.finish_delivery(delivery, false);
+
+        let (retry, _) = encode(&mut state);
+        assert!(deletes(retry), "retry must delete the placement again");
     }
 
     fn scene(asset: SurfaceGraphicsAsset, x: u16, y: u16) -> SurfaceGraphicsScene {

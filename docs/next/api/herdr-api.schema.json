@@ -710,6 +710,41 @@
             },
             {
               "properties": {
+                "agent": {
+                  "type": "string"
+                },
+                "pane_id": {
+                  "type": "string"
+                },
+                "previous_session_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "session_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "pane_agent_session_changed",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "pane_id",
+                "workspace_id",
+                "agent",
+                "session_id",
+                "previous_session_id"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
                 "layout": {
                   "$ref": "#/schemas/event/$defs/PaneLayoutSnapshot"
                 },
@@ -753,6 +788,7 @@
             "pane_exited",
             "pane_agent_detected",
             "pane_agent_status_changed",
+            "pane_agent_session_changed",
             "layout_updated"
           ],
           "type": "string"
@@ -1235,6 +1271,71 @@
     },
     "request": {
       "$defs": {
+        "AgentChannelInfoParams": {
+          "properties": {
+            "target": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "target"
+          ],
+          "type": "object"
+        },
+        "AgentDraftStateParams": {
+          "additionalProperties": false,
+          "description": "A read-only observation, never authority for a later prompt. Callers are\nauthorized exactly like `agent.prompt`: an attributed agent may observe its own\npane, and another pane only with explicit `allow_cross_pane`.",
+          "properties": {
+            "allow_cross_pane": {
+              "type": "boolean"
+            },
+            "target": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "target"
+          ],
+          "type": "object"
+        },
+        "AgentPromptGuardedParams": {
+          "properties": {
+            "allow_cross_pane": {
+              "type": "boolean"
+            },
+            "expected_registration_epoch": {
+              "type": "string"
+            },
+            "expected_terminal": {
+              "type": "string"
+            },
+            "if_draft_empty": {
+              "type": "boolean"
+            },
+            "request_id": {
+              "type": "string"
+            },
+            "target": {
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            },
+            "timeout_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "target",
+            "text",
+            "expected_terminal",
+            "expected_registration_epoch",
+            "request_id"
+          ],
+          "type": "object"
+        },
         "AgentPromptParams": {
           "properties": {
             "allow_cross_pane": {
@@ -1323,6 +1424,26 @@
           "required": [
             "target",
             "source"
+          ],
+          "type": "object"
+        },
+        "AgentRegisterSelfParams": {
+          "properties": {
+            "draft_guard": {
+              "type": "boolean"
+            },
+            "pane_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "session_generation": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "session_generation"
           ],
           "type": "object"
         },
@@ -4555,6 +4676,22 @@
                   "type": "string"
                 },
                 "type": {
+                  "const": "pane.agent_session_changed",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "pane_id"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "pane_id": {
+                  "type": "string"
+                },
+                "type": {
                   "const": "pane.scroll_changed",
                   "type": "string"
                 }
@@ -5968,6 +6105,70 @@
           "type": "object"
         },
         {
+          "properties": {
+            "method": {
+              "const": "agent.register_self",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentRegisterSelfParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "agent.channel_info",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentChannelInfoParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "agent.draft_state",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentDraftStateParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "agent.prompt_guarded",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentPromptGuardedParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
           "description": "Local JSON only; older servers reject instead of ignoring identity guards.",
           "properties": {
             "method": {
@@ -7198,6 +7399,38 @@
           ],
           "type": "string"
         },
+        "PaneAgentSessionChangedEvent": {
+          "description": "The agent in a pane reported a session id different from the pane's\nprevious one. A repeated report of the current session emits nothing.",
+          "properties": {
+            "agent": {
+              "type": "string"
+            },
+            "pane_id": {
+              "type": "string"
+            },
+            "previous_session_id": {
+              "description": "`null` when the pane had no reported session before.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "session_id": {
+              "type": "string"
+            },
+            "workspace_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pane_id",
+            "workspace_id",
+            "agent",
+            "session_id",
+            "previous_session_id"
+          ],
+          "type": "object"
+        },
         "PaneAgentStatusChangedEvent": {
           "properties": {
             "agent": {
@@ -7371,6 +7604,9 @@
             },
             {
               "$ref": "#/schemas/subscription_event/$defs/PaneScrollChangedEvent"
+            },
+            {
+              "$ref": "#/schemas/subscription_event/$defs/PaneAgentSessionChangedEvent"
             }
           ]
         },
@@ -7378,6 +7614,7 @@
           "enum": [
             "pane.output_matched",
             "pane.agent_status_changed",
+            "pane.agent_session_changed",
             "pane.scroll_changed"
           ],
           "type": "string"
@@ -8291,6 +8528,41 @@
             },
             {
               "properties": {
+                "agent": {
+                  "type": "string"
+                },
+                "pane_id": {
+                  "type": "string"
+                },
+                "previous_session_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "session_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "pane_agent_session_changed",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "pane_id",
+                "workspace_id",
+                "agent",
+                "session_id",
+                "previous_session_id"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
                 "layout": {
                   "$ref": "#/schemas/success_response/$defs/PaneLayoutSnapshot"
                 },
@@ -8349,6 +8621,7 @@
             "pane_exited",
             "pane_agent_detected",
             "pane_agent_status_changed",
+            "pane_agent_session_changed",
             "layout_updated"
           ],
           "type": "string"

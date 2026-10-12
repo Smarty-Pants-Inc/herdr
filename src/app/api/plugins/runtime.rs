@@ -11,6 +11,9 @@ use crate::app::App;
 const PLUGIN_COMMAND_OUTPUT_MAX_BYTES: usize = 64 * 1024;
 pub(super) const MAX_PLUGIN_COMMANDS_IN_FLIGHT: usize = 32;
 const PLUGIN_COMMAND_LOG_LIMIT: usize = 200;
+const PLUGIN_ACTION_GRANT_UNAVAILABLE: &str = "plugin_action_grant_unavailable";
+const PLUGIN_ACTION_GRANT_UNAVAILABLE_MESSAGE: &str =
+    "plugin action could not get its security grant; try again";
 
 impl App {
     pub(super) fn start_plugin_command(
@@ -79,11 +82,15 @@ impl App {
                 link_handler_id.clone(),
             ));
         }
-        if self.state.plugin_commands_in_flight >= MAX_PLUGIN_COMMANDS_IN_FLIGHT {
-            let message = format!(
-                "maximum concurrent plugin commands reached ({MAX_PLUGIN_COMMANDS_IN_FLIGHT})"
-            );
-            let log = PluginCommandLogInfo {
+        let refuse = |app: &mut Self,
+                      log_id: String,
+                      action_id: Option<String>,
+                      event: Option<String>,
+                      command: Vec<String>,
+                      code: &'static str,
+                      message: String|
+         -> Result<PluginCommandLogInfo, (&'static str, String)> {
+            app.push_plugin_command_log(PluginCommandLogInfo {
                 log_id,
                 plugin_id: plugin.plugin_id.clone(),
                 action_id,
@@ -96,10 +103,91 @@ impl App {
                 stdout: Some(String::new()),
                 stderr: Some(String::new()),
                 error: Some(message.clone()),
-            };
-            self.push_plugin_command_log(log);
-            return Err(("plugin_command_limit_reached", message));
+            });
+            Err((code, message))
+        };
+        if self.state.plugin_commands_in_flight >= MAX_PLUGIN_COMMANDS_IN_FLIGHT {
+            let message = format!(
+                "maximum concurrent plugin commands reached ({MAX_PLUGIN_COMMANDS_IN_FLIGHT})"
+            );
+            return refuse(
+                self,
+                log_id,
+                action_id,
+                event,
+                command,
+                "plugin_command_limit_reached",
+                message,
+            );
         }
+        // Only user-invoked actions get an input grant; startup and event
+        // hooks never do (herdr-8592). Minted before spawn so the child can
+        // never present it before it is registered.
+        //
+        // herdr#9212: a user-invoked action never runs without its grant.
+        // Running tokenless is not a safe fallback, even for a pane-invoked
+        // action: the action child is spawned by the server, not inside the
+        // invoking pane's process tree, so pane ancestry cannot attribute it,
+        // and a grandchild that strips HERDR_ENV/HERDR_PANE_ID is classified
+        // as an ordinary server descendant that may write to any existing
+        // pane. Mint or bind failure therefore refuses the action before any
+        // worker, spawn or in-flight accounting.
+        let action_grant = match (action_id.as_ref(), event.is_none()) {
+            (Some(granted_action_id), true) => match self.plugin_action_grants.mint(
+                crate::plugin_action_origin::PluginActionGrant {
+                    plugin_id: plugin.plugin_id.clone(),
+                    action_id: granted_action_id.clone(),
+                    invoking_pane: context.focused_pane_id.clone(),
+                    grant_id: log_id.clone(),
+                },
+            ) {
+                Ok((_, key)) if !self.bind_plugin_action_invoking_terminal(key, context) => {
+                    // The server-resolved invoking pane has no terminal or
+                    // the grant refused it: revoke and refuse the action.
+                    self.plugin_action_grants.revoke(key);
+                    tracing::warn!(
+                        plugin_id = %plugin.plugin_id,
+                        "plugin action invoking terminal unavailable; action refused"
+                    );
+                    return refuse(
+                        self,
+                        log_id,
+                        action_id,
+                        event,
+                        command,
+                        PLUGIN_ACTION_GRANT_UNAVAILABLE,
+                        PLUGIN_ACTION_GRANT_UNAVAILABLE_MESSAGE.to_string(),
+                    );
+                }
+                Ok((token, key)) => {
+                    env.push((
+                        crate::plugin_action_origin::TOKEN_ENV_VAR.to_string(),
+                        token.expose_hex(),
+                    ));
+                    Some(ActionGrantLease {
+                        grants: self.plugin_action_grants.clone(),
+                        key,
+                    })
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        err = %err,
+                        plugin_id = %plugin.plugin_id,
+                        "plugin action input grant unavailable; action refused"
+                    );
+                    return refuse(
+                        self,
+                        log_id,
+                        action_id,
+                        event,
+                        command,
+                        PLUGIN_ACTION_GRANT_UNAVAILABLE,
+                        PLUGIN_ACTION_GRANT_UNAVAILABLE_MESSAGE.to_string(),
+                    );
+                }
+            },
+            _ => None,
+        };
         let plugin_root = std::path::PathBuf::from(&plugin.plugin_root);
         let log = PluginCommandLogInfo {
             log_id: log_id.clone(),
@@ -115,57 +203,38 @@ impl App {
             stderr: None,
             error: None,
         };
-        self.push_plugin_command_log(log.clone());
-        self.state.plugin_commands_in_flight += 1;
         let event_tx = self.event_tx.clone();
-        std::thread::spawn(move || {
-            let child =
-                crate::plugin_command::command_for_argv_in_dir(&program, &args, &plugin_root)
-                    .envs(env)
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn();
+        let installation_lease =
+            crate::plugin_installations::command_lease(&self.plugin_installation_leases, plugin);
+        let spawned = crate::thread_spawn::spawn_named("herdr-plugin-command", move || {
+            // The worker may outlive App during normal server teardown.
+            let _installation_lease = installation_lease;
+            let mut command =
+                crate::plugin_command::command_for_argv_in_dir(&program, &args, &plugin_root);
+            scrub_inherited_invocation_env(&mut command, std::env::vars_os().map(|(key, _)| key));
+            let child = command
+                .envs(env)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn();
             let finished = match child {
-                Ok(mut child) => {
-                    let stdout = child.stdout.take();
-                    let stderr = child.stderr.take();
-                    let stdout_reader = stdout.map(|stdout| {
-                        std::thread::spawn(move || {
-                            read_capped_plugin_output(stdout, PLUGIN_COMMAND_OUTPUT_MAX_BYTES)
-                        })
-                    });
-                    let stderr_reader = stderr.map(|stderr| {
-                        std::thread::spawn(move || {
-                            read_capped_plugin_output(stderr, PLUGIN_COMMAND_OUTPUT_MAX_BYTES)
-                        })
-                    });
-                    match child.wait() {
-                        Ok(status) => crate::events::AppEvent::PluginCommandFinished {
-                            log_id,
-                            finished_unix_ms: current_unix_ms(),
-                            exit_code: status.code(),
-                            stdout: stdout_reader
-                                .and_then(|reader| reader.join().ok())
-                                .unwrap_or_default(),
-                            stderr: stderr_reader
-                                .and_then(|reader| reader.join().ok())
-                                .unwrap_or_default(),
-                            error: None,
-                        },
-                        Err(err) => crate::events::AppEvent::PluginCommandFinished {
+                Ok(mut child) => match pin_action_child(&mut child, action_grant.as_ref()) {
+                    Ok(()) => finish_plugin_child(log_id, child, action_grant),
+                    Err(error) => {
+                        // Stop only our own unreaped child; never signal by PID.
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        drop(action_grant);
+                        crate::events::AppEvent::PluginCommandFinished {
                             log_id,
                             finished_unix_ms: current_unix_ms(),
                             exit_code: None,
-                            stdout: stdout_reader
-                                .and_then(|reader| reader.join().ok())
-                                .unwrap_or_default(),
-                            stderr: stderr_reader
-                                .and_then(|reader| reader.join().ok())
-                                .unwrap_or_default(),
-                            error: Some(err.to_string()),
-                        },
+                            stdout: String::new(),
+                            stderr: String::new(),
+                            error: Some(error),
+                        }
                     }
-                }
+                },
                 Err(err) => crate::events::AppEvent::PluginCommandFinished {
                     log_id,
                     finished_unix_ms: current_unix_ms(),
@@ -177,11 +246,36 @@ impl App {
             };
             let _ = event_tx.blocking_send(finished);
         });
+        if let Err(err) = spawned {
+            // The closure (and its grant lease) was dropped unrun, which
+            // already revoked the grant.
+            tracing::warn!(err = %err, "failed to spawn plugin command thread");
+            let log = PluginCommandLogInfo {
+                status: PluginCommandStatus::Failed,
+                finished_unix_ms: Some(current_unix_ms()),
+                stdout: Some(String::new()),
+                stderr: Some(String::new()),
+                error: Some(format!("could not start plugin command: {err}")),
+                ..log
+            };
+            self.push_plugin_command_log(log.clone());
+            return Ok(log);
+        }
+        self.push_plugin_command_log(log.clone());
+        self.state.plugin_commands_in_flight += 1;
         Ok(log)
     }
 
     pub(crate) fn run_plugin_startup_hooks(&mut self) {
-        let mut context = self.current_plugin_context("plugin.startup");
+        if self.policy.persist_plugin_registry && !self.plugin_installation_cleanup_allowed {
+            tracing::warn!("plugin cleanup skipped: some installations could not be pinned");
+        } else if self.policy.persist_plugin_registry {
+            if let Err(err) = crate::plugin_installations::cleanup() {
+                tracing::warn!(%err, "plugin cleanup deferred");
+            }
+        }
+        // Startup has no invoking pane; it must not see the focused pane.
+        let mut context = self.invoking_plugin_context(None, "plugin.startup");
         context.invocation_source = Some("startup".to_string());
         let mut plugins = self
             .state
@@ -265,6 +359,27 @@ impl App {
         }
     }
 
+    /// herdr#223: a grant may write to its invoking terminal, bound by stable
+    /// terminal ID (never the public pane ID, which can be renumbered or
+    /// reused). The pane comes from the server-built invocation context; a
+    /// global invocation binds nothing. False only when an invoking pane is
+    /// named but cannot be bound.
+    fn bind_plugin_action_invoking_terminal(
+        &self,
+        key: crate::plugin_action_origin::GrantKey,
+        context: &PluginInvocationContext,
+    ) -> bool {
+        let Some(pane_id) = context.focused_pane_id.as_deref() else {
+            return true;
+        };
+        self.parse_pane_id(pane_id)
+            .and_then(|(ws_idx, pane_id)| self.terminal_target_for_pane(ws_idx, pane_id))
+            .is_some_and(|target| {
+                self.plugin_action_grants
+                    .bind_target(key, &target.terminal_id)
+            })
+    }
+
     fn push_plugin_command_log(&mut self, log: PluginCommandLogInfo) {
         self.state.plugin_command_logs.push(log);
         if self.state.plugin_command_logs.len() > PLUGIN_COMMAND_LOG_LIMIT {
@@ -272,6 +387,145 @@ impl App {
             self.state.plugin_command_logs.drain(0..extra);
         }
     }
+}
+
+/// The server may itself run inside a Herdr pane, or inherit another plugin's
+/// invocation env. Only ids Herdr sets for this invocation may reach the child.
+fn scrub_inherited_invocation_env(
+    command: &mut std::process::Command,
+    inherited_keys: impl Iterator<Item = std::ffi::OsString>,
+) {
+    for key in [
+        "HERDR_WORKSPACE_ID",
+        "HERDR_TAB_ID",
+        "HERDR_PANE_ID",
+        "HERDR_ACTIVE_WORKSPACE_ID",
+        "HERDR_ACTIVE_TAB_ID",
+        "HERDR_ACTIVE_PANE_ID",
+        "HERDR_ACTIVE_PANE_CWD",
+        crate::plugin_action_origin::TOKEN_ENV_VAR,
+    ] {
+        command.env_remove(key);
+    }
+    for key in inherited_keys {
+        if key.to_string_lossy().starts_with("HERDR_PLUGIN_") {
+            command.env_remove(key);
+        }
+    }
+}
+
+/// Owns one action's input grant. Dropping it revokes the grant, so every
+/// worker path (exit, spawn failure, pin failure, unwinding) revokes.
+struct ActionGrantLease {
+    grants: crate::plugin_action_origin::PluginActionGrants,
+    key: crate::plugin_action_origin::GrantKey,
+}
+
+impl Drop for ActionGrantLease {
+    fn drop(&mut self) {
+        self.grants.revoke(self.key);
+    }
+}
+
+/// Binds the grant to the exact spawned child. A child that already exited
+/// simply never gets a live grant; any other pin failure is an error and the
+/// caller stops the child rather than trusting an unpinned PID.
+fn pin_action_child(
+    child: &mut std::process::Child,
+    lease: Option<&ActionGrantLease>,
+) -> Result<(), String> {
+    let Some(lease) = lease else {
+        return Ok(());
+    };
+    match crate::platform::pin_owned_child(child) {
+        Ok(pin) => {
+            tracing::debug!(pid = pin.identity().pid, "plugin action input grant pinned");
+            lease.grants.activate(lease.key, pin);
+            Ok(())
+        }
+        Err(err) => {
+            lease.grants.revoke(lease.key);
+            match child.try_wait() {
+                Ok(Some(_)) => Ok(()),
+                _ => Err(format!("could not pin plugin action process: {err}")),
+            }
+        }
+    }
+}
+
+type PluginOutputReader = std::thread::JoinHandle<String>;
+
+fn finish_plugin_child(
+    log_id: String,
+    mut child: std::process::Child,
+    action_grant: Option<ActionGrantLease>,
+) -> crate::events::AppEvent {
+    let (stdout_reader, stderr_reader) =
+        match spawn_plugin_output_readers(child.stdout.take(), child.stderr.take()) {
+            Ok(readers) => readers,
+            Err(err) => {
+                // A missing reader would leave the plugin writing into a closed
+                // pipe, so stop it rather than report a misleading result.
+                tracing::warn!(err = %err, "failed to spawn plugin output reader");
+                let _ = child.kill();
+                let _ = child.wait();
+                return crate::events::AppEvent::PluginCommandFinished {
+                    log_id,
+                    finished_unix_ms: current_unix_ms(),
+                    exit_code: None,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    error: Some(format!("could not start output reader: {err}")),
+                };
+            }
+        };
+    let wait = child.wait();
+    // The grant ends with the recorded action child, before output readers
+    // join: descendants holding the pipes do not extend it.
+    drop(action_grant);
+    // Descendants can hold the pipes open after the command exits; the run
+    // ends when the command does, not when its output closes.
+    let finished_unix_ms = current_unix_ms();
+    let join = |reader: Option<PluginOutputReader>| {
+        reader
+            .and_then(|reader| reader.join().ok())
+            .unwrap_or_default()
+    };
+    let stdout = join(stdout_reader);
+    let stderr = join(stderr_reader);
+    let (exit_code, error) = match wait {
+        Ok(status) => (status.code(), None),
+        Err(err) => (None, Some(err.to_string())),
+    };
+    crate::events::AppEvent::PluginCommandFinished {
+        log_id,
+        finished_unix_ms,
+        exit_code,
+        stdout,
+        stderr,
+        error,
+    }
+}
+
+fn spawn_plugin_output_readers(
+    stdout: Option<std::process::ChildStdout>,
+    stderr: Option<std::process::ChildStderr>,
+) -> std::io::Result<(Option<PluginOutputReader>, Option<PluginOutputReader>)> {
+    let stdout = stdout
+        .map(|stdout| {
+            crate::thread_spawn::spawn_named("herdr-plugin-stdout", move || {
+                read_capped_plugin_output(stdout, PLUGIN_COMMAND_OUTPUT_MAX_BYTES)
+            })
+        })
+        .transpose()?;
+    let stderr = stderr
+        .map(|stderr| {
+            crate::thread_spawn::spawn_named("herdr-plugin-stderr", move || {
+                read_capped_plugin_output(stderr, PLUGIN_COMMAND_OUTPUT_MAX_BYTES)
+            })
+        })
+        .transpose()?;
+    Ok((stdout, stderr))
 }
 
 fn current_unix_ms() -> u64 {
@@ -308,4 +562,276 @@ pub(super) fn read_capped_plugin_output(mut reader: impl Read, cap: usize) -> St
         ));
     }
     output
+}
+
+/// herdr#9212: user-invoked actions refuse to run without their grant. These
+/// never spawn, so they run on every platform.
+#[cfg(test)]
+mod grant_refusal_tests {
+    use super::*;
+    use crate::plugin_action_origin::{PluginActionGrant, MAX_ENTRIES};
+
+    fn test_app() -> App {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        App::new(
+            &crate::config::Config::default(),
+            crate::app::AppPolicy::TEST,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        )
+    }
+
+    fn plugin() -> InstalledPluginInfo {
+        InstalledPluginInfo {
+            plugin_id: "example.grant-refusal".into(),
+            name: "Grant refusal".into(),
+            version: "0.1.0".into(),
+            min_herdr_version: crate::build_info::BASE_VERSION.into(),
+            description: None,
+            manifest_path: "never-read/herdr-plugin.toml".into(),
+            plugin_root: "never-read".into(),
+            enabled: true,
+            platforms: None,
+            build: vec![],
+            startup: vec![],
+            actions: vec![],
+            events: vec![],
+            panes: vec![],
+            link_handlers: vec![],
+            source: Default::default(),
+            warnings: vec![],
+        }
+    }
+
+    /// Fills the registry with pending grants through the real mint path.
+    fn fill_registry(app: &App) -> usize {
+        let mut minted = 0;
+        while app
+            .plugin_action_grants
+            .mint(PluginActionGrant {
+                plugin_id: "filler".into(),
+                action_id: "filler".into(),
+                invoking_pane: None,
+                grant_id: format!("filler-{minted}"),
+            })
+            .is_ok()
+        {
+            minted += 1;
+            assert!(minted <= MAX_ENTRIES, "registry never filled");
+        }
+        minted
+    }
+
+    fn assert_refused(
+        app: &mut App,
+        context: &PluginInvocationContext,
+    ) -> Result<PluginCommandLogInfo, (&'static str, String)> {
+        let logs_before = app.state.plugin_command_logs.len();
+        let result = app.start_plugin_command(
+            &plugin(),
+            Some("open".into()),
+            None,
+            vec!["never-launched-9212".into()],
+            context,
+            None,
+        );
+        let Err((code, message)) = &result else {
+            panic!("action ran without a grant: {result:?}");
+        };
+        assert_eq!(*code, "plugin_action_grant_unavailable");
+        assert_eq!(message, PLUGIN_ACTION_GRANT_UNAVAILABLE_MESSAGE);
+        assert!(!message.contains("registry") && !message.contains("token"));
+        assert_eq!(app.state.plugin_commands_in_flight, 0, "no worker started");
+        assert_eq!(app.state.plugin_command_logs.len(), logs_before + 1);
+        let log = app.state.plugin_command_logs.last().unwrap();
+        assert_eq!(log.status, PluginCommandStatus::Failed);
+        assert_eq!(log.error.as_deref(), Some(message.as_str()));
+        assert_eq!(log.exit_code, None);
+        result
+    }
+
+    #[test]
+    fn global_action_is_refused_when_grant_mint_fails() {
+        let mut app = test_app();
+        assert_eq!(fill_registry(&app), MAX_ENTRIES);
+        let context = app.invoking_plugin_context(None, "refuse-global");
+        assert!(context.focused_pane_id.is_none());
+        let _ = assert_refused(&mut app, &context);
+    }
+
+    #[test]
+    fn pane_action_is_refused_when_grant_mint_fails() {
+        let mut app = test_app();
+        let workspace = crate::workspace::Workspace::test_new("grant-refusal");
+        let pane_id = workspace.tabs[0].root_pane;
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        let context = app.plugin_context_for_pane(0, pane_id, "refuse-pane");
+        assert!(context.focused_pane_id.is_some());
+        assert_eq!(fill_registry(&app), MAX_ENTRIES);
+        let _ = assert_refused(&mut app, &context);
+    }
+
+    #[test]
+    fn action_is_refused_and_grant_revoked_when_invoking_terminal_cannot_bind() {
+        let mut app = test_app();
+        let mut context = app.invoking_plugin_context(None, "refuse-bind");
+        context.focused_pane_id = Some("p_missing_9212".into());
+        let _ = assert_refused(&mut app, &context);
+        // The refused grant is a revoked tombstone, so the registry still
+        // admits a full set of pending grants.
+        assert_eq!(fill_registry(&app), MAX_ENTRIES);
+    }
+
+    #[test]
+    fn event_hooks_never_mint_so_a_full_registry_does_not_refuse_them() {
+        let mut app = test_app();
+        assert_eq!(fill_registry(&app), MAX_ENTRIES);
+        let context = app.invoking_plugin_context(None, "hook");
+        let result = app.start_plugin_command(
+            &plugin(),
+            None,
+            Some("worktree.created".into()),
+            vec!["never-launched-9212".into()],
+            &context,
+            None,
+        );
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(app.state.plugin_commands_in_flight, 1);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inherited_invocation_identity_env_is_scrubbed() {
+        let mut command = std::process::Command::new("true");
+        scrub_inherited_invocation_env(
+            &mut command,
+            ["HERDR_PLUGIN_CLICKED_URL", "HERDR_PLUGIN_ACTION_ID", "PATH"]
+                .into_iter()
+                .map(std::ffi::OsString::from),
+        );
+        let removed = command
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(key, _)| key.to_string_lossy().into_owned())
+            .collect::<std::collections::BTreeSet<_>>();
+        for key in [
+            "HERDR_PANE_ID",
+            "HERDR_TAB_ID",
+            "HERDR_WORKSPACE_ID",
+            "HERDR_ACTIVE_PANE_ID",
+            "HERDR_PLUGIN_CLICKED_URL",
+            "HERDR_PLUGIN_ACTION_ID",
+            // Always scrubbed, even when absent from the server's own env.
+            "HERDR_PLUGIN_ACTION_TOKEN",
+        ] {
+            assert!(removed.contains(key), "{key} not scrubbed");
+        }
+        assert!(!removed.contains("PATH"));
+
+        // Values Herdr sets for this invocation still win over the scrub.
+        command.env("HERDR_PANE_ID", "p_1");
+        assert!(command
+            .get_envs()
+            .any(|(key, value)| key == "HERDR_PANE_ID" && value.is_some()));
+    }
+
+    #[test]
+    fn plugin_output_reader_spawn_failure_stops_the_command() {
+        let child = std::process::Command::new("sh")
+            .args(["-c", "sleep 30"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let started = std::time::Instant::now();
+
+        crate::thread_spawn::test_hook::fail_next_spawns(1);
+        let finished = finish_plugin_child("log".into(), child, None);
+
+        let crate::events::AppEvent::PluginCommandFinished {
+            exit_code, error, ..
+        } = finished
+        else {
+            panic!("expected plugin command result");
+        };
+        assert_eq!(exit_code, None);
+        assert!(error.is_some_and(|error| error.starts_with("could not start output reader")));
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    }
+
+    #[test]
+    fn plugin_second_output_reader_spawn_failure_stops_the_command() {
+        let child = std::process::Command::new("sh")
+            .args(["-c", "sleep 30"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let started = std::time::Instant::now();
+
+        crate::thread_spawn::test_hook::fail_spawns_after(1, 1);
+        let finished = finish_plugin_child("log".into(), child, None);
+
+        let crate::events::AppEvent::PluginCommandFinished {
+            exit_code, error, ..
+        } = finished
+        else {
+            panic!("expected plugin command result");
+        };
+        assert_eq!(exit_code, None);
+        assert!(error.is_some_and(|error| error.starts_with("could not start output reader")));
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    }
+
+    #[test]
+    fn plugin_finish_time_is_taken_when_the_command_exits() {
+        // The background `cat` keeps both output pipes open after `sh` exits,
+        // until the test closes its stdin.
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "cat <&0 >/dev/null &"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let pid = child.id().to_string();
+        let releaser = std::thread::spawn(move || {
+            // Hold the pipes until `sh` has exited and been reaped.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while std::time::Instant::now() < deadline
+                && std::process::Command::new("ps")
+                    .args(["-p", &pid])
+                    .stdout(Stdio::null())
+                    .status()
+                    .is_ok_and(|status| status.success())
+            {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let released_unix_ms = current_unix_ms();
+            drop(stdin);
+            released_unix_ms
+        });
+
+        let finished = finish_plugin_child("log".into(), child, None);
+        let released_unix_ms = releaser.join().unwrap();
+
+        let crate::events::AppEvent::PluginCommandFinished {
+            finished_unix_ms,
+            exit_code,
+            ..
+        } = finished
+        else {
+            panic!("expected plugin command result");
+        };
+        assert_eq!(exit_code, Some(0));
+        assert!(finished_unix_ms <= released_unix_ms);
+    }
 }

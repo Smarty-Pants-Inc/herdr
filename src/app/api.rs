@@ -1,5 +1,6 @@
 use std::time::{Duration, Instant};
 
+pub(super) mod agent_channel;
 #[cfg(all(test, target_os = "linux"))]
 mod agent_session_guard_tests;
 mod agent_view;
@@ -42,9 +43,10 @@ impl App {
                 false
             }
             AppEvent::GitStatusRefreshed {
+                generation,
                 results,
                 cache_updates,
-            } => self.handle_git_status_refreshed(results, cache_updates),
+            } => self.handle_git_status_refreshed(generation, results, cache_updates),
             AppEvent::TabBarCommandFinished {
                 generation,
                 segment_index,
@@ -59,7 +61,8 @@ impl App {
                 self.handle_api_worktree_read_finished(*result);
                 changes_workspace
             }
-            ev @ AppEvent::TerminalBell { .. } => {
+            ev @ (AppEvent::TerminalBell { .. }
+            | AppEvent::TerminalFocusReportingEnabled { .. }) => {
                 self.handle_internal_event(ev);
                 false
             }
@@ -72,10 +75,19 @@ impl App {
 
     fn handle_git_status_refreshed(
         &mut self,
+        generation: u64,
         results: Vec<crate::workspace::WorkspaceGitStatus>,
         cache_updates: Vec<(std::path::PathBuf, crate::workspace::GitStatusCacheEntry)>,
     ) -> bool {
         self.git_refresh_in_flight = false;
+        if generation < self.git_identity_refresh_floor {
+            // A newer identity request arrived after this worker started (for
+            // example HEAD restored while the worker saw it missing). Drop its
+            // workspace and cache results; only release the worker and run the
+            // pending newer refresh.
+            self.mark_git_status_refresh_due(Instant::now());
+            return false;
+        }
         for (key, entry) in cache_updates {
             self.git_status_cache.insert(key, entry);
         }
@@ -122,6 +134,25 @@ impl App {
             }
             ev => ev,
         };
+        if let AppEvent::TerminalFocusReportingEnabled { pane_id } = &ev {
+            // The legacy app-only path has no shell-client focus evidence.
+            // Do not infer Gained from app navigation or unknown host focus.
+            if let Some((ws_idx, _)) = self.find_pane(*pane_id) {
+                let Some(runtime) = self.state.runtime_for_pane_in_workspace(
+                    &self.terminal_runtimes,
+                    ws_idx,
+                    *pane_id,
+                ) else {
+                    return Vec::new();
+                };
+                // A normal focus transition may have satisfied this queued report.
+                if !runtime.initial_focus_pending() {
+                    return Vec::new();
+                }
+                self.send_pane_focus_event(ws_idx, *pane_id, crate::ghostty::FocusEvent::Lost);
+            }
+            return Vec::new();
+        }
         if matches!(
             &ev,
             AppEvent::TerminalBell { .. } | AppEvent::ClipboardWrite { .. }
@@ -135,11 +166,40 @@ impl App {
         }
 
         if let AppEvent::GitStatusRefreshed {
+            generation,
             results,
             cache_updates,
         } = ev
         {
-            self.handle_git_status_refreshed(results, cache_updates);
+            self.handle_git_status_refreshed(generation, results, cache_updates);
+            return Vec::new();
+        }
+
+        if let AppEvent::RestoredWorktreeSpaceChecked {
+            workspace_id,
+            expected,
+            valid,
+        } = ev
+        {
+            self.pending_restored_worktree_spaces
+                .retain(|(id, space)| id != &workspace_id || space != &expected);
+            let changed_workspace = (!valid)
+                .then(|| {
+                    self.state.workspaces.iter().position(|workspace| {
+                        workspace.id == workspace_id
+                            && workspace.worktree_space.as_ref() == Some(&expected)
+                    })
+                })
+                .flatten();
+            self.state
+                .handle_app_event(AppEvent::RestoredWorktreeSpaceChecked {
+                    workspace_id,
+                    expected,
+                    valid,
+                });
+            if let Some(ws_idx) = changed_workspace {
+                self.emit_workspace_updated(ws_idx);
+            }
             return Vec::new();
         }
 
@@ -200,6 +260,11 @@ impl App {
 
         let mut worktree_restore_updates = Vec::new();
         if let AppEvent::PaneDied { pane_id, .. } = &ev {
+            if let Some((workspace, _)) = self.find_pane(*pane_id) {
+                if let Some(terminal_id) = self.state.terminal_id_for_pane(workspace, *pane_id) {
+                    self.agent_channels.revoke_terminal(terminal_id.as_str());
+                }
+            }
             if self
                 .state
                 .popup_pane
@@ -342,8 +407,19 @@ impl App {
                 None
             };
         let terminal_cwd_reported = matches!(ev, AppEvent::TerminalCwdReported { .. });
+        // Both report methods apply an agent's session through these events.
+        let session_report = match &ev {
+            AppEvent::AgentSessionReported { pane_id, .. }
+            | AppEvent::HookStateReported { pane_id, .. } => {
+                Some((*pane_id, self.pane_agent_session_info(*pane_id)))
+            }
+            _ => None,
+        };
         let previous_toast = self.state.toast.clone();
         let mut pane_updates = self.state.handle_app_event(ev);
+        if let Some((pane_id, previous_session)) = session_report {
+            self.emit_pane_agent_session_changed(pane_id, previous_session);
+        }
         if update_ready.is_some() {
             self.state.latest_release_notes = crate::release_notes::load_latest();
         }
@@ -586,7 +662,13 @@ impl App {
             .terminal_runtimes
             .get(&terminal_id)
             .map(|runtime| runtime.current_size())
-            .unwrap_or_else(|| self.state.estimate_pane_size());
+            .unwrap_or_else(|| {
+                self.state
+                    .new_pane_size(crate::ui::NewPanePlacement::Existing {
+                        ws_idx,
+                        pane: pane_id,
+                    })
+            });
         let Some(launch_env) = self.pane_launch_env(ws_idx, pane_id, Vec::new()) else {
             return false;
         };
@@ -778,6 +860,47 @@ impl App {
         }
     }
 
+    fn pane_agent_session_info(
+        &self,
+        pane_id: crate::layout::PaneId,
+    ) -> Option<crate::api::schema::AgentSessionInfo> {
+        let (_, pane) = self.find_pane(pane_id)?;
+        let terminal = self.state.terminals.get(&pane.attached_terminal_id)?;
+        super::creation::terminal_agent_session_info(terminal)
+    }
+
+    /// Emits `pane.agent_session_changed` when a session report left the pane
+    /// with a different session id. Repeated reports of one session emit nothing.
+    fn emit_pane_agent_session_changed(
+        &mut self,
+        pane_id: crate::layout::PaneId,
+        previous: Option<crate::api::schema::AgentSessionInfo>,
+    ) {
+        let Some(current) = self.pane_agent_session_info(pane_id) else {
+            return;
+        };
+        let previous_session_id = previous.map(|session| session.value);
+        if previous_session_id.as_deref() == Some(current.value.as_str()) {
+            return;
+        }
+        let Some((ws_idx, _)) = self.find_pane(pane_id) else {
+            return;
+        };
+        let Some(public_pane_id) = self.public_pane_id(ws_idx, pane_id) else {
+            return;
+        };
+        self.emit_event(crate::api::schema::EventEnvelope {
+            event: crate::api::schema::EventKind::PaneAgentSessionChanged,
+            data: crate::api::schema::EventData::PaneAgentSessionChanged {
+                pane_id: public_pane_id,
+                workspace_id: self.public_workspace_id(ws_idx),
+                agent: current.agent,
+                session_id: current.value,
+                previous_session_id,
+            },
+        });
+    }
+
     pub(super) fn emit_event(&mut self, event: crate::api::schema::EventEnvelope) {
         self.run_plugin_event_hooks(&event);
         self.event_hub.push(event);
@@ -937,20 +1060,97 @@ impl App {
         )
     }
 
-    // Headless production dispatch intercepts all session-checked input with
-    // App::api_request_requires_deferred_input before this synchronous fallback.
-    // Private/direct pane handlers still await bounded actor completion; enqueue
-    // alone is never a successful guarded API response.
+    /// Public JSON API dispatch. The caller's invoking pane, if any, comes only
+    /// from `context`'s live peer attribution.
     pub(crate) fn handle_api_request_after_internal_events_drained_with_context(
         &mut self,
         request: crate::api::schema::Request,
         context: crate::api::ApiRequestContext,
     ) -> String {
+        self.handle_api_request_with_ingress(request, context, ApiIngress::Public)
+    }
+
+    /// Dispatch for the authenticated client-shell endpoint lane only (the
+    /// headless server's `client_local` route). Its client-resolved pane for a
+    /// key press, command or link click is trusted as before. Never reachable
+    /// from the public socket or from any request field.
+    pub(crate) fn handle_trusted_client_shell_api_request_after_internal_events_drained(
+        &mut self,
+        request: crate::api::schema::Request,
+        context: crate::api::ApiRequestContext,
+    ) -> String {
+        self.handle_api_request_with_ingress(request, context, ApiIngress::TrustedClientShell)
+    }
+
+    /// herdr#223: runs one creation handler and, only for a request that
+    /// presented a grant token, adds the terminal the server actually created
+    /// to that grant. The new terminal comes from the successful response and
+    /// must exist in server state under the same pane; failures, other result
+    /// shapes or no new terminal add nothing. The registry rejects invalid,
+    /// foreign, expired or revoked claims, so they award nothing. No pane scan.
+    fn with_plugin_action_creation(
+        &mut self,
+        context: crate::api::ApiRequestContext,
+        create: impl FnOnce(&mut Self) -> String,
+    ) -> String {
+        if !matches!(
+            context.plugin_action,
+            crate::plugin_action_origin::PluginActionClaim::Presented(_)
+        ) {
+            return create(self);
+        }
+        let terminals_before = self.state.terminals.len();
+        let response = create(self);
+        if let Some(terminal_id) = self.created_terminal_id(&response, terminals_before) {
+            if self
+                .plugin_action_grants
+                .register_created_target(context.plugin_action, &terminal_id)
+            {
+                tracing::debug!(
+                    terminal = %terminal_id,
+                    "plugin action created terminal registered"
+                );
+            }
+        }
+        response
+    }
+
+    fn created_terminal_id(&self, response: &str, terminals_before: usize) -> Option<String> {
+        use crate::api::schema::ResponseResult;
+        if self.state.terminals.len() <= terminals_before {
+            return None;
+        }
+        let response: crate::api::schema::SuccessResponse = serde_json::from_str(response).ok()?;
+        let pane = match response.result {
+            ResponseResult::PaneInfo { pane }
+            | ResponseResult::TabCreated {
+                root_pane: pane, ..
+            }
+            | ResponseResult::WorkspaceCreated {
+                root_pane: pane, ..
+            } => pane,
+            _ => return None,
+        };
+        let (ws_idx, pane_id) = self.parse_pane_id(&pane.pane_id)?;
+        let target = self.terminal_target_for_pane(ws_idx, pane_id)?;
+        (target.terminal_id == pane.terminal_id).then_some(target.terminal_id)
+    }
+
+    // Headless production dispatch intercepts all session-checked input with
+    // App::api_request_requires_deferred_input before this synchronous fallback.
+    // Private/direct pane handlers still await bounded actor completion; enqueue
+    // alone is never a successful guarded API response.
+    fn handle_api_request_with_ingress(
+        &mut self,
+        request: crate::api::schema::Request,
+        mut context: crate::api::ApiRequestContext,
+        ingress: ApiIngress,
+    ) -> String {
         self.sync_pending_terminal_titles();
         if let Some(response) = self.session_checked_guard_denial(&request) {
             return response;
         }
-        if let Some(response) = self.cross_pane_input_denial(&request, context) {
+        if let Some(response) = self.cross_pane_input_denial_with_ancestry(&request, &mut context) {
             return response;
         }
         let mut request = request;
@@ -960,6 +1160,7 @@ impl App {
         };
         let response = match request.method {
             Method::ServerStop(_) => {
+                self.revoke_agent_channels();
                 self.state.should_quit = true;
                 SuccessResponse {
                     id: request.id,
@@ -1069,7 +1270,14 @@ impl App {
                 return responses::encode_success(request.id, ResponseResult::Ok {});
             }
             Method::CommandInvoke(params) => {
-                return self.handle_command_invoke(request.id, params);
+                return match ingress {
+                    ApiIngress::TrustedClientShell => {
+                        self.handle_command_invoke(request.id, params)
+                    }
+                    ApiIngress::Public => {
+                        self.handle_public_command_invoke(request.id, params, context)
+                    }
+                };
             }
             Method::ClientWindowTitleSet(_) | Method::ClientWindowTitleClear(_) => {
                 return responses::encode_success(
@@ -1084,10 +1292,14 @@ impl App {
             Method::WorkspaceList(_) => return self.handle_workspace_list(request.id),
             Method::WorkspaceGet(target) => return self.handle_workspace_get(request.id, target),
             Method::WorkspaceCreate(params) => {
-                return self.handle_workspace_create(request.id, params);
+                return self.with_plugin_action_creation(context, move |app| {
+                    app.handle_workspace_create(request.id, params)
+                });
             }
             Method::WorkspaceCreateLinked(params) => {
-                return self.handle_workspace_create_linked(request.id, params);
+                return self.with_plugin_action_creation(context, move |app| {
+                    app.handle_workspace_create_linked(request.id, params)
+                });
             }
             Method::WorkspaceFocus(target) => {
                 return self.handle_workspace_focus(request.id, target);
@@ -1133,7 +1345,11 @@ impl App {
             }
             Method::TabList(params) => return self.handle_tab_list(request.id, params),
             Method::TabGet(target) => return self.handle_tab_get(request.id, target),
-            Method::TabCreate(params) => return self.handle_tab_create(request.id, params),
+            Method::TabCreate(params) => {
+                return self.with_plugin_action_creation(context, move |app| {
+                    app.handle_tab_create(request.id, params)
+                });
+            }
             Method::TabFocus(target) => return self.handle_tab_focus(request.id, target),
             Method::TabRename(params) => return self.handle_tab_rename(request.id, params),
             Method::TabMove(params) => return self.handle_tab_move(request.id, params),
@@ -1141,6 +1357,19 @@ impl App {
                 return self.handle_tab_move_project_checked(request.id, params);
             }
             Method::TabClose(target) => return self.handle_tab_close(request.id, target),
+            Method::AgentRegisterSelf(params) => {
+                return self.handle_agent_register_self(request.id, params, context)
+            }
+            Method::AgentChannelInfo(params) => {
+                return self.handle_agent_channel_info(request.id, params)
+            }
+            Method::AgentPromptGuarded(_) | Method::AgentDraftState(_) => {
+                return responses::encode_error(
+                    request.id,
+                    "invalid_request",
+                    "registered channel requests are handled asynchronously by the app runtime",
+                )
+            }
             Method::AgentList(_) => return self.handle_agent_list(request.id),
             Method::AgentGet(target) => return self.handle_agent_get(request.id, target),
             Method::AgentFocus(target) => return self.handle_agent_focus(request.id, target),
@@ -1189,7 +1418,11 @@ impl App {
             Method::AgentSendKeys(params) => {
                 return self.handle_agent_send_keys(request.id, params, context);
             }
-            Method::PaneSplit(params) => return self.handle_pane_split(request.id, params),
+            Method::PaneSplit(params) => {
+                return self.with_plugin_action_creation(context, move |app| {
+                    app.handle_pane_split(request.id, params)
+                });
+            }
             Method::PaneSwap(params) => return self.handle_pane_swap(request.id, params),
             Method::PaneSwapProjectChecked(params) => {
                 return self.handle_pane_swap_project_checked(request.id, params);
@@ -1255,7 +1488,14 @@ impl App {
                 return self.handle_pane_link_resolve(request.id, params);
             }
             Method::PaneLinkActivate(params) => {
-                return self.handle_pane_link_activate(request.id, params);
+                return match ingress {
+                    ApiIngress::TrustedClientShell => {
+                        self.handle_pane_link_activate(request.id, params)
+                    }
+                    ApiIngress::Public => {
+                        self.handle_public_pane_link_activate(request.id, params, context)
+                    }
+                };
             }
             Method::PaneRename(params) => return self.handle_pane_rename(request.id, params),
             Method::PaneRead(params) => return self.handle_pane_read(request.id, params),
@@ -1326,7 +1566,7 @@ impl App {
                 return self.handle_plugin_action_list(request.id, params);
             }
             Method::PluginActionInvoke(params) => {
-                return self.handle_plugin_action_invoke(request.id, params);
+                return self.handle_plugin_action_invoke(request.id, params, context);
             }
             Method::PluginLogList(params) => {
                 return self.handle_plugin_log_list(request.id, params);
@@ -1462,6 +1702,19 @@ fn agent_manifest_info(
         warning: summary.warning,
     }
 }
+
+/// Server-only dispatch origin; never derived from the wire request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApiIngress {
+    Public,
+    TrustedClientShell,
+}
+
+/// Refusal for a public caller naming an invoking pane other than its own
+/// attributed pane. It deliberately does not echo the claimed pane.
+pub(super) const INVOKING_PANE_MISMATCH: &str = "invoking_pane_mismatch";
+pub(super) const INVOKING_PANE_MISMATCH_MESSAGE: &str =
+    "the invoking pane must be the calling process's own pane";
 
 #[cfg(test)]
 pub(super) mod test_support {
@@ -1672,8 +1925,17 @@ mod tests {
             .attached_terminal_id
             .clone();
         let (runtime, _rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        #[cfg(unix)]
+        let (runtime, _detection_events) = {
+            let mut runtime = runtime;
+            runtime.test_process_pty_bytes(b"shell prompt");
+            let events = runtime.test_start_basic_detection();
+            runtime.test_wait_for_detection_reads(1).await;
+            (runtime, events)
+        };
+        #[cfg(not(unix))]
         let reset_notify = runtime.agent_detection_reset_notify_for_test();
-        app.terminal_runtimes.insert(terminal_id, runtime);
+        app.terminal_runtimes.insert(terminal_id.clone(), runtime);
 
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "reload_manifests".into(),
@@ -1688,6 +1950,13 @@ mod tests {
             .unwrap()
             .is_empty());
 
+        #[cfg(unix)]
+        app.terminal_runtimes
+            .get(&terminal_id)
+            .unwrap()
+            .test_wait_for_detection_reads(2)
+            .await;
+        #[cfg(not(unix))]
         tokio::time::timeout(
             std::time::Duration::from_millis(50),
             reset_notify.notified(),

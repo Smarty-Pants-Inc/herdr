@@ -172,6 +172,7 @@ Install an example plugin:
 
 ```bash
 herdr plugin install ogulcancelik/herdr-plugin-examples/agent-telegram-notify
+herdr plugin update
 herdr plugin config-dir examples.agent-telegram-notify
 herdr plugin list
 herdr plugin action list --plugin examples.agent-telegram-notify
@@ -190,9 +191,16 @@ herdr plugin log list --plugin example.layout
 
 `plugin install` accepts GitHub shorthand only, such as
 `owner/repo/subdir`. It clones with `git`, shows a preview in interactive
-terminals, runs supported build commands, then stores the checkout under
-Herdr-managed plugin data and registers it. Use `--yes` for noninteractive
-installs. Reinstalling a GitHub-managed plugin replaces that managed checkout.
+terminals, builds in a new Herdr-managed installation directory, and registers
+it. Use `--yes` for noninteractive installs. Updates and reinstalls leave the
+previous installation in place: running commands and panes keep their original
+files, while new invocations use the new installation without a config reload.
+Existing processes are not restarted, and startup hooks run at the next server
+startup as usual.
+`plugin update` refreshes every GitHub-managed plugin when called without a
+target, or only the listed plugin ids or GitHub sources. It refetches the ref
+recorded during install, skips unchanged commits, and ignores locally linked
+plugins during bulk updates. Use `--yes` for noninteractive updates.
 Installed and linked plugins, including their enabled state, are global to the
 current user and available in every Herdr session. Both `plugin install` and
 `plugin link` can register plugins while no Herdr server is running. Plugins
@@ -203,12 +211,18 @@ local plugin first. `plugin install` and `plugin link` create the plugin's
 config and state directories, and `plugin config-dir <id>` prints the config
 directory for setup docs and shell scripts.
 
-`plugin uninstall <id-or-source>` unregisters the plugin. For GitHub-managed
-installs it also removes the managed checkout, and it accepts either the plugin
-id or the same `owner/repo[/subdir...]` shorthand used by install.
+`plugin uninstall <id-or-source>` unregisters the plugin and accepts either the
+plugin id or the same `owner/repo[/subdir...]` shorthand used by install.
+Installation files are retained after updates, reinstalls, and uninstall so
+running plugins can finish. A later successful installation/update or server
+startup automatically removes obsolete managed installations once the servers
+using them have exited. Reloading config does not release old installations.
+Stop plugin work before shutting down its server: processes surviving server
+exit are not protected from cleanup. Plugins must stop detached background
+processes before their parent command or pane exits. Legacy installations
+without cleanup tracking are retained. Config and state are preserved.
 `plugin unlink <id>` only unregisters a plugin and leaves files alone, which is
-useful for local development. There is no separate `plugin update` in v1;
-reinstall from GitHub to refresh a managed plugin.
+useful for local development.
 
 The example cookbook repo is `ogulcancelik/herdr-plugin-examples`. It contains
 separate example plugins in subdirectories, including `agent-telegram-notify`,
@@ -260,6 +274,28 @@ receive `HERDR_PLUGIN_ACTION_ID`; startup and event hooks receive
 receive `HERDR_PLUGIN_EVENT_JSON`, and pane commands receive
 `HERDR_PLUGIN_ENTRYPOINT_ID`.
 
+Action commands normally also receive `HERDR_PLUGIN_ACTION_TOKEN`. Local Herdr
+CLI content writes and pane-creation requests (`pane split`, tab creation, and
+workspace creation) pass this token automatically. Without
+`--allow-cross-pane`, the token lets an action write only to its invoking
+terminal and to new terminals created with the same token. A terminal keeps
+these rights when it is moved or renamed, but the token grants nothing over
+another existing terminal, a reused public ID, or a terminal created by another
+action. A global action has no invoking terminal, so it can write only to
+terminals it created. For example, an action can split a pane and then run a
+command in the new pane; `pane run` itself does not create a terminal.
+`--allow-cross-pane` remains a separate explicit override. The token is bound
+to one action on one server, expires after at most ten minutes, and stops
+authorizing input when the action process exits. If Herdr cannot issue a
+security grant for a user-invoked action, because too many grants are still
+active, secure random generation is unavailable, or the invoking terminal
+cannot be bound, the action does not launch. This applies to global and pane
+actions alike. Herdr shows an error saying the action could not get a security
+grant; try again. Startup and event hooks receive no action token.
+Treat it as a secret: do not print it or include it in logs. Processes running as the
+same operating-system user may read each other's environment; this token is
+not an isolation boundary between those processes.
+
 `HERDR_PLUGIN_ROOT` is the installed or linked plugin directory. Do not store
 user credentials or durable state there, because GitHub-installed plugin roots
 are managed source checkouts. Put user-editable config such as `.env` files
@@ -269,10 +305,13 @@ under `HERDR_PLUGIN_CONFIG_DIR`, and put local runtime state under
 but it does not validate, sync, or delete their contents. The plugin owns the
 file format and lifecycle.
 
-`HERDR_PLUGIN_CONTEXT_JSON` can include workspace, tab, focused pane, worktree,
+`HERDR_PLUGIN_CONTEXT_JSON` can include workspace, tab, invoking pane, worktree,
 agent, selected text, clicked URL, and link handler fields when they are
-available for that invocation. Shell plugins can read the individual env vars
-for common ids, or parse the context JSON for the full shape.
+available for that invocation. The existing `focused_pane_*` field names refer
+to the invoking pane, not UI focus. Pane actions and link handlers receive that
+pane's ids, cwd, and agent. Global actions receive no pane fields or implicit
+focused-workspace context. Shell plugins can read the individual env vars for
+common ids, or parse the context JSON for the full shape.
 
 Use `HERDR_BIN_PATH` when a plugin needs to call Herdr portably from Node,
 PowerShell, Bash, or another runtime. The raw socket transport behind
@@ -353,6 +392,8 @@ name an action declared by the same plugin. Link handler actions receive
 `HERDR_PLUGIN_CONTEXT_JSON`; shell plugins can also read
 `HERDR_PLUGIN_CLICKED_URL` and `HERDR_PLUGIN_LINK_HANDLER_ID`. Handlers are
 checked in manifest order inside each plugin.
+
+Link clicks invoke plugins only while `ui.mouse_capture` is enabled. Matching handlers run first. A launch failure shows an error and stops. Without a matching handler, only HTTP(S) links open externally. When capture is disabled, the outer terminal handles explicit hyperlinks using its own shortcuts and warnings. See [mouse controls](/docs/quick-start/#use-the-mouse) for the Windows Terminal URL detection caveat.
 
 ## Storage
 

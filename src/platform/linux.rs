@@ -29,6 +29,8 @@ pub(crate) use super::unix_common::{
 pub(crate) use super::unix_common::remote_bridge_endpoint_path_in;
 
 #[cfg(test)]
+mod agent_channel_tests;
+#[cfg(test)]
 mod config_file_tests;
 
 pub(super) mod client_identity;
@@ -192,6 +194,56 @@ pub(super) fn local_socket_peer_process_platform(fd: RawFd) -> Option<LocalSocke
         return None;
     }
     Some(LocalSocketPeerProcess { pid, pidfd })
+}
+
+/// pidfd plus start-time pin of a child this server spawned and still owns
+/// unreaped (herdr-8592). The pidfd reports exit before the owner reaps it and
+/// can never refer to a later process that reuses the PID.
+#[derive(Debug)]
+pub(crate) struct OwnedChildPin {
+    identity: super::ProcessIdentity,
+    pidfd: std::os::fd::OwnedFd,
+}
+
+impl OwnedChildPin {
+    pub(crate) fn identity(&self) -> super::ProcessIdentity {
+        self.identity
+    }
+
+    pub(crate) fn is_alive(&self) -> bool {
+        use std::os::fd::AsRawFd;
+        let mut event = libc::pollfd {
+            fd: self.pidfd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: zero-time poll borrows this owned, initialized pidfd.
+        (unsafe { libc::poll(&mut event, 1, 0) } == 0)
+            && process_identity(self.identity.pid) == Some(self.identity)
+    }
+}
+
+/// No unpinned fallback: without pidfd_open the pin fails and the caller stops
+/// its own child instead of trusting a numeric PID.
+pub(crate) fn pin_owned_child(child: &std::process::Child) -> std::io::Result<OwnedChildPin> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    let pid = child.id();
+    // SAFETY: pidfd_open takes a PID and flags and returns a new descriptor.
+    let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
+    if raw < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: pidfd_open returned a new descriptor that nothing else owns.
+    let pidfd = unsafe { OwnedFd::from_raw_fd(raw as RawFd) };
+    let identity = process_identity(pid)
+        .ok_or_else(|| std::io::Error::other("spawned process exited before it was pinned"))?;
+    let pin = OwnedChildPin { identity, pidfd };
+    if !pin.is_alive() {
+        return Err(std::io::Error::other(
+            "spawned process exited before it was pinned",
+        ));
+    }
+    Ok(pin)
 }
 
 const WSL_MARKER_ENV_VARS: &[&str] = &["WSL_DISTRO_NAME", "WSL_INTEROP"];
@@ -813,6 +865,62 @@ pub fn foreground_group_leader_job(process_group_id: u32) -> Option<ForegroundJo
     })
 }
 
+pub(crate) fn registered_process_liveness(peer: super::ProcessIdentity) -> super::ProcessLiveness {
+    use super::ProcessLiveness;
+    match std::fs::read_to_string(format!("/proc/{}/stat", peer.pid)) {
+        Ok(stat) => match process_identity_and_parent_from_stat(peer.pid, &stat) {
+            Some((identity, _)) if identity != peer => ProcessLiveness::Dead,
+            Some(_) => {
+                let state = stat
+                    .rfind(')')
+                    .and_then(|end| stat.get(end + 2..))
+                    .and_then(|rest| rest.chars().next());
+                match state {
+                    Some('Z' | 'X' | 'x') => ProcessLiveness::Dead,
+                    Some(_) => ProcessLiveness::Alive,
+                    None => ProcessLiveness::Unknown,
+                }
+            }
+            None => ProcessLiveness::Unknown,
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => ProcessLiveness::Dead,
+        Err(_) => ProcessLiveness::Unknown,
+    }
+}
+
+pub(crate) fn registered_process_is_foreground(
+    root: super::ProcessIdentity,
+    peer: super::ProcessIdentity,
+) -> bool {
+    if registered_process_liveness(root) != super::ProcessLiveness::Alive
+        || registered_process_liveness(peer) != super::ProcessLiveness::Alive
+    {
+        return false;
+    }
+    let Some(stat) = std::fs::read_to_string(format!("/proc/{}/stat", peer.pid)).ok() else {
+        return false;
+    };
+    let Some(rest) = stat.rfind(')').and_then(|end| stat.get(end + 2..)) else {
+        return false;
+    };
+    if rest
+        .chars()
+        .next()
+        .is_none_or(|state| matches!(state, 'T' | 't' | 'Z' | 'X' | 'x'))
+    {
+        return false;
+    }
+    let group = rest
+        .split_whitespace()
+        .nth(2)
+        .and_then(|value| value.parse::<u32>().ok());
+    let foreground = foreground_process_group_id(root.pid);
+    group.is_some_and(|group| group > 0 && Some(group) == foreground)
+        && process_identity(root.pid) == Some(root)
+        && process_identity(peer.pid) == Some(peer)
+        && super::process_identity_in_pane_session(root, peer) == Some(true)
+}
+
 pub fn foreground_process_group_id(child_pid: u32) -> Option<u32> {
     // /proc/<pid>/stat format: "pid (comm) state ppid pgrp session tty_nr tpgid ..."
     // The (comm) field can contain spaces and parens, so we find the last ')' first.
@@ -827,6 +935,78 @@ pub fn foreground_process_group_id(child_pid: u32) -> Option<u32> {
 pub fn foreground_process_group_id_for_tty_fd(fd: RawFd) -> Option<u32> {
     let pgid = unsafe { libc::tcgetpgrp(fd) };
     (pgid > 0).then_some(pgid as u32)
+}
+
+/// Start time of `pid` in clock ticks since boot. It tells a process apart
+/// from a later one that reuses its pid.
+pub fn process_start_token(pid: u32) -> Option<u64> {
+    process_job_stat(pid).map(|stat| stat.start_time)
+}
+
+/// Process group of `pid` while that same process, matched by its start
+/// token, is alive in the terminal session of the pane shell `shell_pid`.
+/// A stopped or backgrounded job still counts.
+pub fn live_pane_process_group(shell_pid: u32, pid: u32, start_token: u64) -> Option<u32> {
+    let stat = process_job_stat(pid)?;
+    let shell_session = process_job_stat(shell_pid)?.session;
+    (!matches!(stat.state, 'Z' | 'X')
+        && stat.start_time == start_token
+        && stat.session == shell_session
+        && stat.pgrp > 0)
+        .then_some(stat.pgrp as u32)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProcessJobStat {
+    state: char,
+    pgrp: i32,
+    session: i32,
+    start_time: u64,
+}
+
+fn process_job_stat(pid: u32) -> Option<ProcessJobStat> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    process_job_stat_from_stat(&stat)
+}
+
+fn process_job_stat_from_stat(stat: &str) -> Option<ProcessJobStat> {
+    let rest = stat.get(stat.rfind(')')? + 2..)?;
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    // After (comm): state(0) ppid(1) pgrp(2) session(3) ... starttime(19)
+    Some(ProcessJobStat {
+        state: fields.first()?.chars().next()?,
+        pgrp: fields.get(2)?.parse().ok()?,
+        session: fields.get(3)?.parse().ok()?,
+        start_time: fields.get(19)?.parse().ok()?,
+    })
+}
+
+pub(super) fn socket_peer_pid(fd: RawFd) -> Option<u32> {
+    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let result = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut cred as *mut libc::ucred).cast(),
+            &mut len,
+        )
+    };
+    (result == 0 && cred.pid > 0).then_some(cred.pid as u32)
+}
+
+pub(super) fn process_name_and_parent(pid: u32) -> Option<(String, u32)> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let close = stat.rfind(')')?;
+    let name = stat.get(1 + stat.find('(')?..close)?.to_string();
+    let parent = stat
+        .get(close + 2..)?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()?;
+    Some((name, parent))
 }
 
 fn process_pgrp_comm_and_state(pid: u32) -> Option<(i32, String, char)> {
@@ -1024,6 +1204,10 @@ pub fn read_clipboard_text() -> Option<String> {
             return Some(text);
         }
     }
+    None
+}
+
+pub fn clipboard_text_matches(_bytes: &[u8]) -> Option<bool> {
     None
 }
 
@@ -1442,12 +1626,21 @@ pub(crate) fn process_caller_metadata_platform(
                     .map(str::to_owned)
             })
         });
+    // Reuse the stat snapshot above, rather than adding a getsid syscall (or
+    // another /proc read) just for the log. Field 6 is the OS session ID.
+    let sid = stat
+        .get(stat.rfind(')')? + 2..)?
+        .split_whitespace()
+        .nth(3)
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|sid| *sid != 0);
     // The exe and cgroup lookups reopen a numeric PID; discard the entire
     // snapshot if the original instance exited or was replaced during either.
     (process_identity(peer.pid) == Some(peer)).then_some(super::CallerMetadata {
         exe,
         ppid: Some(ppid),
         unit,
+        sid,
     })
 }
 
@@ -1474,16 +1667,23 @@ fn process_identity_and_parent_from_stat(
 /// outside this server only when its ancestry reaches a strictly older process
 /// before reaching the current server. Missing, reused, exited, or newer
 /// evidence remains unknown; pane markers are enforced by the caller.
-pub(crate) fn process_identity_outside_server_ancestry(
-    peer: crate::platform::ProcessIdentity,
-) -> Option<bool> {
-    let server = process_identity(std::process::id())?;
-    crate::platform::observe_outside_server_ancestry(
-        peer,
-        server,
-        process_identity,
-        parent_process_identity,
-    )
+pub(crate) fn process_identity_server_ancestry_observation(
+    peer: super::ProcessIdentity,
+) -> super::ServerAncestryObservation {
+    let mut root_pid = None;
+    let outside = process_identity(std::process::id()).and_then(|server| {
+        super::observe_outside_server_ancestry_with_root(
+            peer,
+            server,
+            process_identity,
+            parent_process_identity,
+            &mut root_pid,
+        )
+    });
+    super::ServerAncestryObservation {
+        verdict: super::server_ancestry_observation(outside),
+        root_pid,
+    }
 }
 
 fn process_session_id(pid: u32) -> Option<i32> {
@@ -1497,6 +1697,24 @@ fn process_session_id(pid: u32) -> Option<i32> {
 mod tests {
     use super::*;
     use std::{cell::RefCell, collections::HashMap};
+
+    #[test]
+    fn caller_metadata_sid_matches_getsid_without_an_extra_production_syscall() {
+        let peer = process_identity(std::process::id()).expect("live peer");
+        let metadata = process_caller_metadata_platform(peer).expect("live metadata");
+        // SAFETY: getsid only reads the current process's session ID. The
+        // production metadata path instead extracts it from its existing stat.
+        let sid = unsafe { libc::getsid(0) };
+        assert!(sid > 0);
+        assert_eq!(metadata.sid, Some(sid as u32));
+        assert!(
+            process_caller_metadata_platform(super::super::ProcessIdentity {
+                start_time: peer.start_time.wrapping_add(1),
+                ..peer
+            })
+            .is_none()
+        );
+    }
 
     #[test]
     fn session_reporter_foreground_rejects_zombie_and_reaped_process() {
@@ -1893,6 +2111,17 @@ mod tests {
             None
         );
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn socket_peer_resolves_to_the_connecting_process_and_its_parent() {
+        use std::os::fd::AsRawFd as _;
+
+        let (local, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let pid = std::process::id();
+        assert_eq!(socket_peer_pid(local.as_raw_fd()), Some(pid));
+        let (_, parent) = process_name_and_parent(pid).unwrap();
+        assert_eq!(parent, std::os::unix::process::parent_id());
     }
 
     #[test]
@@ -2296,6 +2525,22 @@ mod tests {
             process_pgrp_comm_and_state_from_stat("123 (name with ) paren) S 1 456 789 0 456"),
             Some((456, "name with ) paren".to_string(), 'S'))
         );
+    }
+
+    #[test]
+    fn proc_stat_parsing_reads_job_fields_and_start_time() {
+        let stat =
+            "123 (node ) x) T 1 456 789 34816 456 4194560 1 2 3 4 5 6 7 8 20 0 11 0 987654 0 0";
+        assert_eq!(
+            process_job_stat_from_stat(stat),
+            Some(ProcessJobStat {
+                state: 'T',
+                pgrp: 456,
+                session: 789,
+                start_time: 987654,
+            })
+        );
+        assert_eq!(process_job_stat_from_stat("123 (short) S 1 456 789"), None);
     }
 
     #[test]
