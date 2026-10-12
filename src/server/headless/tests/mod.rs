@@ -8246,20 +8246,40 @@ fn report_agent_session_changed(
     reason: &str,
     seq: u64,
 ) -> bool {
+    report_agent_session_with(
+        server,
+        pane_id,
+        "claude",
+        (Some(session), None),
+        reason,
+        seq,
+    )
+}
+
+/// Reports from this live test process, so an id is transport-bound and
+/// becomes the pane's actual `agent_session_id`, like a real local reporter.
+fn report_agent_session_with(
+    server: &mut HeadlessServer,
+    pane_id: &str,
+    agent: &str,
+    (id, path): (Option<&str>, Option<&str>),
+    reason: &str,
+    seq: u64,
+) -> bool {
     let (respond_to, response_rx) = std::sync::mpsc::channel();
     let changed = server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
-        context: crate::api::ApiRequestContext::default(),
+        context: crate::api::ApiRequestContext::for_local_peer_pid(Some(std::process::id())),
         request: api::schema::Request {
             id: format!("session-probe-{seq}"),
             method: api::schema::Method::PaneReportAgentSession(
                 api::schema::PaneReportAgentSessionParams {
                     allow_cross_pane: false,
                     pane_id: pane_id.into(),
-                    source: "herdr:claude".into(),
-                    agent: "claude".into(),
+                    source: format!("herdr:{agent}"),
+                    agent: agent.into(),
                     seq: Some(seq),
-                    agent_session_id: Some(session.into()),
-                    agent_session_path: None,
+                    agent_session_id: id.map(str::to_string),
+                    agent_session_path: path.map(str::to_string),
                     session_start_source: Some(reason.into()),
                     resume_argv: None,
                 },
@@ -8324,6 +8344,16 @@ fn agent_session_changed_events(
     server: &HeadlessServer,
     after: u64,
 ) -> Vec<(String, String, Option<String>)> {
+    agent_session_changed_events_with_ids(server, after)
+        .into_iter()
+        .map(|event| (event.pane_id, event.session_id, event.previous_session_id))
+        .collect()
+}
+
+fn agent_session_changed_events_with_ids(
+    server: &HeadlessServer,
+    after: u64,
+) -> Vec<api::schema::PaneAgentSessionChangedEvent> {
     server
         .app
         .event_hub
@@ -8332,15 +8362,26 @@ fn agent_session_changed_events(
         .filter_map(|(_, event)| match event.data {
             crate::api::schema::EventData::PaneAgentSessionChanged {
                 pane_id,
+                workspace_id,
+                agent,
                 session_id,
                 previous_session_id,
-                ..
+                agent_session_id,
+                previous_agent_session_id,
             } => {
                 assert_eq!(
                     event.event,
                     crate::api::schema::EventKind::PaneAgentSessionChanged
                 );
-                Some((pane_id, session_id, previous_session_id))
+                Some(api::schema::PaneAgentSessionChangedEvent {
+                    pane_id,
+                    workspace_id,
+                    agent,
+                    session_id,
+                    previous_session_id,
+                    agent_session_id,
+                    previous_agent_session_id,
+                })
             }
             _ => None,
         })
@@ -8349,6 +8390,9 @@ fn agent_session_changed_events(
 
 /// smarty-dev#9124: a session report emits `pane.agent_session_changed` only
 /// when the pane's session id changes, never for a repeat of the same id.
+/// In-process, not E2E: it is the Windows/macOS coverage (tests/cli is
+/// Linux-only); the E2E is tests/cli/panes.rs
+/// `agent_session_changed_cli_reports_carry_the_actual_id_end_to_end`.
 #[test]
 fn agent_session_report_emits_session_changed_only_for_a_new_session() {
     let (writer, _control_rx, _render_rx) = test_client_writer();
@@ -8381,6 +8425,12 @@ fn agent_session_report_emits_session_changed_only_for_a_new_session() {
             Some("session-a".to_string())
         )],
         "A then B emits exactly one change, and the repeat of B none"
+    );
+    let events = agent_session_changed_events_with_ids(&server, replace);
+    assert_eq!(events[0].agent_session_id.as_deref(), Some("session-b"));
+    assert_eq!(
+        events[0].previous_agent_session_id.as_deref(),
+        Some("session-a")
     );
 }
 

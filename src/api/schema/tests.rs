@@ -407,12 +407,18 @@ fn first_agent_session_event_with_null_previous_session_matches_schema() {
     );
     for schema in schemas {
         let required = schema["required"].as_array().unwrap();
-        assert!(required.contains(&serde_json::json!("previous_session_id")));
-        assert_eq!(
-            schema["properties"]["previous_session_id"]["type"],
-            serde_json::json!(["string", "null"]),
-            "previous_session_id must be nullable in {schema}"
-        );
+        for field in [
+            "previous_session_id",
+            "agent_session_id",
+            "previous_agent_session_id",
+        ] {
+            assert!(required.contains(&serde_json::json!(field)), "{field}");
+            assert_eq!(
+                schema["properties"][field]["type"],
+                serde_json::json!(["string", "null"]),
+                "{field} must be nullable in {schema}"
+            );
+        }
     }
 
     let first_session = EventEnvelope {
@@ -423,12 +429,30 @@ fn first_agent_session_event_with_null_previous_session_matches_schema() {
             agent: "pi".into(),
             session_id: "session-a".into(),
             previous_session_id: None,
+            agent_session_id: None,
+            previous_agent_session_id: None,
         },
     };
     let json = serde_json::to_value(&first_session).unwrap();
+    for field in [
+        "previous_session_id",
+        "agent_session_id",
+        "previous_agent_session_id",
+    ] {
+        assert_eq!(
+            json["data"].get(field),
+            Some(&serde_json::Value::Null),
+            "{field} is always present"
+        );
+    }
+    // A pre-change event without the actual-id fields still deserializes.
+    let mut legacy = json.clone();
+    let data = legacy["data"].as_object_mut().unwrap();
+    data.remove("agent_session_id");
+    data.remove("previous_agent_session_id");
     assert_eq!(
-        json["data"].get("previous_session_id"),
-        Some(&serde_json::Value::Null)
+        serde_json::from_value::<EventEnvelope>(legacy).unwrap(),
+        first_session
     );
     assert_eq!(
         serde_json::from_value::<EventEnvelope>(json).unwrap(),
@@ -439,12 +463,22 @@ fn first_agent_session_event_with_null_previous_session_matches_schema() {
         pane_id: "p_1".into(),
         workspace_id: "w_1".into(),
         agent: "pi".into(),
-        session_id: "session-a".into(),
+        session_id: "/sessions/a.jsonl".into(),
         previous_session_id: None,
+        agent_session_id: Some("session-a".into()),
+        previous_agent_session_id: None,
     })
     .unwrap();
     assert_eq!(
         standalone.get("previous_session_id"),
+        Some(&serde_json::Value::Null)
+    );
+    assert_eq!(
+        standalone.get("agent_session_id"),
+        Some(&serde_json::json!("session-a"))
+    );
+    assert_eq!(
+        standalone.get("previous_agent_session_id"),
         Some(&serde_json::Value::Null)
     );
 }
