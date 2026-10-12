@@ -1266,8 +1266,9 @@ no session before. `session_id` matches the pane's `agent_session.value`: the
 reported `agent_session_id`, or for Pi and omp the reported
 `agent_session_path` when present. `agent_session_id` is the actual id that
 `pane get` reports as `agent_session_id` after this report, and
-`previous_agent_session_id` the one before it; each is `null` when there is
-none, for example when an integration reported only a session path. A
+`previous_agent_session_id` the one before it; each is `null` when no actual id
+is bound: e.g. an initial path-only report, or a report for a different session
+without an id; a path-only report of the already-bound session keeps its id. A
 subscriber can therefore detect a session registered without an actual id by
 `agent_session_id` being `null`. Only sessions reported by Herdr's official
 agent integrations are tracked.
