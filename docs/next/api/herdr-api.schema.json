@@ -7420,7 +7420,7 @@
               "type": "string"
             },
             "agent_session_id": {
-              "description": "The actual agent session id from the accepted current report, the same\nvalue as `pane get`'s `agent_session_id`. `null` when the report carried\nno id (for example only a session path).",
+              "description": "The actual agent session id from the accepted current report, the same\nvalue as `pane get`'s `agent_session_id`. `null` when no actual id is\nbound: e.g. an initial path-only report, or a report for a different\nsession without an id; a path-only report of the already-bound session\nkeeps its id.",
               "type": [
                 "string",
                 "null"

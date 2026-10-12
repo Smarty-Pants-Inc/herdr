@@ -434,8 +434,10 @@ pub struct PaneAgentSessionChangedEvent {
     #[schemars(required, schema_with = "super::common::nullable_string_schema")]
     pub previous_session_id: Option<String>,
     /// The actual agent session id from the accepted current report, the same
-    /// value as `pane get`'s `agent_session_id`. `null` when the report carried
-    /// no id (for example only a session path).
+    /// value as `pane get`'s `agent_session_id`. `null` when no actual id is
+    /// bound: e.g. an initial path-only report, or a report for a different
+    /// session without an id; a path-only report of the already-bound session
+    /// keeps its id.
     #[schemars(required, schema_with = "super::common::nullable_string_schema")]
     pub agent_session_id: Option<String>,
     /// The pane's actual agent session id before this report, or `null`.
