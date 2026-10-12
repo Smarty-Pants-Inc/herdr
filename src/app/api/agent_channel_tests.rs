@@ -151,7 +151,7 @@ async fn channel_draft_query_unknown_origin_needs_opt_in_and_unregistered_guard_
         allow_cross_pane: true,
     };
     let rejected = value(
-        app.reserve_guarded_prompt(&params)
+        app.reserve_guarded_prompt(&params, crate::api::ApiRequestContext::default())
             .err()
             .unwrap()
             .response("guard".into(), false),
@@ -195,7 +195,10 @@ async fn channel_expected_terminal_epoch_origin_and_attachment_fail_closed_witho
         timeout_ms: Some(100),
         allow_cross_pane: true,
     };
-    let outcome = app.reserve_guarded_prompt(&params).err().unwrap();
+    let outcome = app
+        .reserve_guarded_prompt(&params, crate::api::ApiRequestContext::default())
+        .err()
+        .unwrap();
     assert!(matches!(
         outcome,
         Outcome::Failure {
@@ -206,7 +209,9 @@ async fn channel_expected_terminal_epoch_origin_and_attachment_fail_closed_witho
     params.expected_terminal = terminal_id.to_string();
     params.expected_registration_epoch = "old-epoch".into();
     assert!(matches!(
-        app.reserve_guarded_prompt(&params).err().unwrap(),
+        app.reserve_guarded_prompt(&params, crate::api::ApiRequestContext::default())
+            .err()
+            .unwrap(),
         Outcome::Failure {
             code: "registration_epoch_mismatch",
             ..
@@ -436,6 +441,122 @@ mod rollover_transport {
             allow_cross_pane: true,
         }
     }
+    #[tokio::test]
+    async fn channel_prompt_logs_peer_ancestry_and_refuses_delivery_when_log_fails() {
+        let (mut app, pane, mut input, _harness) = harness("rollover");
+        let terminal = app.state.workspaces[0]
+            .terminal_id(pane)
+            .unwrap()
+            .to_string();
+        until(&mut app, |app| {
+            app.agent_channels
+                .owners
+                .get(&terminal)
+                .is_some_and(|channel| channel.is_ready())
+        });
+        let epoch = app.agent_channels.owners[&terminal].epoch.clone();
+        let channel = app.agent_channels.owners[&terminal].clone();
+        let call = |app: &mut App, params: AgentPromptGuardedParams, context| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            assert!(app.handle_deferred_guarded_agent_prompt(
+                Request {
+                    id: "logged-channel".into(),
+                    method: Method::AgentPromptGuarded(params)
+                },
+                context,
+                tx,
+            ));
+            let mut response = None;
+            until(app, |_| {
+                response = rx.try_recv().ok();
+                response.is_some()
+            });
+            value(response.unwrap())
+        };
+        // Failure must precede the socket queue and leave the key retryable.
+        std::fs::create_dir(&app.api_input_log).unwrap();
+        let refused_params = params(&app, pane, &epoch, 0);
+        let refused = call(
+            &mut app,
+            refused_params,
+            crate::api::ApiRequestContext::default(),
+        );
+        assert_eq!(refused["error"]["code"], "input_log_unavailable");
+        assert!(channel
+            .duplicate("prompt-0", "literal-0")
+            .unwrap()
+            .is_none());
+        std::fs::remove_dir(&app.api_input_log).unwrap();
+
+        let context = crate::api::ApiRequestContext {
+            local_peer_pane_origin: crate::platform::PeerPaneOrigin::Absent,
+            ..crate::api::ApiRequestContext::for_local_peer_pid(Some(std::process::id()))
+        };
+        let peer = context.local_peer_identity.unwrap();
+        let mut guarded = params(&app, pane, &epoch, 0);
+        guarded.allow_cross_pane = false;
+        let accepted = crate::platform::with_server_ancestry_for_test(peer, Some(true), || {
+            call(&mut app, guarded, context)
+        });
+        assert_eq!(accepted["result"]["status"], "accepted");
+        let raw = std::fs::read_to_string(&app.api_input_log).unwrap();
+        let first: serde_json::Value = serde_json::from_str(raw.trim()).unwrap();
+        assert_eq!(first["method"], "agent.prompt_guarded");
+        assert_eq!(first["bytes"], "literal-0".len());
+        assert_eq!(first["caller"]["pid"], peer.pid);
+        assert_eq!(first["caller"]["ancestry"], "outside");
+        assert_eq!(
+            first["caller"]["sid"],
+            crate::platform::process_caller_metadata(peer)
+                .unwrap()
+                .sid
+                .unwrap()
+        );
+        assert!(!raw.contains("literal-0"));
+
+        // A retained request-local observation wins over a new unknown observation.
+        let cached = crate::api::ApiRequestContext {
+            server_ancestry: Some(crate::platform::ServerAncestryObservation {
+                verdict: crate::platform::ServerAncestry::Outside,
+                root_pid: Some(421),
+            }),
+            ..context
+        };
+        let next = params(&app, pane, &epoch, 1);
+        let queued = crate::platform::with_server_ancestry_for_test(peer, None, || {
+            call(&mut app, next.clone(), cached)
+        });
+        assert_eq!(queued["result"]["status"], "queued");
+        let retry = call(&mut app, next, crate::api::ApiRequestContext::default());
+        assert_eq!(retry["result"]["duplicate"], true);
+        let raw = std::fs::read_to_string(&app.api_input_log).unwrap();
+        let lines: Vec<serde_json::Value> = raw
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 2, "receipt-only retry must not log an input");
+        assert_eq!(lines[1]["caller"]["ancestry"], "outside");
+        assert_eq!(lines[1]["caller"]["ancestry_root_pid"], 421);
+        assert!(!raw.contains("literal-1"));
+
+        let next = params(&app, pane, &epoch, 2);
+        assert_eq!(
+            call(&mut app, next, crate::api::ApiRequestContext::default())["result"]["status"],
+            "accepted"
+        );
+        let raw = std::fs::read_to_string(&app.api_input_log).unwrap();
+        let last: serde_json::Value = serde_json::from_str(raw.lines().last().unwrap()).unwrap();
+        // smarty-dev#931: a peerless line is classified unknown, with no caller identity.
+        assert_eq!(last["caller"]["ancestry"], "unknown");
+        for field in ["sid", "ancestry_root_pid"] {
+            assert!(last["caller"].get(field).is_none());
+        }
+        assert!(
+            input.try_recv().is_err(),
+            "channel delivery must never touch the PTY"
+        );
+        app.revoke_agent_channels();
+    }
     fn rollover_prompts(mode: &str) {
         let (mut app, pane, mut input, harness) = harness(mode);
         let terminal = app.state.workspaces[0]
@@ -455,7 +576,10 @@ mod rollover_transport {
         for index in 0..300 {
             let reservation = loop {
                 let prompt = params(&app, pane, &epoch, index);
-                match app.reserve_guarded_prompt(&prompt) {
+                match app.reserve_guarded_prompt(
+                    &prompt,
+                    crate::api::ApiRequestContext::for_local_peer_pid(Some(std::process::id())),
+                ) {
                     Ok(reservation) => break reservation,
                     Err(Outcome::Failure {
                         code:
@@ -510,13 +634,19 @@ mod rollover_transport {
             "300 prompts must cross a clean rotation"
         );
         let (old, duplicate, _waiter) = app
-            .reserve_guarded_prompt(&params(&app, pane, &first_epoch, 0))
+            .reserve_guarded_prompt(
+                &params(&app, pane, &first_epoch, 0),
+                crate::api::ApiRequestContext::default(),
+            )
             .unwrap();
         assert!(duplicate);
         assert_eq!(old.wait(), first.unwrap());
         if let Some(unknown) = unknown {
             let (old, duplicate, _waiter) = app
-                .reserve_guarded_prompt(&params(&app, pane, &first_epoch, 191))
+                .reserve_guarded_prompt(
+                    &params(&app, pane, &first_epoch, 191),
+                    crate::api::ApiRequestContext::default(),
+                )
                 .unwrap();
             assert!(duplicate);
             assert_eq!(old.wait(), unknown);
@@ -527,14 +657,17 @@ mod rollover_transport {
         let mut mismatch = params(&app, pane, &first_epoch, 0);
         mismatch.text = "changed".into();
         assert!(matches!(
-            app.reserve_guarded_prompt(&mismatch),
+            app.reserve_guarded_prompt(&mismatch, crate::api::ApiRequestContext::default()),
             Err(Outcome::Failure {
                 code: "payload_mismatch",
                 ..
             })
         ));
         assert!(matches!(
-            app.reserve_guarded_prompt(&params(&app, pane, &first_epoch, 300)),
+            app.reserve_guarded_prompt(
+                &params(&app, pane, &first_epoch, 300),
+                crate::api::ApiRequestContext::default(),
+            ),
             Err(Outcome::Failure {
                 code: "registration_epoch_mismatch",
                 ..
@@ -570,20 +703,44 @@ mod rollover_transport {
         let (current, _receiver) = transport.take().unwrap();
         current.mark_ready();
         assert!(matches!(
-            app.reserve_guarded_prompt(&params(&app, pane, &first_epoch, 0)),
+            app.reserve_guarded_prompt(
+                &params(&app, pane, &first_epoch, 0),
+                crate::api::ApiRequestContext::default(),
+            ),
             Err(Outcome::Failure {
                 code: "registration_epoch_mismatch",
                 ..
             })
         ));
         let (previous, duplicate, _waiter) = app
-            .reserve_guarded_prompt(&params(&app, pane, &epoch, 192))
+            .reserve_guarded_prompt(
+                &params(&app, pane, &epoch, 192),
+                crate::api::ApiRequestContext::default(),
+            )
             .unwrap();
         assert!(duplicate);
         assert!(
             matches!(previous.wait(), Outcome::Receipt(value) if value["status"] == "accepted" && value["session_generation"] == "session_test")
         );
         assert_eq!(app.agent_channels.retired.len(), 1);
+        let raw = std::fs::read_to_string(&app.api_input_log).unwrap();
+        let lines: Vec<serde_json::Value> = raw
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            lines.len(),
+            300,
+            "retired receipt reads must not log inputs"
+        );
+        for line in &lines {
+            assert_eq!(line["method"], "agent.prompt_guarded");
+            assert_eq!(line["caller"]["pid"], std::process::id());
+            assert_eq!(line["caller"]["ancestry"], "reached");
+            assert_eq!(line["caller"]["ancestry_root_pid"], std::process::id());
+            assert!(line["caller"]["sid"].is_number());
+        }
+        assert!(!raw.contains("literal-"), "prompt text must stay private");
         std::fs::write(harness.path.join("done"), b"").unwrap();
         app.revoke_agent_channels();
     }

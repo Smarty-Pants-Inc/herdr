@@ -386,6 +386,7 @@ impl Channel {
     ) -> Result<Reservation, Outcome> {
         self.reserve_prompt(request_id, text, false, timeout)
     }
+    #[cfg(test)]
     pub(crate) fn reserve_prompt(
         &self,
         request_id: String,
@@ -393,11 +394,24 @@ impl Channel {
         if_draft_empty: bool,
         timeout: Duration,
     ) -> Result<Reservation, Outcome> {
+        self.reserve_with_audit(request_id, text, if_draft_empty, timeout, || Ok(()))
+    }
+    /// Production prompt admission. `audit` runs after every refusal check
+    /// (including the overflow-safe deadline) and before reservation/enqueue.
+    pub(crate) fn reserve_with_audit(
+        &self,
+        request_id: String,
+        text: String,
+        if_draft_empty: bool,
+        timeout: Duration,
+        audit: impl FnOnce() -> Result<(), Outcome>,
+    ) -> Result<Reservation, Outcome> {
         self.reserve_request(
             request_id,
             text,
             DeliveryKind::Prompt { if_draft_empty },
             timeout,
+            audit,
         )
     }
     pub(crate) fn reserve_draft_state(
@@ -405,7 +419,14 @@ impl Channel {
         request_id: String,
         timeout: Duration,
     ) -> Result<Reservation, Outcome> {
-        self.reserve_request(request_id, String::new(), DeliveryKind::DraftState, timeout)
+        // Draft-state is an internal query, not caller input: nothing to audit.
+        self.reserve_request(
+            request_id,
+            String::new(),
+            DeliveryKind::DraftState,
+            timeout,
+            || Ok(()),
+        )
     }
     fn reserve_request(
         &self,
@@ -413,6 +434,7 @@ impl Channel {
         text: String,
         kind: DeliveryKind,
         timeout: Duration,
+        audit: impl FnOnce() -> Result<(), Outcome>,
     ) -> Result<Reservation, Outcome> {
         if !self.is_ready() && !self.rotating.load(Ordering::Acquire) {
             return Err(Outcome::failure(
@@ -514,6 +536,9 @@ impl Channel {
             channel_waiters: self.waiters.clone(),
         });
         let waiter = delivery.waiter()?; // Capacity refusal is before the dispatch queue effect.
+                                         // Audit only a fresh, validated admission, durably before reservation/enqueue.
+                                         // Receipt-only retries never reach the sink, including on retired epochs.
+        audit()?;
         ledger.bytes += retained_bytes;
         ledger.requests.insert(request_id, delivery.clone()); // Reservation precedes enqueue/effect.
         if ledger.requests.len() >= ROTATE_LEDGER_KEYS || ledger.bytes >= ROTATE_LEDGER_BYTES {

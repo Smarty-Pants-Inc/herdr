@@ -1261,12 +1261,19 @@ Use `events.subscribe` for lifecycle events. Dedicated wait helpers are document
 ## API input log
 
 Before `pane.send_text`, `pane.send_input`, `pane.send_keys`, `agent.send_keys`, or
-`agent.prompt` writes to a pane, herdr appends one JSON line to `api-input.jsonl` in its
+`agent.prompt` writes to a pane, or `agent.prompt_guarded` delivers to an agent channel, herdr appends one JSON line to `api-input.jsonl` in its
 state directory (for example `~/.local/state/herdr/api-input.jsonl`; the file is readable
 by its owner only). The line records the time (`ts_ms`), the method, the target pane and
 terminal, the byte count, and the caller as herdr knows it from the socket peer process:
-its pid, pane, agent name, and agent session. It never records the text. If herdr cannot
-write the line, it refuses the input with `input_log_unavailable`.
+its pid, pane, agent name, and agent session. It never records the text. When the log
+reaches 32 MiB, herdr renames it to `api-input.jsonl.1` (replacing the previous
+generation) before appending the next line. If the log is full and that rotation fails,
+herdr refuses the input with `input_log_full`; the error names the log path and the
+rotation error. If herdr cannot write the line for any other reason, it refuses the input
+with `input_log_unavailable`. The session-checked forms
+(`pane.send_text_session_checked`, `pane.send_keys_session_checked`, and
+`agent.prompt_session_checked`) are logged exactly like their base methods, under the
+base method name, after their expected-session check accepts the input.
 
 On Linux and macOS, `caller.exe` and `caller.ppid` record the executable basename
 (not a mutable process label) and parent PID at write time, even when the caller is
@@ -1275,6 +1282,21 @@ records `caller.unit` when the caller's cgroup names a systemd `.service` or `.s
 These fields are omitted when unavailable; they are not recorded on Windows or other
 platforms. Metadata lookup failure does not refuse input. Typed input does not add an
 API log record.
+
+Every record with a socket peer identity includes `caller.ancestry`: `outside`
+(the peer's ancestry is proven outside this server), `unknown` (the proof could
+not be completed or is unsupported), or `reached` (the walk reached this server).
+This is independent of pane attribution; a null `caller.pane` is not itself an
+ancestry verdict. The log reuses the guard's request-local proof when available.
+Linux additionally records `caller.sid`, the peer's OS session ID (the same ID as
+`getsid`, read from the existing process snapshot), and `caller.ancestry_root_pid`,
+the last pinned PID examined by that walk: the server PID for `reached`, otherwise
+the topmost ancestor examined before the proof stopped. These two fields are
+omitted when unavailable and are absent on other platforms. `caller.ancestor_exe`
+and `caller.ancestor_pid` identify the nearest non-Herdr ancestor when observable;
+`caller.pane_env_present` records only whether `HERDR_PANE_ID` is present, never
+its value. None of these diagnostic fields grants authorization or changes the
+input guard.
 
 A reader of an agent's session can then tell turns that the API sent into a pane from
 turns typed there, without anything in the terminal byte stream.

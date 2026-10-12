@@ -972,9 +972,11 @@ worktree のイベント購読には `worktree.created`、`worktree.opened`、`w
 
 ## API 入力ログ
 
-`pane.send_text`、`pane.send_input`、`pane.send_keys`、`agent.send_keys`、`agent.prompt` がペインに書き込む前に、herdr は状態ディレクトリの `api-input.jsonl`（例: `~/.local/state/herdr/api-input.jsonl`。所有者だけが読めるファイル）に JSON を 1 行追記します。行には時刻（`ts_ms`）、メソッド、対象のペインとターミナル、バイト数、そしてソケットのピアプロセスから herdr が知る呼び出し元（pid、ペイン、エージェント名、エージェントセッション）が入ります。テキストは記録しません。herdr がこの行を書けない場合、入力は `input_log_unavailable` で拒否されます。
+`pane.send_text`、`pane.send_input`、`pane.send_keys`、`agent.send_keys`、`agent.prompt` がペインに書き込む前、または `agent.prompt_guarded` がエージェントチャネルに配信する前に、herdr は状態ディレクトリの `api-input.jsonl`（例: `~/.local/state/herdr/api-input.jsonl`。所有者だけが読めるファイル）に JSON を 1 行追記します。行には時刻（`ts_ms`）、メソッド、対象のペインとターミナル、バイト数、そしてソケットのピアプロセスから herdr が知る呼び出し元（pid、ペイン、エージェント名、エージェントセッション）が入ります。テキストは記録しません。ログが 32 MiB に達すると、herdr は次の行を追記する前にログを `api-input.jsonl.1` にリネームします（以前の世代は置き換えられます）。ログが上限に達していてこのローテーションに失敗した場合、入力は `input_log_full` で拒否され、エラーにはログのパスとローテーションのエラーが含まれます。その他の理由で herdr がこの行を書けない場合、入力は `input_log_unavailable` で拒否されます。セッションチェック付きの形式（`pane.send_text_session_checked`、`pane.send_keys_session_checked`、`agent.prompt_session_checked`）は、期待セッションのチェックが入力を受け入れた後、基本メソッドとまったく同じように基本メソッド名で記録されます。
 
 Linux と macOS では、`caller.exe` と `caller.ppid` に書き込み時の実行ファイルのベース名（変更可能なプロセスラベルではありません）と親 PID を記録します。呼び出し元がどのペインにも属さない場合も同じです。Linux では、呼び出し元の cgroup に systemd の `.service` または `.scope` がある場合、`caller.unit` も記録します。取得できないフィールドは省略し、Windows やその他のプラットフォームではこれらのフィールドを記録しません。メタデータの取得失敗によって入力を拒否することはありません。打鍵された入力は API ログに記録しません。
+
+ソケットのピア識別情報がある行には、必ず `caller.ancestry` を記録します。値は `outside`（このサーバーの子孫ではないと証明された）、`unknown`（証明を完了できない、または未対応）、`reached`（祖先の探索がこのサーバーに到達した）です。これはペインの帰属とは独立しており、`caller.pane` が null であるだけでは祖先の判定になりません。入力ガードがリクエスト内で取得した証明があれば、ログはそれを再利用します。Linux ではさらに `caller.sid`（ピアの OS セッション ID。`getsid` と同じ ID を既存のプロセススナップショットから読み取る）と `caller.ancestry_root_pid`（探索で最後に調べた固定済み PID。`reached` ならサーバーの PID、それ以外は証明が止まるまでに調べた最上位の祖先）を記録します。この 2 フィールドは取得できない場合は省略し、他のプラットフォームにはありません。`caller.ancestor_exe` と `caller.ancestor_pid` は観測できた最も近い Herdr 以外の祖先を示します。`caller.pane_env_present` は `HERDR_PANE_ID` の存在だけを記録し、その値は記録しません。これらは診断用のフィールドであり、権限を付与したり入力ガードを変更したりしません。
 
 これにより、エージェントのセッションを読む側は、ターミナルのバイト列に何も加えずに、API がペインに送ったターンと打鍵されたターンを区別できます。
 
