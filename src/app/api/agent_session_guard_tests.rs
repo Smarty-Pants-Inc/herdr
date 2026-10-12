@@ -1742,21 +1742,6 @@ fn pane_agent_session(f: &mut Fixture) -> (serde_json::Value, serde_json::Value)
     )
 }
 
-/// smarty-dev#10398: a Pi /reload on a pane with no anchored session must anchor it.
-// Not E2E: forces Pi detection in-process, so it pins the API path without process-title detection timing; E2E: tests/cli/panes.rs pi_reload_cli_reports_anchor_the_pane_and_keep_the_id_end_to_end.
-#[tokio::test]
-async fn pi_reload_anchors_a_pane_without_an_agent_session() {
-    let mut f = Fixture::new(Agent::Pi);
-    assert_eq!(pane_agent_session(&mut f).0, serde_json::Value::Null);
-
-    report_pi_reload(&mut f, "private-reload-a", "/tmp/reload-a.jsonl", 1);
-
-    let (session, id) = pane_agent_session(&mut f);
-    assert_eq!(session["kind"], "path");
-    assert_eq!(session["value"], "/tmp/reload-a.jsonl");
-    assert_eq!(id, "private-reload-a");
-}
-
 /// smarty-dev#10398: a reload keeps its session file, so a reload naming a DIFFERENT session
 /// than the live anchored one must not replace it.
 // Not E2E: A also holds live hook authority from a pane.report_agent state report, with Pi detection forced in-process; E2E: tests/cli/panes.rs pi_reload_cli_reports_anchor_the_pane_and_keep_the_id_end_to_end.
