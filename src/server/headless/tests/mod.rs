@@ -8390,6 +8390,9 @@ fn agent_session_changed_events_with_ids(
 
 /// smarty-dev#9124: a session report emits `pane.agent_session_changed` only
 /// when the pane's session id changes, never for a repeat of the same id.
+/// In-process, not E2E: it is the Windows/macOS coverage (tests/cli is
+/// Linux-only); the E2E is tests/cli/panes.rs
+/// `agent_session_changed_cli_reports_carry_the_actual_id_end_to_end`.
 #[test]
 fn agent_session_report_emits_session_changed_only_for_a_new_session() {
     let (writer, _control_rx, _render_rx) = test_client_writer();
@@ -8428,70 +8431,6 @@ fn agent_session_report_emits_session_changed_only_for_a_new_session() {
     assert_eq!(
         events[0].previous_agent_session_id.as_deref(),
         Some("session-a")
-    );
-}
-
-/// smarty-dev#10398: the event carries the actual agent session id that
-/// `pane get` reports, and fires when only that id changes for the same
-/// session value (a pre-v11 Pi extension re-reports its path without an id
-/// after `/reload`).
-#[test]
-fn agent_session_changed_carries_the_actual_id_and_fires_when_only_it_changes() {
-    let (writer, _control_rx, _render_rx) = test_client_writer();
-    let (mut server, pane_id) = completion_guard_server(writer);
-    let pane = server.app.public_pane_id(0, pane_id).unwrap();
-    // Pi session reports are accepted once the pane is detected as Pi.
-    let terminal_id = server.app.state.terminal_id_for_pane(0, pane_id).unwrap();
-    server
-        .app
-        .state
-        .terminals
-        .get_mut(&terminal_id)
-        .unwrap()
-        .detected_agent = Some(crate::detect::Agent::Pi);
-    let path = "/sessions/pi-a.jsonl";
-    let workspace_id = server.app.public_workspace_id(0);
-    let event = |previous_session: Option<&str>, id: Option<&str>, previous_id: Option<&str>| {
-        api::schema::PaneAgentSessionChangedEvent {
-            pane_id: pane.clone(),
-            workspace_id: workspace_id.clone(),
-            agent: "pi".into(),
-            session_id: path.into(),
-            previous_session_id: previous_session.map(str::to_string),
-            agent_session_id: id.map(str::to_string),
-            previous_agent_session_id: previous_id.map(str::to_string),
-        }
-    };
-    let report = |server: &mut HeadlessServer, id: Option<&str>, seq: u64| {
-        let start = server.app.event_hub.current_sequence();
-        report_agent_session_with(server, &pane, "pi", (id, Some(path)), "startup", seq);
-        agent_session_changed_events_with_ids(server, start)
-    };
-
-    assert_eq!(
-        report(&mut server, None, 1),
-        vec![event(None, None, None)],
-        "a path-only report has no actual id"
-    );
-    assert_eq!(
-        report(&mut server, Some("pi-id-a"), 2),
-        vec![event(Some(path), Some("pi-id-a"), None)],
-        "the same path now with an id: only the actual id changed"
-    );
-    assert_eq!(
-        report(&mut server, Some("pi-id-a"), 3),
-        vec![],
-        "the same path and id again emits nothing"
-    );
-    assert_eq!(
-        report(&mut server, None, 4),
-        vec![event(Some(path), None, Some("pi-id-a"))],
-        "a path-only re-report after /reload clears the actual id"
-    );
-    assert_eq!(
-        report(&mut server, None, 5),
-        vec![],
-        "a repeated path-only report emits nothing"
     );
 }
 
