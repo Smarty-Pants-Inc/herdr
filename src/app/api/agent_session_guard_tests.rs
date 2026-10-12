@@ -1722,6 +1722,65 @@ async fn expected_agent_session_real_pty_same_path_stale_rejected_clear_and_disc
     id_only.bytes(b"\r");
 }
 
+fn report_pi_reload(f: &mut Fixture, id: &str, path: &str, seq: u64) {
+    assert_ok(&f.request(
+        "pane.report_agent_session",
+        serde_json::json!({
+            "pane_id": f.pane, "source": "herdr:pi", "agent": "pi", "seq": seq,
+            "agent_session_id": id, "agent_session_path": path,
+            "session_start_source": "reload",
+        }),
+    ));
+}
+
+fn pane_agent_session(f: &mut Fixture) -> (serde_json::Value, serde_json::Value) {
+    let response = f.request("pane.get", serde_json::json!({"pane_id": f.pane}));
+    let json: serde_json::Value = serde_json::from_str(&response).expect("pane info");
+    (
+        json["result"]["pane"]["agent_session"].clone(),
+        json["result"]["pane"]["agent_session_id"].clone(),
+    )
+}
+
+/// smarty-dev#10398: a Pi /reload on a pane with no anchored session must anchor it.
+#[tokio::test]
+async fn pi_reload_anchors_a_pane_without_an_agent_session() {
+    let mut f = Fixture::new(Agent::Pi);
+    assert_eq!(pane_agent_session(&mut f).0, serde_json::Value::Null);
+
+    report_pi_reload(&mut f, "private-reload-a", "/tmp/reload-a.jsonl", 1);
+
+    let (session, id) = pane_agent_session(&mut f);
+    assert_eq!(session["kind"], "path");
+    assert_eq!(session["value"], "/tmp/reload-a.jsonl");
+    assert_eq!(id, "private-reload-a");
+}
+
+/// smarty-dev#10398: a reload keeps its session file, so a reload naming a DIFFERENT session
+/// than the live anchored one must not replace it.
+#[tokio::test]
+async fn pi_reload_does_not_replace_a_different_anchored_session() {
+    let mut f = Fixture::new(Agent::Pi);
+    report_pi_reload(&mut f, "private-reload-a", "/tmp/reload-a.jsonl", 1);
+    assert_ok(&f.request(
+        "pane.report_agent",
+        serde_json::json!({
+            "pane_id": f.pane, "source": "herdr:pi", "agent": "pi", "state": "idle", "seq": 2,
+            "agent_session_id": "private-reload-a", "agent_session_path": "/tmp/reload-a.jsonl",
+        }),
+    ));
+    let (session, id) = pane_agent_session(&mut f);
+    assert_eq!(session["value"], "/tmp/reload-a.jsonl");
+    assert_eq!(id, "private-reload-a");
+
+    report_pi_reload(&mut f, "private-reload-b", "/tmp/reload-b.jsonl", 3);
+
+    let (session, id) = pane_agent_session(&mut f);
+    assert_eq!(session["kind"], "path");
+    assert_eq!(session["value"], "/tmp/reload-a.jsonl");
+    assert_eq!(id, "private-reload-a");
+}
+
 #[tokio::test]
 async fn expected_agent_session_real_pty_guard_precedes_copilot_focus_event() {
     let mut f = Fixture::new(Agent::GithubCopilot);

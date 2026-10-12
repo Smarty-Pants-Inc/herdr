@@ -1859,6 +1859,11 @@ impl TerminalState {
             ) | ("herdr:mastracode", "mastracode", Some("startup"))
                 | ("herdr:hermes", "hermes", Some("startup" | "new" | "resume"))
                 | ("herdr:opencode", "opencode", Some("select"))
+                // ponytail: Pi's "reload" is deliberately absent. A /reload re-runs the
+                // extensions on the SAME session file, so it may anchor an unanchored pane
+                // (see session_start_source_is_recognized) but never replace a different
+                // session this pane is anchored to; it behaves exactly like Pi's "startup"
+                // (smarty-dev#10398).
                 | ("herdr:pi", "pi", Some("new" | "resume" | "fork"))
                 | ("herdr:grok", "grok", Some("new"))
                 | (
@@ -1878,7 +1883,7 @@ impl TerminalState {
     fn session_start_source_is_recognized(session_start_source: Option<&str>) -> bool {
         matches!(
             session_start_source,
-            Some("startup" | "clear" | "resume" | "compact" | "new" | "fork" | "select")
+            Some("startup" | "reload" | "clear" | "resume" | "compact" | "new" | "fork" | "select")
         )
     }
 
@@ -4202,6 +4207,86 @@ mod tests {
                 "pi".into(),
                 crate::agent_resume::AgentSessionRefKind::Path,
                 new_session,
+            ))
+        );
+    }
+
+    #[test]
+    fn pi_reload_anchors_an_unanchored_pane() {
+        // smarty-dev#10398: a /reload is the only report a long-running Pi sends again.
+        let detected = test_session_path("pi-reload-detected.jsonl");
+        let mut terminal = test_terminal();
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
+        // A state report alone never anchors an unanchored pane; it is only buffered.
+        assert!(terminal
+            .set_hook_authority_with_session_ref(
+                "herdr:pi".into(),
+                "pi".into(),
+                AgentState::Working,
+                None,
+                crate::agent_resume::AgentSessionRef::path(detected.clone()),
+                Some(10),
+            )
+            .is_none());
+        assert_eq!(terminal.current_session_identity_for_persistence(), None);
+        let reload = terminal.set_agent_session_ref_for_session_start(
+            "herdr:pi".into(),
+            "pi".into(),
+            crate::agent_resume::AgentSessionRef::path(detected.clone()),
+            Some(11),
+            Some("reload".into()),
+        );
+        assert!(reload.is_some_and(|mutation| mutation.session_ref_changed));
+        assert_eq!(
+            terminal.current_session_identity_for_persistence(),
+            Some((
+                "herdr:pi".into(),
+                "pi".into(),
+                crate::agent_resume::AgentSessionRefKind::Path,
+                detected.clone(),
+            ))
+        );
+        // Pi publishes its state right after the reload report; it now flows normally.
+        assert!(terminal
+            .set_hook_authority_with_session_ref(
+                "herdr:pi".into(),
+                "pi".into(),
+                AgentState::Working,
+                None,
+                crate::agent_resume::AgentSessionRef::path(detected.clone()),
+                Some(12),
+            )
+            .is_some());
+        assert_eq!(terminal.state, AgentState::Working);
+        assert_eq!(
+            terminal
+                .hook_authority
+                .as_ref()
+                .and_then(|authority| authority.session_ref.clone()),
+            crate::agent_resume::AgentSessionRef::path(detected)
+        );
+
+        // Before the Pi process is detected the reload is held, then applied on detection.
+        let undetected = test_session_path("pi-reload-undetected.jsonl");
+        let mut terminal = test_terminal();
+        assert!(terminal
+            .set_agent_session_ref_for_session_start(
+                "herdr:pi".into(),
+                "pi".into(),
+                crate::agent_resume::AgentSessionRef::path(undetected.clone()),
+                Some(11),
+                Some("reload".into()),
+            )
+            .is_none());
+        assert_eq!(terminal.current_session_identity_for_persistence(), None);
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
+        assert_eq!(
+            terminal.current_session_identity_for_persistence(),
+            Some((
+                "herdr:pi".into(),
+                "pi".into(),
+                crate::agent_resume::AgentSessionRefKind::Path,
+                undetected,
             ))
         );
     }
