@@ -158,7 +158,7 @@ ACK 必须匹配实时连接、epoch、请求 ID 和会话代数。ACK 的 `stat
 {"id":"draft","result":{"status":"unknown","reason":"unsupported"}}
 ```
 
-`status: "known"` 中，`empty` 是布尔值，`hold` 为 `null`（无 hold）、`"dialog"`、`"custom"` 或 `"editor"`。结果不包含草稿文本或字符数。`status: "unknown"` 有类型化 `reason`：`unregistered`（无注册通道）、`unsupported`（缺少草稿守卫能力）、`timeout`（未及时回复）或 `unknown`（状态不可观察）。unknown 不能视为空。智能体默认可查询自己的窗格；查询其他窗格需要 `allow_cross_pane: true`。普通外部操作员遵循与 `agent.prompt` 相同的策略。授权在预留或发送帧之前检查。归属或连接不确定时拒绝操作。这次观察不是预留，也不是后续提示的授权；绝不把缓存状态当作后续安全投递的凭据。
+`status: "known"` 中，`empty` 是布尔值，`hold` 为 `null`（无 hold）、`"dialog"`、`"custom"` 或 `"editor"`。结果不包含草稿文本或字符数。`status: "unknown"` 有类型化 `reason`：`unregistered`（无注册通道）、`unsupported`（缺少草稿守卫能力）、`timeout`（未及时回复）或 `unknown`（状态不可观察）。unknown 不能视为空。智能体可查询自己的窗格，也可在不设置 `allow_cross_pane` 的情况下查询其他窗格：输入来源检查仅为建议性，跨窗格及无法确认归属的查询会被允许并记录日志。普通外部操作员遵循与 `agent.prompt` 相同的策略。检查在预留或发送帧之前进行；提供无效的插件动作令牌仍会被拒绝。连接不确定时拒绝操作。这次观察不是预留，也不是后续提示的授权；绝不把缓存状态当作后续安全投递的凭据。
 
 在已有注册 socket 上，查询和回复使用相同的 epoch、请求 ID 和会话代数：
 

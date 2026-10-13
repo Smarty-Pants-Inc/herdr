@@ -74,11 +74,22 @@ impl App {
     ) -> Option<String> {
         // Decide from the method first: attribution walks every agent pane's session in
         // /proc, so doing it for each API request kept the server busy (smarty-dev#931).
-        // Only a content write needs it. The cross-pane opt-in is applied after
-        // attribution so a presented plugin-action token is always validated
-        // first and advisory writes are still logged.
+        // Only a content write needs it.
         let target = self.content_write_target(&request.method)?;
         let allow_cross_pane = Self::allows_cross_pane(&request.method);
+        let token_presented =
+            context.plugin_action != crate::plugin_action_origin::PluginActionClaim::Absent;
+        // The usual opted-in fleet write (smarty send) carries no plugin-action
+        // token: allow it without classifying its origin. A presented token is
+        // always validated below, flag or not (an invalid token stays refused).
+        if allow_cross_pane && !token_presented {
+            return None;
+        }
+        // ponytail: without a token every outcome below is allowed (advisory
+        // guard), so for non-opted-in writes this classification, which walks
+        // agent pane sessions in /proc (smarty-dev#931), only feeds the
+        // advisory log line. Kept on purpose because that log was asked for;
+        // drop it here if the per-write cost ever shows up.
         let origin = self.input_origin_for_context_with_ancestry(context);
         let (code, message) = match origin {
             InputOrigin::Ordinary => return None,
@@ -126,24 +137,19 @@ impl App {
                     origin = "agent",
                     source_terminal = %source.terminal_id,
                     target_terminal = %target.terminal_id,
-                    allow_cross_pane,
                     "cross-pane agent input allowed (advisory input-origin guard)"
                 );
                 return None;
             }
             // An invalid presented plugin-action grant stays refused: plugin
             // grants are an opt-in guard, not fleet input.
-            InputOrigin::Unknown
-                if context.plugin_action
-                    != crate::plugin_action_origin::PluginActionClaim::Absent =>
-            {
+            InputOrigin::Unknown if token_presented => {
                 ("input_origin_unknown", INPUT_ORIGIN_UNKNOWN_MESSAGE)
             }
             InputOrigin::Unknown => {
                 tracing::warn!(
                     origin = "unknown",
                     target_terminal = %target.terminal_id,
-                    allow_cross_pane,
                     "input of unknown origin allowed (advisory input-origin guard)"
                 );
                 return None;
@@ -483,7 +489,6 @@ mod tests {
         assert_eq!(response.error.code, "cross_pane_input_denied");
     }
 
-    #[cfg(unix)]
     fn assert_plugin_unknown(response: &str) {
         let response: ErrorResponse = serde_json::from_str(response).expect("unknown response");
         assert_eq!(response.error.code, "input_origin_unknown");
