@@ -7,6 +7,7 @@ pub(super) fn connect(
 ) -> std::sync::mpsc::Receiver<Vec<u8>> {
     let (writer, control, _render) = test_client_writer();
     server.handle_server_event(ServerEvent::ClientShellConnected {
+        peer_context: crate::api::ApiRequestContext::default(),
         client_id,
         surface_cols: 80,
         surface_rows: 23,

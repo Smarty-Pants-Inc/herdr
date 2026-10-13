@@ -1080,3 +1080,294 @@ fn pane_read_rejects_invalid_value_with_usage_error() {
     assert!(stderr.contains("invalid read source: bogus"));
     assert!(!stderr.contains("Error: Custom"));
 }
+
+/// smarty-dev#8152: clearing a pane's input poison is an operator action. A real
+/// `herdr` CLI run inside a pane is refused for another pane and for its own pane
+/// (plain shell pane: operator_origin_required; reported agent pane targeting
+/// another pane: the cross-pane policy's cross_pane_input_denied). The same CLI
+/// run outside every pane is the operator and succeeds. Drain-before-clear on a
+/// poisoned pane is proven natively in pty::actor guard_tests, because no CLI
+/// path can poison pane input (it needs a failed TCIFLUSH during guarded loss).
+#[cfg(target_os = "linux")]
+#[test]
+fn clear_input_poison_is_refused_inside_panes_and_accepted_from_an_operator() {
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+    let herdr = spawn_herdr(&config_home, &runtime_dir, &socket_path);
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+
+    let created = run_cli_json(
+        &socket_path,
+        &["workspace", "create", "--cwd", base.to_str().unwrap()],
+    );
+    let source = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let split = run_cli_json(
+        &socket_path,
+        &["pane", "split", &source, "--direction", "right"],
+    );
+    let target = split["result"]["pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Runs the real CLI from the source pane's shell and returns its JSON reply.
+    let mut run = 0;
+    let mut clear_from_source_pane = |pane: &str| -> serde_json::Value {
+        run += 1;
+        let out = base.join(format!("clear-{run}.json"));
+        let done = base.join(format!("clear-{run}.done"));
+        let command = format!(
+            "'{}' pane clear-input-poison {pane} 2> '{}'; echo $? > '{}'",
+            env!("CARGO_BIN_EXE_herdr"),
+            out.display(),
+            done.display()
+        );
+        assert!(run_cli(&socket_path, &["pane", "run", &source, &command])
+            .status
+            .success());
+        assert!(
+            wait_until(Duration::from_secs(10), Duration::from_millis(25), || {
+                fs::read_to_string(&done).is_ok_and(|rc| rc.ends_with('\n'))
+            }),
+            "in-pane CLI did not finish"
+        );
+        assert_eq!(fs::read_to_string(&done).unwrap().trim(), "1");
+        // The CLI prints its warnings, then the error response, on stderr.
+        let stderr = fs::read_to_string(&out).unwrap();
+        serde_json::from_str(stderr.lines().last().unwrap_or_default()).unwrap()
+    };
+
+    // A plain shell pane is pane-attributed: refused for another pane and its own.
+    for pane in [target.clone(), source.clone()] {
+        let refused = clear_from_source_pane(&pane);
+        assert_eq!(
+            refused["error"]["code"], "operator_origin_required",
+            "{refused}"
+        );
+    }
+
+    // Once the source pane is an agent, the cross-pane policy refuses it first.
+    assert!(run_cli(
+        &socket_path,
+        &[
+            "pane",
+            "report-agent",
+            &source,
+            "--source",
+            "custom:pi",
+            "--agent",
+            "pi",
+            "--state",
+            "idle",
+        ],
+    )
+    .status
+    .success());
+    let refused = clear_from_source_pane(&target);
+    assert_eq!(
+        refused["error"]["code"], "cross_pane_input_denied",
+        "{refused}"
+    );
+    let refused = clear_from_source_pane(&source);
+    assert_eq!(
+        refused["error"]["code"], "operator_origin_required",
+        "{refused}"
+    );
+
+    // The operator: the same CLI outside every pane.
+    // Strip every inherited HERDR_* so the run is outside every pane even when
+    // the suite itself runs inside a Herdr pane.
+    let mut operator = crate::test_command::herdr_command();
+    strip_herdr_env(&mut operator);
+    let cleared = operator
+        .args(["pane", "clear-input-poison", &target])
+        .env("HERDR_SOCKET_PATH", &socket_path)
+        .output()
+        .unwrap();
+    assert!(
+        cleared.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cleared.stderr)
+    );
+    let cleared: serde_json::Value = serde_json::from_slice(&cleared.stdout).unwrap();
+    assert_eq!(cleared["result"]["type"], "ok", "{cleared}");
+    assert!(cleared["result"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("TCIFLUSH"));
+
+    cleanup_spawned_herdr(herdr, base);
+}
+
+#[cfg(target_os = "linux")]
+/// Removes every `HERDR_*` variable inherited from the test runner, so an
+/// operator leg never carries pane markers of an enclosing Herdr session.
+fn strip_herdr_env(command: &mut std::process::Command) {
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("HERDR_") {
+            command.env_remove(key);
+        }
+    }
+}
+
+const CLIENT_CHILD_SOCKET: &str = "CLEAR_POISON_CLIENT_CHILD_SOCKET";
+const CLIENT_CHILD_PANE: &str = "CLEAR_POISON_CLIENT_CHILD_PANE";
+const CLIENT_CHILD_OUT: &str = "CLEAR_POISON_CLIENT_CHILD_OUT";
+
+/// Opens a real client-protocol connection (endpoint hello, boot id from the
+/// snapshot) and sends `pane.clear_input_poison` on the endpoint command lane.
+#[cfg(target_os = "linux")]
+fn clear_input_poison_over_client_protocol(
+    client_socket: &Path,
+    pane: &str,
+) -> Result<serde_json::Value, String> {
+    let mut stream = UnixStream::connect(client_socket).map_err(|err| err.to_string())?;
+    crate::support::client_shell_handshake(
+        &mut stream,
+        crate::support::CURRENT_ENDPOINT_PROTOCOL_GENERATION,
+        80,
+        24,
+    )?;
+    let boot_id =
+        crate::support::wait_for_client_shell_boot_id(&mut stream, Duration::from_secs(10))?;
+    crate::support::client_shell_endpoint_request(
+        &mut stream,
+        &boot_id,
+        &serde_json::json!({
+            "id": "clear",
+            "method": "pane.clear_input_poison",
+            "params": {"pane_id": pane},
+        }),
+        Duration::from_secs(10),
+    )
+}
+
+/// Child half of the test below: re-executed from this test binary inside a
+/// Herdr pane. A no-op unless that test supplied its environment.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "re-executed inside a pane by clear_input_poison_client_lane_is_refused_inside_a_pane"]
+fn clear_input_poison_client_protocol_child() {
+    let Some(out) = std::env::var_os(CLIENT_CHILD_OUT) else {
+        return;
+    };
+    let socket = std::env::var_os(CLIENT_CHILD_SOCKET).expect("client socket");
+    let pane = std::env::var(CLIENT_CHILD_PANE).expect("pane");
+    let result = match clear_input_poison_over_client_protocol(Path::new(&socket), &pane) {
+        Ok(response) => response.to_string(),
+        Err(error) => serde_json::json!({ "child_error": error }).to_string(),
+    };
+    let out = PathBuf::from(out);
+    let partial = out.with_extension("partial");
+    fs::write(&partial, result).unwrap();
+    fs::rename(partial, out).unwrap();
+}
+
+/// smarty-dev#8152 round 2: the client-shell lane is not operator proof by
+/// itself. A same-user process inside a pane can open the owner-readable
+/// client socket, complete a valid endpoint hello, read the boot id from the
+/// snapshot and send the allowlisted `pane.clear_input_poison`; it must be
+/// refused. The CLI has no command that speaks the client protocol (and the
+/// real `herdr` client refuses to start nested in a pane), so this is not a CLI
+/// E2E: it drives the real server through a real client-protocol connection
+/// from a child process (this test binary, re-executed) spawned inside a pane,
+/// and from this test process outside every pane, which is the operator.
+#[cfg(target_os = "linux")]
+#[test]
+fn clear_input_poison_client_lane_is_refused_inside_a_pane() {
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+    let client_socket = runtime_dir.join("herdr-client.sock");
+    let herdr = spawn_herdr(&config_home, &runtime_dir, &socket_path);
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+    wait_for_socket(&client_socket, Duration::from_secs(5));
+
+    let created = run_cli_json(
+        &socket_path,
+        &["workspace", "create", "--cwd", base.to_str().unwrap()],
+    );
+    let source = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let split = run_cli_json(
+        &socket_path,
+        &["pane", "split", &source, "--direction", "right"],
+    );
+    let target = split["result"]["pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // In-pane client: refused for another pane and for its own pane.
+    let exe = std::env::current_exe().unwrap();
+    for (run, pane) in [target.clone(), source.clone()].into_iter().enumerate() {
+        let out = base.join(format!("client-clear-{run}.json"));
+        let log = base.join(format!("client-clear-{run}.log"));
+        let command = format!(
+            "{CLIENT_CHILD_SOCKET}='{}' {CLIENT_CHILD_PANE}='{pane}' {CLIENT_CHILD_OUT}='{}' '{}' --exact cases::panes::clear_input_poison_client_protocol_child --include-ignored --nocapture > '{}' 2>&1",
+            client_socket.display(),
+            out.display(),
+            exe.display(),
+            log.display()
+        );
+        assert!(run_cli(&socket_path, &["pane", "run", &source, &command])
+            .status
+            .success());
+        assert!(
+            wait_until(Duration::from_secs(30), Duration::from_millis(50), || out
+                .exists()),
+            "in-pane client did not finish: {}",
+            fs::read_to_string(&log).unwrap_or_default()
+        );
+        let refused: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&out).unwrap()).unwrap();
+        assert_eq!(
+            refused["error"]["code"], "operator_origin_required",
+            "in-pane client targeting {pane}: {refused}"
+        );
+    }
+
+    // The operator: a client run outside every pane still clears it. It runs
+    // in a re-executed child with every inherited HERDR_* removed, so the
+    // result does not depend on whether the runner itself is inside a pane.
+    let out = base.join("client-clear-operator.json");
+    let log = base.join("client-clear-operator.log");
+    let mut operator = std::process::Command::new(&exe);
+    strip_herdr_env(&mut operator);
+    let status = operator
+        .args([
+            "--exact",
+            "cases::panes::clear_input_poison_client_protocol_child",
+            "--include-ignored",
+            "--nocapture",
+        ])
+        .env(CLIENT_CHILD_SOCKET, &client_socket)
+        .env(CLIENT_CHILD_PANE, &target)
+        .env(CLIENT_CHILD_OUT, &out)
+        .stdout(fs::File::create(&log).unwrap())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(
+        status.success() && out.exists(),
+        "operator client failed: {}",
+        fs::read_to_string(&log).unwrap_or_default()
+    );
+    let cleared: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&out).unwrap()).unwrap();
+    assert_eq!(cleared["result"]["type"], "ok", "{cleared}");
+    assert!(cleared["result"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("TCIFLUSH"));
+
+    cleanup_spawned_herdr(herdr, base);
+}

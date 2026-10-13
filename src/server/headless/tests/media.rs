@@ -10,6 +10,7 @@ fn connect_media_shell(
     let (writer, control, _render) = test_client_writer();
     assert!(
         server.handle_server_event(ServerEvent::ClientShellConnected {
+            peer_context: crate::api::ApiRequestContext::default(),
             surface_reuse: false,
             surface_delta: false,
             surface_scroll: false,

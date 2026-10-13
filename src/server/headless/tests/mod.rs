@@ -742,6 +742,7 @@ async fn client_shell_attach_seeds_workspace() {
 
     assert!(
         server.handle_server_event(ServerEvent::ClientShellConnected {
+            peer_context: crate::api::ApiRequestContext::default(),
             surface_reuse: false,
             surface_delta: false,
             surface_scroll: false,
@@ -777,6 +778,7 @@ async fn completion_guard_endpoint_pairs_runtime_completions_with_snapshots() {
     server.app.state.active = Some(0);
     let (writer, control_rx, _render_rx) = test_client_writer();
     server.handle_server_event(ServerEvent::ClientShellConnected {
+        peer_context: crate::api::ApiRequestContext::default(),
         client_id: 78,
         principal: None,
         surface_cols: 80,
@@ -838,6 +840,7 @@ async fn client_shell_endpoint_request_uses_the_selected_connection() {
     let client_id = 41;
     assert!(
         server.handle_server_event(ServerEvent::ClientShellConnected {
+            peer_context: crate::api::ApiRequestContext::default(),
             surface_reuse: false,
             surface_delta: false,
             surface_scroll: false,
@@ -960,6 +963,7 @@ async fn client_shell_pairs_agent_view_set_replacement_and_clear_with_snapshots(
     let (writer, control_rx, _render_rx) = test_client_writer();
     assert!(
         server.handle_server_event(ServerEvent::ClientShellConnected {
+            peer_context: crate::api::ApiRequestContext::default(),
             surface_reuse: false,
             surface_delta: false,
             surface_scroll: false,
@@ -1065,6 +1069,7 @@ async fn client_shell_receives_metadata_then_shell_free_pane_surface() {
     let (writer, control_rx, render_rx) = test_client_writer();
     assert!(
         server.handle_server_event(ServerEvent::ClientShellConnected {
+            peer_context: crate::api::ApiRequestContext::default(),
             surface_reuse: false,
             surface_delta: false,
             surface_scroll: false,
@@ -1235,6 +1240,7 @@ fn connect_test_shell(
     let (writer, control, render) = test_client_writer();
     assert!(
         server.handle_server_event(ServerEvent::ClientShellConnected {
+            peer_context: crate::api::ApiRequestContext::default(),
             surface_reuse: false,
             surface_delta: false,
             surface_scroll: false,
@@ -1842,6 +1848,7 @@ async fn client_shell_config_diagnostics_follow_keybinding_ownership() {
     let (local_writer, local_control, _local_render) = test_client_writer();
     assert!(
         server.handle_server_event(ServerEvent::ClientShellConnected {
+            peer_context: crate::api::ApiRequestContext::default(),
             surface_reuse: false,
             surface_delta: false,
             surface_scroll: false,
@@ -1869,6 +1876,7 @@ async fn client_shell_config_diagnostics_follow_keybinding_ownership() {
     let (endpoint_writer, endpoint_control, _endpoint_render) = test_client_writer();
     assert!(
         server.handle_server_event(ServerEvent::ClientShellConnected {
+            peer_context: crate::api::ApiRequestContext::default(),
             surface_reuse: false,
             surface_delta: false,
             surface_scroll: false,
@@ -2957,6 +2965,7 @@ async fn public_api_focus_replaces_every_client_shell_projection() {
     let (writer, control_rx, render_rx) = test_client_writer();
     assert!(
         server.handle_server_event(ServerEvent::ClientShellConnected {
+            peer_context: crate::api::ApiRequestContext::default(),
             surface_reuse: false,
             surface_delta: false,
             surface_scroll: false,
@@ -3207,6 +3216,7 @@ async fn client_shell_streams_and_targets_popup_terminal_content() {
     let (writer, control_rx, render_rx) = test_client_writer();
     assert!(
         server.handle_server_event(ServerEvent::ClientShellConnected {
+            peer_context: crate::api::ApiRequestContext::default(),
             surface_reuse: false,
             surface_delta: false,
             surface_scroll: false,
@@ -6819,6 +6829,7 @@ async fn client_shell_requests_host_pixels_for_an_unfocused_pixel_pane() {
     let (writer, control_rx, _render_rx) = test_client_writer();
     assert!(
         server.handle_server_event(ServerEvent::ClientShellConnected {
+            peer_context: crate::api::ApiRequestContext::default(),
             surface_reuse: false,
             surface_delta: false,
             surface_scroll: false,

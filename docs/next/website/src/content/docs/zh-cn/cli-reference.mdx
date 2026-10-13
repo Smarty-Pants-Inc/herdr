@@ -262,7 +262,7 @@ herdr pane run <pane_id> <command>
 
 如果打开确切 slave 或执行 `TCIFLUSH` 失败，Herdr 不会关闭 PTY master，也不会终止用户进程。它会丢弃剩余请求、不发送 Enter，并将窗格输入标记为 **POISONED**。所有 PTY 写入都会被服务器以类型化错误 `pane_input_poisoned` 拒绝，包括客户端按键和无守卫的 API 发送；服务器还会发送 `Notify`。操作员须显式执行 `herdr pane clear-input-poison <pane>` 才能清除；在已连接客户端中显示该通知的功能仍待 [smarty-dev#7908](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/7908) 实现。之后刷新成功也绝不会自动清除此状态。
 
-只有操作员显式执行 `herdr pane clear-input-poison <pane>`（API `pane.clear_input_poison`）才能清除。**警告：** 暂存文本可能仍留在输入行上。清除前请检查并丢弃；清除不证明输入行为空，之后的 Enter 可能提交读取方已缓冲的文本。不要自动清除，也不要将清除作为重试策略。
+只有操作员显式执行 `herdr pane clear-input-poison <pane>`（API `pane.clear_input_poison`）才能清除，且须从已连接的 Herdr 客户端或任何 Herdr 窗格之外的终端执行。任何窗格内的调用方（包括被污染的窗格本身）都会被拒绝，返回 `operator_origin_required`（智能体针对其他窗格时为 `cross_pane_input_denied`，无法归属的调用方为 `input_origin_unknown`）；没有 `--allow-cross-pane` 覆盖。清除前 Herdr 会再次丢弃窗格中未读取的输入（`TCIFLUSH`）；若失败则拒绝清除，窗格保持污染状态。**警告：** 前台程序已读取的文本仍留在其自身缓冲区，之后的 Enter 可能提交它。清除前请检查窗格。不要自动清除，也不要将清除作为重试策略。
 
 初始检查与接受请求时 Herdr 的已上报窗格状态是原子的。它无法检测智能体尚未上报的会话变化。仍有两类残余竞态：最后一次实时进程／前台原生检查与 `write(2)` 之间的检查／写入间隙，以及所有权丢失／刷新／读取方之间的竞态；读取方可能在刷新前消费已暂存的字节。完成结果和刷新都不保证总写入或总消费字节数为零。App 到 actor 的队列和延迟 Enter 的等待受守卫保护，但不能消除这些原生竞态。CLI 要求 `expected_agent_session_guard`，仅 Linux 支持并通告此能力。macOS 和 Windows 在无法确认安全时拒绝操作；macOS 的原生证明尚待实现。缺少支持时，CLI 返回 `expected_agent_session_unsupported`，不发送带守卫的操作，并使用 checked 方法名，因此即使能力检查后服务器被替换，也会在无法确认安全时拒绝操作。省略这些标志会保留现有行为和独立的跨窗格输入策略。
 

@@ -25,6 +25,7 @@ async fn assert_accepted_binding_before_queued_input(shell: bool, principal: Opt
     let (writer, _control_rx, _render_rx) = test_client_writer();
     let connected = if shell {
         ServerEvent::ClientShellConnected {
+            peer_context: crate::api::ApiRequestContext::default(),
             client_id,
             principal,
             surface_cols: 80,

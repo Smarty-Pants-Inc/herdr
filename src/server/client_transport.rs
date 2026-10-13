@@ -476,6 +476,11 @@ pub(crate) enum ServerEvent {
     ClientShellConnected {
         client_id: u64,
         principal: Option<crate::pty::input_consumer::Principal>,
+        /// smarty-dev#8152: the accept-pinned peer, captured like a public API
+        /// connection's context. Used only to classify the caller of
+        /// `pane.clear_input_poison`; every other endpoint method keeps the
+        /// lane's default context.
+        peer_context: crate::api::ApiRequestContext,
         surface_cols: u16,
         surface_rows: u16,
         cell_width_px: u32,
@@ -762,6 +767,8 @@ pub(crate) fn handle_client_handshake(
     // This identity was pinned at accept, not repinned from a delayed hello.
     // Resolve before reading any client-controlled field or forwarding input.
     let principal = crate::platform::resolve_client_principal(peer, &stream);
+    // smarty-dev#8152: same accept-time capture as the public API socket.
+    let peer_context = crate::api::ApiRequestContext::capture(peer);
 
     // Reset to blocking mode — the accept loop sets nonblocking but
     // the handshake thread needs blocking I/O for read_message/write_message.
@@ -985,6 +992,7 @@ pub(crate) fn handle_client_handshake(
         ServerEvent::ClientShellConnected {
             client_id,
             principal,
+            peer_context,
             surface_cols: client_cols,
             surface_rows: client_rows,
             cell_width_px,
@@ -2156,6 +2164,7 @@ mod tests {
             ServerEvent::ClientShellConnected {
                 client_id,
                 principal,
+                peer_context,
                 surface_cols,
                 surface_rows,
                 cell_width_px,
@@ -2174,6 +2183,12 @@ mod tests {
                 assert_eq!(
                     principal, None,
                     "self-declared hello.user cannot authenticate"
+                );
+                // No pinned peer: the clear-poison classification is unknown.
+                assert_eq!(
+                    peer_context,
+                    crate::api::ApiRequestContext::capture(None),
+                    "the hello cannot supply a peer"
                 );
                 assert!(!media_capable);
                 assert!(!surface_reuse);
