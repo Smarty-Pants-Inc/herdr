@@ -3592,7 +3592,7 @@
               "type": "string"
             },
             "refuse_if_exists": {
-              "description": "Absolute path; the write is refused if `lstat` of it succeeds at write time.",
+              "description": "Absolute path; the write is refused if, at write time, `lstat` of it\nsucceeds (`guard_path_present`) or fails other than not-found\n(`guard_path_unverifiable`).",
               "type": "string"
             }
           },
@@ -3639,7 +3639,7 @@
               "type": "string"
             },
             "refuse_if_exists": {
-              "description": "Absolute path; the write is refused if `lstat` of it succeeds at write time.",
+              "description": "Absolute path; the write is refused if, at write time, `lstat` of it\nsucceeds (`guard_path_present`) or fails other than not-found\n(`guard_path_unverifiable`).",
               "type": "string"
             },
             "text": {

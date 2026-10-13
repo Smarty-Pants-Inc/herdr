@@ -1644,14 +1644,17 @@ impl PtyIoActorRunner {
                             || !guard.status_is_current()
                     });
                 // The path guard: one fresh lstat right before this write(2),
-                // with no request-time check and no cached answer.
+                // with no request-time check and no cached answer. A lookup
+                // error other than "absent" refuses too (fail closed).
                 let guard_path = if session_lost {
                     None
                 } else {
                     self.active_submission
                         .as_ref()
                         .and_then(|submission| submission.refuse_if_exists.as_deref())
-                        .filter(|path| super::guard_path_is_present(path))
+                        .and_then(|path| {
+                            super::guard_path_refusal(path).map(|unverifiable| (path, unverifiable))
+                        })
                 };
                 if session_lost || guard_path.is_some() {
                     let partial_text_consumed = self
@@ -1663,11 +1666,14 @@ impl PtyIoActorRunner {
                         .as_ref()
                         .and_then(|submission| submission.guard.as_ref())
                         .filter(|_| session_lost);
-                    let mut error = match (session_guard, guard_path) {
+                    let mut error = match (session_guard, &guard_path) {
                         (Some(guard), _) => super::agent_session_lost(guard, partial_text_consumed),
-                        (None, Some(path)) => {
-                            super::guard_path_present(path, Some(partial_text_consumed), false)
-                        }
+                        (None, Some((path, unverifiable))) => super::guard_path_present(
+                            path,
+                            unverifiable.as_deref(),
+                            Some(partial_text_consumed),
+                            false,
+                        ),
                         (None, None) => input_submission_closed_error(),
                     };
                     // Single active submission means no request IDs are
@@ -1687,9 +1693,14 @@ impl PtyIoActorRunner {
                             // the pane's later input.
                             warn!(pane = self.pane_id, err = %flush_error,
                                     "guarded PTY flush failed; later pane input is not blocked");
-                            error = match (session_guard, guard_path) {
+                            error = match (session_guard, &guard_path) {
                                 (Some(guard), _) => super::agent_session_flush_failed(guard),
-                                (None, Some(path)) => super::guard_path_present(path, None, true),
+                                (None, Some((path, unverifiable))) => super::guard_path_present(
+                                    path,
+                                    unverifiable.as_deref(),
+                                    None,
+                                    true,
+                                ),
                                 (None, None) => error,
                             };
                         }

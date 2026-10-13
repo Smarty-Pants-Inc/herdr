@@ -401,7 +401,9 @@ pub struct PaneSendKeysParams {
 pub struct PaneSendTextPathCheckedParams {
     #[serde(flatten)]
     pub input: PaneSendTextParams,
-    /// Absolute path; the write is refused if `lstat` of it succeeds at write time.
+    /// Absolute path; the write is refused if, at write time, `lstat` of it
+    /// succeeds (`guard_path_present`) or fails other than not-found
+    /// (`guard_path_unverifiable`).
     pub refuse_if_exists: String,
 }
 
@@ -411,7 +413,9 @@ pub struct PaneSendTextPathCheckedParams {
 pub struct PaneSendKeysPathCheckedParams {
     #[serde(flatten)]
     pub input: PaneSendKeysParams,
-    /// Absolute path; the write is refused if `lstat` of it succeeds at write time.
+    /// Absolute path; the write is refused if, at write time, `lstat` of it
+    /// succeeds (`guard_path_present`) or fails other than not-found
+    /// (`guard_path_unverifiable`).
     pub refuse_if_exists: String,
 }
 

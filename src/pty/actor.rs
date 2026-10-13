@@ -133,11 +133,14 @@ pub(crate) fn agent_session_loss_partial_text_consumed(error: &std::io::Error) -
     agent_session_loss_details(error).and_then(|(partial, _)| partial)
 }
 
-/// The submission's `refuse_if_exists` path existed (`lstat` succeeded) right
-/// before a `write(2)`, so the actor dropped the submission's remaining bytes.
+/// The submission's `refuse_if_exists` path existed (`lstat` succeeded), or
+/// could not be checked, right before a `write(2)`, so the actor dropped the
+/// submission's remaining bytes.
 #[derive(Debug)]
 struct GuardPathPresent {
     path: std::path::PathBuf,
+    /// The lookup error when `lstat` failed with anything but "absent".
+    unverifiable: Option<String>,
     /// As for session loss: text bytes of this submission already reached the PTY.
     partial_text_consumed: Option<bool>,
     flush_failed: bool,
@@ -145,10 +148,21 @@ struct GuardPathPresent {
 
 impl std::fmt::Display for GuardPathPresent {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.unverifiable {
+            Some(error) => write!(
+                formatter,
+                "guard_path_unverifiable: {} could not be checked at write time ({error}); ",
+                self.path.display()
+            )?,
+            None => write!(
+                formatter,
+                "guard_path_present: {} exists at write time; ",
+                self.path.display()
+            )?,
+        }
         write!(
             formatter,
-            "guard_path_present: {} exists at write time; the input was refused; partial_text_consumed={}; flush_failed={}",
-            self.path.display(),
+            "the input was refused; partial_text_consumed={}; flush_failed={}",
             self.partial_text_consumed
                 .map_or("unknown", |partial| if partial { "true" } else { "false" }),
             self.flush_failed
@@ -161,6 +175,7 @@ impl std::error::Error for GuardPathPresent {}
 #[cfg(unix)]
 pub(crate) fn guard_path_present(
     path: &std::path::Path,
+    unverifiable: Option<&str>,
     partial_text_consumed: Option<bool>,
     flush_failed: bool,
 ) -> std::io::Error {
@@ -168,25 +183,53 @@ pub(crate) fn guard_path_present(
         std::io::ErrorKind::AlreadyExists,
         GuardPathPresent {
             path: path.to_path_buf(),
+            unverifiable: unverifiable.map(str::to_owned),
             partial_text_consumed,
             flush_failed,
         },
     )
 }
 
-/// `(partial_text_consumed, flush_failed)` for a `guard_path_present` refusal.
-pub(crate) fn guard_path_present_details(error: &std::io::Error) -> Option<(Option<bool>, bool)> {
+/// `(code, partial_text_consumed, flush_failed)` for a path-guard refusal:
+/// `guard_path_present` or `guard_path_unverifiable`.
+pub(crate) fn guard_path_present_details(
+    error: &std::io::Error,
+) -> Option<(&'static str, Option<bool>, bool)> {
     error
         .get_ref()?
         .downcast_ref::<GuardPathPresent>()
-        .map(|refusal| (refusal.partial_text_consumed, refusal.flush_failed))
+        .map(|refusal| {
+            (
+                if refusal.unverifiable.is_some() {
+                    "guard_path_unverifiable"
+                } else {
+                    "guard_path_present"
+                },
+                refusal.partial_text_consumed,
+                refusal.flush_failed,
+            )
+        })
 }
 
-/// Whether `lstat(path)` succeeds now. Called by the PTY writer right before
-/// each guarded `write(2)`, never cached.
+/// Fresh `lstat(path)` right before each guarded `write(2)`, never cached.
+/// `None`: the path is absent (ENOENT, or ENOTDIR: a component is not a
+/// directory, so it cannot exist), and the write proceeds. `Some(None)`: it
+/// exists. `Some(Some(error))`: it could not be checked (EACCES, ELOOP, EIO,
+/// ...), so the guard fails closed instead of treating it as absent.
 #[cfg(unix)]
-fn guard_path_is_present(path: &std::path::Path) -> bool {
-    std::fs::symlink_metadata(path).is_ok()
+fn guard_path_refusal(path: &std::path::Path) -> Option<Option<String>> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Some(None),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            None
+        }
+        Err(error) => Some(Some(error.to_string())),
+    }
 }
 
 #[derive(Debug)]

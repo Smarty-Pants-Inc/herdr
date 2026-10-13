@@ -901,7 +901,7 @@ fn refuse_if_exists_rechecks_between_partial_syscalls_in_one_flush() {
         .expect_err("path guard refuses");
     assert_eq!(
         super::super::guard_path_present_details(&error),
-        Some((Some(true), false))
+        Some(("guard_path_present", Some(true), false))
     );
     assert!(!super::super::is_agent_session_lost(&error));
     assert!(runner.pending_writes.is_empty() && runner.active_submission.is_none());
@@ -913,6 +913,40 @@ fn refuse_if_exists_rechecks_between_partial_syscalls_in_one_flush() {
         std::thread::sleep(Duration::from_millis(5));
     }
     assert!(fixture.bytes().len() < length, "the rest was dropped");
+}
+
+/// Only "absent" lets the write proceed: ENOENT and ENOTDIR. Any other lookup
+/// error (here EACCES under a mode-000 parent) fails closed as unverifiable.
+#[test]
+fn refuse_if_exists_lookup_errors_fail_closed_and_absent_writes() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = NativePty::new();
+    let dir = &fixture.directory;
+    assert_eq!(super::super::guard_path_refusal(&dir.join("absent")), None);
+    std::fs::write(dir.join("file"), "x").expect("file");
+    assert_eq!(
+        super::super::guard_path_refusal(&dir.join("file/child")),
+        None,
+        "ENOTDIR: a non-directory component means the path cannot exist"
+    );
+    assert_eq!(
+        super::super::guard_path_refusal(&dir.join("file")),
+        Some(None)
+    );
+    // root bypasses directory permissions, so EACCES cannot be produced there.
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipping the EACCES case: running as root");
+        return;
+    }
+    let locked = dir.join("locked");
+    std::fs::create_dir(&locked).expect("locked dir");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+    let refusal = super::super::guard_path_refusal(&locked.join("claim"));
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).expect("restore");
+    let error = refusal
+        .expect("refused")
+        .expect("unverifiable, not present");
+    assert!(error.contains("os error 13"), "{error}");
 }
 
 #[test]

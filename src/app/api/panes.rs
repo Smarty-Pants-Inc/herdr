@@ -46,12 +46,14 @@ pub(super) fn pane_input_completion_response(id: String, result: std::io::Result
         // The path guard refused the write; like session loss, it reports
         // whether text bytes had already reached the PTY.
         Err(error) if crate::pty::actor::guard_path_present_details(&error).is_some() => {
-            let (partial, flush_failed) =
-                crate::pty::actor::guard_path_present_details(&error).unwrap_or((None, false));
+            let (code, partial, flush_failed) = crate::pty::actor::guard_path_present_details(
+                &error,
+            )
+            .unwrap_or(("guard_path_present", None, false));
             serde_json::json!({
                 "id": id,
                 "error": {
-                    "code": "guard_path_present",
+                    "code": code,
                     "message": error.to_string(),
                     "partial_text_consumed": partial,
                     "flush_failed": flush_failed

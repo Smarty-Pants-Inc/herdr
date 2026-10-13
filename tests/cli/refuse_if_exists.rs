@@ -268,6 +268,60 @@ fn refuse_if_exists_drops_the_key_when_the_claim_appears_before_the_write() {
     assert_eq!(pane.received_after_filler(4), b"PAGE");
 }
 
+/// A guard path that cannot be checked (its parent is mode 000, so lstat
+/// fails with EACCES) refuses with guard_path_unverifiable and 0 bytes: the
+/// guard fails closed. Root bypasses directory permissions, so this is
+/// skipped as root.
+#[test]
+fn refuse_if_exists_fails_closed_when_the_path_cannot_be_checked() {
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipping: root bypasses directory permissions (no EACCES)");
+        return;
+    }
+    let pane = HeldPane::start();
+    let locked = pane.base.join("locked");
+    fs::create_dir(&locked).unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+    let claim = locked.join("floor-claim");
+    pane.hold_writer();
+    let mut guarded = pane
+        .command()
+        .args([
+            "pane",
+            "send-keys",
+            &pane.pane_id,
+            "--refuse-if-exists",
+            claim.to_str().unwrap(),
+            "esc",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    pane.wait_for_accepted("pane.send_keys", 1, &mut guarded);
+    pane.release_writer();
+    let refused = guarded.wait_with_output().unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(refused.status.code(), Some(1), "{refused:?}");
+    let error = error_json(&refused);
+    assert_eq!(error["error"]["code"], "guard_path_unverifiable", "{error}");
+    assert_eq!(error["error"]["partial_text_consumed"], false, "{error}");
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("os error 13"),
+        "{error}"
+    );
+    let page = pane
+        .command()
+        .args(["pane", "send-text", &pane.pane_id, "PAGE"])
+        .output()
+        .unwrap();
+    assert!(page.status.success(), "{page:?}");
+    assert_eq!(pane.received_after_filler(4), b"PAGE");
+}
+
 /// Absent at write time: the guarded text is written as usual.
 #[test]
 fn refuse_if_exists_writes_when_the_path_is_still_absent() {

@@ -268,7 +268,7 @@ herdr pane run <pane_id> <command>
 
 既知の制限: 一時停止後に同じネイティブセッションを再開または再読み込みしても、ガード付き送信は再び許可されません。新しいセッションを開始する（`/new`）か、エージェントを再起動してください。[フォローアップの issue](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/7577) を参照してください。
 
-`pane send-text` または `pane send-keys` に `--refuse-if-exists PATH` を指定すると、Herdr が書き込む直前に PATH が存在する場合は入力を破棄します。Herdr はリクエストの受理時ではなく、各 `write(2)` の直前に `lstat` でパスを確認します。そのため、送信側の最後の確認の後、書き込みの前に作成されたファイルでも入力を止められます。拒否すると `guard_path_present` を返し、終了コード 1 で終了します。`partial_text_consumed: false` の場合、ペインには 1 バイトも届いていません。フラグなしの後続の送信は通常どおり届きます。CLI は相対 PATH を自身の作業ディレクトリを基準に絶対パスにします。サーバー機能 `refuse_if_exists_guard`（Unix のみ）が必要で、この機能がない場合は送信せずに `refuse_if_exists_unsupported` を返します。CLI はチェック付きメソッド `pane.send_text_path_checked` と `pane.send_keys_path_checked` を使うため、古いサーバーはリクエストを拒否し、フラグを無視することはありません。フラグを省略すると動作は変わりません。
+`pane send-text` または `pane send-keys` に `--refuse-if-exists PATH` を指定すると、Herdr が書き込む直前に PATH が存在する場合は入力を破棄します。Herdr はリクエストの受理時ではなく、各 `write(2)` の直前に `lstat` でパスを確認します。そのため、送信側の最後の確認の後、書き込みの前に作成されたファイルでも入力を止められます。拒否すると `guard_path_present` を返し、終了コード 1 で終了します。`partial_text_consumed: false` の場合、ペインには 1 バイトも届いていません。Herdr がパスを確認できない場合（たとえば親ディレクトリを検索できない場合）も `guard_path_unverifiable` で拒否します。書き込みが続行するのはパスが存在しない場合だけです。フラグなしの後続の送信は通常どおり届きます。CLI は相対 PATH を自身の作業ディレクトリを基準に絶対パスにします。サーバー機能 `refuse_if_exists_guard`（Unix のみ）が必要で、この機能がない場合は送信せずに `refuse_if_exists_unsupported` を返します。CLI はチェック付きメソッド `pane.send_text_path_checked` と `pane.send_keys_path_checked` を使うため、古いサーバーはリクエストを拒否し、フラグを無視することはありません。フラグを省略すると動作は変わりません。
 
 カスタムフックからエージェント状態を報告する:
 
