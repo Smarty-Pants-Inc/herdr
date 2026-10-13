@@ -2892,6 +2892,10 @@ impl TerminalState {
         timeout: Duration,
     ) {
         self.codex_prompt_ready = false;
+        // A previous agent's exit belongs to that agent. Left in place, the
+        // shell still in front while the new agent starts reads as
+        // exit-then-shell and frees the new launch's name.
+        self.recent_agent_process_exit = None;
         self.set_agent_name(name);
         self.agent_process_acquisition_pending = true;
         self.agent_name_owner = Some(AgentNameOwner {
@@ -3002,7 +3006,21 @@ impl TerminalState {
                 return true;
             }
             if now >= deadline {
-                self.clear_agent_name();
+                // The deadline bounds how long the expected agent may take to
+                // appear, not how long it may stay busy. Once seen (a resumed
+                // session can work past the deadline), the launch has its
+                // agent: keep the name. Only a launch whose agent never
+                // appeared releases it here.
+                // (A seen agent that is gone, or replaced, was cleared above.)
+                if observed_expected {
+                    self.managed_agent = Some(ManagedAgent {
+                        kind: managed.kind,
+                        phase: ManagedAgentPhase::Active,
+                    });
+                    self.managed_agent_launch_session = None;
+                } else {
+                    self.clear_agent_name();
+                }
                 return true;
             }
             if ready_after.is_none_or(|ready_after| now >= ready_after) {
@@ -4179,6 +4197,54 @@ mod tests {
         assert!(!terminal.reconcile_managed_agent_at(now + Duration::from_secs(2), false));
         assert_eq!(terminal.agent_name.as_deref(), Some("reviewer"));
         assert!(terminal.reconcile_managed_agent_at(now + Duration::from_secs(2), true));
+        assert_eq!(terminal.agent_name, None);
+    }
+
+    // Decision C: the CLI E2E in tests/cli/agents.rs cannot deterministically
+    // deliver a detection update with no agent between `agent start` and the
+    // agent process appearing (the detector publishes on change, and that
+    // window is a race), so this pins the relaunch-after-exit state directly.
+    #[test]
+    fn managed_launch_after_an_agent_exit_keeps_its_name_before_the_agent_appears() {
+        let now = Instant::now();
+        let mut terminal = test_terminal();
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
+        terminal.set_detected_state_with_visible_blocker(
+            Some(Agent::Pi),
+            AgentState::Idle,
+            false,
+            false,
+            true,
+        );
+        terminal.set_detected_state(None, AgentState::Unknown);
+        assert!(terminal.recent_agent_process_exit.is_some());
+
+        terminal.begin_managed_agent(
+            "lead-x".into(),
+            Agent::Pi,
+            now,
+            Duration::from_millis(100),
+            Duration::from_secs(60),
+        );
+        // The shell is still in front while it starts the new agent.
+        terminal.set_detected_state(None, AgentState::Unknown);
+        assert_eq!(terminal.agent_name.as_deref(), Some("lead-x"));
+        assert!(terminal.managed_agent_launch_pending());
+
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Working);
+        assert!(terminal.reconcile_managed_agent_at(now + Duration::from_secs(60), false));
+        assert_eq!(terminal.agent_name.as_deref(), Some("lead-x"));
+        assert!(terminal.managed_agent_interactive_ready());
+
+        // Leaving the pane still frees the name.
+        terminal.set_detected_state_with_visible_blocker(
+            Some(Agent::Pi),
+            AgentState::Idle,
+            false,
+            false,
+            true,
+        );
+        terminal.set_detected_state(None, AgentState::Unknown);
         assert_eq!(terminal.agent_name, None);
     }
 
