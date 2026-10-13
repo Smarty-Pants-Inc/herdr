@@ -765,6 +765,15 @@ enum SubmissionPhase {
 }
 
 impl PtyIoActorRunner {
+    /// Discards unread bytes in the slave input queue (TCIFLUSH).
+    fn flush_slave_input(&self) -> std::io::Result<()> {
+        #[cfg(test)]
+        if self.file.force_flush_failure {
+            return Err(std::io::Error::other("forced slave input flush failure"));
+        }
+        crate::platform::flush_pty_input(self.file.as_raw_fd())
+    }
+
     fn refuse_queued_poisoned_input(&mut self) {
         self.pending_writes.clear();
         self.current_write_offset = 0;
@@ -1212,12 +1221,24 @@ impl PtyIoActorRunner {
             PtyIoControlCommand::ClearInputPoison(reply) => {
                 let gate = Arc::clone(&self.user_writes);
                 let _gate = gate.lock().unwrap_or_else(|p| p.into_inner());
-                if self.input_poisoned.load(Ordering::Acquire) {
-                    self.refuse_queued_poisoned_input();
-                    self.sanitizer.reset();
-                    self.input_poisoned.store(false, Ordering::Release);
+                // Staged guarded text may still sit in the slave input queue
+                // (that is why the pane was poisoned). Drain it once more under
+                // the write gate and keep the poison when the drain fails, so a
+                // later Enter can never submit it (smarty-dev#8152).
+                let result = if self.input_poisoned.load(Ordering::Acquire) {
+                    self.flush_slave_input().map(|()| {
+                        self.refuse_queued_poisoned_input();
+                        self.sanitizer.reset();
+                        self.input_poisoned.store(false, Ordering::Release);
+                    })
+                } else {
+                    Ok(())
+                };
+                if let Err(error) = &result {
+                    error!(pane = self.pane_id, err = %error,
+                        "PTY input drain failed; pane input stays poisoned");
                 }
-                let _ = reply.send(Ok(()));
+                let _ = reply.send(result);
             }
             #[cfg(test)]
             PtyIoControlCommand::SetBeforeWrite {
@@ -1605,15 +1626,7 @@ impl PtyIoActorRunner {
                         });
                         self.current_write_offset = 0;
                         if partial_text_consumed {
-                            #[cfg(test)]
-                            let flushed = if self.file.force_flush_failure {
-                                Err(std::io::Error::other("forced slave input flush failure"))
-                            } else {
-                                crate::platform::flush_pty_input(self.file.as_raw_fd())
-                            };
-                            #[cfg(not(test))]
-                            let flushed = crate::platform::flush_pty_input(self.file.as_raw_fd());
-                            if let Err(flush_error) = flushed {
+                            if let Err(flush_error) = self.flush_slave_input() {
                                 error!(pane = self.pane_id, err = %flush_error,
                                     "guarded PTY flush failed; all pane input is poisoned until explicit operator clear");
                                 error = super::agent_session_flush_failed(guard);

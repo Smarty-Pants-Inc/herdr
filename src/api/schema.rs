@@ -36,7 +36,7 @@ pub use worktrees::*;
 
 pub const PANE_INPUT_POISON_NOTICE: &str = "Input is blocked because a failed flush may have left staged text on the line. Inspect or discard that text before explicitly clearing input poison.";
 pub const PANE_INPUT_POISON_CLEAR_WARNING: &str =
-    "Clearing input poison does not discard staged text; staged text may remain on the line.";
+    "Clearing input poison first discards unread pane input (TCIFLUSH) and refuses if that fails; text a program already read may remain in its own buffer.";
 
 fn is_false(value: &bool) -> bool {
     !*value

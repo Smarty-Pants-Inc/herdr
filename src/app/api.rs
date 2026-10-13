@@ -1483,7 +1483,8 @@ impl App {
             Method::PaneScroll(params) => return self.handle_pane_scroll(request.id, params),
             Method::PaneClear(target) => return self.handle_pane_clear(request.id, target),
             Method::PaneClearInputPoison(target) => {
-                return self.handle_pane_clear_input_poison(request.id, target);
+                // Both lanes are classified by the caller's peer, never by ingress.
+                return self.handle_pane_clear_input_poison(request.id, target, &mut context);
             }
             Method::PaneEditScrollback(target) => {
                 return self.handle_pane_edit_scrollback(request.id, target);
