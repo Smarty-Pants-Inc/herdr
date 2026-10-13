@@ -1316,31 +1316,29 @@ fn guarded_channel_draft_query_authorizes_caller_before_reservation_or_frame() {
     target.registration(1);
     let known = json!({"status":"known", "empty":true, "hold":null});
 
-    // Agent -> another pane without opt-in: refused; the receiver sees no frame.
-    let denied = source.agent_cli_draft_state("cross-denied.json", &target.id, false);
-    assert_refusal(&denied);
-    assert_eq!(denied["error"]["code"], "cross_pane_input_denied");
-    assert!(!denied.to_string().contains("empty"), "{denied}");
-    // An unattributable caller is refused the same way unless it opts in.
+    // Advisory guard (Paul, 2026-10-13): agent -> another pane without opt-in
+    // is accepted (and logged).
+    let advisory = source.agent_cli_draft_state("cross-advisory.json", &target.id, false);
+    assert_eq!(advisory["result"], known, "{advisory}");
+    // An unattributable caller is accepted the same way without opt-in.
     let unknown = server.cli_draft_state(&target.id, false, &[("HERDR_ENV", "0")]);
-    assert_refusal(&unknown);
-    assert_eq!(unknown["error"]["code"], "input_origin_unknown");
-    assert!(target.entries("queries.jsonl").is_empty());
+    assert_eq!(unknown["result"], known, "{unknown}");
+    assert_eq!(target.entries("queries.jsonl").len(), 2);
     assert!(source.entries("queries.jsonl").is_empty());
 
-    // Same pane by default, and another pane only with the explicit flag.
+    // Same pane by default, and the explicit flag still works.
     let own = source.agent_cli_draft_state("own.json", &source.id, false);
     assert_eq!(own["result"], known, "{own}");
     assert_eq!(source.entries("queries.jsonl").len(), 1);
     let allowed = source.agent_cli_draft_state("cross-allowed.json", &target.id, true);
     assert_eq!(allowed["result"], known, "{allowed}");
-    assert_eq!(target.entries("queries.jsonl").len(), 1);
+    assert_eq!(target.entries("queries.jsonl").len(), 3);
     let unknown = server.cli_draft_state(&target.id, true, &[("HERDR_ENV", "0")]);
     assert_eq!(unknown["result"], known, "{unknown}");
     // An ordinary external operator keeps agent.prompt's ordinary policy.
     let ordinary = server.cli_draft_state(&target.id, false, &[]);
     assert_eq!(ordinary["result"], known, "{ordinary}");
-    assert_eq!(target.entries("queries.jsonl").len(), 3);
+    assert_eq!(target.entries("queries.jsonl").len(), 5);
     assert_eq!(source.entries("queries.jsonl").len(), 1);
 
     for pane in [&source, &target] {

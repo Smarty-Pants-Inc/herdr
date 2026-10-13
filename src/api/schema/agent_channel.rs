@@ -19,9 +19,9 @@ pub struct AgentChannelInfoParams {
     pub target: String,
 }
 
-/// A read-only observation, never authority for a later prompt. Callers are
-/// authorized exactly like `agent.prompt`: an attributed agent may observe its own
-/// pane, and another pane only with explicit `allow_cross_pane`.
+/// A read-only observation, never authority for a later prompt. Callers follow
+/// the same advisory input-origin policy as `agent.prompt`: cross-pane queries
+/// are allowed and logged; `allow_cross_pane` is kept for compatibility.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AgentDraftStateParams {
