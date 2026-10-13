@@ -209,6 +209,10 @@ impl App {
             return Err(AgentStartError::InvalidTimeout);
         }
 
+        runtime
+            .validate_input_submission(&bytes)
+            .map_err(|err| AgentStartError::InputFailed(err.to_string()))?;
+
         let now = Instant::now();
         let terminal = self
             .state
