@@ -256,6 +256,7 @@ while True:
                 status, reason = 'rejected', 'admission_refused'
             if frame.get('if_draft_empty'):
                 assert isinstance(frame.get('deadline_ms'), int), frame
+                assert isinstance(frame.get('remaining_ms'), int), frame
                 if time.time() * 1000 >= frame['deadline_ms']:
                     status, reason = 'rejected', 'expired'
                 elif mode in ('draft_present', 'ui_hold', 'unknown'):
@@ -1129,6 +1130,10 @@ fn guarded_channel_if_draft_empty_accepts_and_retains_flag_identity_across_epoch
     assert_eq!(frames.len(), 1);
     assert_eq!(frames[0]["if_draft_empty"], true);
     assert!(frames[0]["deadline_ms"].as_u64().is_some());
+    // The relative budget the receiver admits on never exceeds the caller's timeout.
+    assert!(frames[0]["remaining_ms"]
+        .as_u64()
+        .is_some_and(|budget| budget <= 1_500));
     pane.exit(1);
     pane.assert_no_shell_input(1);
     assert!(!server.base.join("must-not-execute").exists());
