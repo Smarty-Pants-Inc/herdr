@@ -43,12 +43,17 @@
 //!    aggregate of the others) and `io.systemd.NameServiceSwitch` (a re-export of NSS) are
 //!    skipped;
 //! 7. the key file is a regular file (no symlink), `root:<key gid>`, no group-write or other
-//!    bits, at most 4096 bytes, in a root-owned directory without group or other write;
+//!    bits, at most 4096 bytes, in a root-owned directory without group or other write; the
+//!    file has no POSIX ACL entry beyond `user::`, `group::` and `other::`, and the directory
+//!    has no named-user or named-group access entry and no default ACL;
 //! 8. after the gid drop the process is verified non-dumpable and untraced.
 //!
 //! Any failure, unreadable file or unparseable record refuses.
-use std::ffi::OsString;
+use std::ffi::{CStr, OsString};
+use std::fs::File;
 use std::io::{Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -467,22 +472,45 @@ fn userdb_services_report_no_membership(
             services.push((name, entry.path()));
         }
     }
-    // ponytail: one thread bounds every blocking step (connect included) by the deadline;
-    // on timeout it is abandoned with its sockets, which have their own timeouts.
-    let (tx, rx) = std::sync::mpsc::channel();
-    let group = group.to_owned();
+    // Runs on the caller: connect, write and every read are bounded by the time left until
+    // `end`, so the whole scan returns by the deadline and leaves no worker behind.
     let end = Instant::now() + deadline;
-    std::thread::Builder::new()
-        .name("herdr-userdb".into())
-        .spawn(move || {
-            let result = services
-                .iter()
-                .try_for_each(|(name, path)| query_service(name, path, &group, gid, end));
-            let _ = tx.send(result);
-        })
-        .map_err(|e| format!("cannot query userdb services: {e}"))?;
-    rx.recv_timeout(deadline)
-        .unwrap_or_else(|_| Err("userdb services did not answer within the deadline".into()))
+    services
+        .iter()
+        .try_for_each(|(name, path)| query_service(name, path, group, gid, end))
+}
+
+/// A blocking Unix stream connect bounded by `timeout`. ponytail: Linux makes a connect to a
+/// listener with a full backlog wait for room for at most the socket's `SO_SNDTIMEO`, then
+/// fail with `EAGAIN`; a nonblocking connect would fail with `EAGAIN` at once, with nothing
+/// to poll for. The timeout stays set as the write timeout. `EINTR` fails (closed).
+fn connect_within(path: &Path, timeout: Duration) -> std::io::Result<UnixStream> {
+    let bytes = path.as_os_str().as_bytes();
+    // SAFETY: sockaddr_un is plain data; all zero is a valid value.
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    if bytes.len() >= addr.sun_path.len() || bytes.contains(&0) {
+        return Err(std::io::ErrorKind::InvalidInput.into());
+    }
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (dst, &src) in addr.sun_path.iter_mut().zip(bytes) {
+        *dst = src as libc::c_char;
+    }
+    // SAFETY: plain socket(2) call; the result is checked before use.
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: fd is a fresh socket this function owns; the stream closes it.
+    let stream = unsafe { UnixStream::from_raw_fd(fd) };
+    stream.set_write_timeout(Some(timeout))?;
+    let len = std::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1;
+    // SAFETY: addr is a valid, NUL-terminated sockaddr_un of at least `len` bytes.
+    let connected =
+        unsafe { libc::connect(fd, std::ptr::addr_of!(addr).cast(), len as libc::socklen_t) };
+    if connected != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(stream)
 }
 
 fn query_service(
@@ -571,7 +599,7 @@ fn varlink_more(
             .filter(|d| !d.is_zero())
             .ok_or_else(|| "timed out".to_owned())
     };
-    let mut stream = UnixStream::connect(path).map_err(|e| format!("connect: {e}"))?;
+    let mut stream = connect_within(path, remaining()?).map_err(|e| format!("connect: {e}"))?;
     parameters["service"] = service.into();
     let request = serde_json::json!({
         "method": format!("io.systemd.UserDatabase.{method}"),
@@ -880,23 +908,44 @@ fn lock_own_stack() -> bool {
 /// `group` is the required owning group in production (`None` only for the test seam, which
 /// requires an owner-only file instead).
 fn read_key_locked(path: &Path, group: Option<u32>) -> Option<LockedKey> {
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
+    // The directory and the key are checked through the fds they are read with (no TOCTOU).
+    let dir = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .open(parent.unwrap_or(Path::new(".")))
+        .ok()?;
     if group.is_some() {
-        let dir = std::fs::metadata(path.parent()?).ok()?;
-        if dir.uid() != 0 || dir.mode() & 0o022 != 0 {
+        let meta = dir.metadata().ok()?;
+        if meta.uid() != 0 || meta.mode() & 0o022 != 0 {
             return None;
         }
     }
-    let mut file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)
-        .ok()?;
+    let name = std::ffi::CString::new(path.file_name()?.as_bytes()).ok()?;
+    // SAFETY: openat on the open directory fd with a NUL-terminated name; checked below.
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: fd is a fresh descriptor this function owns; the File closes it.
+    let mut file = unsafe { File::from_raw_fd(fd) };
     let meta = file.metadata().ok()?;
     let mode_ok = match group {
         Some(gid) => meta.uid() == 0 && meta.gid() == gid && meta.mode() & 0o027 == 0,
         None => meta.mode() & 0o077 == 0,
     };
     if !meta.is_file() || !mode_ok || meta.len() > KEY_LIMIT {
+        return None;
+    }
+    // The test seam's directory is the caller's own; only production checks its ACLs.
+    if let Err(why) = acls_add_no_grant(&file, group.is_some().then_some(&dir)) {
+        eprintln!("herdr: server key unavailable: unexpected ACL: {why}");
         return None;
     }
     let mut pem = LockedBuf::new(KEY_LIMIT as usize + 1)?;
@@ -913,6 +962,73 @@ fn read_key_locked(path: &Path, group: Option<u32>) -> Option<LockedKey> {
         }
     }
     parse_pem(&pem.0[..len])
+}
+
+const ACL_ACCESS: &CStr = c"system.posix_acl_access";
+const ACL_DEFAULT: &CStr = c"system.posix_acl_default";
+const ACL_USER_OBJ: u16 = 0x01;
+const ACL_USER: u16 = 0x02;
+const ACL_GROUP_OBJ: u16 = 0x04;
+const ACL_GROUP: u16 = 0x08;
+const ACL_OTHER: u16 = 0x20;
+
+/// The entry tags of the POSIX ACL in xattr `name` on `fd` (format version 2: a `u32`
+/// version, then `{tag u16, perm u16, id u32}` entries, little-endian). Empty when there is
+/// none (`ENODATA`) or the filesystem has no ACLs (`ENOTSUP`). Any other error, more than 64
+/// entries or a malformed value is an error.
+fn acl_tags(fd: &File, name: &CStr) -> Result<Vec<u16>, String> {
+    let mut buf = [0u8; 4 + 8 * 64];
+    // SAFETY: fgetxattr writes at most buf.len() bytes into buf; the result is checked.
+    let n = unsafe {
+        libc::fgetxattr(
+            fd.as_raw_fd(),
+            name.as_ptr(),
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+        )
+    };
+    let what = name.to_string_lossy();
+    let Ok(n) = usize::try_from(n) else {
+        let err = std::io::Error::last_os_error();
+        return match err.raw_os_error() {
+            Some(libc::ENODATA | libc::ENOTSUP) => Ok(Vec::new()),
+            _ => Err(format!("cannot read {what}: {err}")),
+        };
+    };
+    buf[..n]
+        .strip_prefix(&2u32.to_le_bytes())
+        .filter(|entries| entries.len() % 8 == 0)
+        .map(|entries| {
+            entries
+                .chunks_exact(8)
+                .map(|e| u16::from_le_bytes([e[0], e[1]]))
+                .collect()
+        })
+        .ok_or_else(|| format!("malformed {what}"))
+}
+
+/// The mode bits show the key's access only when its ACL is the base `user::`, `group::`,
+/// `other::` triple: any mask or named entry can grant read to someone else. A named entry
+/// in the directory's access ACL, or any default ACL there, is refused too.
+fn acls_add_no_grant(file: &File, dir: Option<&File>) -> Result<(), String> {
+    if !acl_tags(file, ACL_ACCESS)?
+        .iter()
+        .all(|tag| matches!(*tag, ACL_USER_OBJ | ACL_GROUP_OBJ | ACL_OTHER))
+    {
+        return Err("the key file has a mask or named ACL entry".into());
+    }
+    if let Some(dir) = dir {
+        if acl_tags(dir, ACL_ACCESS)?
+            .iter()
+            .any(|tag| matches!(*tag, ACL_USER | ACL_GROUP))
+        {
+            return Err("the key directory has a named ACL entry".into());
+        }
+        if !acl_tags(dir, ACL_DEFAULT)?.is_empty() {
+            return Err("the key directory has a default ACL".into());
+        }
+    }
+    Ok(())
 }
 
 fn parse_pem(pem: &[u8]) -> Option<LockedKey> {
@@ -2000,5 +2116,146 @@ mod tests {
         std::fs::write(&path, "not a key").expect("write");
         assert!(read_key(&path, None).is_none(), "garbage refused");
         assert!(read_key(Path::new("/nonexistent/server.key"), None).is_none());
+    }
+
+    /// Writes POSIX ACL xattr `name` on `fd` from `(tag, perm, id)` entries.
+    fn set_acl(fd: &File, name: &CStr, entries: &[(u16, u16, u32)]) {
+        let mut value = 2u32.to_le_bytes().to_vec();
+        for (tag, perm, id) in entries {
+            value.extend(tag.to_le_bytes());
+            value.extend(perm.to_le_bytes());
+            value.extend(id.to_le_bytes());
+        }
+        // SAFETY: fsetxattr reads value.len() bytes from a live buffer.
+        let set = unsafe {
+            libc::fsetxattr(
+                fd.as_raw_fd(),
+                name.as_ptr(),
+                value.as_ptr().cast(),
+                value.len(),
+                0,
+            )
+        };
+        let err = std::io::Error::last_os_error();
+        assert!(
+            set == 0,
+            "cannot set {name:?} in {}: {err}; these tests need a TMPDIR with POSIX ACL \
+             support (for example ext4 under /srv/scratch)",
+            std::env::temp_dir().display()
+        );
+    }
+
+    #[test]
+    fn server_key_extra_acl_grants_refuse() {
+        // herdr#195 review P2: a named-user ACL can grant read while the mode bits pass.
+        const NONE: u32 = u32::MAX;
+        let dir = std::env::temp_dir().join(format!("herdr-acl-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("tempdir");
+        let dir = TempDir(dir);
+        let rng = ring::rand::SystemRandom::new();
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).expect("key");
+        use base64::Engine as _;
+        use std::os::unix::fs::PermissionsExt;
+        let pem = format!(
+            "-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n",
+            base64::engine::general_purpose::STANDARD.encode(pkcs8.as_ref())
+        );
+        let path = dir.0.join("server.key");
+        std::fs::write(&path, &pem).expect("write");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("mode");
+        let file = File::open(&path).expect("open key");
+        let dir_fd = File::open(&dir.0).expect("open dir");
+        // No ACL passes; a base-only ACL is the mode and passes too.
+        assert_eq!(acls_add_no_grant(&file, Some(&dir_fd)), Ok(()));
+        assert!(read_key(&path, None).is_some(), "no ACL loads");
+        let base = [
+            (ACL_USER_OBJ, 6, NONE),
+            (ACL_GROUP_OBJ, 0, NONE),
+            (ACL_OTHER, 0, NONE),
+        ];
+        set_acl(&file, ACL_ACCESS, &base);
+        assert_eq!(acls_add_no_grant(&file, Some(&dir_fd)), Ok(()));
+        assert!(read_key(&path, None).is_some(), "base ACL loads");
+        // nobody:r with an empty mask: the mode stays 0600 and passes, the ACL refuses.
+        set_acl(
+            &file,
+            ACL_ACCESS,
+            &[
+                (ACL_USER_OBJ, 6, NONE),
+                (ACL_USER, 4, 65534),
+                (ACL_GROUP_OBJ, 0, NONE),
+                (0x10, 0, NONE),
+                (ACL_OTHER, 0, NONE),
+            ],
+        );
+        let mode = std::fs::metadata(&path).expect("meta").mode();
+        assert_eq!(mode & 0o777, 0o600, "the mode check alone would pass");
+        assert!(acls_add_no_grant(&file, None).is_err());
+        assert!(read_key(&path, None).is_none(), "named-user ACL refused");
+        // A default ACL, or a named entry, on the directory refuses.
+        set_acl(&file, ACL_ACCESS, &base);
+        let dir_base = [
+            (ACL_USER_OBJ, 7, NONE),
+            (ACL_GROUP_OBJ, 0, NONE),
+            (ACL_OTHER, 0, NONE),
+        ];
+        set_acl(&dir_fd, ACL_DEFAULT, &dir_base);
+        assert_eq!(
+            acls_add_no_grant(&file, Some(&dir_fd)),
+            Err("the key directory has a default ACL".into())
+        );
+        // SAFETY: removes a named xattr from a live fd.
+        assert_eq!(
+            unsafe { libc::fremovexattr(dir_fd.as_raw_fd(), ACL_DEFAULT.as_ptr()) },
+            0
+        );
+        set_acl(
+            &dir_fd,
+            ACL_ACCESS,
+            &[
+                (ACL_USER_OBJ, 7, NONE),
+                (ACL_GROUP_OBJ, 0, NONE),
+                (ACL_GROUP, 5, 65534),
+                (0x10, 5, NONE),
+                (ACL_OTHER, 0, NONE),
+            ],
+        );
+        assert_eq!(
+            acls_add_no_grant(&file, Some(&dir_fd)),
+            Err("the key directory has a named ACL entry".into())
+        );
+        set_acl(&dir_fd, ACL_ACCESS, &dir_base);
+        assert_eq!(acls_add_no_grant(&file, Some(&dir_fd)), Ok(()));
+    }
+
+    #[test]
+    fn server_key_userdb_stalled_connect_returns_by_the_deadline() {
+        // herdr#195 review P3: a listener with a full backlog stalls a blocking connect. The
+        // scan must still return by its deadline and leave no thread behind.
+        let dir = std::env::temp_dir().join(format!("herdr-udb-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("tempdir");
+        let dir = TempDir(dir);
+        let path = dir.0.join("com.example.Full");
+        let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
+        // SAFETY: re-listens a live socket with backlog 0 (one pending connection).
+        assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 0) }, 0);
+        let mut pending = Vec::new();
+        while let Ok(stream) = connect_within(&path, Duration::from_millis(50)) {
+            pending.push(stream);
+            assert!(pending.len() < 8, "the backlog never filled");
+        }
+        let start = Instant::now();
+        let result =
+            userdb_services_report_no_membership(&dir.0, "herdr", 990, Duration::from_millis(300));
+        let took = start.elapsed();
+        let err = result.expect_err("a stalled service refuses");
+        assert!(err.contains("connect"), "{err}");
+        assert!(took < Duration::from_millis(600), "returned after {took:?}");
+        let threads = std::fs::read_dir("/proc/self/task")
+            .expect("tasks")
+            .filter_map(|t| std::fs::read_to_string(t.ok()?.path().join("comm")).ok())
+            .filter(|comm| comm.starts_with("herdr-userdb"))
+            .count();
+        assert_eq!(threads, 0, "no userdb worker outlives the call");
     }
 }
