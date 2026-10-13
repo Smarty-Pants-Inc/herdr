@@ -3112,9 +3112,18 @@ finally:
             .app
             .plugin_action_grants
             .bind_target(key, &source_terminal));
+        // The grandchild re-execs this unsigned test binary rather than
+        // Apple's protected `sleep`, whose environment macOS hides from
+        // KERN_PROCARGS2, so its pane marker stays observable on Darwin too.
         let mut action = GuardTestChild(
             std::process::Command::new("sh")
-                .args(["-c", "sleep 30 & echo $!; wait"])
+                .args([
+                    "-c",
+                    "\"$0\" --exact app::api::input_guard::tests::guard_exec_peer_helper \
+                     --nocapture >/dev/null & echo $!; wait",
+                ])
+                .arg(std::env::current_exe().expect("test executable"))
+                .env("HERDR_GUARD_EXEC_HELPER", "marked")
                 .env("HERDR_ENV", "1")
                 .env("HERDR_PANE_ID", &fixture.source_pane_id)
                 .stdout(std::process::Stdio::piped())
@@ -3131,7 +3140,7 @@ finally:
             crate::platform::pin_owned_child(&action).expect("pin action child")
         ));
         // `sh` prints the child PID immediately after fork. Before the child
-        // execs `sleep`, Linux can expose an empty /proc/<pid>/environ (and
+        // execs the helper, Linux can expose an empty /proc/<pid>/environ (and
         // macOS can likewise expose incomplete launch metadata). Poll the
         // production accept-time probe to wait for the exec, with a bound so
         // a live process that never reports its pane still fails this test.
