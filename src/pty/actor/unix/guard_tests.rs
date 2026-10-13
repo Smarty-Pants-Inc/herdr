@@ -274,6 +274,7 @@ impl NativePty {
             response_order: Arc::clone(&runner.response_order),
             foreground_fd: PtyForegroundObserver(Arc::downgrade(&runner.file.foreground)),
             consumer_epoch: Arc::clone(&runner.consumer_epoch),
+            input_guard: crate::platform::PtyInputGuard::new(&runner.file.foreground),
         }
     }
 
@@ -610,7 +611,11 @@ fn guarded_native_flush_failure_poison_blocks_all_input_until_operator_clear() {
         super::super::agent_session_loss_details(&loss),
         Some((None, true))
     );
-    assert!(handle.input_is_poisoned());
+    // Paul, 2026-10-13: a failed guarded flush no longer poisons the pane.
+    assert!(!handle.input_is_poisoned());
+    // The retained poison gate and its draining clear are still exercised
+    // through the test hook.
+    handle.test_set_input_poisoned(true);
     assert!(super::super::is_pane_input_poisoned(
         &runner
             .begin_handoff()
@@ -1320,41 +1325,16 @@ fn guarded_native_status_flush_failure_stays_typed_and_poisons_input() {
     );
     pump(&mut runner);
     status_mismatch(receipt, None, true);
-    assert!(handle.input_is_poisoned());
+    // Paul, 2026-10-13: the failed flush stays typed on this submission but
+    // never poisons the pane; later input is accepted.
+    assert!(!handle.input_is_poisoned());
     assert!(runner.pending_writes.is_empty());
     assert!(runner.active_submission.is_none());
-    let refused = handle
-        .queue_user_input_submission(
-            Bytes::from_static(b"forbidden"),
-            Bytes::from_static(b"\r"),
-            Duration::ZERO,
-        )
-        .expect_err("poison blocks later submissions");
-    assert!(super::super::is_pane_input_poisoned(&refused));
-    assert!(handle
-        .try_write_user_input(Bytes::from_static(b"\r"))
-        .is_err());
-    runner.enqueue_terminal_responses(vec![Bytes::from_static(b"response")]);
-    runner
-        .flush_pending_writes_once()
-        .expect("poison refuses writes");
-    assert!(runner.pending_writes.is_empty());
     runner.file.force_flush_failure = false;
-    crate::platform::flush_pty_input(runner.file.as_raw_fd()).expect("operator discards text");
-    assert!(
-        handle.input_is_poisoned(),
-        "successful flush alone never clears poison"
-    );
-    let (reply, cleared) = std_mpsc::channel();
-    runner.handle_control_command(PtyIoControlCommand::ClearInputPoison(reply));
-    cleared
-        .recv()
-        .expect("clear receipt")
-        .expect("operator clear");
-    assert!(!handle.input_is_poisoned());
+    crate::platform::flush_pty_input(runner.file.as_raw_fd()).expect("discard staged text");
     handle
         .try_write_user_input(Bytes::from_static(b"healthy"))
-        .expect("explicit clear restores input");
+        .expect("later input is accepted");
     runner.drain_data_commands();
     pump(&mut runner);
     assert_eq!(fixture.probe_bytes(), b"healthy");

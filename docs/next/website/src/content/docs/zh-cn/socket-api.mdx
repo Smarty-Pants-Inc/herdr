@@ -148,9 +148,19 @@ ACK 必须匹配实时连接、epoch、请求 ID 和会话代数。ACK 的 `stat
 
 只有完整帧才会提交。帧大小、并发请求、回执等待方和每个 epoch 的去重账本都有上限；容量耗尽时拒绝，不会驱逐仍可复用的去重键。服务器在发送前预留 `(registration_epoch, request_id, exact text, if_draft_empty)`。服务器和 Pi 都将守卫值纳入载荷身份，包括保留的旧 epoch 条目。相同载荷的重复请求共享首次回执并标记 `duplicate`；载荷改变时以 `payload_mismatch` 拒绝。新的请求 ID 绝不是自动重试。
 
+#### Epoch 轮换
+
+当某个 epoch 的去重账本达到轮换阈值时，服务器不再为该 epoch 预留新的请求 ID；这些请求以 `agent_channel_rotating` 失败，既不预留也不投递。已预留 ID 的重复请求仍返回其回执。当该 epoch 上没有待处理的请求后，服务器发送一个控制帧并关闭连接：
+
+```json
+{"type":"rotate","registration_epoch":"epoch_opaque","session_generation":"pi-session-token"}
+```
+
+Pi 只处理与其当前连接、epoch 和会话代数都匹配的 rotate 帧。它关闭套接字并打开新的套接字，以当前 `session_generation`（支持时附带 `draft_guard`）作为第一个请求再次发送 `agent.register_self`，并等待 `ready: true`。它不会重发旧连接上的投递或 ACK。在新注册就绪之前，`agent.channel_info` 报告 `ready: false`，投递会被拒绝。固定到旧 epoch 的投递以 `registration_epoch_mismatch` 失败，但在旧 epoch 上已预留请求的重复请求仅在该 epoch 是唯一保留的上一个 epoch，且当前通道仍已连接、处于前台并绑定到同一窗格时，才返回原回执；否则同样以 `registration_epoch_mismatch` 失败。调用方随后再次调用 `agent.channel_info` 并固定新的 `registration_epoch`；不得在新 epoch 下重放旧请求。
+
 #### 隐藏文本的草稿状态查询
 
-`agent.draft_state` 要求 `target`，并接受可选布尔值 `allow_cross_pane`（默认 `false`）作为显式跨窗格许可；查询同一窗格无需许可。它观察已注册接收端的编辑器和 UI hold，不作修改。默认查询超时为两秒。绝不返回草稿文本：
+`agent.draft_state` 要求 `target`，并为兼容性接受可选布尔值 `allow_cross_pane`（默认 `false`）；输入来源检查仅为建议性，跨窗格查询无需它也会被允许并记录日志。它观察已注册接收端的编辑器和 UI hold，不作修改。默认查询超时为两秒。绝不返回草稿文本：
 
 ```json
 {"id":"draft","method":"agent.draft_state","params":{"target":"w1:p1"}}
@@ -158,7 +168,7 @@ ACK 必须匹配实时连接、epoch、请求 ID 和会话代数。ACK 的 `stat
 {"id":"draft","result":{"status":"unknown","reason":"unsupported"}}
 ```
 
-`status: "known"` 中，`empty` 是布尔值，`hold` 为 `null`（无 hold）、`"dialog"`、`"custom"` 或 `"editor"`。结果不包含草稿文本或字符数。`status: "unknown"` 有类型化 `reason`：`unregistered`（无注册通道）、`unsupported`（缺少草稿守卫能力）、`timeout`（未及时回复）或 `unknown`（状态不可观察）。unknown 不能视为空。智能体默认可查询自己的窗格；查询其他窗格需要 `allow_cross_pane: true`。普通外部操作员遵循与 `agent.prompt` 相同的策略。授权在预留或发送帧之前检查。归属或连接不确定时拒绝操作。这次观察不是预留，也不是后续提示的授权；绝不把缓存状态当作后续安全投递的凭据。
+`status: "known"` 中，`empty` 是布尔值，`hold` 为 `null`（无 hold）、`"dialog"`、`"custom"` 或 `"editor"`。结果不包含草稿文本或字符数。`status: "unknown"` 有类型化 `reason`：`unregistered`（无注册通道）、`unsupported`（缺少草稿守卫能力）、`timeout`（未及时回复）或 `unknown`（状态不可观察）。unknown 不能视为空。智能体可查询自己的窗格，也可在不设置 `allow_cross_pane` 的情况下查询其他窗格：输入来源检查仅为建议性，跨窗格及无法确认归属的查询会被允许并记录日志。普通外部操作员遵循与 `agent.prompt` 相同的策略。检查在预留或发送帧之前进行；提供无效的插件动作令牌仍会被拒绝。连接不确定时拒绝操作。这次观察不是预留，也不是后续提示的授权；绝不把缓存状态当作后续安全投递的凭据。
 
 在已有注册 socket 上，查询和回复使用相同的 epoch、请求 ID 和会话代数：
 
@@ -180,7 +190,7 @@ ACK 必须匹配实时连接、epoch、请求 ID 和会话代数。ACK 的 `stat
 
 请求 `if_draft_empty: true` 前必须确认 `agent.channel_info.result.draft_guard == true`；否则旧服务器可能忽略新字段。CLI 的 `agent prompt --if-draft-empty` 和 `agent prompt-guarded --if-draft-empty` 都会预检能力，不会回退到键入或原有路径。便捷 `agent prompt` 标志不能与 `--wait`、`--until`、`--timeout` 组合。不带该标志时，原有 `agent prompt` 行为不变；原始 `agent.prompt` 不是草稿守卫方法。
 
-请求守卫时，`deliver` 帧增加 `if_draft_empty: true` 和 `deadline_ms`；无守卫帧省略守卫标志。`deadline_ms` 是服务器首次预留时固定的绝对 Unix 纪元毫秒期限，不是新的公开 API 参数。重复请求保留首次期限；调用方超时不同不改变载荷身份。Pi 在编辑器/hold 检查和 submit 调用前同步校验期限：`Date.now() >= deadline_ms` 以 `expired` 拒绝，不提交也不修改编辑器；守卫期限缺失或无效以 `unknown` 拒绝。
+请求守卫时，`deliver` 帧增加 `if_draft_empty: true`、`deadline_ms` 和 `remaining_ms`；无守卫帧省略守卫标志。期限在服务器首次预留时按服务器的单调时钟固定，不是新的公开 API 参数。重复请求保留首次期限；调用方超时不同不改变载荷身份。`remaining_ms` 是服务器开始写入该帧时该期限剩余的整毫秒数。`deadline_ms` 是同一期限的绝对 Unix 纪元毫秒值，保留用于日志和不认识 `remaining_ms` 的旧接收方。Pi 在收到帧时把 `remaining_ms` 换算为自身单调时钟上的期限，接纳要求该预算和 `deadline_ms` 都未到期：预算保证墙上时钟回拨不会让提示被迟到接纳，`deadline_ms` 保证 Pi 读取帧之前经过的时间也不会。缺少 `remaining_ms` 时仅使用 `deadline_ms`。Pi 在编辑器/hold 检查前和 submit 调用前同步校验期限：预算耗尽或期限已过以 `expired` 拒绝，不提交也不修改编辑器；守卫期限缺失或无效（包括缺少 `deadline_ms`（即使存在 `remaining_ms`），以及存在但格式错误的 `remaining_ms` 或 `deadline_ms`）以 `unknown` 拒绝。
 
 Pi 在调用 `pi.submitUserMessage` 前同步检查编辑器和 hold，检查与调用间无 await 或调度间隙，调用后再等待回执。绝不修改编辑器，也不使用键入或原有入口。非空草稿以 `draft_present` 拒绝，任何非 `undefined` 的 `holdState()` 值都以 `ui_hold` 拒绝（包括 `dialog`、`custom`、`editor`），getter 缺失、异常、非字符串草稿或不可观察的状态以 `unknown` 拒绝。这些都成为带类型化 `error.reason` 的 `agent_prompt_rejected` 错误。缺少注册或能力分别以 `unregistered` 或 `unsupported` 拒绝。这些接纳前拒绝不会提交任何提示，并保留草稿；之前的草稿查询不能绕过检查。
 
@@ -380,15 +390,15 @@ principal 由服务器解析，每个客户端连接只绑定一次。在 Linux 
 
 `agent_session_lost` 的 `error.partial_text_consumed` 为布尔值或 `null`，`error.flush_failed` 表示打开确切 slave 或执行 `TCIFLUSH` 是否失败。刷新成功时（或未写入文本阶段的字节、无需刷新时），`flush_failed` 为 `false`：当且仅当文本阶段的字节已到达 PTY、可能已被消费时，`partial_text_consumed` 为 `true`；当且仅当没有写入任何文本阶段的字节时，为 `false`。这不是读取方的接收确认。如果打开确切 slave 或执行 `TCIFLUSH` 失败，错误返回 `partial_text_consumed: null`（未知）和 `flush_failed: true`。会话守卫下的文本和按键发送会等待 actor 的类型化完成结果，而非在入队时返回成功。完成确认的是 PTY 写入，而不是接收方智能体的确认。丢失错误只会显示预期 ID，绝不显示实际 ID；出错后不要自动重试或降级为 unchecked 操作。
 
-如果打开确切 slave 或执行 `TCIFLUSH` 失败，Herdr 不会关闭 PTY master，也不会终止用户进程。它会丢弃剩余请求、不发送 Enter，并将窗格输入标记为 **POISONED**。所有 PTY 写入都会被服务器以类型化错误 `pane_input_poisoned` 拒绝，包括客户端按键和无守卫的 API 发送；服务器还会发送 `Notify`。操作员须显式执行 `herdr pane clear-input-poison <pane>` 才能清除；在已连接客户端中显示该通知的功能仍待 [smarty-dev#7908](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/7908) 实现。之后刷新成功也绝不会自动清除此状态。
+如果打开确切 slave 或执行 `TCIFLUSH` 失败，Herdr 不会关闭 PTY master，也不会终止用户进程。它会丢弃剩余请求、不发送 Enter，以 `flush_failed: true` 使该请求失败，并记录警告。之后的窗格输入不会被阻止。
 
-只有操作员显式调用 `pane.clear_input_poison`（指定 `pane_id`），或执行 CLI `herdr pane clear-input-poison <pane>` 才能清除，且须来自已连接的 Herdr 客户端或任何 Herdr 窗格之外的调用方。任何窗格内的调用方（包括被污染的窗格本身）都会收到 `operator_origin_required`（智能体针对其他窗格时为 `cross_pane_input_denied`，无法归属的调用方为 `input_origin_unknown`）；`allow_cross_pane` 不适用。清除前 Herdr 会再次丢弃窗格中未读取的输入（`TCIFLUSH`）；若失败，请求返回 `pane_clear_input_poison_failed`，窗格保持污染状态。**警告：** 前台程序已读取的文本仍留在其自身缓冲区，之后的 Enter 可能提交它。清除前请检查窗格。不要自动清除，也不要将清除作为重试策略。
+`pane.clear_input_poison`（指定 `pane_id`）或 CLI `herdr pane clear-input-poison <pane>` 仍然可用，并接受任何调用方；调用方来源会记录到日志。清除前 Herdr 会再次丢弃窗格中未读取的输入（`TCIFLUSH`）；若失败，请求返回 `pane_clear_input_poison_failed`，窗格保持污染状态。**警告：** 前台程序已读取的文本仍留在其自身缓冲区，之后的 Enter 可能提交它。清除前请检查窗格。不要自动清除，也不要将清除作为重试策略。
 
 ```json
 {"id":"clear_input_poison","method":"pane.clear_input_poison","params":{"pane_id":"w1:p1"}}
 ```
 
-内置的 Pi 集成版本 11 和 OMP 集成版本 12 会上报原生 ID 和未改变的恢复路径。旧的仅上报路径的集成会返回 `agent_session_unknown`；请运行 `herdr integration install pi` 或 `herdr integration install omp` 重新安装更新后的集成，再在安全的停顿点重启或重新加载该智能体，以加载更新的钩子并上报 ID。这一步加载钩子并不等于从暂停中恢复：恢复或重新加载同一个原生会话不会恢复带守卫发送的资格。请开启新会话（`/new`）或重启智能体；参见[后续问题](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/7577)。
+内置的 Pi 集成版本 12 和 OMP 集成版本 12 会上报原生 ID 和未改变的恢复路径。旧的仅上报路径的集成会返回 `agent_session_unknown`；请运行 `herdr integration install pi` 或 `herdr integration install omp` 重新安装更新后的集成，再在安全的停顿点重启或重新加载该智能体，以加载更新的钩子并上报 ID。这一步加载钩子并不等于从暂停中恢复：恢复或重新加载同一个原生会话不会恢复带守卫发送的资格。请开启新会话（`/new`）或重启智能体；参见[后续问题](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/7577)。
 
 `agent.prompt` 还接受 `expected_pane_id`，要求其目标（包括别名）解析到该精确窗格。解析到不同窗格时初始拒绝并返回 `expected_pane_mismatch`，不写入任何输入字节。这些预期条件可以单独或一起使用，也可与可选的 `wait` 对象一起使用。窗格发送操作已指定精确的 `pane_id`，没有 `expected_pane_id` 字段。初始检查与接受请求时 Herdr 的已上报窗格状态是原子的，但不是与智能体尚未上报的内部会话变化保持原子性。仍有两类残余竞态：最后一次实时进程／前台原生检查与 `write(2)` 之间的检查／写入间隙，以及所有权丢失／刷新／读取方之间的竞态；读取方可能在刷新前消费已暂存的字节。完成结果和刷新都不保证总写入或总消费字节数为零。App 到 actor 的队列和延迟 Enter 的等待受守卫保护，但不能消除这些原生竞态。省略预期条件会保留现有行为，不改变跨窗格输入策略。
 
@@ -415,6 +425,8 @@ principal 由服务器解析，每个客户端连接只绑定一次。在 Linux 
 检测到的 idle 是**最后观察到的状态**，并非实际智能体不忙的事务性证明。钩子和屏幕观察可能滞后，智能体也可能在检查后变忙。破坏性命令仍需要智能体侧的忙碌检查。这不是等待 idle 的操作，`wait` 仍观察提交后的活动和稳定状态。
 
 `pane.send_keys` 和 `pane.send_input.keys` 接受 Herdr 组合键字符串: 普通可打印键、`enter` 和 `esc` 这类特殊键、`ctrl+h`、`control+j`、`alt+x`、`shift+tab` 这类修饰组合键、`f1` 这类功能键,以及 `minus` 和 `plus` 这类命名标点。它们不接受 `prefix+` 绑定字符串。
+
+在 macOS 上,`pane.send_input`（由 `pane run` 使用）和 `agent.start` 会在命令进入输入队列前,检查终端当前规范模式的输入长度限制。编码后的行（包括 Enter）超限时,整条输入会被拒绝;请等待 shell 提示符出现后重试。多条短行和原始模式输入仍受支持。成功响应仍只表示已接受入队,不表示命令已执行。检查仅覆盖本次提交:它无法检查此前尚未完成的输入行,也无法保证排队期间终端模式不会改变。
 
 ```json
 {"id":"req_current","method":"pane.current","params":{"caller_pane_id":"w1:p1"}}
@@ -869,7 +881,7 @@ Herdr 在本地 socket 上使用换行分隔的 JSON。在 Unix 上,那个 socke
 
 两个方法都接受可选的 `resume_argv` 数组,内容是 Herdr 服务器重启后恢复上报者当前会话的命令。第一个元素必须是普通命令名而不是路径。该数组最多允许 64 个元素,总大小不超过 8 KiB,并且任何元素都不能包含撇号或控制字符;无效值会以 `invalid_resume_argv` 失败,该次上报不会生效。自定义智能体必须先通过 `pane.report_agent` 持有窗格才能附加命令,否则请求会以 `resume_not_accepted` 失败。Herdr 只在同一 `source` 和 `agent` 持有窗格时保留该命令,并且它优先于 Herdr 为该智能体内置的恢复命令。旧版 Herdr 会忽略这个字段。
 
-包含 `resume_argv` 的上报属于内容写入。Herdr 将本地智能体调用者及其子进程归属到终端,并以 `cross_pane_input_denied` 拒绝向其他窗格上报。无法确认归属的调用者会收到 `input_origin_unknown`。两个方法都接受 `allow_cross_pane`（默认 `false`）以显式允许跨窗格上报;CLI 用法为 `herdr pane report-agent ... --allow-cross-pane -- <resume-command...>` 或 `herdr pane report-agent-session ... --allow-cross-pane -- <resume-command...>`。不含 `resume_argv` 的上报仍仅更新元数据,无需此选项。显式允许仅绕过跨窗格策略,不会绕过恢复命令验证或上报权限规则。
+包含 `resume_argv` 的上报属于内容写入。Herdr 将本地智能体调用者及其子进程归属到终端,并记录向其他窗格的上报以及无法确认归属的上报;输入来源检查仅为建议性,不会拒绝它们。两个方法仍为兼容性接受 `allow_cross_pane`（默认 `false`）;CLI 用法为 `herdr pane report-agent ... --allow-cross-pane -- <resume-command...>` 或 `herdr pane report-agent-session ... --allow-cross-pane -- <resume-command...>`。不含 `resume_argv` 的上报仍仅更新元数据,无需此选项。显式允许仅绕过跨窗格策略,不会绕过恢复命令验证或上报权限规则。
 
 ```json
 {

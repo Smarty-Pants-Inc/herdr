@@ -1298,7 +1298,7 @@
         },
         "AgentDraftStateParams": {
           "additionalProperties": false,
-          "description": "A read-only observation, never authority for a later prompt. Callers are\nauthorized exactly like `agent.prompt`: an attributed agent may observe its own\npane, and another pane only with explicit `allow_cross_pane`.",
+          "description": "A read-only observation, never authority for a later prompt. Callers follow\nthe same advisory input-origin policy as `agent.prompt`: cross-pane queries\nare allowed and logged; `allow_cross_pane` is kept for compatibility.",
           "properties": {
             "allow_cross_pane": {
               "type": "boolean"
@@ -1336,8 +1336,10 @@
               "type": "string"
             },
             "timeout_ms": {
+              "description": "Admission receipt timeout in milliseconds (default 10000). Must be between 1 and 300000.",
               "format": "uint64",
-              "minimum": 0,
+              "maximum": 300000,
+              "minimum": 1,
               "type": "integer"
             }
           },

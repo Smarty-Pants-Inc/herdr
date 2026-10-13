@@ -364,9 +364,9 @@ fn agent_command() -> Command {
                 .arg(required("target", "TARGET").allow_hyphen_values(true))
                 .arg(
                     flag("allow-cross-pane")
-                        .help("Deliberately allow an agent-originated query to observe another pane"),
+                        .help("Accepted for compatibility; cross-pane agent queries are allowed and logged without it"),
                 )
-                .after_help("Callers are authorized like agent prompt: an agent may observe its own pane, and another pane only with --allow-cross-pane. An unregistered pane, an old extension, or an unavailable reply returns unknown. This snapshot does not authorize a later prompt; use --if-draft-empty for an atomic check."),
+                .after_help("Callers are authorized like agent prompt: an agent may observe its own pane, and another pane is allowed and logged without --allow-cross-pane. An unregistered pane, an old extension, or an unavailable reply returns unknown. This snapshot does not authorize a later prompt; use --if-draft-empty for an atomic check."),
         )
         .subcommand(
             Command::new("prompt-guarded")
@@ -391,7 +391,7 @@ fn agent_command() -> Command {
                 )
                 .arg(
                     flag("allow-cross-pane")
-                        .help("Deliberately allow an agent-originated request to target another pane"),
+                        .help("Accepted for compatibility; cross-pane agent input is allowed and logged without it"),
                 )
                 .arg(
                     flag("if-draft-empty")
@@ -416,7 +416,7 @@ fn agent_command() -> Command {
                 .arg(required("key", "KEY").num_args(1..).action(ArgAction::Append))
                 .arg(
                     flag("allow-cross-pane")
-                        .help("Deliberately allow an agent-originated request to target another pane"),
+                        .help("Accepted for compatibility; cross-pane agent input is allowed and logged without it"),
                 )
                 .after_help("Use esc as the canonical Escape key name; escape is also accepted. Use -- before payload arguments that match an option."),
         )
@@ -462,7 +462,7 @@ fn agent_command() -> Command {
                 )
                 .arg(
                     flag("allow-cross-pane")
-                        .help("Deliberately allow an agent-originated request to target another pane"),
+                        .help("Accepted for compatibility; cross-pane agent input is allowed and logged without it"),
                 )
                 .after_help(
                     "If the agent is already blocked, submission is rejected with agent_blocked before any input is sent. When an accepted submission starts from another non-working state, --wait requires an observed working or blocked state within 5000ms; otherwise it returns agent_prompt_stalled. A caller timeout that expires first returns timeout. It then matches idle, done, or blocked by default, or any exact --until state. It does not track turns: if the agent is already working, that active turn's completion may match.",
@@ -531,7 +531,7 @@ fn agent_command() -> Command {
                 )
                 .arg(
                     flag("allow-cross-pane")
-                        .help("Deliberately allow an agent-originated request to target another pane"),
+                        .help("Accepted for compatibility; cross-pane agent input is allowed and logged without it"),
                 )
                 .arg(
                     Arg::new("agent_args")
@@ -705,7 +705,7 @@ fn pane_command() -> Command {
                 .arg(required("text", "TEXT").num_args(1..).action(ArgAction::Append))
                 .arg(
                     flag("allow-cross-pane")
-                        .help("Deliberately allow an agent-originated request to target another pane"),
+                        .help("Accepted for compatibility; cross-pane agent input is allowed and logged without it"),
                 )
                 .after_help(
                     "Use -- before TEXT when the payload matches an option.\n\nnext: herdr pane run <PANE_ID> <COMMAND> sends text and Enter in one call",
@@ -719,7 +719,7 @@ fn pane_command() -> Command {
                 .arg(required("key", "KEY").num_args(1..).action(ArgAction::Append))
                 .arg(
                     flag("allow-cross-pane")
-                        .help("Deliberately allow an agent-originated request to target another pane"),
+                        .help("Accepted for compatibility; cross-pane agent input is allowed and logged without it"),
                 )
                 .after_help("Use esc as the canonical Escape key name; escape is also accepted. Use -- before payload arguments that match an option."),
         )
@@ -760,7 +760,7 @@ fn pane_command() -> Command {
                 .arg(expected_terminal_option())
                 .arg(
                     flag("allow-cross-pane")
-                        .help("Deliberately allow an agent-originated request to target another pane"),
+                        .help("Accepted for compatibility; cross-pane agent input is allowed and logged without it"),
                 )
                 .after_help("Use -- before command arguments that match an option."),
         )

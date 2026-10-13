@@ -4,7 +4,7 @@ use crate::api::schema::{Method, Request};
 use crate::api::ApiRequestContext;
 use crate::app::terminal_targets::{InputOrigin, TerminalTarget};
 
-const INPUT_ORIGIN_UNKNOWN_MESSAGE: &str = "cannot validate input origin; retry from a live attributable caller or explicitly opt in with CLI --allow-cross-pane (API allow_cross_pane: true)";
+const INPUT_ORIGIN_UNKNOWN_MESSAGE: &str = "the presented plugin action token is invalid, expired or already used; start the action again from its plugin";
 
 fn session_checked_guard_error(
     supported: bool,
@@ -74,11 +74,22 @@ impl App {
     ) -> Option<String> {
         // Decide from the method first: attribution walks every agent pane's session in
         // /proc, so doing it for each API request kept the server busy (smarty-dev#931).
-        // Only a content write that does not allow cross-pane input needs it.
-        if Self::allows_cross_pane(&request.method) {
+        // Only a content write needs it.
+        let target = self.content_write_target(&request.method)?;
+        let allow_cross_pane = Self::allows_cross_pane(&request.method);
+        let token_presented =
+            context.plugin_action != crate::plugin_action_origin::PluginActionClaim::Absent;
+        // The usual opted-in fleet write (smarty send) carries no plugin-action
+        // token: allow it without classifying its origin. A presented token is
+        // always validated below, flag or not (an invalid token stays refused).
+        if allow_cross_pane && !token_presented {
             return None;
         }
-        let target = self.content_write_target(&request.method)?;
+        // ponytail: without a token every outcome below is allowed (advisory
+        // guard), so for non-opted-in writes this classification, which walks
+        // agent pane sessions in /proc (smarty-dev#931), only feeds the
+        // advisory log line. Kept on purpose because that log was asked for;
+        // drop it here if the per-write cost ever shows up.
         let origin = self.input_origin_for_context_with_ancestry(context);
         let (code, message) = match origin {
             InputOrigin::Ordinary => return None,
@@ -100,6 +111,18 @@ impl App {
                     );
                     return None;
                 }
+                // A valid grant keeps the explicit opt-in as an override.
+                Ok(false) if allow_cross_pane => {
+                    tracing::info!(
+                        plugin_id = %grant.plugin_id,
+                        action_id = %grant.action_id,
+                        invoking_pane = grant.invoking_pane.as_deref().unwrap_or(""),
+                        grant = %grant.grant_id,
+                        target_terminal = %target.terminal_id,
+                        "plugin action cross-pane input allowed by explicit opt-in"
+                    );
+                    return None;
+                }
                 Ok(false) => (
                     "cross_pane_input_denied",
                     "plugin action input may target only its invoking pane and panes it created",
@@ -107,11 +130,30 @@ impl App {
                 Err(()) => ("input_origin_unknown", INPUT_ORIGIN_UNKNOWN_MESSAGE),
             },
             InputOrigin::Agent(source) if source.terminal_id == target.terminal_id => return None,
-            InputOrigin::Agent(_) => (
-                "cross_pane_input_denied",
-                "agent-originated input cannot target a different pane",
-            ),
-            InputOrigin::Unknown => ("input_origin_unknown", INPUT_ORIGIN_UNKNOWN_MESSAGE),
+            // Advisory only (Paul, 2026-10-13): fleet agents prompt each other,
+            // so cross-pane and unattributable writes are logged, never refused.
+            InputOrigin::Agent(source) => {
+                tracing::info!(
+                    origin = "agent",
+                    source_terminal = %source.terminal_id,
+                    target_terminal = %target.terminal_id,
+                    "cross-pane agent input allowed (advisory input-origin guard)"
+                );
+                return None;
+            }
+            // An invalid presented plugin-action grant stays refused: plugin
+            // grants are an opt-in guard, not fleet input.
+            InputOrigin::Unknown if token_presented => {
+                ("input_origin_unknown", INPUT_ORIGIN_UNKNOWN_MESSAGE)
+            }
+            InputOrigin::Unknown => {
+                tracing::warn!(
+                    origin = "unknown",
+                    target_terminal = %target.terminal_id,
+                    "input of unknown origin allowed (advisory input-origin guard)"
+                );
+                return None;
+            }
         };
         Some(encode_error(request.id.clone(), code, message))
     }
@@ -415,12 +457,39 @@ mod tests {
         ApiRequestContext::for_local_peer_pid(Some(std::process::id()))
     }
 
+    /// The input-origin guard is advisory (Paul, 2026-10-13): a cross-pane or
+    /// unattributable fleet write is accepted, so no origin refusal is returned.
+    fn assert_not_origin_refused(response: &str) {
+        let code = serde_json::from_str::<ErrorResponse>(response)
+            .map(|response| response.error.code)
+            .unwrap_or_default();
+        assert!(
+            code != "cross_pane_input_denied" && code != "input_origin_unknown",
+            "{response}"
+        );
+    }
+
+    /// Consumes whatever an advisory-allowed cross-pane write delivered.
+    fn drain_advisory_delivery(rx: &mut Receiver<Bytes>) {
+        while rx.try_recv().is_ok() {}
+    }
+
     fn assert_denied(response: &str) {
+        assert_not_origin_refused(response);
+    }
+
+    fn assert_unknown(response: &str) {
+        assert_not_origin_refused(response);
+    }
+
+    // Plugin-action grants are an opt-in guard and still refuse.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn assert_plugin_denied(response: &str) {
         let response: ErrorResponse = serde_json::from_str(response).expect("denial response");
         assert_eq!(response.error.code, "cross_pane_input_denied");
     }
 
-    fn assert_unknown(response: &str) {
+    fn assert_plugin_unknown(response: &str) {
         let response: ErrorResponse = serde_json::from_str(response).expect("unknown response");
         assert_eq!(response.error.code, "input_origin_unknown");
     }
@@ -678,13 +747,14 @@ mod tests {
                 }),
             };
             let denial = fixture.app.cross_pane_input_denial(&request, context);
+            // Advisory guard: both a proven foreign and an unprovable import
+            // are accepted now.
             if expected.is_some() {
-                let denial = denial.expect("imported guard applies");
                 // Name the failing branch under load: capture-time origin,
                 // live root identity, and whether the owned root exited.
                 assert!(
-                    denial.contains("cross_pane_input_denied"),
-                    "case {index}: {denial}; origin={:?}; live={:?}; original={original:?}; root_exit={:?}; recaptured={:?}; environ={:?}",
+                    denial.is_none(),
+                    "case {index}: {denial:?}; origin={:?}; live={:?}; original={original:?}; root_exit={:?}; recaptured={:?}; environ={:?}",
                     context.local_peer_pane_origin,
                     crate::platform::process_identity(pid),
                     child.try_wait(),
@@ -699,9 +769,8 @@ mod tests {
                             .collect::<Vec<_>>()
                     )),
                 );
-                assert_denied(&denial);
             } else {
-                assert_unknown(&denial.expect("unprovable import refuses input"));
+                assert!(denial.is_none());
             }
             if let Some(repeated_runtime) = repeat_runtime {
                 fixture
@@ -717,22 +786,16 @@ mod tests {
                         allow_cross_pane: false,
                     }),
                 };
-                assert_unknown(
-                    &fixture
-                        .app
-                        .cross_pane_input_denial(&repeated_request, context)
-                        .expect("rejected reimport refuses input"),
-                );
+                assert!(fixture
+                    .app
+                    .cross_pane_input_denial(&repeated_request, context)
+                    .is_none());
             }
             if let Method::PaneSendText(params) = &mut request.method {
                 params.pane_id = fixture.source_pane_id.clone();
             }
             let own_denial = fixture.app.cross_pane_input_denial(&request, context);
-            if expected.is_some() {
-                assert!(own_denial.is_none());
-            } else {
-                assert_unknown(&own_denial.expect("unproven own pane is also protected"));
-            }
+            assert!(own_denial.is_none());
             request.method = Method::AgentPrompt(AgentPromptParams {
                 expected_agent_session_id: None,
                 expected_pane_id: None,
@@ -872,12 +935,11 @@ mod tests {
                 allow_cross_pane: false,
             }),
         };
-        assert_denied(
-            &fixture
-                .app
-                .cross_pane_input_denial(&request, context)
-                .expect("attributed detached child must be denied without opt-in"),
-        );
+        // Advisory guard: allowed even without opt-in.
+        assert!(fixture
+            .app
+            .cross_pane_input_denial(&request, context)
+            .is_none());
         if let Method::AgentPrompt(params) = &mut request.method {
             params.allow_cross_pane = true;
         }
@@ -1023,25 +1085,25 @@ mod tests {
                     },
                     context,
                 );
-                let response: ErrorResponse =
-                    serde_json::from_str(&response).expect("denial response");
-                assert_eq!(
-                    response.error.code,
-                    if unsupported_guard {
-                        "expected_agent_session_unsupported"
-                    } else {
-                        origin_code
-                    },
-                    "method {index}: {origin_code}"
-                );
+                // Advisory guard: never an origin refusal; the opt-in
+                // session guard still refuses where unsupported.
+                if unsupported_guard {
+                    let response: ErrorResponse =
+                        serde_json::from_str(&response).expect("denial response");
+                    assert_eq!(
+                        response.error.code, "expected_agent_session_unsupported",
+                        "method {index}: {origin_code}"
+                    );
+                } else {
+                    assert_not_origin_refused(&response);
+                }
                 assert!(fixture.source_rx.try_recv().is_err());
-                assert!(fixture.target_rx.try_recv().is_err());
-                assert!(fixture.app.accepted_api_inputs.is_empty());
+                drain_advisory_delivery(&mut fixture.target_rx);
             }
         }
 
         assert!(fixture.source_rx.try_recv().is_err());
-        assert!(fixture.target_rx.try_recv().is_err());
+        drain_advisory_delivery(&mut fixture.target_rx);
     }
 
     #[tokio::test]
@@ -1057,17 +1119,13 @@ mod tests {
         let denial =
             |request: &Request, context| fixture.app.cross_pane_input_denial(request, context);
         // Another pane's private editor state needs the same explicit opt-in as a prompt.
-        assert_denied(
-            &denial(&query(&fixture.target_pane_id, false), attributed_context())
-                .expect("cross-pane draft query denied"),
-        );
-        assert_unknown(
-            &denial(
-                &query(&fixture.target_pane_id, false),
-                ApiRequestContext::default(),
-            )
-            .expect("unknown origin denied"),
-        );
+        // Advisory guard: cross-pane and unknown-origin queries are allowed.
+        assert!(denial(&query(&fixture.target_pane_id, false), attributed_context()).is_none());
+        assert!(denial(
+            &query(&fixture.target_pane_id, false),
+            ApiRequestContext::default(),
+        )
+        .is_none());
         assert!(denial(&query(&fixture.source_pane_id, false), attributed_context()).is_none());
         for context in [attributed_context(), ApiRequestContext::default()] {
             assert!(denial(&query(&fixture.target_pane_id, true), context).is_none());
@@ -1147,9 +1205,10 @@ mod tests {
             .terminal_id(target_pane)
             .unwrap()
             .clone();
+        // Advisory guard: the cross-pane report is accepted.
         assert!(fixture.app.state.terminals[&target_terminal_id]
             .reported_resume()
-            .is_none());
+            .is_some());
 
         let own_response = fixture.app.handle_api_request_with_context(
             Request {
@@ -1222,7 +1281,7 @@ mod tests {
             ApiRequestContext::capture(Some(stale)),
         );
         assert_unknown(&response);
-        assert!(fixture.target_rx.try_recv().is_err());
+        drain_advisory_delivery(&mut fixture.target_rx);
         assert!(fixture.source_rx.try_recv().is_err());
     }
 
@@ -1249,7 +1308,7 @@ mod tests {
                 context,
             );
             assert_unknown(&response);
-            assert!(fixture.target_rx.try_recv().is_err());
+            drain_advisory_delivery(&mut fixture.target_rx);
             assert!(fixture.source_rx.try_recv().is_err());
         }
 
@@ -1307,7 +1366,7 @@ mod tests {
                 .handle_api_request_with_context(request, attributed_context())
         });
         assert_unknown(&response);
-        assert!(fixture.target_rx.try_recv().is_err());
+        drain_advisory_delivery(&mut fixture.target_rx);
         assert!(fixture.source_rx.try_recv().is_err());
     }
 
@@ -1366,7 +1425,7 @@ mod tests {
                 .handle_api_request_with_context(request.clone(), context)
         });
         assert_unknown(&response);
-        assert!(fixture.target_rx.try_recv().is_err());
+        drain_advisory_delivery(&mut fixture.target_rx);
         fixture
             .app
             .state
@@ -1379,7 +1438,7 @@ mod tests {
                 .handle_api_request_with_context(request, context)
         });
         assert_unknown(&response);
-        assert!(fixture.target_rx.try_recv().is_err());
+        drain_advisory_delivery(&mut fixture.target_rx);
         assert!(fixture.source_rx.try_recv().is_err());
     }
 
@@ -1476,7 +1535,7 @@ mod tests {
                 ));
                 assert_unknown(&response.recv().expect("deferred unknown"));
                 assert!(fixture.source_rx.try_recv().is_err());
-                assert!(fixture.target_rx.try_recv().is_err());
+                drain_advisory_delivery(&mut fixture.target_rx);
             });
         });
     }
@@ -1596,8 +1655,8 @@ mod tests {
                 } else {
                     assert_denied(&response);
                 }
-                assert!(fixture.source_rx.try_recv().is_err());
-                assert!(fixture.target_rx.try_recv().is_err());
+                drain_advisory_delivery(&mut fixture.source_rx);
+                drain_advisory_delivery(&mut fixture.target_rx);
             }
 
             let (respond_to, response_rx) = std::sync::mpsc::channel();
@@ -1624,7 +1683,7 @@ mod tests {
                 } else {
                     assert_denied(&response);
                 }
-                assert!(fixture.target_rx.try_recv().is_err());
+                drain_advisory_delivery(&mut fixture.target_rx);
             }
         });
     }
@@ -1698,7 +1757,7 @@ mod tests {
                     assert_unknown(&response);
                 }
                 assert!(fixture.source_rx.try_recv().is_err());
-                assert!(fixture.target_rx.try_recv().is_err());
+                drain_advisory_delivery(&mut fixture.target_rx);
             });
         }
         // Captured markers are checked before outside/age evidence. Neither a
@@ -1721,7 +1780,7 @@ mod tests {
                             .handle_api_request_with_context(request.clone(), marked),
                     );
                     assert!(fixture.source_rx.try_recv().is_err());
-                    assert!(fixture.target_rx.try_recv().is_err());
+                    drain_advisory_delivery(&mut fixture.target_rx);
                     let mut explicit = request.clone();
                     if let Method::PaneSendText(params) = &mut explicit.method {
                         params.allow_cross_pane = true;
@@ -1848,7 +1907,7 @@ mod tests {
                     marked,
                 );
                 assert_denied(&denied);
-                assert!(fixture.target_rx.try_recv().is_err());
+                drain_advisory_delivery(&mut fixture.target_rx);
             }
 
             // Check the native adapter against a real strictly older ancestor.
@@ -1908,7 +1967,7 @@ mod tests {
                 unknown,
             );
             assert_unknown(&response);
-            assert!(fixture.target_rx.try_recv().is_err());
+            drain_advisory_delivery(&mut fixture.target_rx);
 
             // Losing the real pane link cannot promote the marked caller even
             // with Outside observation available for that exact live peer.
@@ -1924,7 +1983,7 @@ mod tests {
             );
             assert_unknown(&response);
             assert!(fixture.source_rx.try_recv().is_err());
-            assert!(fixture.target_rx.try_recv().is_err());
+            drain_advisory_delivery(&mut fixture.target_rx);
         });
     }
 
@@ -1955,7 +2014,7 @@ mod tests {
             );
             assert_unknown(&response);
             assert!(fixture.source_rx.try_recv().is_err());
-            assert!(fixture.target_rx.try_recv().is_err());
+            drain_advisory_delivery(&mut fixture.target_rx);
         });
     }
 
@@ -2389,7 +2448,7 @@ mod tests {
                 assert_denied(&response);
             }
             assert!(fixture.source_rx.try_recv().is_err());
-            assert!(fixture.target_rx.try_recv().is_err());
+            drain_advisory_delivery(&mut fixture.target_rx);
         }
         let (respond_to, response) = std::sync::mpsc::channel();
         assert!(fixture.app.handle_deferred_agent_api_request(
@@ -2409,7 +2468,7 @@ mod tests {
             respond_to,
         ));
         assert_denied(&response.recv().expect("deferred cross-pane refusal"));
-        assert!(fixture.target_rx.try_recv().is_err());
+        drain_advisory_delivery(&mut fixture.target_rx);
     }
 
     #[cfg(windows)]
@@ -2433,7 +2492,7 @@ mod tests {
                 .handle_api_request_with_context(request, attributed_context())
         });
         assert_unknown(&response);
-        assert!(fixture.target_rx.try_recv().is_err());
+        drain_advisory_delivery(&mut fixture.target_rx);
         assert!(fixture.source_rx.try_recv().is_err());
     }
 
@@ -2482,7 +2541,7 @@ mod tests {
                 );
             } else {
                 assert_denied(&response);
-                assert!(fixture.target_rx.try_recv().is_err());
+                drain_advisory_delivery(&mut fixture.target_rx);
             }
         }
         drop(client);
@@ -2524,7 +2583,7 @@ mod tests {
             missing,
         );
         assert_unknown(&response);
-        assert!(fixture.target_rx.try_recv().is_err());
+        drain_advisory_delivery(&mut fixture.target_rx);
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -2560,7 +2619,7 @@ mod tests {
             .app
             .handle_api_request_with_context(queued.request.clone(), queued.context);
         assert_unknown(&response);
-        assert!(fixture.target_rx.try_recv().is_err());
+        drain_advisory_delivery(&mut fixture.target_rx);
         let mut explicit = queued.request;
         if let Method::PaneSendText(params) = &mut explicit.method {
             params.allow_cross_pane = true;
@@ -2807,7 +2866,7 @@ finally:
                 respond_to,
             ));
             assert_unknown(&response.recv().expect("deferred refusal"));
-            assert!(fixture.target_rx.try_recv().is_err());
+            drain_advisory_delivery(&mut fixture.target_rx);
             assert!(fixture.source_rx.try_recv().is_err());
         }
         let mut explicit = queued.request;
@@ -2921,7 +2980,7 @@ finally:
                 .app
                 .handle_api_request_with_context(request, context),
         );
-        assert!(fixture.target_rx.try_recv().is_err());
+        drain_advisory_delivery(&mut fixture.target_rx);
         let _ = ordinary_peer.kill();
         let _ = ordinary_peer.wait();
     }
@@ -2941,9 +3000,10 @@ finally:
             assert!(
                 matches!(origin, InputOrigin::Agent(ref target) if target.terminal_id == source.terminal_id)
             );
+            // Advisory guard (Paul, 2026-10-13): the foreign report is accepted.
             for (pane_id, opt_in, resume, denied) in [
                 (fixture.source_pane_id.clone(), false, true, false),
-                (fixture.target_pane_id.clone(), false, true, true),
+                (fixture.target_pane_id.clone(), false, true, false),
                 (fixture.target_pane_id.clone(), true, true, false),
                 (fixture.target_pane_id.clone(), false, false, false),
             ] {
@@ -3172,20 +3232,13 @@ finally:
             }),
         };
 
-        // Copied pane marker without a grant is still refused cross-pane (this
-        // fixture's source pane root is the test process, so the descendant is
-        // attributed to the source agent rather than unknown).
-        let refused: ErrorResponse =
-            serde_json::from_str(&fixture.app.handle_api_request_with_context(
-                send("no-token", &fixture.target_pane_id, false),
-                copied_marker,
-            ))
-            .expect("refusal");
-        assert!(matches!(
-            refused.error.code.as_str(),
-            "cross_pane_input_denied" | "input_origin_unknown"
+        // Copied pane marker without a grant is no plugin input: it takes the
+        // advisory fleet path and is accepted (Paul, 2026-10-13).
+        assert_not_origin_refused(&fixture.app.handle_api_request_with_context(
+            send("no-token", &fixture.target_pane_id, false),
+            copied_marker,
         ));
-        assert!(fixture.target_rx.try_recv().is_err());
+        drain_advisory_delivery(&mut fixture.target_rx);
 
         // The grandchild with the grant reaches its invoking terminal, no
         // opt-in needed, but not the pre-existing other pane (herdr#223).
@@ -3194,7 +3247,7 @@ finally:
             fixture.app.input_origin_for_context(granted),
             InputOrigin::PluginAction(grant.clone())
         );
-        assert_denied(&fixture.app.handle_api_request_with_context(
+        assert_plugin_denied(&fixture.app.handle_api_request_with_context(
             send("granted-cross", &fixture.target_pane_id, false),
             granted,
         ));
@@ -3229,10 +3282,15 @@ finally:
             PluginActionClaim::Malformed,
         ] {
             for context in [copied_marker, attributed_context()] {
-                assert_unknown(&fixture.app.handle_api_request_with_context(
-                    send("forged", &fixture.source_pane_id, false),
-                    context.with_plugin_action(claim),
-                ));
+                // The cross-pane opt-in never bypasses token validation.
+                for opt_in in [false, true] {
+                    for pane in [&fixture.source_pane_id, &fixture.target_pane_id] {
+                        assert_plugin_unknown(&fixture.app.handle_api_request_with_context(
+                            send("forged", pane, opt_in),
+                            context.with_plugin_action(claim),
+                        ));
+                    }
+                }
             }
         }
         assert!(fixture.source_rx.try_recv().is_err());
@@ -3243,10 +3301,12 @@ finally:
             attributed_context(),
         ));
         assert!(fixture.source_rx.try_recv().is_ok());
-        assert_denied(&fixture.app.handle_api_request_with_context(
+        // No grant: the advisory fleet path accepts agent cross-pane input.
+        assert_ok(&fixture.app.handle_api_request_with_context(
             send("agent-cross", &fixture.target_pane_id, false),
             attributed_context(),
         ));
+        drain_advisory_delivery(&mut fixture.target_rx);
         assert_ok(&fixture.app.handle_api_request_with_context(
             send("opt-in", &fixture.target_pane_id, true),
             copied_marker,
@@ -3262,11 +3322,13 @@ finally:
             "descendant still alive"
         );
         for pane in [&fixture.target_pane_id, &fixture.source_pane_id] {
-            assert_unknown(
-                &fixture
-                    .app
-                    .handle_api_request_with_context(send("replay", pane, false), granted),
-            );
+            for opt_in in [false, true] {
+                assert_plugin_unknown(
+                    &fixture
+                        .app
+                        .handle_api_request_with_context(send("replay", pane, opt_in), granted),
+                );
+            }
         }
         assert!(fixture.source_rx.try_recv().is_err());
         assert!(fixture.target_rx.try_recv().is_err());
@@ -3274,6 +3336,41 @@ finally:
         // observes alive (its parent was reaped above, so it is reparented, not
         // reused; start time is compared just before).
         unsafe { libc::kill(grandchild as libc::pid_t, libc::SIGKILL) };
+    }
+
+    /// Review fix: a forged or malformed plugin-action token with
+    /// allow_cross_pane: true is refused exactly as without the flag, on every
+    /// content-write method, while the same opt-in without a token is accepted.
+    #[tokio::test]
+    async fn invalid_plugin_token_with_allow_cross_pane_is_still_refused() {
+        use crate::plugin_action_origin::{PluginActionClaim, PluginActionToken};
+        let fixture = attributed_agent_fixture();
+        let forged =
+            PluginActionClaim::Presented(PluginActionToken::parse(&"7".repeat(64)).expect("hex"));
+        let send = |pane: &str| Request {
+            id: "opt-in".into(),
+            method: Method::PaneSendText(PaneSendTextParams {
+                expected_agent_session_id: None,
+                pane_id: pane.into(),
+                text: "x".into(),
+                allow_cross_pane: true,
+            }),
+        };
+        for pane in [&fixture.source_pane_id, &fixture.target_pane_id] {
+            for claim in [forged, PluginActionClaim::Malformed] {
+                for base in [ApiRequestContext::default(), attributed_context()] {
+                    let denial = fixture
+                        .app
+                        .cross_pane_input_denial(&send(pane), base.with_plugin_action(claim))
+                        .expect("invalid token refused despite opt-in");
+                    assert_plugin_unknown(&denial);
+                }
+            }
+            assert!(fixture
+                .app
+                .cross_pane_input_denial(&send(pane), ApiRequestContext::default())
+                .is_none());
+        }
     }
 
     /// herdr-8592: a grant past its maximum age is refused while the child lives.
@@ -3326,7 +3423,17 @@ finally:
             .plugin_action_grants
             .backdate_for_test(key, MAX_GRANT_AGE + std::time::Duration::from_secs(1));
         let late = request();
-        assert_unknown(&fixture.app.handle_api_request_with_context(late, context));
+        assert_plugin_unknown(&fixture.app.handle_api_request_with_context(late, context));
+        // The cross-pane opt-in does not revive an expired grant.
+        let mut late_opt_in = request();
+        if let Method::PaneSendText(params) = &mut late_opt_in.method {
+            params.allow_cross_pane = true;
+        }
+        assert_plugin_unknown(
+            &fixture
+                .app
+                .handle_api_request_with_context(late_opt_in, context),
+        );
         assert!(fixture.target_rx.try_recv().is_err());
         drop(action);
     }
@@ -3427,7 +3534,7 @@ finally:
                     assert_ok(&response);
                     assert!(fixture.target_rx.try_recv().is_ok(), "{name}");
                 } else {
-                    assert_unknown(&response);
+                    assert_plugin_unknown(&response);
                     assert!(fixture.target_rx.try_recv().is_err(), "{name}");
                 }
             }
@@ -3536,7 +3643,7 @@ finally:
 
         // Token A: pre-existing B refused, own invoking A admitted (real write).
         assert_eq!(decide(&fixture, &fixture.target_pane_id, a), denied);
-        assert_denied(
+        assert_plugin_denied(
             &fixture
                 .app
                 .handle_api_request_with_context(send(&fixture.target_pane_id), a),

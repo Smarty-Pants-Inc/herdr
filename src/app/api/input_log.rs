@@ -131,8 +131,8 @@ impl App {
             }
         }
         if let Some(peer) = context.local_peer_identity {
-            // The guard may have skipped its chronology proof (explicit opt-in
-            // or captured pane markers). Otherwise reuse its request-local
+            // The guard may have skipped its chronology proof (a non-write
+            // method or captured pane markers). Otherwise reuse its request-local
             // observation: no additional /proc walk to log verdict or root.
             let ancestry = context
                 .server_ancestry

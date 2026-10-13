@@ -122,6 +122,7 @@ pub(crate) struct PtyIoActorHandle {
     response_order: Arc<Mutex<()>>,
     foreground_fd: PtyForegroundObserver,
     consumer_epoch: Arc<Mutex<Option<String>>>,
+    input_guard: crate::platform::PtyInputGuard,
 }
 
 #[derive(Debug)]
@@ -194,6 +195,10 @@ impl PtyIoActorHandle {
             })?;
         self.wake_actor();
         Ok(rx)
+    }
+
+    pub(crate) fn validate_input_submission(&self, bytes: &[u8]) -> std::io::Result<()> {
+        self.input_guard.validate(bytes)
     }
 
     pub(crate) fn try_write_user_input_with_source(
@@ -552,6 +557,7 @@ impl PtyIoActor {
             response_order: Arc::clone(&response_order),
             foreground_fd: PtyForegroundObserver(Arc::downgrade(&file.foreground)),
             consumer_epoch: Arc::new(Mutex::new(None)),
+            input_guard: crate::platform::PtyInputGuard::new(&file.foreground),
         };
 
         let mut runner = PtyIoActorRunner {
@@ -1637,10 +1643,12 @@ impl PtyIoActorRunner {
                         self.current_write_offset = 0;
                         if partial_text_consumed {
                             if let Err(flush_error) = self.flush_slave_input() {
-                                error!(pane = self.pane_id, err = %flush_error,
-                                    "guarded PTY flush failed; all pane input is poisoned until explicit operator clear");
+                                // Advisory (Paul, 2026-10-13): report the flush
+                                // failure on this submission but never poison
+                                // the pane's later input.
+                                warn!(pane = self.pane_id, err = %flush_error,
+                                    "guarded PTY flush failed; later pane input is not blocked");
                                 error = super::agent_session_flush_failed(guard);
-                                self.input_poisoned.store(true, Ordering::Release);
                             }
                         }
                         self.fail_active_submission(error);
@@ -2476,6 +2484,30 @@ mod tests {
         handle.shutdown();
     }
 
+    #[tokio::test]
+    async fn input_preflight_preserves_handoff_and_shutdown_write_gates() {
+        let (handle, mut peer, _read_rx) = actor_with_socket_pair(false);
+        let runtime = crate::terminal::TerminalRuntime::test_with_actor(handle.clone());
+        handle.begin_handoff(Duration::from_secs(1)).unwrap();
+        // A successful preflight is not permission to bypass the existing gate.
+        runtime.validate_input_submission(b"blocked").unwrap();
+        assert!(runtime
+            .try_send_bytes(Bytes::from_static(b"blocked"))
+            .is_err());
+        handle.rollback_handoff().unwrap();
+        runtime.validate_input_submission(b"after").unwrap();
+        runtime
+            .try_send_bytes(Bytes::from_static(b"after"))
+            .unwrap();
+        let mut bytes = [0; 5];
+        peer.read_exact(&mut bytes).unwrap();
+        assert_eq!(&bytes, b"after");
+        handle.shutdown();
+        assert!(runtime
+            .try_send_bytes(Bytes::from_static(b"closed"))
+            .is_err());
+    }
+
     #[test]
     fn resize_and_nudge_keep_latest_request_when_command_queue_is_full() {
         let (data_tx, _data_rx) = mpsc::channel(1);
@@ -2498,6 +2530,7 @@ mod tests {
             response_order: Arc::new(Mutex::new(())),
             foreground_fd: PtyForegroundObserver::default(),
             consumer_epoch: Arc::new(Mutex::new(None)),
+            input_guard: Default::default(),
         };
 
         handle.resize(20, 80, 8, 16, vec![Bytes::from_static(b"old")]);
@@ -2588,6 +2621,7 @@ mod tests {
             response_order,
             foreground_fd: PtyForegroundObserver(Arc::downgrade(&runner.file.foreground)),
             consumer_epoch: Arc::clone(&runner.consumer_epoch),
+            input_guard: crate::platform::PtyInputGuard::new(&runner.file.foreground),
         };
         let (changed_tx, changed_rx) = std_mpsc::channel();
         let (continue_tx, continue_rx) = std_mpsc::channel();
@@ -2663,6 +2697,7 @@ mod tests {
             response_order: Arc::new(Mutex::new(())),
             foreground_fd: PtyForegroundObserver::default(),
             consumer_epoch: Arc::new(Mutex::new(None)),
+            input_guard: Default::default(),
         };
 
         let handoff = std::thread::spawn(move || handle.begin_handoff(Duration::from_secs(1)));

@@ -196,7 +196,7 @@ herdr tab close <tab_id>
 
 标签页是工作区内的另一个终端布局。不指定 `--workspace` 时,`tab create` 使用活动工作区;如果没有活动工作区则失败。JSON 响应中的 `.result.tab.tab_id` 和 `.result.root_pane.pane_id` 是对应 ID。关闭工作区的最后一个标签页也会关闭该工作区。启用 `ui.confirm_close` 时，如果关闭父工作树的最后一个标签页会连带关闭整个工作树组，`tab close` 会返回 `confirmation_required` 错误。
 
-启用 `ui.confirm_close` 时，通过快捷键或标签页菜单关闭工作区的最后一个标签页前，TUI 会要求确认。普通的 CLI/API 标签页关闭操作仍立即执行。
+启用 `ui.confirm_close` 时，通过快捷键或标签页／窗格菜单关闭工作区的最后一个标签页或唯一窗格前，TUI 会要求确认。普通的窗格关闭及 CLI/API 关闭操作仍立即执行。
 
 创建工作区、标签页和拆分窗格默认不改变焦点。`--focus` 选择新布局;`--no-focus` 显式表达默认行为。不指定 `--cwd` 时,新终端遵循 `terminal.new_cwd` 设置,默认跟随来源窗格或工作区。每个 `--env KEY=VALUE` 在新的根 shell 中添加或替换一个环境变量。
 
@@ -260,9 +260,9 @@ herdr pane run <pane_id> <command>
 
 `agent_session_lost` 的 `partial_text_consumed` 为布尔值或 `null`，`flush_failed` 表示打开确切 slave 或执行 `TCIFLUSH` 是否失败。刷新成功时（或未写入文本阶段的字节、无需刷新时），`flush_failed` 为 `false`：当且仅当文本阶段的字节已到达 PTY、可能已被消费时，`partial_text_consumed` 为 `true`；当且仅当没有写入任何文本阶段的字节时，为 `false`。这不是读取方的接收确认。如果打开确切 slave 或执行 `TCIFLUSH` 失败，错误返回 `partial_text_consumed: null`（未知）和 `flush_failed: true`。带守卫的发送返回 PTY actor 的完成结果，而非仅确认入队成功；这并不是接收方智能体的确认。由于输入可能已部分写入，出错后不要自动重试或移除预期条件。这些错误绝不会泄露实际会话 ID。
 
-如果打开确切 slave 或执行 `TCIFLUSH` 失败，Herdr 不会关闭 PTY master，也不会终止用户进程。它会丢弃剩余请求、不发送 Enter，并将窗格输入标记为 **POISONED**。所有 PTY 写入都会被服务器以类型化错误 `pane_input_poisoned` 拒绝，包括客户端按键和无守卫的 API 发送；服务器还会发送 `Notify`。操作员须显式执行 `herdr pane clear-input-poison <pane>` 才能清除；在已连接客户端中显示该通知的功能仍待 [smarty-dev#7908](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/7908) 实现。之后刷新成功也绝不会自动清除此状态。
+如果打开确切 slave 或执行 `TCIFLUSH` 失败，Herdr 不会关闭 PTY master，也不会终止用户进程。它会丢弃剩余请求、不发送 Enter，以 `flush_failed: true` 使该请求失败，并记录警告。之后的窗格输入不会被阻止。
 
-只有操作员显式执行 `herdr pane clear-input-poison <pane>`（API `pane.clear_input_poison`）才能清除，且须从已连接的 Herdr 客户端或任何 Herdr 窗格之外的终端执行。任何窗格内的调用方（包括被污染的窗格本身）都会被拒绝，返回 `operator_origin_required`（智能体针对其他窗格时为 `cross_pane_input_denied`，无法归属的调用方为 `input_origin_unknown`）；没有 `--allow-cross-pane` 覆盖。清除前 Herdr 会再次丢弃窗格中未读取的输入（`TCIFLUSH`）；若失败则拒绝清除，窗格保持污染状态。**警告：** 前台程序已读取的文本仍留在其自身缓冲区，之后的 Enter 可能提交它。清除前请检查窗格。不要自动清除，也不要将清除作为重试策略。
+`herdr pane clear-input-poison <pane>`（API `pane.clear_input_poison`）仍然可用，并接受任何调用方；调用方来源会记录到日志。清除前 Herdr 会再次丢弃窗格中未读取的输入（`TCIFLUSH`）；若失败则拒绝清除，窗格保持污染状态。**警告：** 前台程序已读取的文本仍留在其自身缓冲区，之后的 Enter 可能提交它。清除前请检查窗格。不要自动清除，也不要将清除作为重试策略。
 
 初始检查与接受请求时 Herdr 的已上报窗格状态是原子的。它无法检测智能体尚未上报的会话变化。仍有两类残余竞态：最后一次实时进程／前台原生检查与 `write(2)` 之间的检查／写入间隙，以及所有权丢失／刷新／读取方之间的竞态；读取方可能在刷新前消费已暂存的字节。完成结果和刷新都不保证总写入或总消费字节数为零。App 到 actor 的队列和延迟 Enter 的等待受守卫保护，但不能消除这些原生竞态。CLI 要求 `expected_agent_session_guard`，仅 Linux 支持并通告此能力。macOS 和 Windows 在无法确认安全时拒绝操作；macOS 的原生证明尚待实现。缺少支持时，CLI 返回 `expected_agent_session_unsupported`，不发送带守卫的操作，并使用 checked 方法名，因此即使能力检查后服务器被替换，也会在无法确认安全时拒绝操作。省略这些标志会保留现有行为和独立的跨窗格输入策略。
 
@@ -396,7 +396,7 @@ herdr agent prompt-guarded w1:p1 "Review this change" \
   --request-id review-1 --timeout-ms 10000
 ```
 
-`prompt-guarded` 只通过智能体已注册的 socket 通道发送字面文本，绝不向 PTY 写入提示文本、准备字节或 Enter，不改变输入焦点，也不回退到 `agent prompt`。不带 `--if-draft-empty` 时，现有 `agent prompt` 行为保持不变。目标、文本、两个固定标识和请求 ID 都不能为空。`--timeout-ms` 等待的是接纳回执，而非轮次完成；默认 10000，允许 1–300000 毫秒。`--allow-cross-pane` 显式允许现有跨窗格输入策略中的操作，但不会绕过通道或身份检查。
+`prompt-guarded` 只通过智能体已注册的 socket 通道发送字面文本，绝不向 PTY 写入提示文本、准备字节或 Enter，不改变输入焦点，也不回退到 `agent prompt`。不带 `--if-draft-empty` 时，现有 `agent prompt` 行为保持不变。目标、文本、两个固定标识和请求 ID 都不能为空。`--timeout-ms` 等待的是接纳回执，而非轮次完成；默认 10000，允许 1–300000 毫秒。`--allow-cross-pane` 为兼容性保留；不带它时跨窗格输入也会被允许并记录日志。二者都不会绕过通道或身份检查。
 
 `agent prompt --if-draft-empty` 是已注册通道的便捷入口：它在发送前要求 `draft_guard: true`，复制当前终端/epoch 标识并生成请求 ID，然后以 `if_draft_empty: true` 调用 `agent.prompt_guarded`。绝不回退到键入或原有提示投递。此标志不能与原有的 `--wait`、`--until`、`--timeout` 组合；这类组合在发送前即被拒绝。要指定接纳回执期限，请用 `prompt-guarded --timeout-ms`。
 
@@ -404,7 +404,7 @@ herdr agent prompt-guarded w1:p1 "Review this change" \
 
 守卫帧带有期限；Pi 在上述检查和调用前同步拒绝已过期帧，原因为 `expired`，不提交提示也不修改编辑器。守卫期限缺失或无效时以 `unknown` 拒绝。在 socket 发送前发生的类型化失败表示没有发送；可能已接纳后的回执丢失仍是 `delivery_unknown`，绝不重放。
 
-`agent draft-state` 通过注册通道执行只读、隐藏文本的观察，默认查询超时为两秒。known 结果只报告草稿是否为空以及 UI hold（`null`、`"dialog"`、`"custom"` 或 `"editor"`）；绝不返回草稿文本或字符数。否则返回 `{status: "unknown", reason}`，原因为 `unregistered`（无通道）、`unsupported`（无能力）、`timeout`（未及时回复）或 `unknown`（状态不可观察）。unknown 不代表草稿为空。智能体默认可查询自己的窗格；查询其他窗格需要 `--allow-cross-pane`。普通外部操作员遵循与 `agent.prompt` 相同的策略。授权在预留或发送帧之前检查。查询不是后续发送的授权；守卫提示会在接纳时重新检查。
+`agent draft-state` 通过注册通道执行只读、隐藏文本的观察，默认查询超时为两秒。known 结果只报告草稿是否为空以及 UI hold（`null`、`"dialog"`、`"custom"` 或 `"editor"`）；绝不返回草稿文本或字符数。否则返回 `{status: "unknown", reason}`，原因为 `unregistered`（无通道）、`unsupported`（无能力）、`timeout`（未及时回复）或 `unknown`（状态不可观察）。unknown 不代表草稿为空。输入来源检查仅为建议性：智能体查询其他窗格会被允许并记录日志，`--allow-cross-pane` 为兼容性保留但不再需要。普通外部操作员遵循与 `agent.prompt` 相同的策略。授权在预留或发送帧之前检查。查询不是后续发送的授权；守卫提示会在接纳时重新检查。
 
 成功返回 `status: "accepted"`（已接纳到活动会话的输入）或 `"queued"`（已进入该会话的后续消息队列），以及固定的终端、epoch、请求 ID 和会话代数。两种状态都不保证模型轮次已完成或成功。同一 epoch 中，相同请求 ID、完全相同文本和相同 `if_draft_empty` 值共享首次结果，不会再次提交；改变文本或守卫值返回 `payload_mismatch`。新 ID 表示新请求，不是安全重试。
 

@@ -1081,11 +1081,10 @@ fn pane_read_rejects_invalid_value_with_usage_error() {
     assert!(!stderr.contains("Error: Custom"));
 }
 
-/// smarty-dev#8152: clearing a pane's input poison is an operator action. A real
-/// `herdr` CLI run inside a pane is refused for another pane and for its own pane
-/// (plain shell pane: operator_origin_required; reported agent pane targeting
-/// another pane: the cross-pane policy's cross_pane_input_denied). The same CLI
-/// run outside every pane is the operator and succeeds. Drain-before-clear on a
+/// smarty-dev#8152, rolled back by Paul on 2026-10-13: clearing a pane's input
+/// poison accepts any caller. A real `herdr` CLI run inside a pane succeeds for
+/// another pane and for its own pane, from a plain shell pane and from a
+/// reported agent pane. The same CLI run outside every pane also succeeds. Drain-before-clear on a
 /// poisoned pane is proven natively in pty::actor guard_tests, because no CLI
 /// path can poison pane input (it needs a failed TCIFLUSH during guarded loss).
 #[cfg(target_os = "linux")]
@@ -1122,7 +1121,7 @@ fn clear_input_poison_is_refused_inside_panes_and_accepted_from_an_operator() {
         let out = base.join(format!("clear-{run}.json"));
         let done = base.join(format!("clear-{run}.done"));
         let command = format!(
-            "'{}' pane clear-input-poison {pane} 2> '{}'; echo $? > '{}'",
+            "'{}' pane clear-input-poison {pane} > '{}'; echo $? > '{}'",
             env!("CARGO_BIN_EXE_herdr"),
             out.display(),
             done.display()
@@ -1136,22 +1135,20 @@ fn clear_input_poison_is_refused_inside_panes_and_accepted_from_an_operator() {
             }),
             "in-pane CLI did not finish"
         );
-        assert_eq!(fs::read_to_string(&done).unwrap().trim(), "1");
-        // The CLI prints its warnings, then the error response, on stderr.
-        let stderr = fs::read_to_string(&out).unwrap();
-        serde_json::from_str(stderr.lines().last().unwrap_or_default()).unwrap()
+        // Paul, 2026-10-13: any caller may clear, so the in-pane CLI succeeds.
+        assert_eq!(fs::read_to_string(&done).unwrap().trim(), "0");
+        let stdout = fs::read_to_string(&out).unwrap();
+        serde_json::from_str(stdout.lines().last().unwrap_or_default()).unwrap()
     };
 
-    // A plain shell pane is pane-attributed: refused for another pane and its own.
+    // A plain shell pane is pane-attributed: accepted for another pane and its own.
     for pane in [target.clone(), source.clone()] {
-        let refused = clear_from_source_pane(&pane);
-        assert_eq!(
-            refused["error"]["code"], "operator_origin_required",
-            "{refused}"
-        );
+        let accepted = clear_from_source_pane(&pane);
+        assert_eq!(accepted["result"]["type"], "ok", "{accepted}");
     }
 
-    // Once the source pane is an agent, the cross-pane policy refuses it first.
+    // Once the source pane is an agent, cross-pane and own-pane clears are
+    // still accepted (the origin check is advisory).
     assert!(run_cli(
         &socket_path,
         &[
@@ -1168,16 +1165,10 @@ fn clear_input_poison_is_refused_inside_panes_and_accepted_from_an_operator() {
     )
     .status
     .success());
-    let refused = clear_from_source_pane(&target);
-    assert_eq!(
-        refused["error"]["code"], "cross_pane_input_denied",
-        "{refused}"
-    );
-    let refused = clear_from_source_pane(&source);
-    assert_eq!(
-        refused["error"]["code"], "operator_origin_required",
-        "{refused}"
-    );
+    for pane in [target.clone(), source.clone()] {
+        let accepted = clear_from_source_pane(&pane);
+        assert_eq!(accepted["result"]["type"], "ok", "{accepted}");
+    }
 
     // The operator: the same CLI outside every pane.
     // Strip every inherited HERDR_* so the run is outside every pane even when
@@ -1327,11 +1318,12 @@ fn clear_input_poison_client_lane_is_refused_inside_a_pane() {
             "in-pane client did not finish: {}",
             fs::read_to_string(&log).unwrap_or_default()
         );
-        let refused: serde_json::Value =
+        // Paul, 2026-10-13: any caller may clear, in-pane clients too.
+        let accepted: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&out).unwrap()).unwrap();
         assert_eq!(
-            refused["error"]["code"], "operator_origin_required",
-            "in-pane client targeting {pane}: {refused}"
+            accepted["result"]["type"], "ok",
+            "in-pane client targeting {pane}: {accepted}"
         );
     }
 

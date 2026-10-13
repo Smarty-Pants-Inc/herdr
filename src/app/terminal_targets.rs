@@ -516,8 +516,10 @@ impl App {
         let server_boundary =
             Some(crate::platform::process_identity(std::process::id()).ok_or(())?);
         if allow_outside_proof {
-            let observation = crate::platform::process_identity_server_ancestry(peer_identity);
-            *ancestry = Some(observation);
+            // Reuse a request-local observation already made for this request.
+            let observation = *ancestry.get_or_insert_with(|| {
+                crate::platform::process_identity_server_ancestry(peer_identity)
+            });
             match observation.verdict {
                 crate::platform::ServerAncestry::Outside => return Ok(None),
                 crate::platform::ServerAncestry::Unknown => return Err(()),

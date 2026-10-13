@@ -37,7 +37,7 @@ use std::io;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-const MIN_RENDER_INTERVAL: Duration = Duration::from_millis(16);
+pub(crate) const MIN_RENDER_INTERVAL: Duration = Duration::from_millis(16);
 // Native git metadata events drive freshness; this timer is only a safety net.
 const GIT_REMOTE_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 const GIT_REPO_DISCOVERY_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
