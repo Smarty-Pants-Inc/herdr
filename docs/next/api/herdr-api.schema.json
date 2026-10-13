@@ -1336,8 +1336,10 @@
               "type": "string"
             },
             "timeout_ms": {
+              "description": "Admission receipt timeout in milliseconds (default 10000). Must be between 1 and 300000.",
               "format": "uint64",
-              "minimum": 0,
+              "maximum": 300000,
+              "minimum": 1,
               "type": "integer"
             }
           },

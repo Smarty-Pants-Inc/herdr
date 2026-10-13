@@ -331,7 +331,8 @@ mod tests {
         );
         assert_eq!(
             actual.remove("agent.prompt_guarded").as_deref(),
-            Some("0050a4d70632bcb5f0fe36a83a901ce950e88c01cb10bcd14242e773bf3a350b")
+            // Documents the timeout_ms range (1..=300000) the runtime already enforced.
+            Some("5997009857a9ad7d619501f43f89638cbe1ba8ba83624945dc548145f4dd66c4")
         );
         assert_eq!(
             actual.remove("pane.clear").as_deref(),
@@ -369,7 +370,8 @@ mod tests {
             endpoint_method_shape_digests(false)
                 .get("agent.prompt_guarded")
                 .map(String::as_str),
-            Some("bd40c327ee86565c527641a10d3fceb74f5f797e69bf9f3bdbdf0f55c13c413b")
+            // Documents the timeout_ms range (1..=300000) the runtime already enforced.
+            Some("e9c1f4e9f2cc0cbe48015ce593d12407b656c1580d6e806cb2fd60424a4270e4")
         );
         let schema = serde_json::to_value(schemars::schema_for!(
             crate::api::schema::AgentPromptGuardedParams

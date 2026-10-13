@@ -44,7 +44,8 @@ pub struct AgentPromptGuardedParams {
         skip_serializing_if = "Option::is_none",
         deserialize_with = "deserialize_timeout"
     )]
-    #[schemars(with = "u64")]
+    /// Admission receipt timeout in milliseconds (default 10000). Must be between 1 and 300000.
+    #[schemars(with = "u64", range(min = 1, max = 300_000))]
     pub timeout_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "super::is_false")]
     pub allow_cross_pane: bool,
