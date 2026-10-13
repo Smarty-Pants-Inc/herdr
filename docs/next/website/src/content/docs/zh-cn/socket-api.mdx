@@ -180,7 +180,7 @@ ACK 必须匹配实时连接、epoch、请求 ID 和会话代数。ACK 的 `stat
 
 请求 `if_draft_empty: true` 前必须确认 `agent.channel_info.result.draft_guard == true`；否则旧服务器可能忽略新字段。CLI 的 `agent prompt --if-draft-empty` 和 `agent prompt-guarded --if-draft-empty` 都会预检能力，不会回退到键入或原有路径。便捷 `agent prompt` 标志不能与 `--wait`、`--until`、`--timeout` 组合。不带该标志时，原有 `agent prompt` 行为不变；原始 `agent.prompt` 不是草稿守卫方法。
 
-请求守卫时，`deliver` 帧增加 `if_draft_empty: true` 和 `deadline_ms`；无守卫帧省略守卫标志。`deadline_ms` 是服务器首次预留时固定的绝对 Unix 纪元毫秒期限，不是新的公开 API 参数。重复请求保留首次期限；调用方超时不同不改变载荷身份。Pi 在编辑器/hold 检查和 submit 调用前同步校验期限：`Date.now() >= deadline_ms` 以 `expired` 拒绝，不提交也不修改编辑器；守卫期限缺失或无效以 `unknown` 拒绝。
+请求守卫时，`deliver` 帧增加 `if_draft_empty: true`、`deadline_ms` 和 `remaining_ms`；无守卫帧省略守卫标志。期限在服务器首次预留时按服务器的单调时钟固定，不是新的公开 API 参数。重复请求保留首次期限；调用方超时不同不改变载荷身份。`remaining_ms` 是服务器开始写入该帧时该期限剩余的整毫秒数。`deadline_ms` 是同一期限的绝对 Unix 纪元毫秒值，保留用于日志和不认识 `remaining_ms` 的旧接收方。Pi 在收到帧时把 `remaining_ms` 换算为自身单调时钟上的期限，接纳要求该预算和 `deadline_ms` 都未到期：预算保证墙上时钟回拨不会让提示被迟到接纳，`deadline_ms` 保证 Pi 读取帧之前经过的时间也不会。缺少 `remaining_ms` 时仅使用 `deadline_ms`。Pi 在编辑器/hold 检查前和 submit 调用前同步校验期限：预算耗尽或期限已过以 `expired` 拒绝，不提交也不修改编辑器；守卫期限缺失或无效（包括缺少 `deadline_ms`（即使存在 `remaining_ms`），以及存在但格式错误的 `remaining_ms` 或 `deadline_ms`）以 `unknown` 拒绝。
 
 Pi 在调用 `pi.submitUserMessage` 前同步检查编辑器和 hold，检查与调用间无 await 或调度间隙，调用后再等待回执。绝不修改编辑器，也不使用键入或原有入口。非空草稿以 `draft_present` 拒绝，任何非 `undefined` 的 `holdState()` 值都以 `ui_hold` 拒绝（包括 `dialog`、`custom`、`editor`），getter 缺失、异常、非字符串草稿或不可观察的状态以 `unknown` 拒绝。这些都成为带类型化 `error.reason` 的 `agent_prompt_rejected` 错误。缺少注册或能力分别以 `unregistered` 或 `unsupported` 拒绝。这些接纳前拒绝不会提交任何提示，并保留草稿；之前的草稿查询不能绕过检查。
 
@@ -386,7 +386,7 @@ principal 由服务器解析，每个客户端连接只绑定一次。在 Linux 
 {"id":"clear_input_poison","method":"pane.clear_input_poison","params":{"pane_id":"w1:p1"}}
 ```
 
-内置的 Pi 集成版本 11 和 OMP 集成版本 12 会上报原生 ID 和未改变的恢复路径。旧的仅上报路径的集成会返回 `agent_session_unknown`；请运行 `herdr integration install pi` 或 `herdr integration install omp` 重新安装更新后的集成，再在安全的停顿点重启或重新加载该智能体，以加载更新的钩子并上报 ID。这一步加载钩子并不等于从暂停中恢复：恢复或重新加载同一个原生会话不会恢复带守卫发送的资格。请开启新会话（`/new`）或重启智能体；参见[后续问题](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/7577)。
+内置的 Pi 集成版本 12 和 OMP 集成版本 12 会上报原生 ID 和未改变的恢复路径。旧的仅上报路径的集成会返回 `agent_session_unknown`；请运行 `herdr integration install pi` 或 `herdr integration install omp` 重新安装更新后的集成，再在安全的停顿点重启或重新加载该智能体，以加载更新的钩子并上报 ID。这一步加载钩子并不等于从暂停中恢复：恢复或重新加载同一个原生会话不会恢复带守卫发送的资格。请开启新会话（`/new`）或重启智能体；参见[后续问题](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/7577)。
 
 `agent.prompt` 还接受 `expected_pane_id`，要求其目标（包括别名）解析到该精确窗格。解析到不同窗格时初始拒绝并返回 `expected_pane_mismatch`，不写入任何输入字节。这些预期条件可以单独或一起使用，也可与可选的 `wait` 对象一起使用。窗格发送操作已指定精确的 `pane_id`，没有 `expected_pane_id` 字段。初始检查与接受请求时 Herdr 的已上报窗格状态是原子的，但不是与智能体尚未上报的内部会话变化保持原子性。仍有两类残余竞态：最后一次实时进程／前台原生检查与 `write(2)` 之间的检查／写入间隙，以及所有权丢失／刷新／读取方之间的竞态；读取方可能在刷新前消费已暂存的字节。完成结果和刷新都不保证总写入或总消费字节数为零。App 到 actor 的队列和延迟 Enter 的等待受守卫保护，但不能消除这些原生竞态。省略预期条件会保留现有行为，不改变跨窗格输入策略。
 

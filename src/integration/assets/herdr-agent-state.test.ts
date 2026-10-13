@@ -1921,7 +1921,7 @@ function draftContext(ui: Record<string, any> = {}) {
 function guardedDeliver(connection: ChannelConnection, requestId = "guarded", text = "remote prompt", guard = true) {
   connection.socket.write(`${JSON.stringify({
     ...delivery(connection, requestId, text), if_draft_empty: guard,
-    ...(guard ? { deadline_ms: Date.now() + 60_000 } : {}),
+    ...(guard ? { deadline_ms: Date.now() + 60_000, remaining_ms: 60_000 } : {}),
   })}\n`);
 }
 
@@ -2529,26 +2529,169 @@ for (const [name, deadline] of [
 registeredChannelTest("Pi guarded deadline elapsed during synchronous UI inspection refuses before submit", async () => {
   const { connections } = await startChannelServer();
   const asset = await loadChannelAsset(accepted);
-  const deadline = Date.now() + 60_000;
-  const originalNow = Date.now;
+  const originalMonotonic = performance.now;
   try {
     await asset.handlers.get("session_start")?.({}, draftContext({
       getEditorText: () => "",
       holdState: () => {
-        Date.now = () => deadline;
-        queueMicrotask(() => { Date.now = originalNow; });
+        // The UI read itself spends the whole budget on Pi's monotonic clock.
+        const spentAt = originalMonotonic.call(performance) + 60_000;
+        performance.now = () => spentAt;
+        queueMicrotask(() => { performance.now = originalMonotonic; });
         return undefined;
       },
     }));
     await waitFor(() => connections.length === 1);
     const connection = connections[0];
-    connection.socket.write(`${JSON.stringify({ ...delivery(connection), if_draft_empty: true, deadline_ms: deadline })}\n`);
+    connection.socket.write(`${JSON.stringify({
+      ...delivery(connection), if_draft_empty: true, deadline_ms: Date.now() + 60_000, remaining_ms: 60_000,
+    })}\n`);
     await waitFor(() => connection.acks.length === 1);
     expect(connection.acks[0]).toMatchObject({ status: "rejected", reason: "expired" });
     expect(asset.calls).toEqual([]);
   } finally {
+    performance.now = originalMonotonic;
+  }
+});
+
+// smarty-dev#8792. These drive the real extension over a real socket but stand in for Herdr and Pi
+// core (a fake channel server and submitUserMessage), and step the wall clock by replacing
+// Date.now: an E2E run cannot step the host's wall clock. They are not E2E for that reason.
+const WALL_STEP_BACK_MS = 3_600_000;
+function stepWallClockBack(): () => void {
+  const originalNow = Date.now;
+  Date.now = () => originalNow() - WALL_STEP_BACK_MS;
+  return () => { Date.now = originalNow; };
+}
+function spinMonotonic(ms: number) {
+  const until = performance.now() + ms;
+  while (performance.now() < until) { /* a slow synchronous UI read */ }
+}
+
+registeredChannelTest("Pi guarded admission refuses after its budget even when the wall clock steps back between send and check", async () => {
+  const { connections } = await startChannelServer();
+  const asset = await loadChannelAsset(accepted);
+  let restoreWall = () => {};
+  try {
+    await asset.handlers.get("session_start")?.({}, draftContext({
+      getEditorText: () => "",
+      holdState: () => { spinMonotonic(80); return undefined; },
+    }));
+    await waitFor(() => connections.length === 1);
+    const connection = connections[0];
+    // Herdr samples deadline_ms, then the wall clock steps back an hour before Pi checks. A wall
+    // comparison would pass both checks; the 50 ms budget is spent during the UI read.
+    const frame = { ...delivery(connection), if_draft_empty: true, deadline_ms: Date.now() + 50, remaining_ms: 50 };
+    restoreWall = stepWallClockBack();
+    connection.socket.write(`${JSON.stringify(frame)}\n`);
+    await waitFor(() => connection.acks.length === 1);
+    expect(connection.acks[0]).toMatchObject({ status: "rejected", reason: "expired" });
+    expect(asset.calls).toEqual([]);
+  } finally {
+    restoreWall();
+  }
+});
+
+registeredChannelTest("Pi held guarded delivery expires on its budget, not the wall clock, after a backward wall-clock step", async () => {
+  const { connection, asset, sessionReady, state } = await guardedChannelInsideNewFence();
+  let restoreWall = () => {};
+  try {
+    const sentAt = performance.now();
+    const frame = { ...delivery(connection, "held"), if_draft_empty: true, deadline_ms: Date.now() + 600, remaining_ms: 600 };
+    restoreWall = stepWallClockBack();
+    connection.socket.write(`${JSON.stringify(frame)}\n`);
+    await waitFor(() => asset.calls.length === 1);
+    // The hold still settles with Pi's refusal ahead of the 600 ms budget, not an hour later.
+    await waitFor(() => connection.acks.length === 1, 2_000);
+    expect(performance.now() - sentAt).toBeLessThan(600);
+    expect(connection.acks[0]).toMatchObject({ request_id: "held", status: "rejected", reason: "session_changed" });
+    // A session_ready after the budget, with the wall clock still behind, admits nothing.
+    state.held = false;
+    sessionReady();
+    await Bun.sleep(50);
+    expect(asset.calls).toHaveLength(1);
+    expect(connection.acks).toHaveLength(1);
+  } finally {
+    restoreWall();
+  }
+});
+
+registeredChannelTest("Pi guarded frame received after a pause past deadline_ms is refused despite a fresh budget", async () => {
+  const { connections } = await startChannelServer();
+  const asset = await loadChannelAsset(accepted);
+  await asset.handlers.get("session_start")?.({}, draftContext());
+  await waitFor(() => connections.length === 1);
+  const connection = connections[0];
+  // Herdr sends a 60 s budget; Pi's event loop is then paused for ten minutes before its handler
+  // reads the frame. The budget starts at receipt and is still fresh, but the wall clock has
+  // passed deadline_ms, so admission must refuse.
+  const frame = { ...delivery(connection, "paused"), if_draft_empty: true, deadline_ms: Date.now() + 60_000, remaining_ms: 60_000 };
+  const originalNow = Date.now;
+  Date.now = () => originalNow() + 600_000;
+  try {
+    connection.socket.write(`${JSON.stringify(frame)}\n`);
+    await waitFor(() => connection.acks.length === 1);
+    expect(connection.acks[0]).toMatchObject({ request_id: "paused", status: "rejected", reason: "expired" });
+    expect(asset.calls).toEqual([]);
+  } finally {
     Date.now = originalNow;
   }
+});
+
+registeredChannelTest("Pi guarded admission requires both remaining_ms and deadline_ms, with deadline_ms alone as the fallback", async () => {
+  const { connections } = await startChannelServer();
+  const asset = await loadChannelAsset(accepted);
+  await asset.handlers.get("session_start")?.({}, draftContext());
+  await waitFor(() => connections.length === 1);
+  const connection = connections[0];
+  const send = (requestId: string, fields: Record<string, unknown>) =>
+    connection.socket.write(`${JSON.stringify({ ...delivery(connection, requestId), if_draft_empty: true, ...fields })}\n`);
+  // A live budget with a past deadline_ms refuses: the wall deadline is also enforced.
+  send("budget-live", { deadline_ms: Date.now() - 1_000, remaining_ms: 60_000 });
+  await waitFor(() => connection.acks.length === 1);
+  expect(connection.acks[0]).toMatchObject({ request_id: "budget-live", status: "rejected", reason: "expired" });
+  // A spent budget refuses even when the absolute deadline is far away.
+  send("budget-spent", { deadline_ms: Date.now() + 60_000, remaining_ms: 0 });
+  await waitFor(() => connection.acks.length === 2);
+  expect(connection.acks[1]).toMatchObject({ request_id: "budget-spent", reason: "expired" });
+  // An older Herdr sends deadline_ms alone: it still admits until that deadline.
+  send("legacy", { deadline_ms: Date.now() + 60_000 });
+  await waitFor(() => connection.acks.length === 3);
+  expect(connection.acks[2]).toMatchObject({ request_id: "legacy", status: "accepted" });
+  // A present but malformed budget fails closed; it never falls back to deadline_ms.
+  let acks = 3;
+  for (const [index, budget] of [-1, 1.5, "60000", null, {}, Number.MAX_SAFE_INTEGER + 1].entries()) {
+    send(`bad-${index}`, { deadline_ms: Date.now() + 60_000, remaining_ms: budget });
+    acks += 1;
+    await waitFor(() => connection.acks.length === acks);
+    expect(connection.acks[acks - 1]).toMatchObject({ request_id: `bad-${index}`, status: "rejected", reason: "unknown" });
+  }
+  // A present but malformed deadline_ms fails closed even with a live budget.
+  for (const [index, deadline] of [1.5, "60000", null, {}].entries()) {
+    send(`bad-wall-${index}`, { deadline_ms: deadline, remaining_ms: 60_000 });
+    acks += 1;
+    await waitFor(() => connection.acks.length === acks);
+    expect(connection.acks[acks - 1]).toMatchObject({ request_id: `bad-wall-${index}`, status: "rejected", reason: "unknown" });
+  }
+  // Both live: admitted.
+  send("both-live", { deadline_ms: Date.now() + 60_000, remaining_ms: 60_000 });
+  acks += 1;
+  await waitFor(() => connection.acks.length === acks);
+  expect(connection.acks[acks - 1]).toMatchObject({ request_id: "both-live", status: "accepted" });
+  expect(asset.calls.map((call) => call.requestId)).toEqual(["legacy", "both-live"]);
+});
+
+registeredChannelTest("Pi refuses remaining_ms without deadline_ms as unknown and never reaches ingress", async () => {
+  const { connections } = await startChannelServer();
+  const asset = await loadChannelAsset(accepted);
+  await asset.handlers.get("session_start")?.({}, draftContext());
+  await waitFor(() => connections.length === 1);
+  const connection = connections[0];
+  // A live budget alone would skip the wall-clock check, refunding a pause before receipt.
+  connection.socket.write(`${JSON.stringify({ ...delivery(connection, "budget-only"), if_draft_empty: true, remaining_ms: 60_000 })}\n`);
+  await waitFor(() => connection.acks.length === 1);
+  expect(connection.acks[0]).toMatchObject({ request_id: "budget-only", status: "rejected", reason: "unknown" });
+  expect(asset.calls).toEqual([]);
 });
 
 for (const deadline of ["1e999", "-1e999"]) {

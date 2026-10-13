@@ -98,7 +98,13 @@ enum DeliveryKind {
 pub(crate) struct Delivery {
     text: String,
     kind: DeliveryKind,
+    /// The reservation-time frame. A guarded prompt's frame ends in `remaining_ms` carrying the
+    /// full timeout; dispatch rewrites that budget (see `budget_at`) and never grows the frame.
     frame: Vec<u8>,
+    /// For a draft-guarded prompt: the byte offset in `frame` where its trailing
+    /// `,"remaining_ms":N}\n` suffix starts. `write_delivery` replaces the suffix with the budget
+    /// left on `deadline` when the frame's first byte is written (smarty-dev#8792).
+    budget_at: Option<usize>,
     deadline: Instant,
     state: Mutex<RequestState>,
     completed: Condvar,
@@ -214,6 +220,20 @@ impl Delivery {
     }
     fn pending(&self) -> bool {
         self.state.lock().is_ok_and(|state| state.outcome.is_none())
+    }
+    /// The bytes to put on the wire when dispatch starts at `now`. A guarded prompt carries the
+    /// whole milliseconds left on Herdr's monotonic deadline, rounded down, so the receiver's
+    /// monotonic deadline (receipt time plus this budget) starts no earlier than Herdr's
+    /// remaining wait and no wall clock enters admission. Never longer than `frame`, whose
+    /// budget is the full timeout, so the reserved capacity still bounds it.
+    fn dispatch_frame(&self, now: Instant) -> std::borrow::Cow<'_, [u8]> {
+        let Some(at) = self.budget_at else {
+            return std::borrow::Cow::Borrowed(&self.frame);
+        };
+        let remaining = self.deadline.saturating_duration_since(now).as_millis();
+        let mut frame = self.frame[..at].to_vec();
+        frame.extend_from_slice(format!(",\"remaining_ms\":{remaining}}}\n").as_bytes());
+        std::borrow::Cow::Owned(frame)
     }
 }
 
@@ -485,6 +505,10 @@ impl Channel {
         let (deadline, deadline_ms) =
             request_deadlines(timeout, guarded, std::time::SystemTime::now, Instant::now)
                 .ok_or_else(|| Outcome::failure("agent_prompt_rejected", "unknown"))?;
+        // `deadline_ms` validated that the timeout fits the JSON safe-integer range.
+        let budget_ms = u64::try_from(timeout.as_millis())
+            .ok()
+            .filter(|millis| *millis <= MAX_SAFE_JSON_INTEGER);
         let mut frame = serde_json::json!({"registration_epoch":self.epoch,
             "request_id":request_id,"session_generation":self.session_generation});
         match kind {
@@ -499,6 +523,18 @@ impl Channel {
             DeliveryKind::DraftState => frame["type"] = "draft_state".into(),
         }
         let mut frame = frame.to_string().into_bytes();
+        // Guarded prompts also carry the relative budget the receiver admits on. `deadline_ms`
+        // stays on the wire, unchanged, for receivers that predate `remaining_ms` and for logs.
+        let mut budget_at = None;
+        if guarded {
+            let budget_ms =
+                budget_ms.ok_or_else(|| Outcome::failure("agent_prompt_rejected", "unknown"))?;
+            if frame.pop() != Some(b'}') {
+                return Err(Outcome::failure("agent_prompt_rejected", "unknown"));
+            }
+            budget_at = Some(frame.len());
+            frame.extend_from_slice(format!(",\"remaining_ms\":{budget_ms}}}").as_bytes());
+        }
         frame.push(b'\n');
         let retained_bytes = frame.len() + text.len();
         if frame.len() > MAX_FRAME_BYTES {
@@ -525,6 +561,7 @@ impl Channel {
             text,
             kind,
             frame,
+            budget_at,
             deadline,
             state: Mutex::new(RequestState {
                 possible_dispatch: false,
@@ -665,15 +702,15 @@ impl Channel {
     }
 }
 
-/// Herdr's monotonic deadline and, for draft-guarded prompts, the receiver's wall-clock
-/// deadline. The wall clock is sampled strictly BEFORE the monotonic clock, so scheduling
-/// delay between the two reads can only shorten the receiver's window, never extend it
-/// past Herdr's deadline (the other order would). This bound assumes the wall clock keeps
-/// its relation to the monotonic clock until the receiver checks `deadline_ms`; it is not
-/// a guarantee against wall-clock adjustment. If the wall clock steps backward after
-/// sampling, a receiver comparing its own wall clock with `deadline_ms` can still admit
-/// after Herdr's monotonic wait has reported timeout (as `delivery_unknown` once dispatch
-/// was possible). That is the pre-existing limitation of any wall-clock deadline.
+/// Herdr's monotonic deadline and, for draft-guarded prompts, the legacy wall-clock
+/// `deadline_ms`. Current receivers admit only while both the relative `remaining_ms` budget
+/// that `Delivery::dispatch_frame` derives from the monotonic deadline at dispatch and
+/// `deadline_ms` are unexpired, so neither a backward wall-clock step nor a receiver pause
+/// before it reads the frame can admit after Herdr's deadline (smarty-dev#8792). Receivers
+/// that predate `remaining_ms` check `deadline_ms` alone. In both cases the wall clock is
+/// sampled strictly BEFORE the monotonic clock, so scheduling delay between the two reads
+/// can only shorten their window, never extend it past Herdr's deadline, as long as the
+/// wall clock is not stepped backward before they check it.
 /// Clocks are injected so the read order is unit-testable.
 /// `None` means either deadline is unrepresentable (monotonic or wall-clock overflow,
 /// pre-epoch wall time or above the JSON safe-integer range); callers refuse before reservation.
@@ -860,6 +897,7 @@ fn write_rotation(
             if_draft_empty: false,
         },
         frame: frame.into_bytes(),
+        budget_at: None,
         deadline: Instant::now() + Duration::from_secs(2),
         state: Mutex::new(RequestState {
             possible_dispatch: false,
@@ -982,7 +1020,9 @@ fn write_delivery(
     mut native_valid: impl FnMut() -> bool,
 ) -> io::Result<()> {
     let mut offset = 0;
-    while offset < delivery.frame.len() {
+    // Fixed once its first byte is written: a partial frame continues with the same bytes.
+    let mut frame = std::borrow::Cow::Borrowed(delivery.frame.as_slice());
+    while offset < frame.len() {
         if !delivery.pending() {
             return if offset == 0 {
                 Ok(())
@@ -1008,7 +1048,8 @@ fn write_delivery(
             .effect
             .lock()
             .map_err(|_| io::Error::other("channel gate unavailable"))?;
-        let expired = Instant::now() >= delivery.deadline;
+        let now = Instant::now();
+        let expired = now >= delivery.deadline;
         if !channel.is_active() || expired || !native_valid() {
             drop(effect);
             if expired {
@@ -1033,11 +1074,16 @@ fn write_delivery(
                 Err(io::Error::other("partial frame cancelled"))
             };
         }
+        if offset == 0 {
+            // Sampled at the last eligibility check before the first byte can leave, so queue
+            // and write-retry delay are already spent from the budget the receiver gets.
+            frame = delivery.dispatch_frame(now);
+        }
         state.possible_dispatch = true;
-        let write = writer.write(&delivery.frame[offset..]);
+        let write = writer.write(&frame[offset..]);
         if write
             .as_ref()
-            .is_ok_and(|count| offset + count == delivery.frame.len())
+            .is_ok_and(|count| offset + count == frame.len())
         {
             state.complete_dispatch = true;
         }
