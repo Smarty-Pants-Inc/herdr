@@ -354,6 +354,7 @@ fn submit(
             enter,
             delay,
             guard,
+            refuse_if_exists: None,
             reply,
         })
     );
@@ -859,6 +860,59 @@ fn guarded_native_rechecks_between_partial_syscalls_in_one_flush() {
     assert!(accepted > 0 && accepted < length);
     fixture.captured(&vec![b'x'; accepted]);
     assert!(runner.pending_writes.is_empty());
+}
+
+/// smarty-code#1707: the path guard is re-checked before every syscall, so a
+/// path that appears between partial chunks drops the rest and reports that
+/// text already reached the PTY; unrelated later input still arrives.
+#[test]
+fn refuse_if_exists_rechecks_between_partial_syscalls_in_one_flush() {
+    let fixture = NativePty::new();
+    let mut runner = fixture.runner();
+    let claim = fixture.directory.join("floor-claim");
+    let created = claim.clone();
+    let mut attempts = 0;
+    runner.file.before_write = Some(Box::new(move |_| {
+        attempts += 1;
+        if attempts == 2 {
+            std::fs::write(&created, "claimed").expect("create claim");
+        }
+    }));
+    let length = 4 * 1024 * 1024;
+    let (reply, receipt) = std_mpsc::channel();
+    assert!(
+        !runner.handle_data_command(PtyIoDataCommand::SubmitUserInput {
+            source: InputSource::Api,
+            text: Bytes::from(vec![b'x'; length]),
+            enter: Bytes::new(),
+            delay: Duration::ZERO,
+            guard: None,
+            refuse_if_exists: Some(claim),
+            reply,
+        })
+    );
+    assert_eq!(
+        runner.flush_pending_writes_once().expect("single flush"),
+        None
+    );
+    let error = receipt
+        .recv_timeout(Duration::from_secs(1))
+        .expect("completion")
+        .expect_err("path guard refuses");
+    assert_eq!(
+        super::super::guard_path_present_details(&error),
+        Some((Some(true), false))
+    );
+    assert!(!super::super::is_agent_session_lost(&error));
+    assert!(runner.pending_writes.is_empty() && runner.active_submission.is_none());
+    runner.enqueue_write(Bytes::from_static(b"after"));
+    pump(&mut runner);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !fixture.bytes().ends_with(b"after") {
+        assert!(Instant::now() < deadline, "later input arrives");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(fixture.bytes().len() < length, "the rest was dropped");
 }
 
 #[test]

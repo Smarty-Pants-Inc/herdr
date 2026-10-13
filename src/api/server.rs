@@ -156,6 +156,8 @@ fn default_capabilities() -> Option<ServerCapabilities> {
         // platforms deliberately refuse guarded session delivery.
         expected_agent_session_guard: crate::platform::expected_agent_session_guard_supported(),
         expected_agent_status_guard: crate::platform::expected_agent_session_guard_supported(),
+        // The Unix PTY writer checks the path before each write(2).
+        refuse_if_exists_guard: cfg!(unix),
         input_consumer: crate::platform::input_consumer_supported(),
     })
 }
@@ -1031,6 +1033,8 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::PaneSendTextSessionChecked(_) => "pane.send_text_session_checked",
         Method::PaneSendKeys(_) => "pane.send_keys",
         Method::PaneSendKeysSessionChecked(_) => "pane.send_keys_session_checked",
+        Method::PaneSendTextPathChecked(_) => "pane.send_text_path_checked",
+        Method::PaneSendKeysPathChecked(_) => "pane.send_keys_path_checked",
         Method::PaneSendInput(_) => "pane.send_input",
         Method::PaneSendInputGuarded(_) => "pane.send_input_guarded",
         Method::PaneRead(_) => "pane.read",
@@ -2267,6 +2271,7 @@ mod tests {
                 expected_terminal_guard: true,
                 expected_agent_session_guard: true,
                 expected_agent_status_guard: true,
+                refuse_if_exists_guard: true,
                 input_consumer: false,
             }),
             None,

@@ -394,6 +394,27 @@ pub struct PaneSendKeysParams {
     pub allow_cross_pane: bool,
 }
 
+/// `pane.send_text_path_checked`: `pane.send_text` that the PTY writer refuses,
+/// with `guard_path_present` and no byte written, when `refuse_if_exists`
+/// exists right before a write. Older servers reject the method name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneSendTextPathCheckedParams {
+    #[serde(flatten)]
+    pub input: PaneSendTextParams,
+    /// Absolute path; the write is refused if `lstat` of it succeeds at write time.
+    pub refuse_if_exists: String,
+}
+
+/// `pane.send_keys_path_checked`: `pane.send_keys` with the same write-time
+/// `refuse_if_exists` guard as `pane.send_text_path_checked`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneSendKeysPathCheckedParams {
+    #[serde(flatten)]
+    pub input: PaneSendKeysParams,
+    /// Absolute path; the write is refused if `lstat` of it succeeds at write time.
+    pub refuse_if_exists: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PaneSendInputParams {
     pub pane_id: String,

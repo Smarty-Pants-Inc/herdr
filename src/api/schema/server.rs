@@ -60,6 +60,10 @@ pub struct ServerCapabilities {
     /// Supports the detected-agent-status guard on local JSON prompts.
     #[serde(default)]
     pub expected_agent_status_guard: bool,
+    /// Supports the write-time `refuse_if_exists` path guard on the local JSON
+    /// `pane.send_text_path_checked` and `pane.send_keys_path_checked` methods.
+    #[serde(default)]
+    pub refuse_if_exists_guard: bool,
     /// Supports the local `pane.input_consumer.*` methods (Linux servers only).
     #[serde(default)]
     pub input_consumer: bool,

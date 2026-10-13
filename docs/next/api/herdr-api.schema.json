@@ -3572,6 +3572,37 @@
           ],
           "type": "object"
         },
+        "PaneSendKeysPathCheckedParams": {
+          "description": "`pane.send_keys_path_checked`: `pane.send_keys` with the same write-time\n`refuse_if_exists` guard as `pane.send_text_path_checked`.",
+          "properties": {
+            "allow_cross_pane": {
+              "description": "Deliberately allow an agent-originated request to target another pane.",
+              "type": "boolean"
+            },
+            "expected_agent_session_id": {
+              "type": "string"
+            },
+            "keys": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "pane_id": {
+              "type": "string"
+            },
+            "refuse_if_exists": {
+              "description": "Absolute path; the write is refused if `lstat` of it succeeds at write time.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "pane_id",
+            "keys",
+            "refuse_if_exists"
+          ],
+          "type": "object"
+        },
         "PaneSendTextParams": {
           "properties": {
             "allow_cross_pane": {
@@ -3591,6 +3622,34 @@
           "required": [
             "pane_id",
             "text"
+          ],
+          "type": "object"
+        },
+        "PaneSendTextPathCheckedParams": {
+          "description": "`pane.send_text_path_checked`: `pane.send_text` that the PTY writer refuses,\nwith `guard_path_present` and no byte written, when `refuse_if_exists`\nexists right before a write. Older servers reject the method name.",
+          "properties": {
+            "allow_cross_pane": {
+              "description": "Deliberately allow an agent-originated request to target another pane.",
+              "type": "boolean"
+            },
+            "expected_agent_session_id": {
+              "type": "string"
+            },
+            "pane_id": {
+              "type": "string"
+            },
+            "refuse_if_exists": {
+              "description": "Absolute path; the write is refused if `lstat` of it succeeds at write time.",
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pane_id",
+            "text",
+            "refuse_if_exists"
           ],
           "type": "object"
         },
@@ -6870,6 +6929,40 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/PaneSendKeysParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Local JSON only; older servers reject instead of ignoring the path guard.",
+          "properties": {
+            "method": {
+              "const": "pane.send_text_path_checked",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneSendTextPathCheckedParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Local JSON only; older servers reject instead of ignoring the path guard.",
+          "properties": {
+            "method": {
+              "const": "pane.send_keys_path_checked",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneSendKeysPathCheckedParams"
             }
           },
           "required": [
@@ -11776,6 +11869,11 @@
               "type": "boolean"
             },
             "live_handoff": {
+              "type": "boolean"
+            },
+            "refuse_if_exists_guard": {
+              "default": false,
+              "description": "Supports the write-time `refuse_if_exists` path guard on the local JSON\n`pane.send_text_path_checked` and `pane.send_keys_path_checked` methods.",
               "type": "boolean"
             },
             "ssh_agent_registration": {

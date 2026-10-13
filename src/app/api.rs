@@ -1536,6 +1536,22 @@ impl App {
             Method::PaneSendText(params) | Method::PaneSendTextSessionChecked(params) => {
                 return self.handle_pane_send_text(request.id, params, context);
             }
+            Method::PaneSendTextPathChecked(params) => {
+                return self.handle_pane_path_checked_input(
+                    request.id,
+                    panes::SessionCheckedPaneInput::Text(params.input),
+                    params.refuse_if_exists,
+                    context,
+                );
+            }
+            Method::PaneSendKeysPathChecked(params) => {
+                return self.handle_pane_path_checked_input(
+                    request.id,
+                    panes::SessionCheckedPaneInput::Keys(params.input),
+                    params.refuse_if_exists,
+                    context,
+                );
+            }
             Method::PaneSendInputGuarded(params) if params.expected_terminal.is_none() => {
                 return responses::encode_error(
                     request.id,

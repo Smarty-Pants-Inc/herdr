@@ -88,6 +88,7 @@ enum PtyIoDataCommand {
     },
     SubmitUserInput {
         guard: Option<SessionInputGuard>,
+        refuse_if_exists: Option<std::path::PathBuf>,
         source: InputSource,
         text: Bytes,
         enter: Bytes,
@@ -265,7 +266,7 @@ impl PtyIoActorHandle {
         delay: Duration,
         source: InputSource,
     ) -> std::io::Result<std_mpsc::Receiver<std::io::Result<()>>> {
-        self.queue_submission(text, enter, delay, None, source)
+        self.queue_submission(text, enter, delay, None, None, source)
     }
 
     pub(crate) fn queue_guarded_user_input_submission_with_source(
@@ -276,7 +277,21 @@ impl PtyIoActorHandle {
         guard: SessionInputGuard,
         source: InputSource,
     ) -> std::io::Result<std_mpsc::Receiver<std::io::Result<()>>> {
-        self.queue_submission(text, enter, delay, Some(guard), source)
+        self.queue_submission(text, enter, delay, Some(guard), None, source)
+    }
+
+    /// A submission with an optional session guard and an optional
+    /// `refuse_if_exists` path, both checked right before each `write(2)`.
+    pub(crate) fn queue_checked_user_input_submission_with_source(
+        &self,
+        text: Bytes,
+        enter: Bytes,
+        delay: Duration,
+        guard: Option<SessionInputGuard>,
+        refuse_if_exists: Option<std::path::PathBuf>,
+        source: InputSource,
+    ) -> std::io::Result<std_mpsc::Receiver<std::io::Result<()>>> {
+        self.queue_submission(text, enter, delay, guard, refuse_if_exists, source)
     }
 
     fn queue_submission(
@@ -285,6 +300,7 @@ impl PtyIoActorHandle {
         enter: Bytes,
         delay: Duration,
         guard: Option<SessionInputGuard>,
+        refuse_if_exists: Option<std::path::PathBuf>,
         source: InputSource,
     ) -> std::io::Result<std_mpsc::Receiver<std::io::Result<()>>> {
         let user_writes = self
@@ -304,6 +320,7 @@ impl PtyIoActorHandle {
         self.data_tx
             .try_send(PtyIoDataCommand::SubmitUserInput {
                 guard,
+                refuse_if_exists,
                 source: source.user(),
                 text,
                 enter,
@@ -740,6 +757,9 @@ struct PtyIoActorRunner {
 
 struct ActiveSubmission {
     guard: Option<SessionInputGuard>,
+    /// Refuse the remaining bytes when `lstat` of this path succeeds right
+    /// before a write (smarty-code#1707). Never checked at request time.
+    refuse_if_exists: Option<std::path::PathBuf>,
     source: InputSource,
     enter: Bytes,
     delay: Duration,
@@ -1179,6 +1199,7 @@ impl PtyIoActorRunner {
             }
             PtyIoDataCommand::SubmitUserInput {
                 guard,
+                refuse_if_exists,
                 source,
                 text,
                 enter,
@@ -1204,6 +1225,7 @@ impl PtyIoActorRunner {
                     };
                     self.active_submission = Some(ActiveSubmission {
                         guard,
+                        refuse_if_exists,
                         source,
                         enter,
                         delay,
@@ -1590,65 +1612,95 @@ impl PtyIoActorRunner {
                 write.boundary,
                 Some(SubmissionBoundary::Text | SubmissionBoundary::Enter)
             ) {
-                if let Some(guard) = self
+                let session_lost = self
                     .active_submission
                     .as_ref()
                     .and_then(|submission| submission.guard.as_ref())
-                {
-                    // Re-prove at EVERY syscall, including the next partial
-                    // chunk and retries after WouldBlock or Interrupted. This
-                    // reads this actor's master directly, without a cached
-                    // observer, process-tree scan, or actor request roundtrip.
-                    // Scalar-only weak-root checks bracket the native proof.
-                    // Each upgrade temporary is dropped within the helper: no
-                    // strong Arc survives across native evidence or write(2).
-                    if !guard.binding_is_current()
-                        || !guard.status_is_current()
-                        || !crate::platform::session_reporter_is_foreground(guard.reporter, || {
-                            #[cfg(test)]
-                            if let Some(during_proof) = self.file.during_guard_proof.as_mut() {
-                                during_proof();
-                            }
-                            crate::platform::foreground_process_group_id_for_tty_fd(
-                                self.file.as_raw_fd(),
+                    .is_some_and(|guard| {
+                        // Re-prove at EVERY syscall, including the next partial
+                        // chunk and retries after WouldBlock or Interrupted. This
+                        // reads this actor's master directly, without a cached
+                        // observer, process-tree scan, or actor request roundtrip.
+                        // Scalar-only weak-root checks bracket the native proof.
+                        // Each upgrade temporary is dropped within the helper: no
+                        // strong Arc survives across native evidence or write(2).
+                        !guard.binding_is_current()
+                            || !guard.status_is_current()
+                            || !crate::platform::session_reporter_is_foreground(
+                                guard.reporter,
+                                || {
+                                    #[cfg(test)]
+                                    if let Some(during_proof) =
+                                        self.file.during_guard_proof.as_mut()
+                                    {
+                                        during_proof();
+                                    }
+                                    crate::platform::foreground_process_group_id_for_tty_fd(
+                                        self.file.as_raw_fd(),
+                                    )
+                                },
                             )
-                        })
-                        || !guard.binding_is_current()
-                        || !guard.status_is_current()
-                    {
-                        let partial_text_consumed = self
-                            .active_submission
-                            .as_ref()
-                            .is_some_and(|submission| submission.text_bytes_written);
-                        let mut error = super::agent_session_lost(guard, partial_text_consumed);
-                        // Single active submission means no request IDs are
-                        // needed. Drop only its remaining parts, preserving
-                        // unrelated FIFO work and ordered consumer markers.
-                        self.pending_writes.retain(|pending| {
-                            !matches!(
-                                pending.boundary,
-                                Some(SubmissionBoundary::Text | SubmissionBoundary::Enter)
-                            )
-                        });
-                        self.current_write_offset = 0;
-                        if partial_text_consumed {
-                            if let Err(flush_error) = self.flush_slave_input() {
-                                // Advisory (Paul, 2026-10-13): report the flush
-                                // failure on this submission but never poison
-                                // the pane's later input.
-                                warn!(pane = self.pane_id, err = %flush_error,
+                            || !guard.binding_is_current()
+                            || !guard.status_is_current()
+                    });
+                // The path guard: one fresh lstat right before this write(2),
+                // with no request-time check and no cached answer.
+                let guard_path = if session_lost {
+                    None
+                } else {
+                    self.active_submission
+                        .as_ref()
+                        .and_then(|submission| submission.refuse_if_exists.as_deref())
+                        .filter(|path| super::guard_path_is_present(path))
+                };
+                if session_lost || guard_path.is_some() {
+                    let partial_text_consumed = self
+                        .active_submission
+                        .as_ref()
+                        .is_some_and(|submission| submission.text_bytes_written);
+                    let session_guard = self
+                        .active_submission
+                        .as_ref()
+                        .and_then(|submission| submission.guard.as_ref())
+                        .filter(|_| session_lost);
+                    let mut error = match (session_guard, guard_path) {
+                        (Some(guard), _) => super::agent_session_lost(guard, partial_text_consumed),
+                        (None, Some(path)) => {
+                            super::guard_path_present(path, Some(partial_text_consumed), false)
+                        }
+                        (None, None) => input_submission_closed_error(),
+                    };
+                    // Single active submission means no request IDs are
+                    // needed. Drop only its remaining parts, preserving
+                    // unrelated FIFO work and ordered consumer markers.
+                    self.pending_writes.retain(|pending| {
+                        !matches!(
+                            pending.boundary,
+                            Some(SubmissionBoundary::Text | SubmissionBoundary::Enter)
+                        )
+                    });
+                    self.current_write_offset = 0;
+                    if partial_text_consumed {
+                        if let Err(flush_error) = self.flush_slave_input() {
+                            // Advisory (Paul, 2026-10-13): report the flush
+                            // failure on this submission but never poison
+                            // the pane's later input.
+                            warn!(pane = self.pane_id, err = %flush_error,
                                     "guarded PTY flush failed; later pane input is not blocked");
-                                error = super::agent_session_flush_failed(guard);
-                            }
+                            error = match (session_guard, guard_path) {
+                                (Some(guard), _) => super::agent_session_flush_failed(guard),
+                                (None, Some(path)) => super::guard_path_present(path, None, true),
+                                (None, None) => error,
+                            };
                         }
-                        self.fail_active_submission(error);
-                        if self.input_poisoned.load(Ordering::Acquire) {
-                            self.end_consumer();
-                            self.refuse_queued_poisoned_input();
-                            return Ok(None);
-                        }
-                        continue;
                     }
+                    self.fail_active_submission(error);
+                    if self.input_poisoned.load(Ordering::Acquire) {
+                        self.end_consumer();
+                        self.refuse_queued_poisoned_input();
+                        return Ok(None);
+                    }
+                    continue;
                 }
             }
             let chunk = &write.bytes[self.current_write_offset..];

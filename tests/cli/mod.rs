@@ -14,6 +14,8 @@ mod panes;
 mod plugins;
 mod protocol;
 mod protocol_guard;
+#[cfg(target_os = "linux")]
+mod refuse_if_exists;
 mod sessions;
 mod surface;
 mod workspace;

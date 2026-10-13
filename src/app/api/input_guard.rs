@@ -34,6 +34,18 @@ fn session_checked_guard_error(
         }
         Method::PaneSendTextSessionChecked(params) => params.expected_agent_session_id.is_none(),
         Method::PaneSendKeysSessionChecked(params) => params.expected_agent_session_id.is_none(),
+        // The path guard stands alone; an added session expectation still
+        // needs native session-guard support.
+        Method::PaneSendTextPathChecked(params)
+            if params.input.expected_agent_session_id.is_some() =>
+        {
+            false
+        }
+        Method::PaneSendKeysPathChecked(params)
+            if params.input.expected_agent_session_id.is_some() =>
+        {
+            false
+        }
         _ => return None,
     };
     if !supported {
@@ -48,12 +60,36 @@ fn session_checked_guard_error(
     ))
 }
 
+/// The write-time path guard needs a Unix PTY writer and an absolute path:
+/// the server's working directory is not the caller's.
+fn path_checked_guard_error(
+    supported: bool,
+    method: &Method,
+) -> Option<(&'static str, &'static str)> {
+    let path = match method {
+        Method::PaneSendTextPathChecked(params) => &params.refuse_if_exists,
+        Method::PaneSendKeysPathChecked(params) => &params.refuse_if_exists,
+        _ => return None,
+    };
+    if !supported {
+        return Some((
+            "refuse_if_exists_unsupported",
+            "the refuse_if_exists write guard is supported only on Unix",
+        ));
+    }
+    (!std::path::Path::new(path).is_absolute()).then_some((
+        "invalid_request",
+        "refuse_if_exists must be an absolute path",
+    ))
+}
+
 impl App {
     pub(super) fn session_checked_guard_denial(&self, request: &Request) -> Option<String> {
         session_checked_guard_error(
             crate::platform::expected_agent_session_guard_supported(),
             &request.method,
         )
+        .or_else(|| path_checked_guard_error(cfg!(unix), &request.method))
         .map(|(code, message)| encode_error(request.id.clone(), code, message))
     }
 
@@ -177,6 +213,8 @@ impl App {
             Method::PaneSendKeys(params) | Method::PaneSendKeysSessionChecked(params) => {
                 params.allow_cross_pane
             }
+            Method::PaneSendTextPathChecked(params) => params.input.allow_cross_pane,
+            Method::PaneSendKeysPathChecked(params) => params.input.allow_cross_pane,
             Method::PaneSendInput(params) | Method::PaneSendInputGuarded(params) => {
                 params.allow_cross_pane
             }
@@ -205,6 +243,8 @@ impl App {
             Method::PaneSendKeys(params) | Method::PaneSendKeysSessionChecked(params) => {
                 self.pane_target(&params.pane_id)
             }
+            Method::PaneSendTextPathChecked(params) => self.pane_target(&params.input.pane_id),
+            Method::PaneSendKeysPathChecked(params) => self.pane_target(&params.input.pane_id),
             Method::PaneSendInput(params) | Method::PaneSendInputGuarded(params) => {
                 self.pane_target(&params.pane_id)
             }

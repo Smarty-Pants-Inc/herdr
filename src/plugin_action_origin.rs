@@ -89,7 +89,9 @@ pub(crate) fn method_carries_grant(method: &crate::api::schema::Method) -> bool 
         Method::AgentPromptSessionChecked(_)
         | Method::AgentPromptStatusChecked(_)
         | Method::PaneSendTextSessionChecked(_)
-        | Method::PaneSendKeysSessionChecked(_) => true,
+        | Method::PaneSendKeysSessionChecked(_)
+        | Method::PaneSendTextPathChecked(_)
+        | Method::PaneSendKeysPathChecked(_) => true,
         // Pane creation the CLI performs, so the server can attribute the
         // created terminals to the grant (herdr#223). Carrying a claim never
         // awards rights by itself; the server registers only actually

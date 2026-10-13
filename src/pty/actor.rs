@@ -133,6 +133,62 @@ pub(crate) fn agent_session_loss_partial_text_consumed(error: &std::io::Error) -
     agent_session_loss_details(error).and_then(|(partial, _)| partial)
 }
 
+/// The submission's `refuse_if_exists` path existed (`lstat` succeeded) right
+/// before a `write(2)`, so the actor dropped the submission's remaining bytes.
+#[derive(Debug)]
+struct GuardPathPresent {
+    path: std::path::PathBuf,
+    /// As for session loss: text bytes of this submission already reached the PTY.
+    partial_text_consumed: Option<bool>,
+    flush_failed: bool,
+}
+
+impl std::fmt::Display for GuardPathPresent {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "guard_path_present: {} exists at write time; the input was refused; partial_text_consumed={}; flush_failed={}",
+            self.path.display(),
+            self.partial_text_consumed
+                .map_or("unknown", |partial| if partial { "true" } else { "false" }),
+            self.flush_failed
+        )
+    }
+}
+
+impl std::error::Error for GuardPathPresent {}
+
+#[cfg(unix)]
+pub(crate) fn guard_path_present(
+    path: &std::path::Path,
+    partial_text_consumed: Option<bool>,
+    flush_failed: bool,
+) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        GuardPathPresent {
+            path: path.to_path_buf(),
+            partial_text_consumed,
+            flush_failed,
+        },
+    )
+}
+
+/// `(partial_text_consumed, flush_failed)` for a `guard_path_present` refusal.
+pub(crate) fn guard_path_present_details(error: &std::io::Error) -> Option<(Option<bool>, bool)> {
+    error
+        .get_ref()?
+        .downcast_ref::<GuardPathPresent>()
+        .map(|refusal| (refusal.partial_text_consumed, refusal.flush_failed))
+}
+
+/// Whether `lstat(path)` succeeds now. Called by the PTY writer right before
+/// each guarded `write(2)`, never cached.
+#[cfg(unix)]
+fn guard_path_is_present(path: &std::path::Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok()
+}
+
 #[derive(Debug)]
 struct PaneInputPoisoned;
 impl std::fmt::Display for PaneInputPoisoned {
@@ -310,6 +366,29 @@ mod windows {
             // against ConPTY. Do not substitute process existence for ownership.
             let _ = (guard.reporter, &guard.binding_validity);
             Err(super::agent_session_lost(&guard, false))
+        }
+
+        /// No write-time path guard on ConPTY yet; the server does not
+        /// advertise `refuse_if_exists_guard` here, so never enqueue.
+        pub(crate) fn queue_checked_user_input_submission_with_source(
+            &self,
+            text: Bytes,
+            enter: Bytes,
+            delay: Duration,
+            guard: Option<super::SessionInputGuard>,
+            refuse_if_exists: Option<std::path::PathBuf>,
+            source: crate::pty::input_consumer::InputSource,
+        ) -> std::io::Result<std_mpsc::Receiver<std::io::Result<()>>> {
+            if let Some(guard) = guard {
+                return self.queue_guarded_user_input_submission_with_source(
+                    text, enter, delay, guard, source,
+                );
+            }
+            let _ = refuse_if_exists;
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "refuse_if_exists is supported only on Unix",
+            ))
         }
 
         pub(crate) fn input_consumer_epoch_matches(&self, _epoch: &str) -> bool {

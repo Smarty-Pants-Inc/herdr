@@ -3114,6 +3114,7 @@ mod tests {
                 expected_terminal_guard: true,
                 expected_agent_session_guard: true,
                 expected_agent_status_guard: true,
+                refuse_if_exists_guard: true,
                 input_consumer: false,
             }),
         };
@@ -3185,6 +3186,7 @@ mod tests {
                     expected_terminal_guard: true,
                     expected_agent_session_guard: true,
                     expected_agent_status_guard: true,
+                    refuse_if_exists_guard: true,
                     live_handoff: true,
                     detached_server_daemon: true,
                     endpoint_protocol_generation: Some(
@@ -3441,6 +3443,7 @@ mod tests {
                     expected_terminal_guard: true,
                     expected_agent_session_guard: true,
                     expected_agent_status_guard: true,
+                    refuse_if_exists_guard: true,
                     live_handoff: true,
                     detached_server_daemon: true,
                     endpoint_protocol_generation: Some(

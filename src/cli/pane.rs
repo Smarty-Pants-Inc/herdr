@@ -4,7 +4,8 @@ use crate::api::schema::{
     PaneMoveDestination, PaneMoveParams, PaneNeighborParams, PaneProcessInfoParams, PaneReadParams,
     PaneReleaseAgentParams, PaneRenameParams, PaneReportAgentParams, PaneReportAgentSessionParams,
     PaneReportMetadataParams, PaneResizeParams, PaneRightClickTarget, PaneSendInputParams,
-    PaneSendKeysParams, PaneSendTextParams, PaneSplitParams, PaneSwapParams, PaneTarget,
+    PaneSendKeysParams, PaneSendKeysPathCheckedParams, PaneSendTextParams,
+    PaneSendTextPathCheckedParams, PaneSplitParams, PaneSwapParams, PaneTarget,
     PaneWaitForOutputParams, PaneZoomMode, PaneZoomParams, ReadFormat, ReadSource, Request,
     SplitDirection,
 };
@@ -1089,16 +1090,52 @@ fn parse_pane_send_text_args(args: &[String]) -> Result<PaneSendTextParams, clap
     })
 }
 
+/// `--refuse-if-exists PATH`, made absolute against this CLI's working
+/// directory: the server checks it from its own.
+fn parse_refuse_if_exists_arg(
+    command: &str,
+    args: &[String],
+) -> Result<Option<String>, clap::Error> {
+    let matches = super::spec::parse_leaf_args(&["pane", command], args)?;
+    let Some(path) = matches.get_one::<String>("refuse-if-exists") else {
+        return Ok(None);
+    };
+    let absolute = std::path::absolute(path).map_err(|err| {
+        clap::Error::raw(
+            clap::error::ErrorKind::ValueValidation,
+            format!("invalid --refuse-if-exists path {path:?}: {err}\n"),
+        )
+    })?;
+    absolute
+        .into_os_string()
+        .into_string()
+        .map(Some)
+        .map_err(|_| {
+            clap::Error::raw(
+                clap::error::ErrorKind::InvalidUtf8,
+                "--refuse-if-exists needs a UTF-8 path\n",
+            )
+        })
+}
+
 fn pane_send_text(args: &[String]) -> std::io::Result<i32> {
-    let params = match parse_pane_send_text_args(args) {
-        Ok(params) => params,
+    let parsed = parse_pane_send_text_args(args)
+        .and_then(|params| Ok((params, parse_refuse_if_exists_arg("send-text", args)?)));
+    let (params, refuse_if_exists) = match parsed {
+        Ok(parsed) => parsed,
         Err(err) => {
             let exit_code = err.exit_code();
             err.print()?;
             return Ok(exit_code);
         }
     };
-    super::send_ok_request(Method::PaneSendText(params))
+    super::send_ok_request(match refuse_if_exists {
+        Some(refuse_if_exists) => Method::PaneSendTextPathChecked(PaneSendTextPathCheckedParams {
+            input: params,
+            refuse_if_exists,
+        }),
+        None => Method::PaneSendText(params),
+    })
 }
 
 fn parse_pane_send_keys_args(args: &[String]) -> Result<PaneSendKeysParams, clap::Error> {
@@ -1113,15 +1150,23 @@ fn parse_pane_send_keys_args(args: &[String]) -> Result<PaneSendKeysParams, clap
 }
 
 fn pane_send_keys(args: &[String]) -> std::io::Result<i32> {
-    let params = match parse_pane_send_keys_args(args) {
-        Ok(params) => params,
+    let parsed = parse_pane_send_keys_args(args)
+        .and_then(|params| Ok((params, parse_refuse_if_exists_arg("send-keys", args)?)));
+    let (params, refuse_if_exists) = match parsed {
+        Ok(parsed) => parsed,
         Err(err) => {
             let exit_code = err.exit_code();
             err.print()?;
             return Ok(exit_code);
         }
     };
-    super::send_ok_request(Method::PaneSendKeys(params))
+    super::send_ok_request(match refuse_if_exists {
+        Some(refuse_if_exists) => Method::PaneSendKeysPathChecked(PaneSendKeysPathCheckedParams {
+            input: params,
+            refuse_if_exists,
+        }),
+        None => Method::PaneSendKeys(params),
+    })
 }
 
 fn pane_run(args: &[String]) -> std::io::Result<i32> {
@@ -1799,10 +1844,8 @@ fn print_pane_help() {
     eprintln!("  {}", pane_move_usage());
     eprintln!("  herdr pane close <pane_id>");
     eprintln!("  herdr pane clear-input-poison <pane_id>");
-    eprintln!(
-        "  herdr pane send-text <pane_id> [--expected-session ID] [--allow-cross-pane] <text>"
-    );
-    eprintln!("  herdr pane send-keys <pane_id> [--expected-session ID] [--allow-cross-pane] <key> [key ...]");
+    eprintln!("  herdr pane send-text <pane_id> [--expected-session ID] [--refuse-if-exists PATH] [--allow-cross-pane] <text>");
+    eprintln!("  herdr pane send-keys <pane_id> [--expected-session ID] [--refuse-if-exists PATH] [--allow-cross-pane] <key> [key ...]");
     eprintln!("  herdr pane wait-output <pane_id> (--match TEXT | --regex PATTERN) [--source visible|recent|recent-unwrapped] [--lines N] [--timeout MS] [--raw]");
     eprintln!("  herdr pane report-agent <pane_id> --source ID --agent LABEL --state idle|working|blocked|unknown [--message TEXT] [--seq N] [--agent-session-id ID] [--agent-session-path PATH]");
     eprintln!("  herdr pane report-agent-session <pane_id> --source ID --agent LABEL [--seq N] [--agent-session-id ID] [--agent-session-path PATH]");

@@ -99,7 +99,7 @@ herdr pane read w1:p2 --source recent --lines 50
 | ワークスペース | `workspace.create`、`workspace.list`、`workspace.get`、`workspace.focus`、`workspace.rename`、`workspace.move`、`workspace.move_block`、`workspace.report_metadata`、`workspace.close` |
 | Worktree | `worktree.list`、`worktree.create`、`worktree.create_project_checked`、`worktree.open`、`worktree.open_project_checked`、`worktree.remove` |
 | タブ | `tab.create`、`tab.list`、`tab.get`、`tab.focus`、`tab.rename`、`tab.move`、`tab.close` |
-| ペイン | `pane.split`、`pane.swap`、`pane.move`、`pane.zoom`、`pane.layout`、`pane.process_info`、`pane.neighbor`、`pane.edges`、`pane.focus_direction`、`pane.resize`、`pane.list`、`pane.current`、`pane.get`、`pane.last_input`、`pane.rename`、`pane.send_text`、`pane.send_text_session_checked`、`pane.send_keys`、`pane.send_keys_session_checked`、`pane.send_input`、`pane.send_input_guarded`、`pane.read`、`pane.report_agent`、`pane.report_agent_session`、`pane.report_metadata`、`pane.clear_agent_authority`、`pane.release_agent`、`pane.close`、`pane.wait_for_output` |
+| ペイン | `pane.split`、`pane.swap`、`pane.move`、`pane.zoom`、`pane.layout`、`pane.process_info`、`pane.neighbor`、`pane.edges`、`pane.focus_direction`、`pane.resize`、`pane.list`、`pane.current`、`pane.get`、`pane.last_input`、`pane.rename`、`pane.send_text`、`pane.send_text_session_checked`、`pane.send_keys`、`pane.send_keys_session_checked`、`pane.send_text_path_checked`、`pane.send_keys_path_checked`、`pane.send_input`、`pane.send_input_guarded`、`pane.read`、`pane.report_agent`、`pane.report_agent_session`、`pane.report_metadata`、`pane.clear_agent_authority`、`pane.release_agent`、`pane.close`、`pane.wait_for_output` |
 | 入力コンシューマー（ローカル JSON 専用） | `pane.input_consumer.enroll`、`pane.input_consumer.cut`、`pane.input_consumer.release` |
 | ポップアップ | `popup.close` |
 | レイアウト | `layout.export`、`layout.apply`、`layout.apply_restorable`、`layout.set_split_ratio` |
@@ -388,6 +388,16 @@ principal の解決はサーバーが行い、クライアント接続ごとに�
 {"id":"checked_prompt","method":"agent.prompt_session_checked","params":{"target":"worker","text":"review this change","expected_agent_session_id":"reported_id_from_agent_get","expected_pane_id":"w1:p1","wait":{"until":["idle"],"timeout_ms":30000}}}
 {"id":"checked_text","method":"pane.send_text_session_checked","params":{"pane_id":"w1:p1","text":"hello","expected_agent_session_id":"reported_id_from_pane_get"}}
 {"id":"checked_keys","method":"pane.send_keys_session_checked","params":{"pane_id":"w1:p1","keys":["Enter"],"expected_agent_session_id":"reported_id_from_pane_get"}}
+```
+
+### 書き込み時のパスガード
+
+`pane.send_text_path_checked` と `pane.send_keys_path_checked` は、`pane.send_text` と `pane.send_keys` の params に加えて、必須の文字列 `refuse_if_exists`（絶対パス）を受け取ります。Herdr はリクエストの受理時にはパスを確認しません。PTY ライターは、リクエストのバイトを書き込む各 `write(2)` の直前（部分チャンクと再試行を含む）にパスを `lstat` します。`lstat` が成功した場合（ファイルの種類を問わず、リンク先のないシンボリックリンクも含む）、Herdr はリクエストの残りのバイトを破棄し、`guard_path_present` を返します。`error.partial_text_consumed: false` の場合、リクエストのバイトは 1 バイトもペインに届いていません。前のチャンクがすでに書き込まれていた場合、`partial_text_consumed` は `true` となり、Herdr は `agent_session_lost` と同様に `TCIFLUSH` で未読のペイン入力を破棄します。このフラッシュが失敗した場合、`partial_text_consumed` は `null`、`flush_failed` は `true` になります。他の入力には影響しません。ガードなしの後続の書き込みは届きます。相対パスは `invalid_request` を返します。レスポンスはキュー投入ではなく、PTY ライターの完了を報告します。`expected_agent_session_id` も併用できますが、その場合は `expected_agent_session_guard` も必要です。
+
+`ping.result.capabilities.refuse_if_exists_guard == true` を確認してください（Unix サーバーのみ。Windows は `false` を通知し、`refuse_if_exists_unsupported` で拒否します）。古いサーバーはこれらのメソッド名を `invalid_request` で拒否するため、ping とリクエストの間にサーバーが置き換えられても安全側で失敗します。拒否された後に `pane.send_text` や `pane.send_keys` へフォールバックしないでください。`lstat` と `write(2)` の間には小さな競合が残ります。
+
+```json
+{"id":"claim_checked_keys","method":"pane.send_keys_path_checked","params":{"pane_id":"w1:p1","keys":["esc"],"refuse_if_exists":"/run/user/1000/floor/claim"}}
 ```
 
 ### 検出されたエージェント状態の期待値ガード

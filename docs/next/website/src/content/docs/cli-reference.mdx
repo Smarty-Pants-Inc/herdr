@@ -258,8 +258,8 @@ herdr pane read <pane_id> --source recent-unwrapped --lines 120
 Send input:
 
 ```bash
-herdr pane send-text <pane_id> [--expected-session ID] <text>
-herdr pane send-keys <pane_id> [--expected-session ID] <key> [key ...]
+herdr pane send-text <pane_id> [--expected-session ID] [--refuse-if-exists PATH] <text>
+herdr pane send-keys <pane_id> [--expected-session ID] [--refuse-if-exists PATH] <key> [key ...]
 herdr pane run <pane_id> [--expected-terminal TERMINAL_ID] <command>
 ```
 
@@ -290,6 +290,8 @@ On an exact-slave open or `TCIFLUSH` failure, Herdr does **not** close the PTY m
 The initial check is atomic with Herdr's reported pane state at admission. It cannot detect a session change that the agent has not reported. Residual races remain: the final native-check/write gap between the fresh process/foreground check and `write(2)`, and the loss/flush/reader race in which a reader can consume staged bytes before the flush. Neither completion nor flushing guarantees zero total bytes written or consumed. The App-to-actor queue and delayed Enter wait are guarded, but do not eliminate these native races. The CLI requires `expected_agent_session_guard`, supported and advertised only on Linux. macOS and Windows fail closed; macOS is pending native proof. The CLI returns `expected_agent_session_unsupported` without sending the guarded operation when support is absent, and uses checked method names so a server replacement after the capability check fails closed. Omitting these flags preserves existing behavior and the separate cross-pane input policy.
 
 Known limitation: after suspension, resuming or reloading the same native session does not restore guarded-send eligibility; start a new session (`/new`) or restart the agent. See [the follow-up issue](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/7577).
+
+Use `--refuse-if-exists PATH` on `pane send-text` or `pane send-keys` to drop the input if PATH exists when Herdr is about to write it. Herdr checks the path with `lstat` right before each `write(2)`, not when it accepts the request, so a file created after your last check but before the write still stops the input. A refusal returns `guard_path_present` and exits 1; with `partial_text_consumed: false`, no byte reached the pane. A later send without the flag is delivered as usual. The CLI makes a relative PATH absolute against its own working directory. It needs the server capability `refuse_if_exists_guard` (Unix only) and returns `refuse_if_exists_unsupported` without sending when the capability is absent. It uses the checked methods `pane.send_text_path_checked` and `pane.send_keys_path_checked`, so an older server rejects the request and never ignores the flag. Without the flag, behavior is unchanged.
 
 Report agent state from custom hooks:
 

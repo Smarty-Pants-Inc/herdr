@@ -833,6 +833,7 @@ fn old_server_capabilities_do_not_advertise_expected_terminal_guard() {
     assert!(!caps.expected_terminal_guard);
     assert!(!caps.expected_agent_session_guard);
     assert!(!caps.expected_agent_status_guard);
+    assert!(!caps.refuse_if_exists_guard);
     assert!(!caps.input_consumer);
 }
 
@@ -1238,6 +1239,7 @@ fn success_response_round_trips() {
                 expected_terminal_guard: true,
                 expected_agent_session_guard: true,
                 expected_agent_status_guard: true,
+                refuse_if_exists_guard: true,
                 input_consumer: false,
             }),
         },

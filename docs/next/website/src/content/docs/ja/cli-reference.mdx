@@ -241,8 +241,8 @@ herdr pane read <pane_id> --source recent-unwrapped --lines 120
 入力を送る:
 
 ```bash
-herdr pane send-text <pane_id> [--expected-session ID] <text>
-herdr pane send-keys <pane_id> [--expected-session ID] <key> [key ...]
+herdr pane send-text <pane_id> [--expected-session ID] [--refuse-if-exists PATH] <text>
+herdr pane send-keys <pane_id> [--expected-session ID] [--refuse-if-exists PATH] <key> [key ...]
 herdr pane run <pane_id> <command>
 ```
 
@@ -267,6 +267,8 @@ herdr pane run <pane_id> <command>
 初期チェックは、受理時の Herdr の報告済みペイン状態に対してアトミックです。エージェントがまだ報告していないセッション変更は検出できません。最後の最新プロセス／フォアグラウンド確認と `write(2)` の間のネイティブ確認／書き込みの隙間、および所有権喪失／フラッシュ／読み取り側の競合は残ります。読み取り側がフラッシュ前に蓄積されたバイトを消費する可能性があります。完了やフラッシュは、書き込まれた、または消費された総バイト数がゼロであることを保証しません。App からアクターへのキューと遅延 Enter の待機はガードされますが、これらのネイティブの競合をなくすものではありません。CLI は `expected_agent_session_guard` を必要とし、対応と能力の通知は Linux のみです。macOS と Windows は安全を確認できないため拒否し、macOS はネイティブな証明の実装待ちです。未対応なら CLI はガード付き操作を送らずに `expected_agent_session_unsupported` を返します。また checked メソッド名を使うため、能力チェック後にサーバーが置き換わっても、安全を確認できなければ操作を拒否します。これらのフラグを省略すると、既存の動作と別途定められたペイン間入力ポリシーは変わりません。
 
 既知の制限: 一時停止後に同じネイティブセッションを再開または再読み込みしても、ガード付き送信は再び許可されません。新しいセッションを開始する（`/new`）か、エージェントを再起動してください。[フォローアップの issue](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/7577) を参照してください。
+
+`pane send-text` または `pane send-keys` に `--refuse-if-exists PATH` を指定すると、Herdr が書き込む直前に PATH が存在する場合は入力を破棄します。Herdr はリクエストの受理時ではなく、各 `write(2)` の直前に `lstat` でパスを確認します。そのため、送信側の最後の確認の後、書き込みの前に作成されたファイルでも入力を止められます。拒否すると `guard_path_present` を返し、終了コード 1 で終了します。`partial_text_consumed: false` の場合、ペインには 1 バイトも届いていません。フラグなしの後続の送信は通常どおり届きます。CLI は相対 PATH を自身の作業ディレクトリを基準に絶対パスにします。サーバー機能 `refuse_if_exists_guard`（Unix のみ）が必要で、この機能がない場合は送信せずに `refuse_if_exists_unsupported` を返します。CLI はチェック付きメソッド `pane.send_text_path_checked` と `pane.send_keys_path_checked` を使うため、古いサーバーはリクエストを拒否し、フラグを無視することはありません。フラグを省略すると動作は変わりません。
 
 カスタムフックからエージェント状態を報告する:
 

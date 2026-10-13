@@ -103,7 +103,7 @@ Raw socket method names use dot notation:
 | Workspace | `workspace.create`, `workspace.create_linked`, `workspace.list`, `workspace.get`, `workspace.focus`, `workspace.rename`, `workspace.move`, `workspace.move_block`, `workspace.report_metadata`, `workspace.close` |
 | Worktree | `worktree.list`, `worktree.create`, `worktree.create_project_checked`, `worktree.open`, `worktree.open_project_checked`, `worktree.remove` |
 | Tab | `tab.create`, `tab.list`, `tab.get`, `tab.focus`, `tab.rename`, `tab.move`, `tab.close` |
-| Pane | `pane.split`, `pane.swap`, `pane.move`, `pane.zoom`, `pane.layout`, `pane.process_info`, `pane.neighbor`, `pane.edges`, `pane.focus_direction`, `pane.resize`, `pane.list`, `pane.current`, `pane.get`, `pane.last_input`, `pane.rename`, `pane.send_text`, `pane.send_text_session_checked`, `pane.send_keys`, `pane.send_keys_session_checked`, `pane.send_input`, `pane.send_input_guarded`, `pane.read`, `pane.report_agent`, `pane.report_agent_session`, `pane.report_metadata`, `pane.clear_agent_authority`, `pane.release_agent`, `pane.close`, `pane.wait_for_output` |
+| Pane | `pane.split`, `pane.swap`, `pane.move`, `pane.zoom`, `pane.layout`, `pane.process_info`, `pane.neighbor`, `pane.edges`, `pane.focus_direction`, `pane.resize`, `pane.list`, `pane.current`, `pane.get`, `pane.last_input`, `pane.rename`, `pane.send_text`, `pane.send_text_session_checked`, `pane.send_keys`, `pane.send_keys_session_checked`, `pane.send_text_path_checked`, `pane.send_keys_path_checked`, `pane.send_input`, `pane.send_input_guarded`, `pane.read`, `pane.report_agent`, `pane.report_agent_session`, `pane.report_metadata`, `pane.clear_agent_authority`, `pane.release_agent`, `pane.close`, `pane.wait_for_output` |
 | Input consumer (local JSON only) | `pane.input_consumer.enroll`, `pane.input_consumer.cut`, `pane.input_consumer.release` |
 | Popup | `popup.close` |
 | Layout | `layout.export`, `layout.apply`, `layout.apply_restorable`, `layout.set_split_ratio` |
@@ -494,6 +494,16 @@ Check `ping.result.capabilities.expected_agent_session_guard == true` (supported
 {"id":"checked_prompt","method":"agent.prompt_session_checked","params":{"target":"worker","text":"review this change","expected_agent_session_id":"reported_id_from_agent_get","expected_pane_id":"w1:p1","wait":{"until":["idle"],"timeout_ms":30000}}}
 {"id":"checked_text","method":"pane.send_text_session_checked","params":{"pane_id":"w1:p1","text":"hello","expected_agent_session_id":"reported_id_from_pane_get"}}
 {"id":"checked_keys","method":"pane.send_keys_session_checked","params":{"pane_id":"w1:p1","keys":["Enter"],"expected_agent_session_id":"reported_id_from_pane_get"}}
+```
+
+### Write-time path guard
+
+`pane.send_text_path_checked` and `pane.send_keys_path_checked` take the params of `pane.send_text` and `pane.send_keys` plus a required `refuse_if_exists` string, which must be an absolute path. Herdr does not check the path when it accepts the request. The PTY writer calls `lstat` on the path right before each `write(2)` of the request's bytes, including partial chunks and retries. If `lstat` succeeds (any file type, also a dangling symlink), Herdr drops the remaining bytes of the request and returns `guard_path_present`. With `error.partial_text_consumed: false`, no byte of the request reached the pane. If an earlier chunk was already written, `partial_text_consumed` is `true` and Herdr discards unread pane input with `TCIFLUSH`, as for `agent_session_lost`; if that flush fails, `partial_text_consumed` is `null` and `flush_failed` is `true`. Other input is not affected: a later write without the guard is delivered. A relative path returns `invalid_request`. The response reports the PTY writer's completion, not the enqueue. You can also give `expected_agent_session_id`; the request then also needs `expected_agent_session_guard`.
+
+Check `ping.result.capabilities.refuse_if_exists_guard == true` (Unix servers only; Windows advertises `false` and refuses with `refuse_if_exists_unsupported`). Older servers reject these method names with `invalid_request`, so a server replaced between the ping and the request fails closed. Do not fall back to `pane.send_text` or `pane.send_keys` after a rejection. A small race remains between the `lstat` and the `write(2)`.
+
+```json
+{"id":"claim_checked_keys","method":"pane.send_keys_path_checked","params":{"pane_id":"w1:p1","keys":["esc"],"refuse_if_exists":"/run/user/1000/floor/claim"}}
 ```
 
 ### Expected detected agent status guard
@@ -1308,7 +1318,9 @@ rotation error. If herdr cannot write the line for any other reason, it refuses 
 with `input_log_unavailable`. The session-checked forms
 (`pane.send_text_session_checked`, `pane.send_keys_session_checked`, and
 `agent.prompt_session_checked`) are logged exactly like their base methods, under the
-base method name, after their expected-session check accepts the input.
+base method name, after their expected-session check accepts the input. The path-checked
+forms (`pane.send_text_path_checked` and `pane.send_keys_path_checked`) are also logged
+under the base method name, when Herdr accepts the input and before the write-time check.
 
 On Linux and macOS, `caller.exe` and `caller.ppid` record the executable basename
 (not a mutable process label) and parent PID at write time, even when the caller is

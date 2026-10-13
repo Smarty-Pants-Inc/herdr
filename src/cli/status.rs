@@ -323,6 +323,7 @@ struct ServerCapabilitiesJson {
     expected_terminal_guard: bool,
     expected_agent_session_guard: bool,
     expected_agent_status_guard: bool,
+    refuse_if_exists_guard: bool,
     live_handoff: bool,
     detached_server_daemon: bool,
     endpoint_protocol_generation: Option<u32>,
@@ -376,6 +377,7 @@ fn server_status_json(server: &ServerRuntimeStatus) -> ServerStatusJson {
                     expected_terminal_guard: capabilities.expected_terminal_guard,
                     expected_agent_session_guard: capabilities.expected_agent_session_guard,
                     expected_agent_status_guard: capabilities.expected_agent_status_guard,
+                    refuse_if_exists_guard: capabilities.refuse_if_exists_guard,
                     live_handoff: capabilities.live_handoff,
                     detached_server_daemon: capabilities.detached_server_daemon,
                     endpoint_protocol_generation: capabilities.endpoint_protocol_generation,
@@ -486,6 +488,7 @@ mod tests {
                 expected_terminal_guard: true,
                 expected_agent_session_guard: true,
                 expected_agent_status_guard: true,
+                refuse_if_exists_guard: true,
                 input_consumer: false,
             }),
         }
