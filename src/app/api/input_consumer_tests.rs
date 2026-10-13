@@ -185,3 +185,140 @@ fn input_consumer_release_and_refusal_envelopes() {
     assert!(!is_lower_hex(&"AB".repeat(32), 64));
     assert!(!is_lower_hex(&"ab".repeat(31), 64));
 }
+
+/// Shared vectors V1-V3 (design "Acceptance tests"; H1), pinned verbatim from
+/// dp2636/vectors-v2.json, which Pi's implementation generated. Ed25519 under the
+/// fixed test seed 0x01..0x20 is deterministic, so Herdr must produce the exact
+/// transcript bytes, digests, signatures and answer shapes.
+#[cfg(target_os = "linux")]
+mod vectors {
+    use super::*;
+    use base64::Engine as _;
+    use sha2::Digest as _;
+
+    const PINNED: &str = include_str!("../../../tests/fixtures/input-consumer-vectors-v2.json");
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+    fn unhex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("hex"))
+            .collect()
+    }
+    fn text(v: &serde_json::Value) -> &str {
+        v.as_str().expect("string field")
+    }
+    fn number(v: &serde_json::Value) -> u64 {
+        text(v).parse().expect("decimal field")
+    }
+
+    #[test]
+    fn input_consumer_v2_shared_vectors_match_byte_for_byte() {
+        use ring::signature::KeyPair as _;
+        let pinned: serde_json::Value = serde_json::from_str(PINNED).expect("vectors json");
+        let seed = unhex(text(&pinned["key"]["seed_hex"]));
+        assert_eq!(seed, (1..=32).collect::<Vec<u8>>());
+        let key = ring::signature::Ed25519KeyPair::from_seed_unchecked(&seed).expect("seed");
+        assert_eq!(
+            hex(key.public_key().as_ref()),
+            text(&pinned["key"]["public_key_hex"])
+        );
+        let sign = |m: &[u8]| Some(key.sign(m).as_ref().to_vec());
+
+        let enroll = &pinned["enroll"];
+        assert_eq!(text(&enroll["domain"]), ENROLL_LABEL);
+        let f = &enroll["fields"];
+        let enrollment = Enrollment {
+            challenge: text(&f["challenge"]),
+            epoch: text(&f["epoch"]),
+            nonce: text(&f["nonce"]),
+            pane_id: text(&f["pane_id"]),
+            tty: (number(&f["tty"]["dev"]), number(&f["tty"]["ino"])),
+            peer_pid: number(&f["peer"]["pid"]) as u32,
+            pidns: number(&f["peer"]["pidns"]),
+        };
+        let t = enroll_transcript(&enrollment);
+        assert_eq!(hex(&t), text(&enroll["message_hex"]));
+        assert_eq!(
+            hex(&sha2::Sha256::digest(&t)),
+            text(&enroll["message_sha256"])
+        );
+        let answer = enroll_answer(&enrollment, sign).expect("signed");
+        assert_eq!(answer["sig"], enroll["sig_b64"]);
+        assert_eq!(answer["tty"], f["tty"]);
+        assert_eq!(answer["peer"], f["peer"]);
+
+        let cuts = pinned["cut"].as_array().expect("cut vectors");
+        let mut names = Vec::new();
+        for vector in cuts {
+            assert_eq!(text(&vector["domain"]), CUT_ANSWER_LABEL);
+            let r = &vector["request"];
+            let request = CutRequest {
+                epoch: text(&r["epoch"]).into(),
+                seq: r["seq"].as_u64().expect("seq"),
+                token: text(&r["token"]).into(),
+                cut: r["cut"].as_u64().expect("cut"),
+                digest: text(&r["digest"]).into(),
+                kind: match text(&r["kind"]) {
+                    "submit" => CutKind::Submit,
+                    "discard" => CutKind::Discard,
+                    other => panic!("kind {other}"),
+                },
+            };
+            let a = &vector["answer"];
+            let result = match text(&a["result"]) {
+                "client" => CutResult::Client {
+                    principal: serde_json::from_value(a["principal"].clone()).expect("principal"),
+                },
+                "api" => CutResult::Api,
+                "mixed" => CutResult::Mixed,
+                "unknown" => CutResult::Unknown {
+                    reason: text(&a["reason"]).into(),
+                },
+                other => panic!("result {other}"),
+            };
+            let message = cut_answer_message(&request, &result);
+            assert_eq!(hex(&message), text(&vector["message_hex"]), "{vector}");
+            assert_eq!(
+                hex(&sha2::Sha256::digest(&message)),
+                text(&vector["message_sha256"])
+            );
+            let mut answer = cut_answer(&request, &result, sign).expect("signed");
+            assert_eq!(answer["sig"], vector["sig_b64"], "{vector}");
+            // The rest of the answer is exactly Pi's expected wire shape.
+            answer.as_object_mut().expect("object").remove("sig");
+            assert_eq!(&answer, a, "{vector}");
+            names.push(text(&vector["name"]).to_owned());
+        }
+        assert_eq!(
+            names,
+            [
+                "client-principal",
+                "client-null-principal",
+                "api",
+                "unknown-reason"
+            ]
+        );
+        // The pinned signatures are not merely reproduced: they verify.
+        let verifier =
+            ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, key.public_key());
+        let b64 = |v: &serde_json::Value| {
+            base64::engine::general_purpose::STANDARD
+                .decode(text(v))
+                .expect("base64")
+        };
+        verifier
+            .verify(&t, &b64(&enroll["sig_b64"]))
+            .expect("enroll vector verifies");
+        for vector in cuts {
+            verifier
+                .verify(
+                    &unhex(text(&vector["message_hex"])),
+                    &b64(&vector["sig_b64"]),
+                )
+                .expect("cut vector verifies");
+        }
+    }
+}
