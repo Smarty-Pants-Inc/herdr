@@ -9276,13 +9276,6 @@ impl CrossPaneGuardFixture {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn assert_cross_pane_denied(response: &str) {
-    let response: api::schema::ErrorResponse =
-        serde_json::from_str(response).expect("denial response");
-    assert_eq!(response.error.code, "cross_pane_input_denied");
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn assert_agent_prompted(response: &str) {
     let response: api::schema::SuccessResponse =
         serde_json::from_str(response).unwrap_or_else(|err| panic!("{err}: {response}"));
@@ -9302,13 +9295,19 @@ async fn headless_api_dispatch_uses_origin_context_for_cross_pane_guard() {
         api::schema::Method::PaneSendText(api::schema::PaneSendTextParams {
             expected_agent_session_id: None,
             pane_id: target_pane_id,
-            text: "blocked".into(),
+            text: "advisory".into(),
             allow_cross_pane: false,
         }),
     );
 
-    assert_cross_pane_denied(&response);
-    assert!(fixture.target_rx.try_recv().is_err());
+    // Advisory guard (Paul, 2026-10-13): cross-pane fleet input is accepted.
+    let response: api::schema::SuccessResponse =
+        serde_json::from_str(&response).unwrap_or_else(|err| panic!("{err}: {response}"));
+    assert!(matches!(
+        response.result,
+        api::schema::ResponseResult::Ok {}
+    ));
+    assert!(fixture.target_rx.try_recv().is_ok());
     fixture.shutdown();
 }
 
@@ -9328,9 +9327,10 @@ async fn headless_deferred_agent_prompt_enforces_cross_pane_guard() {
     };
     let mut fixture = CrossPaneGuardFixture::new();
 
-    let denied = fixture.send_attributed("prompt-denied", prompt("target-agent", false));
-    assert_cross_pane_denied(&denied);
-    assert!(fixture.target_rx.try_recv().is_err());
+    // Advisory guard (Paul, 2026-10-13): no opt-in needed any more.
+    let advisory = fixture.send_attributed("prompt-advisory", prompt("target-agent", false));
+    assert_agent_prompted(&advisory);
+    while fixture.target_rx.try_recv().is_ok() {}
 
     let allowed = fixture.send_attributed("prompt-allowed", prompt("target-agent", true));
     assert_agent_prompted(&allowed);

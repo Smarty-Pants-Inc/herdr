@@ -1298,7 +1298,7 @@
         },
         "AgentDraftStateParams": {
           "additionalProperties": false,
-          "description": "A read-only observation, never authority for a later prompt. Callers are\nauthorized exactly like `agent.prompt`: an attributed agent may observe its own\npane, and another pane only with explicit `allow_cross_pane`.",
+          "description": "A read-only observation, never authority for a later prompt. Callers follow\nthe same advisory input-origin policy as `agent.prompt`: cross-pane queries\nare allowed and logged; `allow_cross_pane` is kept for compatibility.",
           "properties": {
             "allow_cross_pane": {
               "type": "boolean"
