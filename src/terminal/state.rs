@@ -112,6 +112,11 @@ enum ManagedAgentPhase {
         observed_expected: bool,
     },
     Blocked,
+    /// The launch deadline passed after the expected agent was seen, but it
+    /// has not reached readiness (a resumed session still working). The
+    /// launch keeps its name and stays pending, with no deadline, until the
+    /// normal readiness condition makes it active.
+    Seen,
     Active,
 }
 
@@ -2916,7 +2921,9 @@ impl TerminalState {
         self.managed_agent.is_some_and(|managed| {
             matches!(
                 managed.phase,
-                ManagedAgentPhase::Pending { .. } | ManagedAgentPhase::Blocked
+                ManagedAgentPhase::Pending { .. }
+                    | ManagedAgentPhase::Blocked
+                    | ManagedAgentPhase::Seen
             )
         })
     }
@@ -2965,24 +2972,26 @@ impl TerminalState {
             ManagedAgentPhase::Pending {
                 observed_expected, ..
             } => observed_expected || known_agent == Some(managed.kind),
+            ManagedAgentPhase::Seen => true,
             ManagedAgentPhase::Blocked | ManagedAgentPhase::Active => false,
         };
         let clear = process_exited
             || known_agent.is_some_and(|agent| agent != managed.kind)
-            || matches!(managed.phase, ManagedAgentPhase::Pending { .. })
-                && observed_expected
-                && known_agent.is_none();
+            || observed_expected && known_agent.is_none();
         if clear {
             self.clear_agent_name();
             return true;
         }
-        if managed.phase == ManagedAgentPhase::Blocked {
-            if known_agent == Some(managed.kind)
-                && (self.state == AgentState::Idle
-                    || managed.kind == Agent::Codex
-                        && self.state == AgentState::Unknown
-                        && self.codex_prompt_ready)
-            {
+        let ready = known_agent == Some(managed.kind)
+            && (self.state == AgentState::Idle
+                || managed.kind == Agent::Codex
+                    && self.state == AgentState::Unknown
+                    && self.codex_prompt_ready);
+        if matches!(
+            managed.phase,
+            ManagedAgentPhase::Blocked | ManagedAgentPhase::Seen
+        ) {
+            if ready {
                 self.managed_agent = Some(ManagedAgent {
                     kind: managed.kind,
                     phase: ManagedAgentPhase::Active,
@@ -3008,28 +3017,29 @@ impl TerminalState {
             if now >= deadline {
                 // The deadline bounds how long the expected agent may take to
                 // appear, not how long it may stay busy. Once seen (a resumed
-                // session can work past the deadline), the launch has its
-                // agent: keep the name. Only a launch whose agent never
-                // appeared releases it here.
+                // session can work past the deadline), the launch keeps its
+                // name but is not ready: it waits in `Seen` for the normal
+                // readiness condition. Only a launch whose agent never
+                // appeared releases the name here.
                 // (A seen agent that is gone, or replaced, was cleared above.)
                 if observed_expected {
+                    let phase = if ready {
+                        self.managed_agent_launch_session = None;
+                        ManagedAgentPhase::Active
+                    } else {
+                        ManagedAgentPhase::Seen
+                    };
                     self.managed_agent = Some(ManagedAgent {
                         kind: managed.kind,
-                        phase: ManagedAgentPhase::Active,
+                        phase,
                     });
-                    self.managed_agent_launch_session = None;
                 } else {
                     self.clear_agent_name();
                 }
                 return true;
             }
             if ready_after.is_none_or(|ready_after| now >= ready_after) {
-                if known_agent == Some(managed.kind)
-                    && (self.state == AgentState::Idle
-                        || managed.kind == Agent::Codex
-                            && self.state == AgentState::Unknown
-                            && self.codex_prompt_ready)
-                {
+                if ready {
                     self.managed_agent = Some(ManagedAgent {
                         kind: managed.kind,
                         phase: ManagedAgentPhase::Active,
@@ -4233,8 +4243,22 @@ mod tests {
 
         terminal.set_detected_state(Some(Agent::Pi), AgentState::Working);
         assert!(terminal.reconcile_managed_agent_at(now + Duration::from_secs(60), false));
+        // Past the deadline, still working: the name stays, the launch is not
+        // ready, and there is no further deadline.
         assert_eq!(terminal.agent_name.as_deref(), Some("lead-x"));
+        assert!(terminal.managed_agent_launch_pending());
+        assert!(!terminal.managed_agent_interactive_ready());
+        assert_eq!(terminal.next_managed_agent_deadline(), None);
+        assert!(!terminal.reconcile_managed_agent_at(now + Duration::from_secs(120), false));
+        assert_eq!(terminal.agent_name.as_deref(), Some("lead-x"));
+        assert!(!terminal.managed_agent_interactive_ready());
+
+        // The normal readiness condition makes it active.
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
+        assert!(terminal.reconcile_managed_agent_at(now + Duration::from_secs(120), false));
+        assert!(!terminal.managed_agent_launch_pending());
         assert!(terminal.managed_agent_interactive_ready());
+        assert_eq!(terminal.agent_name.as_deref(), Some("lead-x"));
 
         // Leaving the pane still frees the name.
         terminal.set_detected_state_with_visible_blocker(

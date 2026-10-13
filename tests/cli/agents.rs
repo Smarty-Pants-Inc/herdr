@@ -818,7 +818,8 @@ fn agent_start_timeout_releases_the_name_for_reuse() {
 }
 
 /// A fake `pi` on PATH that reports the state given as its first argument
-/// (default `working`) and stays in it until it reads `quit`.
+/// (default `working`), reports `idle` or `working` again when it reads that
+/// line, and exits when it reads `quit`.
 fn write_stateful_fake_pi(base: &Path) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
 
@@ -828,7 +829,7 @@ fn write_stateful_fake_pi(base: &Path) -> PathBuf {
     fs::write(
         &fake_pi,
         format!(
-            "#!/bin/sh\nexport HERDR_AGENT=pi\n'{0}' pane report-agent \"$HERDR_PANE_ID\" --source custom:fake-pi --agent pi --state \"${{1:-working}}\" >/dev/null\nwhile IFS= read -r line; do\n  [ \"$line\" = quit ] && exit 0\ndone\n",
+            "#!/bin/sh\nexport HERDR_AGENT=pi\nreport() {{ '{0}' pane report-agent \"$HERDR_PANE_ID\" --source custom:fake-pi --agent pi --state \"$1\" >/dev/null; }}\nreport \"${{1:-working}}\"\nwhile IFS= read -r line; do\n  case \"$line\" in\n    quit) exit 0 ;;\n    idle|working) report \"$line\" ;;\n  esac\ndone\n",
             env!("CARGO_BIN_EXE_herdr"),
         ),
     )
@@ -851,8 +852,9 @@ fn agent_get(socket_path: &Path, name: &str) -> Result<serde_json::Value, serde_
 
 // smarty-dev#11073: a managed launch whose agent was seen, but is still working
 // when the launch deadline passes (a Pi resuming a big session, or one that
-// starts work at once), keeps its name. Leaving the pane still frees it, and the
-// same pane can be relaunched under the same name.
+// starts work at once), keeps its name without becoming ready: prompts are still
+// rejected until the agent reaches idle. Leaving the pane still frees the name,
+// and the same pane can be relaunched under the same name.
 #[test]
 fn agent_start_keeps_the_name_of_a_seen_agent_still_working_at_the_deadline() {
     let base = unique_test_dir();
@@ -875,6 +877,23 @@ fn agent_start_keeps_the_name_of_a_seen_agent_still_working_at_the_deadline() {
         .unwrap()
         .to_string();
 
+    // Before the deadline, a prompt to the still-starting launch is rejected
+    // by the managed-startup guard. Capture that rejection to compare with the
+    // one after the deadline.
+    let early_socket = socket_path.clone();
+    let early_prompt = thread::spawn(move || {
+        assert!(
+            wait_until(Duration::from_secs(3), Duration::from_millis(50), || {
+                agent_get(&early_socket, "lead-x")
+                    .is_ok_and(|agent| agent["agent_status"] == "working")
+            }),
+            "the launch never showed its working agent"
+        );
+        let prompted = run_cli(&early_socket, &["agent", "prompt", "lead-x", "too early"]);
+        assert_eq!(prompted.status.code(), Some(1));
+        serde_json::from_slice::<serde_json::Value>(&prompted.stderr).unwrap()
+    });
+
     // The agent is seen and working, never idle, so the CLI's readiness wait
     // times out; the launch deadline passes with the agent still in the pane.
     let started = run_cli(
@@ -894,8 +913,15 @@ fn agent_start_keeps_the_name_of_a_seen_agent_still_working_at_the_deadline() {
     assert_eq!(started.status.code(), Some(1));
     let error: serde_json::Value = serde_json::from_slice(&started.stderr).unwrap();
     assert_eq!(error["error"]["code"], "timeout");
+    let early_rejection = early_prompt.join().unwrap();
+    assert_eq!(
+        early_rejection["error"]["code"], "agent_not_ready",
+        "{early_rejection}"
+    );
 
-    // Past the deadline, and again after more reconcile ticks: the name stays.
+    // Past the deadline, and again after more reconcile ticks: the name stays,
+    // but the still-working launch is not ready and a prompt is rejected
+    // exactly as before the deadline.
     for _ in 0..2 {
         let agent = agent_get(&socket_path, "lead-x")
             .unwrap_or_else(|err| panic!("the working agent lost its name: {err}"));
@@ -903,9 +929,35 @@ fn agent_start_keeps_the_name_of_a_seen_agent_still_working_at_the_deadline() {
         assert_eq!(agent["pane_id"], pane_id.as_str(), "{agent}");
         assert_eq!(agent["agent"], "pi", "{agent}");
         assert_eq!(agent["agent_status"], "working", "{agent}");
-        assert_eq!(agent["interactive_ready"], true, "{agent}");
+        // `interactive_ready` is omitted when false.
+        assert_ne!(agent["interactive_ready"], true, "{agent}");
+        assert_eq!(agent["launch_pending"], true, "{agent}");
+        let prompted = run_cli(&socket_path, &["agent", "prompt", "lead-x", "too early"]);
+        assert_eq!(prompted.status.code(), Some(1));
+        let rejection: serde_json::Value = serde_json::from_slice(&prompted.stderr).unwrap();
+        assert_eq!(rejection["error"], early_rejection["error"], "{rejection}");
         thread::sleep(Duration::from_millis(600));
     }
+
+    // The agent reports idle: the launch becomes ready and takes a prompt.
+    assert!(run_cli(&socket_path, &["pane", "run", &pane_id, "idle"])
+        .status
+        .success());
+    assert!(
+        wait_until(Duration::from_secs(10), Duration::from_millis(50), || {
+            agent_get(&socket_path, "lead-x").is_ok_and(|agent| {
+                agent["agent_status"] == "idle" && agent["interactive_ready"] == true
+            })
+        }),
+        "the idle agent never became ready: {:?}",
+        agent_get(&socket_path, "lead-x")
+    );
+    let prompted = run_cli(&socket_path, &["agent", "prompt", "lead-x", "hello"]);
+    assert!(
+        prompted.status.success(),
+        "a ready agent rejected the prompt: {}",
+        String::from_utf8_lossy(&prompted.stderr)
+    );
 
     // The agent leaves the pane (exit, shell back): the name is freed.
     assert!(run_cli(&socket_path, &["pane", "run", &pane_id, "quit"])
