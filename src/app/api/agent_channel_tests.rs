@@ -113,7 +113,8 @@ async fn channel_draft_query_unknown_origin_needs_opt_in_and_unregistered_guard_
         }),
     };
     assert!(!crate::api::request_changes_ui(&query));
-    // Unknown origin is refused like agent.prompt, before any typed observation.
+    // Advisory guard (Paul, 2026-10-13): unknown origin is accepted like
+    // agent.prompt and reaches the typed observation without opt-in.
     let (respond_to, response) = std::sync::mpsc::channel();
     assert!(app.handle_deferred_agent_api_request(
         query.clone(),
@@ -121,8 +122,10 @@ async fn channel_draft_query_unknown_origin_needs_opt_in_and_unregistered_guard_
         respond_to
     ));
     let response = value(response.recv_timeout(Duration::from_secs(1)).unwrap());
-    assert_eq!(response["error"]["code"], "input_origin_unknown");
-    assert!(response.get("result").is_none());
+    assert_eq!(
+        response["result"],
+        serde_json::json!({"status":"unknown", "reason":"unregistered"})
+    );
     if let Method::AgentDraftState(params) = &mut query.method {
         params.allow_cross_pane = true;
     }
@@ -227,28 +230,21 @@ async fn channel_expected_terminal_epoch_origin_and_attachment_fail_closed_witho
             ..params.clone()
         }),
     };
-    assert_eq!(
-        value(
-            app.cross_pane_input_denial(
-                &cross,
-                crate::api::ApiRequestContext::for_local_peer_pid(Some(root.pid))
-            )
-            .unwrap()
-        )["error"]["code"],
-        "cross_pane_input_denied"
-    );
+    // Advisory guard: cross-pane and unknown-origin prompts are accepted.
+    assert!(app
+        .cross_pane_input_denial(
+            &cross,
+            crate::api::ApiRequestContext::for_local_peer_pid(Some(root.pid))
+        )
+        .is_none());
     params.allow_cross_pane = false;
     let request = Request {
         id: "unknown-origin".into(),
         method: Method::AgentPromptGuarded(params.clone()),
     };
-    assert_eq!(
-        value(
-            app.cross_pane_input_denial(&request, crate::api::ApiRequestContext::default())
-                .unwrap()
-        )["error"]["code"],
-        "input_origin_unknown"
-    );
+    assert!(app
+        .cross_pane_input_denial(&request, crate::api::ApiRequestContext::default())
+        .is_none());
     params.expected_registration_epoch = "epoch".into();
     let request = Request {
         id: "explicit".into(),

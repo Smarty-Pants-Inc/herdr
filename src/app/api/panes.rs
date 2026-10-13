@@ -104,57 +104,31 @@ fn precheck_pane_input_poison(id: &str, poisoned: bool) -> Result<(), String> {
     }
 }
 
-const OPERATOR_ORIGIN_REQUIRED_MESSAGE: &str = "only an operator can clear pane input poison: use the attached Herdr client or run the CLI outside every Herdr pane";
-const OPERATOR_ORIGIN_UNKNOWN_MESSAGE: &str = "cannot validate the caller's origin; clear pane input poison from the attached Herdr client or a terminal outside every Herdr pane";
-
 impl App {
-    /// smarty-dev#8152: clearing poison re-enables input that may still find
-    /// staged text, so it is an operator action. Every caller, on the public
-    /// API socket or the attached client's endpoint lane, is classified by the
-    /// same caller-origin policy as content writes from its accept-pinned peer;
-    /// the client lane's trusted flag alone proves nothing, because any
-    /// same-user process, also one inside a pane, can open the client socket.
-    /// A caller is an operator only with an ordinary origin and no pane of its
-    /// own (proven outside every pane). Every pane-attributed caller is
-    /// refused, including for its own pane: the poisoned pane's agent is the
-    /// party whose staged text the poison guards. An unattributable caller is
-    /// `input_origin_unknown`.
-    ///
-    /// ponytail: accepted residual. Attribution is by current ancestry, so a
-    /// pane process that strips its Herdr markers and escapes the server's
-    /// process tree (double fork + `setsid`) is classified as an ordinary
-    /// caller. That is the general ancestry-escape limit tracked in
-    /// smarty-dev#9333, not specific to this method: such a process is already
-    /// an ordinary caller for every content write (`input_guard.rs` returns
-    /// `None` for `InputOrigin::Ordinary`), so it can type into any unpoisoned
-    /// pane today. Clearing poison gives it nothing beyond that class; closing
-    /// the class (#9333) closes it here too.
+    /// Clears pane input poison and drains staged input. Any caller is
+    /// accepted (herdr#257's operator-only gate was rolled back 2026-10-13).
     pub(super) fn handle_pane_clear_input_poison(
         &mut self,
         id: String,
         target: PaneTarget,
         context: &mut crate::api::ApiRequestContext,
     ) -> String {
+        // Advisory only (Paul, 2026-10-13): a failed guarded flush no longer
+        // poisons input, so clearing is harmless and any caller is accepted.
+        // The caller's origin is still logged for attribution.
         use crate::app::terminal_targets::InputOrigin;
-        let denial = match self.input_origin_for_context_with_ancestry(context) {
-            InputOrigin::Ordinary if self.trusted_invoking_pane(*context).is_none() => None,
-            InputOrigin::Agent(source)
-                if self
-                    .parse_pane_id(&target.pane_id)
-                    .and_then(|(ws, pane)| self.terminal_target_for_pane(ws, pane))
-                    .is_some_and(|target| target.terminal_id != source.terminal_id) =>
-            {
-                Some((
-                    "cross_pane_input_denied",
-                    "agent-originated input cannot target a different pane",
-                ))
-            }
-            InputOrigin::Unknown => Some(("input_origin_unknown", OPERATOR_ORIGIN_UNKNOWN_MESSAGE)),
-            _ => Some(("operator_origin_required", OPERATOR_ORIGIN_REQUIRED_MESSAGE)),
+        let (origin, source_terminal) = match self.input_origin_for_context_with_ancestry(context) {
+            InputOrigin::Ordinary => ("ordinary", String::new()),
+            InputOrigin::PluginAction(_) => ("plugin_action", String::new()),
+            InputOrigin::Agent(source) => ("agent", source.terminal_id.to_string()),
+            InputOrigin::Unknown => ("unknown", String::new()),
         };
-        if let Some((code, message)) = denial {
-            return encode_error(id, code, message);
-        }
+        tracing::info!(
+            origin,
+            source_terminal = %source_terminal,
+            target_pane = %target.pane_id,
+            "pane input poison clear accepted (advisory origin check)"
+        );
         let Some((ws_idx, pane_id)) = self.parse_pane_id(&target.pane_id) else {
             return pane_not_found(id, &target.pane_id);
         };
@@ -2936,31 +2910,35 @@ mod tests {
                 pane_id: pane_id.clone(),
             }),
         };
-        // smarty-dev#8152: a public caller whose origin cannot be proven is no
-        // operator; the poison stays.
-        let refused: ErrorResponse =
+        // Paul, 2026-10-13: any caller may clear (operator-only gate rolled
+        // back). A public caller of unknown origin clears it...
+        let value: serde_json::Value =
             serde_json::from_str(&app.handle_api_request(clear.clone())).unwrap();
-        assert_eq!(refused.error.code, "input_origin_unknown");
-        assert!(app
+        assert_eq!(value["result"]["type"], "ok");
+        assert!(!app
             .lookup_runtime_sender(0, internal_pane_id)
             .unwrap()
             .input_is_poisoned());
-        // The client lane's trusted flag alone is no operator proof: a
-        // client connection without a pinned peer is refused the same way.
-        let refused: ErrorResponse = serde_json::from_str(
+        // ...so does a client-lane connection without a pinned peer...
+        app.lookup_runtime_sender(0, internal_pane_id)
+            .unwrap()
+            .test_set_input_poisoned(true);
+        let value: serde_json::Value = serde_json::from_str(
             &app.handle_trusted_client_shell_api_request_after_internal_events_drained(
                 clear.clone(),
                 Default::default(),
             ),
         )
         .unwrap();
-        assert_eq!(refused.error.code, "input_origin_unknown");
-        assert!(app
+        assert_eq!(value["result"]["type"], "ok");
+        assert!(!app
             .lookup_runtime_sender(0, internal_pane_id)
             .unwrap()
             .input_is_poisoned());
-        // The attached client whose pinned peer is proven outside every pane
-        // is an operator.
+        // ...and the attached operator client.
+        app.lookup_runtime_sender(0, internal_pane_id)
+            .unwrap()
+            .test_set_input_poisoned(true);
         let response = as_operator_client(&mut app, clear);
         let value: serde_json::Value = serde_json::from_str(&response).unwrap();
         assert_eq!(value["result"]["type"], "ok");
@@ -3048,7 +3026,8 @@ mod tests {
             ..crate::api::ApiRequestContext::for_local_peer_pid(Some(std::process::id()))
         };
         let peer = context.local_peer_identity.expect("live peer");
-        // Unobservable ancestry: unknown, not ordinary, on the client lane too.
+        // Advisory (Paul, 2026-10-13): an unknown-origin caller is no longer
+        // refused; the request reaches the pane lookup.
         let response: ErrorResponse = serde_json::from_str(
             &crate::platform::with_server_ancestry_for_test(peer, None, || {
                 app.handle_trusted_client_shell_api_request_after_internal_events_drained(
@@ -3058,9 +3037,7 @@ mod tests {
             }),
         )
         .unwrap();
-        assert_eq!(response.error.code, "input_origin_unknown");
-        // A peer whose launch markers say it was started in a pane needs a
-        // live pane link; without one it is unknown, never an operator.
+        assert_ne!(response.error.code, "input_origin_unknown");
         let marked = crate::api::ApiRequestContext {
             local_peer_pane_origin: crate::platform::PeerPaneOrigin::HasPane,
             ..context
@@ -3071,7 +3048,7 @@ mod tests {
             ),
         )
         .unwrap();
-        assert_eq!(response.error.code, "input_origin_unknown");
+        assert_ne!(response.error.code, "input_origin_unknown");
     }
 
     #[test]

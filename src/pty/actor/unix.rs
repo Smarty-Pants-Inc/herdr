@@ -1627,10 +1627,12 @@ impl PtyIoActorRunner {
                         self.current_write_offset = 0;
                         if partial_text_consumed {
                             if let Err(flush_error) = self.flush_slave_input() {
-                                error!(pane = self.pane_id, err = %flush_error,
-                                    "guarded PTY flush failed; all pane input is poisoned until explicit operator clear");
+                                // Advisory (Paul, 2026-10-13): report the flush
+                                // failure on this submission but never poison
+                                // the pane's later input.
+                                warn!(pane = self.pane_id, err = %flush_error,
+                                    "guarded PTY flush failed; later pane input is not blocked");
                                 error = super::agent_session_flush_failed(guard);
-                                self.input_poisoned.store(true, Ordering::Release);
                             }
                         }
                         self.fail_active_submission(error);

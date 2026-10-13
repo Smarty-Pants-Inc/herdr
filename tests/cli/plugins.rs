@@ -1434,8 +1434,9 @@ EOF
 /// a pane and forks a `herdr pane run` grandchild into the new pane without
 /// --allow-cross-pane. This CLI invocation has no live-attributed invoking
 /// pane, so the grant is global: it admits only the pane it created while the
-/// action child lives, never pre-existing panes (herdr#223); a copied HERDR_PANE_ID without the token, a malformed token,
-/// and a replay after the action child exits are refused. Startup hooks never
+/// action child lives, never pre-existing panes (herdr#223); a malformed token and a replay after the
+/// action child exits are refused; a copied HERDR_PANE_ID without any token is
+/// accepted by the advisory fleet input-origin guard (Paul, 2026-10-13). Startup hooks never
 /// receive a grant.
 #[cfg(target_os = "linux")]
 #[test]
@@ -1607,7 +1608,20 @@ command = ["sh", "-c", 'printf %s "${HERDR_PLUGIN_ACTION_TOKEN-none}" > hook.tmp
         Duration::from_millis(50),
         || pane_read_recent_contains(&socket, &target_pane, "\nstripped-marker")
     ));
-    for case in ["copied", "forged", "replay"] {
+    // Paul, 2026-10-13: a copied HERDR_PANE_ID without any token is no plugin
+    // input; it takes the advisory fleet path and is accepted (and logged).
+    assert_eq!(
+        read("copied.rc").trim(),
+        "0",
+        "copied: {}",
+        out("copied.out")
+    );
+    assert!(wait_until(
+        Duration::from_secs(10),
+        Duration::from_millis(50),
+        || pane_read_recent_contains(&socket, &created_pane, "\ncopied-marker")
+    ));
+    for case in ["forged", "replay"] {
         assert_ne!(read(&format!("{case}.rc")).trim(), "0", "{case}");
         let output = out(&format!("{case}.out"));
         assert!(output.contains("input_origin_unknown"), "{case}: {output}");
@@ -1617,7 +1631,7 @@ command = ["sh", "-c", 'printf %s "${HERDR_PLUGIN_ACTION_TOKEN-none}" > hook.tmp
         Duration::from_millis(50),
         || pane_read_recent_contains(&socket, &created_pane, "granted-marker")
     ));
-    for refused in ["copied-marker", "forged-marker", "replay-marker"] {
+    for refused in ["forged-marker", "replay-marker"] {
         assert!(!pane_read_recent_contains(
             &socket,
             &created_pane,

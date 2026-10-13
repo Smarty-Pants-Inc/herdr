@@ -150,7 +150,7 @@ ACK 必须匹配实时连接、epoch、请求 ID 和会话代数。ACK 的 `stat
 
 #### 隐藏文本的草稿状态查询
 
-`agent.draft_state` 要求 `target`，并接受可选布尔值 `allow_cross_pane`（默认 `false`）作为显式跨窗格许可；查询同一窗格无需许可。它观察已注册接收端的编辑器和 UI hold，不作修改。默认查询超时为两秒。绝不返回草稿文本：
+`agent.draft_state` 要求 `target`，并为兼容性接受可选布尔值 `allow_cross_pane`（默认 `false`）；输入来源检查仅为建议性，跨窗格查询无需它也会被允许并记录日志。它观察已注册接收端的编辑器和 UI hold，不作修改。默认查询超时为两秒。绝不返回草稿文本：
 
 ```json
 {"id":"draft","method":"agent.draft_state","params":{"target":"w1:p1"}}
@@ -378,9 +378,9 @@ principal 由服务器解析，每个客户端连接只绑定一次。在 Linux 
 
 `agent_session_lost` 的 `error.partial_text_consumed` 为布尔值或 `null`，`error.flush_failed` 表示打开确切 slave 或执行 `TCIFLUSH` 是否失败。刷新成功时（或未写入文本阶段的字节、无需刷新时），`flush_failed` 为 `false`：当且仅当文本阶段的字节已到达 PTY、可能已被消费时，`partial_text_consumed` 为 `true`；当且仅当没有写入任何文本阶段的字节时，为 `false`。这不是读取方的接收确认。如果打开确切 slave 或执行 `TCIFLUSH` 失败，错误返回 `partial_text_consumed: null`（未知）和 `flush_failed: true`。会话守卫下的文本和按键发送会等待 actor 的类型化完成结果，而非在入队时返回成功。完成确认的是 PTY 写入，而不是接收方智能体的确认。丢失错误只会显示预期 ID，绝不显示实际 ID；出错后不要自动重试或降级为 unchecked 操作。
 
-如果打开确切 slave 或执行 `TCIFLUSH` 失败，Herdr 不会关闭 PTY master，也不会终止用户进程。它会丢弃剩余请求、不发送 Enter，并将窗格输入标记为 **POISONED**。所有 PTY 写入都会被服务器以类型化错误 `pane_input_poisoned` 拒绝，包括客户端按键和无守卫的 API 发送；服务器还会发送 `Notify`。操作员须显式执行 `herdr pane clear-input-poison <pane>` 才能清除；在已连接客户端中显示该通知的功能仍待 [smarty-dev#7908](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/7908) 实现。之后刷新成功也绝不会自动清除此状态。
+如果打开确切 slave 或执行 `TCIFLUSH` 失败，Herdr 不会关闭 PTY master，也不会终止用户进程。它会丢弃剩余请求、不发送 Enter，以 `flush_failed: true` 使该请求失败，并记录警告。之后的窗格输入不会被阻止。
 
-只有操作员显式调用 `pane.clear_input_poison`（指定 `pane_id`），或执行 CLI `herdr pane clear-input-poison <pane>` 才能清除，且须来自已连接的 Herdr 客户端或任何 Herdr 窗格之外的调用方。任何窗格内的调用方（包括被污染的窗格本身）都会收到 `operator_origin_required`（智能体针对其他窗格时为 `cross_pane_input_denied`，无法归属的调用方为 `input_origin_unknown`）；`allow_cross_pane` 不适用。清除前 Herdr 会再次丢弃窗格中未读取的输入（`TCIFLUSH`）；若失败，请求返回 `pane_clear_input_poison_failed`，窗格保持污染状态。**警告：** 前台程序已读取的文本仍留在其自身缓冲区，之后的 Enter 可能提交它。清除前请检查窗格。不要自动清除，也不要将清除作为重试策略。
+`pane.clear_input_poison`（指定 `pane_id`）或 CLI `herdr pane clear-input-poison <pane>` 仍然可用，并接受任何调用方；调用方来源会记录到日志。清除前 Herdr 会再次丢弃窗格中未读取的输入（`TCIFLUSH`）；若失败，请求返回 `pane_clear_input_poison_failed`，窗格保持污染状态。**警告：** 前台程序已读取的文本仍留在其自身缓冲区，之后的 Enter 可能提交它。清除前请检查窗格。不要自动清除，也不要将清除作为重试策略。
 
 ```json
 {"id":"clear_input_poison","method":"pane.clear_input_poison","params":{"pane_id":"w1:p1"}}
@@ -867,7 +867,7 @@ Herdr 在本地 socket 上使用换行分隔的 JSON。在 Unix 上,那个 socke
 
 两个方法都接受可选的 `resume_argv` 数组,内容是 Herdr 服务器重启后恢复上报者当前会话的命令。第一个元素必须是普通命令名而不是路径。该数组最多允许 64 个元素,总大小不超过 8 KiB,并且任何元素都不能包含撇号或控制字符;无效值会以 `invalid_resume_argv` 失败,该次上报不会生效。自定义智能体必须先通过 `pane.report_agent` 持有窗格才能附加命令,否则请求会以 `resume_not_accepted` 失败。Herdr 只在同一 `source` 和 `agent` 持有窗格时保留该命令,并且它优先于 Herdr 为该智能体内置的恢复命令。旧版 Herdr 会忽略这个字段。
 
-包含 `resume_argv` 的上报属于内容写入。Herdr 将本地智能体调用者及其子进程归属到终端,并以 `cross_pane_input_denied` 拒绝向其他窗格上报。无法确认归属的调用者会收到 `input_origin_unknown`。两个方法都接受 `allow_cross_pane`（默认 `false`）以显式允许跨窗格上报;CLI 用法为 `herdr pane report-agent ... --allow-cross-pane -- <resume-command...>` 或 `herdr pane report-agent-session ... --allow-cross-pane -- <resume-command...>`。不含 `resume_argv` 的上报仍仅更新元数据,无需此选项。显式允许仅绕过跨窗格策略,不会绕过恢复命令验证或上报权限规则。
+包含 `resume_argv` 的上报属于内容写入。Herdr 将本地智能体调用者及其子进程归属到终端,并记录向其他窗格的上报以及无法确认归属的上报;输入来源检查仅为建议性,不会拒绝它们。两个方法仍为兼容性接受 `allow_cross_pane`（默认 `false`）;CLI 用法为 `herdr pane report-agent ... --allow-cross-pane -- <resume-command...>` 或 `herdr pane report-agent-session ... --allow-cross-pane -- <resume-command...>`。不含 `resume_argv` 的上报仍仅更新元数据,无需此选项。显式允许仅绕过跨窗格策略,不会绕过恢复命令验证或上报权限规则。
 
 ```json
 {
