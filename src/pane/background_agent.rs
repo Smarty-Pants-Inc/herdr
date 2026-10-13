@@ -42,6 +42,17 @@ impl AgentJobTracker {
         self.in_background
     }
 
+    /// The exact agent process identified in front, if any. A held
+    /// background process is not in front.
+    pub(super) fn foreground_process(&self) -> Option<crate::platform::ProcessIdentity> {
+        self.process.filter(|_| !self.in_background).map(|process| {
+            crate::platform::ProcessIdentity {
+                pid: process.pid,
+                start_time: process.start_token,
+            }
+        })
+    }
+
     /// `agent_missing` means the probe lost a current agent whose exit has not
     /// been reported yet. Liveness is checked only then, never per render.
     ///

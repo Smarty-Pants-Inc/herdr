@@ -124,6 +124,10 @@ enum ManagedAgentPhase {
 struct ManagedAgent {
     kind: Agent,
     phase: ManagedAgentPhase,
+    /// The agent process first identified for this launch. The launch, and
+    /// its name, belong to that process only: another process of the same
+    /// kind in the pane ends the launch.
+    process: Option<crate::platform::ProcessIdentity>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2914,6 +2918,7 @@ impl TerminalState {
                 deadline: now.checked_add(timeout).unwrap_or(now),
                 observed_expected: false,
             },
+            process: None,
         });
     }
 
@@ -2994,6 +2999,7 @@ impl TerminalState {
             if ready {
                 self.managed_agent = Some(ManagedAgent {
                     kind: managed.kind,
+                    process: managed.process,
                     phase: ManagedAgentPhase::Active,
                 });
                 self.managed_agent_launch_session = None;
@@ -3010,6 +3016,7 @@ impl TerminalState {
             if known_agent == Some(managed.kind) && self.state == AgentState::Blocked {
                 self.managed_agent = Some(ManagedAgent {
                     kind: managed.kind,
+                    process: managed.process,
                     phase: ManagedAgentPhase::Blocked,
                 });
                 return true;
@@ -3031,6 +3038,7 @@ impl TerminalState {
                     };
                     self.managed_agent = Some(ManagedAgent {
                         kind: managed.kind,
+                        process: managed.process,
                         phase,
                     });
                 } else {
@@ -3042,6 +3050,7 @@ impl TerminalState {
                 if ready {
                     self.managed_agent = Some(ManagedAgent {
                         kind: managed.kind,
+                        process: managed.process,
                         phase: ManagedAgentPhase::Active,
                     });
                     self.managed_agent_launch_session = None;
@@ -3050,6 +3059,7 @@ impl TerminalState {
                 if ready_after.is_some() {
                     self.managed_agent = Some(ManagedAgent {
                         kind: managed.kind,
+                        process: managed.process,
                         phase: ManagedAgentPhase::Pending {
                             ready_after: None,
                             deadline,
@@ -3062,6 +3072,7 @@ impl TerminalState {
             if observed_expected != previous_observed_expected {
                 self.managed_agent = Some(ManagedAgent {
                     kind: managed.kind,
+                    process: managed.process,
                     phase: ManagedAgentPhase::Pending {
                         ready_after,
                         deadline,
@@ -3083,7 +3094,35 @@ impl TerminalState {
         self.managed_agent = Some(ManagedAgent {
             kind,
             phase: ManagedAgentPhase::Active,
+            process: None,
         });
+    }
+
+    /// Binds a managed launch to the first agent process of its kind
+    /// identified in the pane. A later, different process of the same kind
+    /// (another instance replacing the launched one without an observed
+    /// exit) does not inherit the launch: the launch ends and its name is
+    /// freed. A different kind is handled by kind reconciliation.
+    pub(crate) fn observe_agent_process_identity(
+        &mut self,
+        agent: Agent,
+        process: crate::platform::ProcessIdentity,
+    ) -> Option<TerminalStateMutation> {
+        let managed = self.managed_agent.as_mut()?;
+        if managed.kind != agent {
+            return None;
+        }
+        match managed.process {
+            None => {
+                managed.process = Some(process);
+                None
+            }
+            Some(bound) if bound == process => None,
+            Some(_) => {
+                self.clear_agent_name();
+                Some(TerminalStateMutation::default())
+            }
+        }
     }
 
     pub fn clear_agent_name(&mut self) {
@@ -4214,6 +4253,67 @@ mod tests {
     // deliver a detection update with no agent between `agent start` and the
     // agent process appearing (the detector publishes on change, and that
     // window is a race), so this pins the relaunch-after-exit state directly.
+    // A managed launch belongs to the agent process first seen for it. Another
+    // process of the same kind replacing it, in any phase, ends the launch.
+    #[test]
+    fn managed_launch_name_is_bound_to_the_first_agent_process_seen() {
+        let now = Instant::now();
+        let first = crate::platform::ProcessIdentity {
+            pid: 21,
+            start_time: 11,
+        };
+        let reused_pid = crate::platform::ProcessIdentity {
+            pid: 21,
+            start_time: 12,
+        };
+        let other = crate::platform::ProcessIdentity {
+            pid: 22,
+            start_time: 11,
+        };
+        for replacement in [reused_pid, other] {
+            for active in [false, true] {
+                let mut terminal = test_terminal();
+                terminal.begin_managed_agent(
+                    "lead-x".into(),
+                    Agent::Pi,
+                    now,
+                    Duration::from_millis(100),
+                    Duration::from_secs(60),
+                );
+                terminal.set_detected_state(Some(Agent::Pi), AgentState::Working);
+                assert_eq!(
+                    terminal.observe_agent_process_identity(Agent::Pi, first),
+                    None
+                );
+                // Seen (still working past the deadline), or Active.
+                if active {
+                    terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
+                }
+                assert!(terminal.reconcile_managed_agent_at(now + Duration::from_secs(60), false));
+                assert_eq!(terminal.managed_agent_interactive_ready(), active);
+                // The same process again, or another kind: not this check's call.
+                assert_eq!(
+                    terminal.observe_agent_process_identity(Agent::Pi, first),
+                    None
+                );
+                assert_eq!(
+                    terminal.observe_agent_process_identity(Agent::Claude, other),
+                    None
+                );
+                assert_eq!(terminal.agent_name.as_deref(), Some("lead-x"));
+
+                assert!(terminal
+                    .observe_agent_process_identity(Agent::Pi, replacement)
+                    .is_some());
+                assert_eq!(terminal.agent_name, None, "{replacement:?} active={active}");
+                assert_eq!(terminal.managed_agent_kind(), None);
+                assert!(!terminal.managed_agent_launch_pending());
+                // The replacement is still the pane's (unnamed) agent.
+                assert_eq!(terminal.effective_known_agent(), Some(Agent::Pi));
+            }
+        }
+    }
+
     #[test]
     fn managed_launch_after_an_agent_exit_keeps_its_name_before_the_agent_appears() {
         let now = Instant::now();
