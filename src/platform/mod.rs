@@ -275,7 +275,8 @@ pub(crate) fn server_key_available() -> bool {
     false
 }
 
-/// Ed25519 signature for an enroll answer only.
+/// Ed25519 signature over an input-consumer answer transcript: the enroll
+/// answer and each cut answer (domain-separated by their labels).
 pub(crate) fn server_key_sign(message: &[u8]) -> Option<Vec<u8>> {
     #[cfg(target_os = "linux")]
     return linux::server_key::sign(message);

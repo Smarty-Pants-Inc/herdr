@@ -380,8 +380,12 @@ impl Fixture {
             .verify(&message, &sig)
             .expect("enroll signature verifies with the server key");
     }
+    /// Fleet input as the operator: explicit cross-pane permission, so setup and
+    /// API writes never depend on how the runner's own process is classified
+    /// (inherited `HERDR_*` variables, or an unknown caller origin).
     pub fn api_input(&self, method: &str, mut params: Value) -> Value {
         params["pane_id"] = json!(self.pane);
+        params["allow_cross_pane"] = json!(true);
         let r = request(&self.api, method, params);
         assert!(r.get("error").is_none(), "{method}: {r}");
         r
