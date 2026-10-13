@@ -155,6 +155,93 @@ fn workspace_list_reports_root_pane_cwd_for_plain_and_git_workspaces() {
     cleanup_spawned_herdr(herdr, base);
 }
 
+/// smarty-dev#2014 review: a worktree row carries exactly one path. Its root
+/// pane `cd`ing elsewhere must not add a `cwd` that contradicts `checkout_path`.
+#[test]
+fn worktree_workspace_row_reports_checkout_path_and_no_cwd_after_cd() {
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+    let repo = base.join("repo");
+    let checkout = base.join("checkout");
+    let elsewhere = base.join("elsewhere");
+    create_committed_repo(&repo);
+    fs::create_dir_all(&elsewhere).unwrap();
+    let checkout_path = checkout.to_str().unwrap();
+
+    let herdr = spawn_herdr(&config_home, &runtime_dir, &socket_path);
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+
+    let created = run_cli_json(
+        &socket_path,
+        &[
+            "worktree",
+            "create",
+            "--cwd",
+            repo.to_str().unwrap(),
+            "--branch",
+            "worktree/one-path",
+            "--path",
+            checkout_path,
+            "--json",
+        ],
+    );
+    let child_id = created["result"]["workspace"]["workspace_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let child_pane = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let rows = || {
+        run_cli_json(&socket_path, &["workspace", "list"])["result"]["workspaces"]
+            .as_array()
+            .unwrap()
+            .clone()
+    };
+    let row = |id: &str| {
+        rows()
+            .into_iter()
+            .find(|row| row["workspace_id"] == id)
+            .unwrap()
+    };
+
+    let ran = run_cli(
+        &socket_path,
+        &[
+            "pane",
+            "run",
+            &child_pane,
+            &format!("cd {}", elsewhere.display()),
+        ],
+    );
+    assert!(ran.status.success());
+    // The pane really moved: `pane get` reports the new cwd.
+    assert!(
+        wait_until(Duration::from_secs(10), Duration::from_millis(50), || {
+            run_cli_json(&socket_path, &["pane", "get", &child_pane])["result"]["pane"]["cwd"]
+                == elsewhere.to_str().unwrap()
+        }),
+        "root pane did not cd"
+    );
+
+    let child = row(&child_id);
+    assert_eq!(child["worktree"]["checkout_path"], checkout_path, "{child}");
+    assert_eq!(child["worktree"]["is_linked_worktree"], true, "{child}");
+    assert!(child.get("cwd").is_none(), "{child}");
+    // Every row (the parent checkout too) carries exactly one path.
+    for row in rows() {
+        assert!(
+            row.get("worktree").is_some() != row.get("cwd").is_some(),
+            "{row}"
+        );
+    }
+
+    cleanup_spawned_herdr(herdr, base);
+}
+
 #[test]
 fn worktree_management_commands_work() {
     let base = unique_test_dir();

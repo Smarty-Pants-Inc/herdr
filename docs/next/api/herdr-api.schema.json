@@ -1140,7 +1140,7 @@
               "$ref": "#/schemas/event/$defs/AgentStatus"
             },
             "cwd": {
-              "description": "Current cwd of the workspace's root pane (first tab), else the cwd it was\ncreated in. Present even when `worktree` is absent: `worktree` reports only\na checkout opened through `worktree`/`workspace.create_linked`.",
+              "description": "Current cwd of the workspace's root pane (first tab), else the cwd it was\ncreated in. Present only when the workspace has no `worktree` (a checkout\nopened through `worktree`/`workspace.create_linked`), so a row carries\nexactly one path: `worktree.checkout_path` or `cwd`.",
               "type": [
                 "string",
                 "null"
@@ -11926,7 +11926,7 @@
               "$ref": "#/schemas/success_response/$defs/AgentStatus"
             },
             "cwd": {
-              "description": "Current cwd of the workspace's root pane (first tab), else the cwd it was\ncreated in. Present even when `worktree` is absent: `worktree` reports only\na checkout opened through `worktree`/`workspace.create_linked`.",
+              "description": "Current cwd of the workspace's root pane (first tab), else the cwd it was\ncreated in. Present only when the workspace has no `worktree` (a checkout\nopened through `worktree`/`workspace.create_linked`), so a row carries\nexactly one path: `worktree.checkout_path` or `cwd`.",
               "type": [
                 "string",
                 "null"

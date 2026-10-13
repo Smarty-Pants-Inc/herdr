@@ -74,8 +74,9 @@ pub struct WorkspaceInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree: Option<WorkspaceWorktreeInfo>,
     /// Current cwd of the workspace's root pane (first tab), else the cwd it was
-    /// created in. Present even when `worktree` is absent: `worktree` reports only
-    /// a checkout opened through `worktree`/`workspace.create_linked`.
+    /// created in. Present only when the workspace has no `worktree` (a checkout
+    /// opened through `worktree`/`workspace.create_linked`), so a row carries
+    /// exactly one path: `worktree.checkout_path` or `cwd`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
 }
