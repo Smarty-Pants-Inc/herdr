@@ -221,8 +221,10 @@ herdr pane move <pane_id> --tab <tab_id> --split right|down [--target-pane ID] [
 herdr pane move <pane_id> --new-tab [--workspace ID] [--label TEXT] [--focus|--no-focus]
 herdr pane move <pane_id> --new-workspace [--label TEXT] [--tab-label TEXT] [--focus|--no-focus]
 herdr pane clear-input-poison <pane>
-herdr pane close <pane_id>
+herdr pane close <pane_id> [--expected-terminal TERMINAL_ID]
 ```
+
+`pane close --expected-terminal <terminal_id>` 仅在窗格仍持有该终端时才关闭窗格。关闭你自己启动的窗格时使用它:`terminal_id` 是不透明值,请从创建窗格的响应或 `pane get` 中复制。如果窗格现在持有另一个终端(例如服务器被替换后,新终端复用了同一窗格 ID),服务器会以 `terminal_identity_mismatch` 拒绝,并且不关闭任何窗格。服务器在同一步骤中检查标识并关闭窗格,因此其间不会有别的终端接管该窗格。如果服务器未声明支持,CLI 返回 `expected_terminal_unsupported`,不关闭任何窗格。不带该参数时,`pane close` 的行为不变。
 
 接受 `--current` 的窗格命令在 Herdr 窗格内运行时使用调用方的 `HERDR_PANE_ID`。对 `pane split` 而言，显式窗格 ID 或 `--pane ID` 拆分指定窗格。省略目标时，若存在 `HERDR_PANE_ID` 则拆分调用方窗格，否则使用当前聚焦的窗格。`--current` 必须有调用方窗格；缺少 `HERDR_PANE_ID` 时会报错。拆分响应中的新窗格 ID 位于 `.result.pane.pane_id`。
 

@@ -474,6 +474,123 @@ fn expected_terminal_absent_remains_legacy_compatible_for_both_native_methods() 
     assert_eq!(named["result"]["agent"]["terminal_id"], pane["terminal_id"]);
 }
 
+fn assert_pane_holds(server: &GuardServer, pane: &Value) {
+    let got = server.request("pane.get", json!({"pane_id": pane["pane_id"]}));
+    assert_eq!(
+        got["result"]["pane"]["terminal_id"], pane["terminal_id"],
+        "{got}"
+    );
+}
+
+fn assert_pane_gone(server: &GuardServer, pane: &Value) {
+    let got = server.request("pane.get", json!({"pane_id": pane["pane_id"]}));
+    assert_eq!(got["error"]["code"], "pane_not_found", "{got}");
+}
+
+#[test]
+fn pane_close_expected_terminal_cli_refuses_reoccupied_pane_then_closes_exact_terminal() {
+    let mut server = GuardServer::new("0");
+    assert_eq!(
+        server.request("ping", json!({}))["result"]["capabilities"]
+            ["pane_close_expected_terminal_guard"],
+        true
+    );
+    let original = server.pane("original");
+    server.barrier(&original);
+    // The proof runner's snapshot: the pane ID and the terminal it started.
+    let stale = original["terminal_id"].as_str().unwrap().to_string();
+    let replacement = server.replace(&original);
+    let other = server.pane("other");
+    let pane_id = server.pane_id(&replacement).to_string();
+    for wrong in [stale.as_str(), other["terminal_id"].as_str().unwrap()] {
+        let output = server.cli(&["pane", "close", &pane_id, "--expected-terminal", wrong]);
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert!(output.stdout.is_empty(), "{output:?}");
+        assert_mismatch(serde_json::from_slice(&output.stderr).unwrap());
+        // Nothing was closed: the re-occupying terminal still runs a live shell.
+        assert_pane_holds(&server, &replacement);
+        assert_pane_holds(&server, &other);
+        server.barrier(&replacement);
+    }
+    let closed = server.cli_json(&[
+        "pane",
+        "close",
+        &pane_id,
+        "--expected-terminal",
+        replacement["terminal_id"].as_str().unwrap(),
+    ]);
+    assert!(closed.get("result").is_some(), "{closed}");
+    assert_pane_gone(&server, &replacement);
+    assert_pane_holds(&server, &other);
+}
+
+#[test]
+fn pane_close_without_expected_terminal_is_unchanged() {
+    let server = GuardServer::new("0");
+    let pane = server.pane("original");
+    server.barrier(&pane);
+    let other = server.pane("other");
+    let closed = server.cli_json(&["pane", "close", server.pane_id(&pane)]);
+    assert!(closed.get("result").is_some(), "{closed}");
+    assert_pane_gone(&server, &pane);
+    assert_pane_holds(&server, &other);
+    let legacy = server.request("pane.close", json!({"pane_id": other["pane_id"]}));
+    assert!(legacy.get("result").is_some(), "{legacy}");
+    assert_pane_gone(&server, &other);
+}
+
+#[test]
+fn pane_close_native_json_guard_is_checked_with_the_close() {
+    let server = GuardServer::new("0");
+    let pane = server.pane("original");
+    server.barrier(&pane);
+    let other = server.pane("other");
+    for method in ["pane.close", "pane.close_guarded"] {
+        for expected in [
+            other["terminal_id"].clone(),
+            json!("term_nonexistent"),
+            json!(""),
+        ] {
+            assert_mismatch(server.request(
+                method,
+                json!({"pane_id": pane["pane_id"], "expected_terminal": expected}),
+            ));
+        }
+        for expected in [Value::Null, json!(42), json!(false), json!([])] {
+            let response = server.request(
+                method,
+                json!({"pane_id": pane["pane_id"], "expected_terminal": expected}),
+            );
+            assert!(
+                response.get("error").is_some(),
+                "explicit null/type must not become absent: {response}"
+            );
+        }
+        assert_mismatch(server.request(
+            method,
+            json!({"pane_id": "w999:p999", "expected_terminal": pane["terminal_id"]}),
+        ));
+        assert_pane_holds(&server, &pane);
+        assert_pane_holds(&server, &other);
+    }
+    // The guarded alias never degrades to an unguarded close.
+    assert_mismatch(server.request("pane.close_guarded", json!({"pane_id": pane["pane_id"]})));
+    assert_pane_holds(&server, &pane);
+    server.barrier(&pane);
+    let closed = server.request(
+        "pane.close_guarded",
+        json!({"pane_id": pane["pane_id"], "expected_terminal": pane["terminal_id"]}),
+    );
+    assert!(closed.get("result").is_some(), "{closed}");
+    assert_pane_gone(&server, &pane);
+    let closed = server.request(
+        "pane.close",
+        json!({"pane_id": other["pane_id"], "expected_terminal": other["terminal_id"]}),
+    );
+    assert!(closed.get("result").is_some(), "{closed}");
+    assert_pane_gone(&server, &other);
+}
+
 #[test]
 fn expected_terminal_cli_retries_same_terminal_transient_busy_successfully() {
     let server = GuardServer::new("0.8");

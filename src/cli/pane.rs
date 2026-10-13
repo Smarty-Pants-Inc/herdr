@@ -1,5 +1,5 @@
 use crate::api::schema::{
-    Method, OutputMatch, PaneCurrentParams, PaneDirection, PaneEdgesParams,
+    Method, OutputMatch, PaneCloseParams, PaneCurrentParams, PaneDirection, PaneEdgesParams,
     PaneFocusDirectionParams, PaneInputSetParams, PaneLayoutParams, PaneListParams,
     PaneMoveDestination, PaneMoveParams, PaneNeighborParams, PaneProcessInfoParams, PaneReadParams,
     PaneReleaseAgentParams, PaneRenameParams, PaneReportAgentParams, PaneReportAgentSessionParams,
@@ -1009,16 +1009,27 @@ fn parse_pane_direction(value: &str) -> Result<PaneDirection, String> {
 }
 
 fn pane_close(args: &[String]) -> std::io::Result<i32> {
-    let Some(raw_pane_id) = args.first() else {
-        eprintln!("usage: herdr pane close <pane_id>");
-        return Ok(2);
-    };
-    if args.len() != 1 {
-        eprintln!("usage: herdr pane close <pane_id>");
-        return Ok(2);
+    match parse_pane_close_args(args) {
+        Ok(params) => super::runtime::pane_close(params),
+        Err(err) => {
+            let exit_code = err.exit_code();
+            err.print()?;
+            Ok(exit_code)
+        }
     }
+}
 
-    super::runtime::pane_close(super::normalize_pane_id(raw_pane_id))
+/// The terminal ID is opaque: only the pane ID is normalized.
+fn parse_pane_close_args(args: &[String]) -> Result<PaneCloseParams, clap::Error> {
+    let matches = super::spec::parse_leaf_args(&["pane", "close"], args)?;
+    Ok(PaneCloseParams {
+        pane_id: super::normalize_pane_id(
+            matches
+                .get_one::<String>("pane_id")
+                .expect("Clap requires the pane target"),
+        ),
+        expected_terminal: matches.get_one::<String>("expected-terminal").cloned(),
+    })
 }
 
 fn parse_pane_clear_input_poison_args(args: &[String]) -> Result<PaneTarget, clap::Error> {
@@ -2466,6 +2477,22 @@ mod tests {
                 assert!(parse_pane_content_args(command, payload, &values).is_err());
             }
         }
+    }
+
+    #[test]
+    fn pane_close_parses_expected_terminal_without_normalizing_it() {
+        for values in [
+            &["--expected-terminal", "term_opaque", "1-2"][..],
+            &["1-2", "--expected-terminal=term_opaque"][..],
+        ] {
+            let params = parse_pane_close_args(&args(values)).unwrap();
+            assert_eq!(params.pane_id, super::super::normalize_pane_id("1-2"));
+            assert_eq!(params.expected_terminal.as_deref(), Some("term_opaque"));
+        }
+        let params = parse_pane_close_args(&args(&["w1:p1"])).unwrap();
+        assert_eq!(params, PaneCloseParams::unguarded("w1:p1"));
+        assert!(parse_pane_close_args(&args(&["w1:p1", "w1:p2"])).is_err());
+        assert!(parse_pane_close_args(&args(&["w1:p1", "--expected-terminal"])).is_err());
     }
 
     #[test]

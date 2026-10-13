@@ -2584,9 +2584,12 @@ async fn public_close_reapplies_controller_geometry() {
             context: crate::api::ApiRequestContext::default(),
             request: crate::api::schema::Request {
                 id: "public-close-geometry".into(),
-                method: crate::api::schema::Method::PaneClose(crate::api::schema::PaneTarget {
-                    pane_id: second_pane_id,
-                }),
+                method: crate::api::schema::Method::PaneClose(
+                    crate::api::schema::PaneCloseParams {
+                        pane_id: second_pane_id,
+                        expected_terminal: None,
+                    }
+                ),
             },
             respond_to,
             response_write_complete: None,

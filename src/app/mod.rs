@@ -3209,8 +3209,9 @@ mod tests {
 
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "req_pane_close".into(),
-            method: crate::api::schema::Method::PaneClose(crate::api::schema::PaneTarget {
+            method: crate::api::schema::Method::PaneClose(crate::api::schema::PaneCloseParams {
                 pane_id: target_pane_id,
+                expected_terminal: None,
             }),
         });
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
@@ -3235,8 +3236,9 @@ mod tests {
 
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "req_pane_close_last".into(),
-            method: crate::api::schema::Method::PaneClose(crate::api::schema::PaneTarget {
+            method: crate::api::schema::Method::PaneClose(crate::api::schema::PaneCloseParams {
                 pane_id: target_pane_id,
+                expected_terminal: None,
             }),
         });
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
@@ -3274,8 +3276,9 @@ mod tests {
 
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "req_pane_close_parent_group".into(),
-            method: crate::api::schema::Method::PaneClose(crate::api::schema::PaneTarget {
+            method: crate::api::schema::Method::PaneClose(crate::api::schema::PaneCloseParams {
                 pane_id: target_pane_id,
+                expected_terminal: None,
             }),
         });
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();

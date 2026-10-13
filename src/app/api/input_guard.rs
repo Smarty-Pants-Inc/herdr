@@ -3546,7 +3546,7 @@ finally:
     #[tokio::test]
     async fn plugin_action_grant_targets_only_invoking_and_own_created_terminals() {
         use crate::api::schema::{
-            PaneMoveDestination, PaneMoveParams, PaneSplitParams, PaneTarget, SplitDirection,
+            PaneCloseParams, PaneMoveDestination, PaneMoveParams, PaneSplitParams, SplitDirection,
             TabCreateParams, WorkspaceCreateParams,
         };
         use crate::plugin_action_origin::{
@@ -3776,8 +3776,9 @@ finally:
         let closed = fixture.app.handle_api_request_with_context(
             Request {
                 id: "close".into(),
-                method: Method::PaneClose(PaneTarget {
+                method: Method::PaneClose(PaneCloseParams {
                     pane_id: moved_pane.clone(),
+                    expected_terminal: None,
                 }),
             },
             ApiRequestContext::default(),

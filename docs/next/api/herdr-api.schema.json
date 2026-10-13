@@ -2721,6 +2721,21 @@
           ],
           "type": "object"
         },
+        "PaneCloseParams": {
+          "properties": {
+            "expected_terminal": {
+              "description": "Refuse the close unless the pane still owns this opaque terminal identity.\nOlder servers ignore this field on `pane.close`; use `pane.close_guarded`\nafter checking `pane_close_expected_terminal_guard`.",
+              "type": "string"
+            },
+            "pane_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pane_id"
+          ],
+          "type": "object"
+        },
         "PaneCopyMotion": {
           "enum": [
             "line_end",
@@ -7014,7 +7029,24 @@
               "type": "string"
             },
             "params": {
-              "$ref": "#/schemas/request/$defs/PaneTarget"
+              "$ref": "#/schemas/request/$defs/PaneCloseParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Requires `expected_terminal`; older servers reject instead of ignoring the guard.",
+          "properties": {
+            "method": {
+              "const": "pane.close_guarded",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneCloseParams"
             }
           },
           "required": [
@@ -11776,6 +11808,11 @@
               "type": "boolean"
             },
             "live_handoff": {
+              "type": "boolean"
+            },
+            "pane_close_expected_terminal_guard": {
+              "default": false,
+              "description": "Supports the fail-closed `expected_terminal` guard on `pane.close` and `pane.close_guarded`.",
               "type": "boolean"
             },
             "ssh_agent_registration": {
