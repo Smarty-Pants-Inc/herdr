@@ -306,42 +306,43 @@ and client hello names are not substitutes.
 
 | Method | Required params | Purpose |
 | --- | --- | --- |
-| `pane.input_consumer.enroll` | `pane_id`, `challenge` | Admit the local socket peer and issue `epoch`, secret `epoch_key`, `nonce`, and the pane `tty`. |
-| `pane.input_consumer.cut` | `epoch`, `epoch_key`, `seq`, `token`, `cut`, `digest`, `kind` | Close an interval; `kind` is `submit` or `discard`. |
-| `pane.input_consumer.release` | `epoch`, `epoch_key` | End the epoch before exit, suspension, or TTY handover. |
+| `pane.input_consumer.enroll` | `pane_id`, `challenge` | Admit the local socket peer and issue `epoch`, `nonce`, the pane `tty`, the pinned `peer`, and the server signature `sig`. |
+| `pane.input_consumer.cut` | `epoch`, `seq`, `token`, `cut`, `digest`, `kind` | Close an interval; `kind` is `submit` or `discard`. |
+| `pane.input_consumer.release` | `epoch` | End the epoch before exit, suspension, or TTY handover. |
 
 Requests and responses below are separate JSON lines. Success echoes `id` with
-a flat `result`, **without a `type` tag**. `<epoch>`, `<epoch_key>`, and `<nonce>`
-are illustrative placeholders, not usable credentials; use the values returned
-by enrollment privately.
+a flat `result`, **without a `type` tag**. `<epoch>` and `<nonce>` are
+illustrative placeholders. Nothing the consumer holds or sends is a secret:
+requests carry no credential, and only the enrolled process may cut or release.
+The value labels the input's provenance; it is not a gate on input.
 
 ```json
 {"id":"enroll","method":"pane.input_consumer.enroll","params":{"pane_id":"w1:p1","challenge":"<64 lowercase hex>"}}
-{"id":"enroll","result":{"epoch":"<epoch>","epoch_key":"<epoch_key>","nonce":"<nonce>","tty":{"dev":"<st_dev>","ino":"<st_ino>"}}}
+{"id":"enroll","result":{"epoch":"<epoch>","nonce":"<nonce>","tty":{"dev":"<st_dev>","ino":"<st_ino>"},"peer":{"pid":"<pid>","pidns":"<pid namespace inode>"},"sig":"<base64 Ed25519>"}}
 ```
 
 For the first interval containing exactly `a\r` (hex bytes `61 0d`), `cut = 2`
 and `digest` is SHA-256 of those two bytes, not of the literal backslash notation:
 
 ```json
-{"id":"cut","method":"pane.input_consumer.cut","params":{"epoch":"<epoch>","epoch_key":"<epoch_key>","seq":1,"token":"example-submit-1","cut":2,"digest":"961a57df036f6c4f44ca8a054271c45e823f469bcc439f0255c40974c3e3d131","kind":"submit"}}
+{"id":"cut","method":"pane.input_consumer.cut","params":{"epoch":"<epoch>","seq":1,"token":"example-submit-1","cut":2,"digest":"961a57df036f6c4f44ca8a054271c45e823f469bcc439f0255c40974c3e3d131","kind":"submit"}}
 ```
 
 Alternative responses to that cut (one response per request):
 
 ```json
-{"id":"cut","result":{"result":"client","principal":null,"mac":"<64 hex>"}}
-{"id":"cut","result":{"result":"client","principal":{"smarty_id":"kate","display_name":"Kate"},"mac":"<64 hex>"}}
-{"id":"cut","result":{"result":"api","mac":"<64 hex>"}}
-{"id":"cut","result":{"result":"mixed","mac":"<64 hex>"}}
-{"id":"cut","result":{"result":"unknown","reason":"input_log_unavailable","mac":"<64 hex>"}}
+{"id":"cut","result":{"result":"client","principal":null,"sig":"<base64 Ed25519>"}}
+{"id":"cut","result":{"result":"client","principal":{"smarty_id":"kate","display_name":"Kate"},"sig":"<base64 Ed25519>"}}
+{"id":"cut","result":{"result":"api","sig":"<base64 Ed25519>"}}
+{"id":"cut","result":{"result":"mixed","sig":"<base64 Ed25519>"}}
+{"id":"cut","result":{"result":"unknown","reason":"input_log_unavailable","sig":"<base64 Ed25519>"}}
 ```
 
 Release succeeds with an empty object. Refusals use the standard `error`
 envelope with `code` and `message`, not an attribution result:
 
 ```json
-{"id":"release","method":"pane.input_consumer.release","params":{"epoch":"<epoch>","epoch_key":"<epoch_key>"}}
+{"id":"release","method":"pane.input_consumer.release","params":{"epoch":"<epoch>"}}
 {"id":"release","result":{}}
 {"id":"cut","error":{"code":"token_conflict","message":"token_conflict"}}
 ```
@@ -361,14 +362,53 @@ all be off. Each cut rechecks raw mode and unchanged termios; failure returns
 `ping.result.capabilities.input_consumer == true` first: non-Linux servers
 advertise `false` and refuse all three methods with `unsupported_platform`.
 
-**Server authentication.** This build has none: the enroll answer carries no
-`sig`, so a consumer cannot prove which server answered and must treat its
-answers as unauthenticated terminal input. Check `tty` against `fstat` of your
-own stdin. Each cut answer's `mac` is HMAC-SHA256 under the decoded `epoch_key`
-over `herdr-cut-v1`, `epoch`, `seq`, `token`, `cut`, `digest`, `kind`, `result`,
-`reason`, and the principal's `smarty_id` and `display_name` (empty strings when
-absent), each encoded as a u32 big-endian byte length plus UTF-8 bytes. The
-`challenge` is validated but not yet bound to a signature.
+**Peer pin.** Enrollment requires the kernel's `SO_PEERPIDFD` (Linux 6.5),
+pidfs (6.9, 64-bit) and `PIDFD_GET_INFO` (6.13). Herdr keeps the enroll
+connection's pidfd for the epoch. A `cut` or `release` is accepted only when its
+connection's `SO_PEERPIDFD` names the same pidfs inode and that process has not
+exited; otherwise it is refused with `invalid_epoch`, with no sequence change
+and no audit record. Without those kernel features, or when the server's
+`/proc` belongs to another pid namespace, enrollment is refused with
+`peer_identity_unsupported`. There is no pid or start-time fallback.
+
+**Server authentication.** A consumer must not trust any socket that answers.
+The installed server is `root:herdr` mode `2755` and reads the Ed25519 key
+`/etc/herdr/server.key` (`0640 root:herdr`) once at startup, then drops the
+group, so no pane child runs with it and same-user processes cannot read the
+key from the file or from server memory. The `herdr` group must have no
+members and be nobody's primary group, or the server does not load the key:
+`nsswitch.conf` must map `passwd` and `group` (and `initgroups`, if listed) to
+`files` or `files systemd`, `/etc/group` must hold exactly one entry with the
+group's gid (no second name) and no other entry with its name, `/etc/group` and
+`/etc/passwd` must give the group no member or primary holder, and no systemd
+userdb drop-in (`*.membership`, `*.user` `memberOf`, `*.group` `members` in
+`/etc/userdb`, `/run/userdb`, `/run/host/userdb`, or `/usr/lib/userdb`) may
+name it or define its gid under another name. When NSS lists `systemd`, every
+Varlink userdb service in `/run/systemd/userdb` (homed, machined,
+`DynamicUser=`, third-party services; the multiplexer and the NSS re-export are
+skipped) must answer `GetMemberships` for the group and `GetGroupRecord` for its
+gid with `NoRecordFound`, and its user enumeration (`GetUserRecord` without a
+name) must hold no user whose primary gid is the group or whose `memberOf`
+names it. Only `io.systemd.Machine` may refuse enumeration. All queries share a
+2-second deadline; a membership, an error, a timeout, or a bad reply refuses. The server also refuses when it runs with `herdr` as a
+supplementary group, which a setgid drop cannot shed and which proves a member
+exists. An unreadable or unparseable record also refuses. The key is provisioned only by a reviewed root
+setup step that runs the same checks before it writes the key; the server's
+check is defense in depth. Every field below is encoded as a u32 big-endian
+byte length plus UTF-8 bytes; numbers are unsigned decimal strings. The enroll
+`sig` is Ed25519 over `herdr-enroll-v2`, `challenge`, `epoch`, `nonce`,
+`pane_id`, the pane slave's `tty.dev` and `tty.ino`, and the pinned
+`peer.pid` and `peer.pidns` (the peer's pid from `PIDFD_GET_INFO` and the
+nsfs inode of the server's pid namespace). Verify it with
+`/etc/herdr/server.pub` over a message built from your own `challenge` and
+`pane_id`, check `tty` against `fstat` of your own stdin, `peer.pid` against
+your own pid, and `peer.pidns` against the inode of `/proc/self/ns/pid`. Each
+cut answer's `sig` is Ed25519 under the same key over `herdr-cut-answer-v2`,
+`epoch`, `seq`, `token`, `cut`, `digest`, `kind`, `result`, `reason`, and the
+principal's `smarty_id` and `display_name` (empty strings when absent). Fresh
+answers, exact replays and early `unknown` answers are all signed; the release
+answer is not. Without a usable key the server advertises `false` and refuses
+enrollment with `server_key_unavailable`; there is no unsigned mode.
 
 Enrollment and the marker write are one ordered pane-actor operation. The marker
 is `ESC _ herdr-epoch;<nonce> ESC \\`; discard earlier input and strip the expected
@@ -391,7 +431,7 @@ unknown, never neutral. API text and API-sent Enter are not neutral.
 
 New cuts increment `seq` by one, starting at 1. `token` is an idempotency and
 correlation identifier, not authority. An exact retry (same epoch, sequence,
-token, cut, digest, and kind with valid key) returns the recorded result. Changed
+token, cut, digest, and kind from the enrolled process) returns the recorded result. Changed
 fields for a known token are refused as `token_conflict`; an old token cannot
 answer a new sequence. A cut must arrive within **30 seconds** of the server
 writing its endpoint byte. Retained receipts have a 10-minute limit; raw interval
@@ -421,9 +461,8 @@ The map is read at server start and checked by mtime on new connections. An
 invalid map supplies no labels; existing connections keep their bindings.
 **There is no SIGHUP reload**; do not send SIGHUP to refresh the map.
 
-Keep `epoch_key` private and **never log it**. A separate owner-only
-input-consumer audit log records token, epoch, sequence, cut, digest, kind, and
-result, never the key, nonce, or raw input. Attribution requires durable
+A separate owner-only input-consumer audit log records token, epoch, sequence,
+cut, digest, kind, and result, never the nonce, the signature, or raw input. Attribution requires durable
 append/fsync before returning: failure yields `unknown` with
 `input_log_unavailable` and poisons the epoch. Exact retries reuse the durable
 record. This audit is separate from the existing API prewrite input log.

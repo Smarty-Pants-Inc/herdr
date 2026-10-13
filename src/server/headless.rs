@@ -3351,6 +3351,7 @@ impl HeadlessServer {
                 self.app.handle_deferred_input_consumer_request(
                     msg.request,
                     msg.context,
+                    msg.peer_pidfd,
                     msg.respond_to,
                 );
             }

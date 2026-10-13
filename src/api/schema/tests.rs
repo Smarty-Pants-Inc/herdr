@@ -71,11 +71,11 @@ fn input_consumer_local_methods_are_registered_and_not_endpoint_methods() {
         ),
         (
             "pane.input_consumer.cut",
-            serde_json::json!({"epoch":"e", "epoch_key":"k", "seq":1, "token":"t", "cut":2, "digest":"d", "kind":"submit"}),
+            serde_json::json!({"epoch":"e", "seq":1, "token":"t", "cut":2, "digest":"d", "kind":"submit"}),
         ),
         (
             "pane.input_consumer.release",
-            serde_json::json!({"epoch":"e", "epoch_key":"k"}),
+            serde_json::json!({"epoch":"e"}),
         ),
     ] {
         let value = serde_json::json!({"id":"consumer", "method":name, "params":params});
@@ -91,22 +91,14 @@ fn input_consumer_local_methods_are_registered_and_not_endpoint_methods() {
 #[test]
 fn input_consumer_params_require_capabilities_and_exclusive_end_counts() {
     let params = serde_json::json!({
-        "epoch": "epoch", "epoch_key": "key", "seq": 1, "token": "token",
+        "epoch": "epoch", "seq": 1, "token": "token",
         "cut": 2, "digest": "digest", "kind": "submit"
     });
     let cut: PaneInputConsumerCutParams = serde_json::from_value(params.clone()).unwrap();
     assert_eq!(cut.cut, 2); // a\r is two post-marker bytes, not byte index 1.
     assert_eq!(cut.kind, InputConsumerCutKind::Submit);
     assert_eq!(serde_json::to_value(&cut).unwrap(), params);
-    for field in [
-        "epoch",
-        "epoch_key",
-        "seq",
-        "token",
-        "cut",
-        "digest",
-        "kind",
-    ] {
+    for field in ["epoch", "seq", "token", "cut", "digest", "kind"] {
         let mut missing = params.clone();
         missing.as_object_mut().unwrap().remove(field);
         assert!(serde_json::from_value::<PaneInputConsumerCutParams>(missing).is_err());
@@ -114,6 +106,18 @@ fn input_consumer_params_require_capabilities_and_exclusive_end_counts() {
     let mut attributed = params.clone();
     attributed["pane_id"] = "p1".into();
     assert!(serde_json::from_value::<PaneInputConsumerCutParams>(attributed).is_err());
+    // H2: v2 has no bearer key; a v1 `epoch_key` is an unknown field.
+    let mut keyed = params.clone();
+    keyed["epoch_key"] = "k".into();
+    assert!(serde_json::from_value::<PaneInputConsumerCutParams>(keyed).is_err());
+    assert!(serde_json::from_value::<PaneInputConsumerReleaseParams>(
+        serde_json::json!({"epoch": "e", "epoch_key": "k"})
+    )
+    .is_err());
+    assert!(serde_json::from_value::<PaneInputConsumerEnrollParams>(
+        serde_json::json!({"pane_id": "p1"})
+    )
+    .is_err());
     let mut discard = params;
     discard["kind"] = "discard".into();
     assert_eq!(
@@ -124,12 +128,11 @@ fn input_consumer_params_require_capabilities_and_exclusive_end_counts() {
     );
     discard["kind"] = "keyboard".into();
     assert!(serde_json::from_value::<PaneInputConsumerCutParams>(discard).is_err());
+    assert!(
+        serde_json::from_value::<PaneInputConsumerReleaseParams>(serde_json::json!({})).is_err()
+    );
     assert!(serde_json::from_value::<PaneInputConsumerReleaseParams>(
-        serde_json::json!({"epoch": "e"})
-    )
-    .is_err());
-    assert!(serde_json::from_value::<PaneInputConsumerReleaseParams>(
-        serde_json::json!({"epoch": "e", "epoch_key": "k", "pane_id": "p1"})
+        serde_json::json!({"epoch": "e", "pane_id": "p1"})
     )
     .is_err());
 }

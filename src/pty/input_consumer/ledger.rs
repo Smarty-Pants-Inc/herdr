@@ -19,7 +19,6 @@ struct Replay {
 }
 pub(crate) struct Ledger {
     pub(crate) epoch: String,
-    key: String,
     previous: u64,
     written: u64,
     seq: u64,
@@ -47,10 +46,9 @@ fn unknown(reason: &str) -> CutResult {
     }
 }
 impl Ledger {
-    pub(crate) fn new(epoch: String, key: String) -> Self {
+    pub(crate) fn new(epoch: String) -> Self {
         Self {
             epoch,
-            key,
             previous: 0,
             written: 0,
             seq: 0,
@@ -60,16 +58,6 @@ impl Ledger {
             replay_cost: 0,
             poison: None,
         }
-    }
-    pub(crate) fn authentic(&self, epoch: &str, key: &str) -> bool {
-        // Fixed-size keys; do not early-exit on a mismatching key byte.
-        let different = self
-            .key
-            .as_bytes()
-            .iter()
-            .zip(key.as_bytes())
-            .fold(0u8, |d, (a, b)| d | (a ^ b));
-        epoch == self.epoch && key.len() == self.key.len() && different == 0
     }
     pub(crate) fn poisoned(&self) -> bool {
         self.poison.is_some()
@@ -130,7 +118,8 @@ impl Ledger {
         audit: Option<&AuditSink>,
         now: Instant,
     ) -> ConsumerResponse {
-        if !self.authentic(&req.epoch, &req.epoch_key) {
+        // The actor has already pinned the caller to the enrolled peer.
+        if req.epoch != self.epoch {
             return ConsumerResponse::Refused {
                 reason: "invalid_epoch".into(),
             };
@@ -141,9 +130,7 @@ impl Ledger {
             .position(|r| r.request.token == req.token)
         {
             let old = &self.replays[index];
-            let mut comparison = req.clone();
-            comparison.epoch_key.clear();
-            if old.request != comparison {
+            if old.request != req {
                 return ConsumerResponse::Refused {
                     reason: "token_conflict".into(),
                 };
@@ -218,12 +205,9 @@ impl Ledger {
             self.previous = req.cut;
         }
         self.seq = req.seq;
-        // Never retain the bearer key in replay records.
-        let mut stored = req;
-        stored.epoch_key.clear();
         self.replay_cost += replay_cost;
         self.replays.push(Replay {
-            request: stored,
+            request: req,
             result: result.clone(),
         });
         ConsumerResponse::Cut(result)
