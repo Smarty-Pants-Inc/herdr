@@ -366,7 +366,7 @@ fn agent_command() -> Command {
                     flag("allow-cross-pane")
                         .help("Accepted for compatibility; cross-pane agent queries are allowed and logged without it"),
                 )
-                .after_help("Callers are authorized like agent prompt: an agent may observe its own pane, and another pane only with --allow-cross-pane. An unregistered pane, an old extension, or an unavailable reply returns unknown. This snapshot does not authorize a later prompt; use --if-draft-empty for an atomic check."),
+                .after_help("Callers are authorized like agent prompt: an agent may observe its own pane, and another pane is allowed and logged without --allow-cross-pane. An unregistered pane, an old extension, or an unavailable reply returns unknown. This snapshot does not authorize a later prompt; use --if-draft-empty for an atomic check."),
         )
         .subcommand(
             Command::new("prompt-guarded")

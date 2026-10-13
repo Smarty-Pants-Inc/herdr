@@ -74,11 +74,11 @@ impl App {
     ) -> Option<String> {
         // Decide from the method first: attribution walks every agent pane's session in
         // /proc, so doing it for each API request kept the server busy (smarty-dev#931).
-        // Only a content write that does not allow cross-pane input needs it.
-        if Self::allows_cross_pane(&request.method) {
-            return None;
-        }
+        // Only a content write needs it. The cross-pane opt-in is applied after
+        // attribution so a presented plugin-action token is always validated
+        // first and advisory writes are still logged.
         let target = self.content_write_target(&request.method)?;
+        let allow_cross_pane = Self::allows_cross_pane(&request.method);
         let origin = self.input_origin_for_context_with_ancestry(context);
         let (code, message) = match origin {
             InputOrigin::Ordinary => return None,
@@ -100,6 +100,18 @@ impl App {
                     );
                     return None;
                 }
+                // A valid grant keeps the explicit opt-in as an override.
+                Ok(false) if allow_cross_pane => {
+                    tracing::info!(
+                        plugin_id = %grant.plugin_id,
+                        action_id = %grant.action_id,
+                        invoking_pane = grant.invoking_pane.as_deref().unwrap_or(""),
+                        grant = %grant.grant_id,
+                        target_terminal = %target.terminal_id,
+                        "plugin action cross-pane input allowed by explicit opt-in"
+                    );
+                    return None;
+                }
                 Ok(false) => (
                     "cross_pane_input_denied",
                     "plugin action input may target only its invoking pane and panes it created",
@@ -114,6 +126,7 @@ impl App {
                     origin = "agent",
                     source_terminal = %source.terminal_id,
                     target_terminal = %target.terminal_id,
+                    allow_cross_pane,
                     "cross-pane agent input allowed (advisory input-origin guard)"
                 );
                 return None;
@@ -130,6 +143,7 @@ impl App {
                 tracing::warn!(
                     origin = "unknown",
                     target_terminal = %target.terminal_id,
+                    allow_cross_pane,
                     "input of unknown origin allowed (advisory input-origin guard)"
                 );
                 return None;
@@ -3261,10 +3275,15 @@ finally:
             PluginActionClaim::Malformed,
         ] {
             for context in [copied_marker, attributed_context()] {
-                assert_plugin_unknown(&fixture.app.handle_api_request_with_context(
-                    send("forged", &fixture.source_pane_id, false),
-                    context.with_plugin_action(claim),
-                ));
+                // The cross-pane opt-in never bypasses token validation.
+                for opt_in in [false, true] {
+                    for pane in [&fixture.source_pane_id, &fixture.target_pane_id] {
+                        assert_plugin_unknown(&fixture.app.handle_api_request_with_context(
+                            send("forged", pane, opt_in),
+                            context.with_plugin_action(claim),
+                        ));
+                    }
+                }
             }
         }
         assert!(fixture.source_rx.try_recv().is_err());
@@ -3296,11 +3315,13 @@ finally:
             "descendant still alive"
         );
         for pane in [&fixture.target_pane_id, &fixture.source_pane_id] {
-            assert_plugin_unknown(
-                &fixture
-                    .app
-                    .handle_api_request_with_context(send("replay", pane, false), granted),
-            );
+            for opt_in in [false, true] {
+                assert_plugin_unknown(
+                    &fixture
+                        .app
+                        .handle_api_request_with_context(send("replay", pane, opt_in), granted),
+                );
+            }
         }
         assert!(fixture.source_rx.try_recv().is_err());
         assert!(fixture.target_rx.try_recv().is_err());
@@ -3308,6 +3329,41 @@ finally:
         // observes alive (its parent was reaped above, so it is reparented, not
         // reused; start time is compared just before).
         unsafe { libc::kill(grandchild as libc::pid_t, libc::SIGKILL) };
+    }
+
+    /// Review fix: a forged or malformed plugin-action token with
+    /// allow_cross_pane: true is refused exactly as without the flag, on every
+    /// content-write method, while the same opt-in without a token is accepted.
+    #[tokio::test]
+    async fn invalid_plugin_token_with_allow_cross_pane_is_still_refused() {
+        use crate::plugin_action_origin::{PluginActionClaim, PluginActionToken};
+        let fixture = attributed_agent_fixture();
+        let forged =
+            PluginActionClaim::Presented(PluginActionToken::parse(&"7".repeat(64)).expect("hex"));
+        let send = |pane: &str| Request {
+            id: "opt-in".into(),
+            method: Method::PaneSendText(PaneSendTextParams {
+                expected_agent_session_id: None,
+                pane_id: pane.into(),
+                text: "x".into(),
+                allow_cross_pane: true,
+            }),
+        };
+        for pane in [&fixture.source_pane_id, &fixture.target_pane_id] {
+            for claim in [forged, PluginActionClaim::Malformed] {
+                for base in [ApiRequestContext::default(), attributed_context()] {
+                    let denial = fixture
+                        .app
+                        .cross_pane_input_denial(&send(pane), base.with_plugin_action(claim))
+                        .expect("invalid token refused despite opt-in");
+                    assert_plugin_unknown(&denial);
+                }
+            }
+            assert!(fixture
+                .app
+                .cross_pane_input_denial(&send(pane), ApiRequestContext::default())
+                .is_none());
+        }
     }
 
     /// herdr-8592: a grant past its maximum age is refused while the child lives.
@@ -3361,6 +3417,16 @@ finally:
             .backdate_for_test(key, MAX_GRANT_AGE + std::time::Duration::from_secs(1));
         let late = request();
         assert_plugin_unknown(&fixture.app.handle_api_request_with_context(late, context));
+        // The cross-pane opt-in does not revive an expired grant.
+        let mut late_opt_in = request();
+        if let Method::PaneSendText(params) = &mut late_opt_in.method {
+            params.allow_cross_pane = true;
+        }
+        assert_plugin_unknown(
+            &fixture
+                .app
+                .handle_api_request_with_context(late_opt_in, context),
+        );
         assert!(fixture.target_rx.try_recv().is_err());
         drop(action);
     }
