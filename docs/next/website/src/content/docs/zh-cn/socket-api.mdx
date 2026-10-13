@@ -148,6 +148,16 @@ ACK 必须匹配实时连接、epoch、请求 ID 和会话代数。ACK 的 `stat
 
 只有完整帧才会提交。帧大小、并发请求、回执等待方和每个 epoch 的去重账本都有上限；容量耗尽时拒绝，不会驱逐仍可复用的去重键。服务器在发送前预留 `(registration_epoch, request_id, exact text, if_draft_empty)`。服务器和 Pi 都将守卫值纳入载荷身份，包括保留的旧 epoch 条目。相同载荷的重复请求共享首次回执并标记 `duplicate`；载荷改变时以 `payload_mismatch` 拒绝。新的请求 ID 绝不是自动重试。
 
+#### Epoch 轮换
+
+当某个 epoch 的去重账本达到轮换阈值时，服务器不再为该 epoch 预留新的请求 ID；这些请求以 `agent_channel_rotating` 失败，既不预留也不投递。已预留 ID 的重复请求仍返回其回执。当该 epoch 上没有待处理的请求后，服务器发送一个控制帧并关闭连接：
+
+```json
+{"type":"rotate","registration_epoch":"epoch_opaque","session_generation":"pi-session-token"}
+```
+
+Pi 只处理与其当前连接、epoch 和会话代数都匹配的 rotate 帧。它关闭套接字并打开新的套接字，以当前 `session_generation`（支持时附带 `draft_guard`）作为第一个请求再次发送 `agent.register_self`，并等待 `ready: true`。它不会重发旧连接上的投递或 ACK。在新注册就绪之前，`agent.channel_info` 报告 `ready: false`，投递会被拒绝。固定到旧 epoch 的投递以 `registration_epoch_mismatch` 失败，但在旧 epoch 上已预留请求的重复请求仅在该 epoch 是唯一保留的上一个 epoch，且当前通道仍已连接、处于前台并绑定到同一窗格时，才返回原回执；否则同样以 `registration_epoch_mismatch` 失败。调用方随后再次调用 `agent.channel_info` 并固定新的 `registration_epoch`；不得在新 epoch 下重放旧请求。
+
 #### 隐藏文本的草稿状态查询
 
 `agent.draft_state` 要求 `target`，并接受可选布尔值 `allow_cross_pane`（默认 `false`）作为显式跨窗格许可；查询同一窗格无需许可。它观察已注册接收端的编辑器和 UI hold，不作修改。默认查询超时为两秒。绝不返回草稿文本：

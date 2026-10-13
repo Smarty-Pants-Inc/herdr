@@ -136,6 +136,16 @@ herdr pane read w1:p2 --source recent --lines 50
 
 ACK は接続、epoch、リクエスト ID、セッション世代と一致する必要があります。`status` は `accepted`、`queued`、`rejected` で、`rejected` は型付きの `reason` が必須、`duplicate: true` は任意です。拒否は成功ではなく、その `reason` を持つ `agent_prompt_rejected` エラーになります。完全なフレームだけを送信します。フレーム、処理中リクエスト、確認待ち、epoch ごとの重複排除台帳には上限があり、容量不足では再利用可能なキーを追い出さず拒否します。配信前に `(registration_epoch, request_id, exact text, if_draft_empty)` を予約し、同じ内容の重複は最初の確認を共有して `duplicate` を付けます。内容の変更は `payload_mismatch` で拒否し、新しい ID を自動再試行として扱いません。サーバーと Pi はどちらも、保持された旧 epoch のエントリを含め、ガード値をペイロードの同一性に含めます。
 
+#### epoch のローテーション
+
+epoch の重複排除台帳がローテーションのしきい値に達すると、サーバーはその epoch で新しいリクエスト ID を予約しなくなります。新しい ID は `agent_channel_rotating` で失敗し、予約も配信もされません。予約済み ID の重複は引き続き元の確認を返します。その epoch に処理待ちのリクエストがなくなると、サーバーは制御フレームを 1 つ送信して接続を閉じます。
+
+```json
+{"type":"rotate","registration_epoch":"epoch_opaque","session_generation":"pi-session-token"}
+```
+
+Pi は、現在の接続、epoch、セッション世代と一致する rotate フレームにだけ反応します。ソケットを閉じて新しいソケットを開き、最初のリクエストとして現在の `session_generation`（対応している場合は `draft_guard` も）を付けて `agent.register_self` を再送し、`ready: true` を待ちます。古い接続の配信や ACK は再送しません。新しい登録が準備完了になるまで、`agent.channel_info` は `ready: false` を返し、配信は拒否されます。古い epoch を指定した配信は `registration_epoch_mismatch` で失敗します。ただし、古い epoch で予約済みのリクエストの重複は、その epoch がサーバーの保持する唯一の直前の epoch であり、現在のチャンネルが接続済み・フォアグラウンドで同じペインに紐付いている場合に限り、元の確認を返します。それ以外の場合も `registration_epoch_mismatch` で失敗します。呼び出し側は `agent.channel_info` を再度呼び、新しい `registration_epoch` を固定します。古いリクエストを新しい epoch で再実行してはいけません。
+
 #### 本文を返さないドラフト状態の問い合わせ
 
 `agent.draft_state` は `target` が必須で、別ペインへの明示的な許可として任意の boolean `allow_cross_pane`（既定値 `false`）を受け付けます。同じペインへの問い合わせに許可は不要です。登録済み受信側のエディタと UI hold を変更せずに観測します。既定の問い合わせタイムアウトは 2 秒です。ドラフト本文は返しません。
