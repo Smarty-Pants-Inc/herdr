@@ -4,7 +4,7 @@ use crate::api::schema::{Method, Request};
 use crate::api::ApiRequestContext;
 use crate::app::terminal_targets::{InputOrigin, TerminalTarget};
 
-const INPUT_ORIGIN_UNKNOWN_MESSAGE: &str = "cannot validate input origin; retry from a live attributable caller or explicitly opt in with CLI --allow-cross-pane (API allow_cross_pane: true)";
+const INPUT_ORIGIN_UNKNOWN_MESSAGE: &str = "the presented plugin action token is invalid, expired or already used; start the action again from its plugin";
 
 fn session_checked_guard_error(
     supported: bool,
