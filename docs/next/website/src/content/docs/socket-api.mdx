@@ -154,6 +154,16 @@ ACKs must match the live connection, epoch, request ID, and session generation. 
 
 Only complete frames are submitted. Frame size, in-flight requests, receipt waiters, and the per-epoch dedup ledger are bounded; capacity exhaustion refuses rather than evicting reusable dedup keys. The server reserves `(registration_epoch, request_id, exact text, if_draft_empty)` before dispatch. Both server and Pi include the guard value in payload identity, including retained retired-epoch entries. A duplicate with the same payload shares the first receipt and is marked `duplicate`; a changed payload is rejected with `payload_mismatch`. A new request ID is never an automatic retry.
 
+#### Epoch rotation
+
+When an epoch's dedup ledger reaches its rotation threshold, the server stops reserving new request IDs on that epoch; they fail with `agent_channel_rotating` and are neither reserved nor delivered. Duplicates of already reserved IDs still return their receipts. Once no request on the epoch is pending, the server sends one control frame and closes the connection:
+
+```json
+{"type":"rotate","registration_epoch":"epoch_opaque","session_generation":"pi-session-token"}
+```
+
+Pi acts only on a rotate frame that matches its live connection, epoch, and session generation. It closes the socket and opens a new one, sends `agent.register_self` again as the first request with its current `session_generation` (and `draft_guard` when supported), and waits for `ready: true`. It does not resend deliveries or ACKs from the old connection. Until the new registration is ready, `agent.channel_info` reports `ready: false` and delivery is refused. A delivery pinned to the old epoch fails with `registration_epoch_mismatch`, except that a duplicate of a request reserved on the old epoch still returns its original receipt while that epoch is the one retained prior epoch and the current channel is still attached, foreground, and bound to the same pane; otherwise it also fails with `registration_epoch_mismatch`. Callers then call `agent.channel_info` again and pin the new `registration_epoch`; they must not replay the old request under the new epoch.
+
 #### Redacted draft-state queries
 
 `agent.draft_state` requires `target` and accepts an optional boolean `allow_cross_pane` (default `false`) as an explicit cross-pane opt-in; same-pane queries need no opt-in. It observes the registered receiver's editor and UI hold without changing them. The default query timeout is two seconds. It never returns draft text:
