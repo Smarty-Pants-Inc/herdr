@@ -322,7 +322,8 @@ pub(super) fn apply_client_pane_input_events(
     events: &[ClientPaneInputEvent],
     input_source: InputSource,
 ) -> Result<bool, ClientInputError> {
-    apply_client_terminal_input_events(runtime, events, true, input_source)
+    let mut keyboard_forwarded = false;
+    apply_client_terminal_input_events(runtime, events, true, input_source, &mut keyboard_forwarded)
 }
 
 pub(super) fn apply_client_popup_input_events(
@@ -330,14 +331,25 @@ pub(super) fn apply_client_popup_input_events(
     events: &[ClientPaneInputEvent],
     input_source: InputSource,
 ) -> Result<bool, ClientInputError> {
-    apply_client_terminal_input_events(runtime, events, false, input_source)
+    let mut keyboard_forwarded = false;
+    apply_client_terminal_input_events(
+        runtime,
+        events,
+        false,
+        input_source,
+        &mut keyboard_forwarded,
+    )
 }
 
-fn apply_client_terminal_input_events(
+pub(super) fn apply_client_terminal_input_events(
     runtime: &crate::terminal::TerminalRuntime,
     events: &[ClientPaneInputEvent],
     host_page_keys: bool,
     input_source: InputSource,
+    // Set once a key press or non-empty text reaches the PTY queue, and kept
+    // when a later event in the same batch fails (the accepted prefix stays
+    // interactive for render priority).
+    keyboard_forwarded: &mut bool,
 ) -> Result<bool, ClientInputError> {
     precheck_client_input(runtime)?;
     let mut accepted = false;
@@ -453,6 +465,7 @@ fn apply_client_terminal_input_events(
                             )
                         })?;
                     accepted = true;
+                    *keyboard_forwarded |= key_event.kind != KeyEventKind::Release;
                 }
             }
             crate::raw_input::RawInputEvent::Text(text) => {
@@ -470,6 +483,8 @@ fn apply_client_terminal_input_events(
                         )
                     })?;
                 accepted = true;
+                // Empty text was skipped above, so this is a forwarded keystroke.
+                *keyboard_forwarded = true;
             }
             crate::raw_input::RawInputEvent::Paste(text) => {
                 runtime.scroll_reset();

@@ -73,6 +73,7 @@ pub(super) fn apply_profiles(
     }) {
         catalog.select_local();
     }
+    let pixel_mouse_available = state.pixel_mouse_available();
     if let Some(shell) = state.shell.as_mut() {
         shell.set_endpoint_catalog(&catalog.ssh);
         if endpoints.active_surface_available()
@@ -86,7 +87,7 @@ pub(super) fn apply_profiles(
                 state.reported_size.1,
                 state.reported_cell_size.0,
                 state.reported_cell_size.1,
-                state.pixel_geometry_exact,
+                pixel_mouse_available,
             ));
         }
     }
