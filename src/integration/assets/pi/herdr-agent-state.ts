@@ -2,7 +2,7 @@
 // managed by herdr; reinstalling or updating the integration overwrites this file.
 // add custom hooks/plugins beside this file instead of editing it.
 // HERDR_INTEGRATION_ID=pi
-// HERDR_INTEGRATION_VERSION=11
+// HERDR_INTEGRATION_VERSION=12
 // @ts-nocheck
 
 import { AsyncResource } from "node:async_hooks";
@@ -25,8 +25,8 @@ const MAX_CHANNEL_ID = 1024;
 const RECONNECT_DELAY_MS = 250;
 const REGISTRATION_TIMEOUT_MS = 2000;
 // A held guarded delivery (see handleDeliver) is acknowledged with its refusal this long before the
-// frame's deadline_ms. Herdr's own wait ends at that deadline as delivery_unknown, so an ACK sent
-// exactly at the deadline could lose the race and turn a definite refusal into an unknown.
+// frame's admission deadline. Herdr's own wait ends at that deadline as delivery_unknown, so an ACK
+// sent exactly at the deadline could lose the race and turn a definite refusal into an unknown.
 const HELD_DELIVERY_ACK_MARGIN_MS = 250;
 const CHANNEL_REASONS = new Set([
   "no_session",
@@ -40,6 +40,50 @@ const CHANNEL_REASONS = new Set([
   "ui_hold",
   "expired",
 ]);
+
+function monotonicNow(): number {
+  return performance.now();
+}
+
+// A guarded admission deadline on two clocks (smarty-dev#8792). Admission requires BOTH at every
+// check: `monotonic`, the budget on this process's performance.now() timeline, catches a backward
+// wall-clock step; `wall`, the frame's absolute deadline_ms, catches time spent before this handler
+// read the frame (socket buffering, Pi paused or busy), which the budget cannot see. Accepted
+// residual: a pause before receipt combined with a backward wall-clock step can still admit late.
+// Herdr's own monotonic deadline still governs everything on the server side.
+type AdmissionDeadline = { monotonic: number; wall: number };
+
+// Builds the admission deadline for a guarded deliver frame at receipt. Herdr sends
+// `remaining_ms`, the budget left on its own monotonic deadline when it began writing the frame;
+// the monotonic deadline is receipt time plus that budget. An older Herdr sends only
+// `deadline_ms`: its remaining budget is read once against the wall clock here. `deadline_ms` is
+// required on every guarded frame (Herdr always sends it) and is always enforced as the wall
+// deadline; `remaining_ms` without it would skip the wall check, so it is refused. A present but
+// malformed field fails closed and never falls back. undefined means the frame carries no usable deadline (refused as
+// unknown).
+function admissionDeadline(frame: Record<string, any>, receivedAt: number): AdmissionDeadline | undefined {
+  if (!Number.isSafeInteger(frame.deadline_ms)) return undefined;
+  const wall: number = frame.deadline_ms;
+  if (frame.remaining_ms !== undefined) {
+    return Number.isSafeInteger(frame.remaining_ms) && frame.remaining_ms >= 0
+      ? { monotonic: receivedAt + frame.remaining_ms, wall }
+      : undefined;
+  }
+  return { monotonic: receivedAt + (wall - Date.now()), wall };
+}
+
+// True while both clocks are more than `marginMs` before their deadlines.
+function beforeDeadline(deadline: AdmissionDeadline, marginMs = 0): boolean {
+  return monotonicNow() < deadline.monotonic - marginMs &&
+    Date.now() < deadline.wall - marginMs;
+}
+
+// Milliseconds until the earlier of the two clocks reaches its deadline less `marginMs`.
+function msUntilDeadline(deadline: AdmissionDeadline, marginMs = 0): number {
+  const monotonic = deadline.monotonic - marginMs - monotonicNow();
+  const wall = deadline.wall - marginMs - Date.now();
+  return Math.max(0, Math.min(monotonic, wall));
+}
 
 // HERDR_PANE_ID is not required: when it is missing or empty, reports carry pane_id "" and
 // Herdr rebinds them to the pane whose session holds this process (smarty-dev#10398).
@@ -286,7 +330,7 @@ export default function (pi) {
     socket: any;
     registrationEpoch: string;
     sessionGeneration: string;
-    expiresAt: number;
+    deadline: AdmissionDeadline; // Expires HELD_DELIVERY_ACK_MARGIN_MS before either clock's deadline.
     timer?: ReturnType<typeof setTimeout>;
     // Re-attempts admission synchronously in the caller's callback; settles the delivery.
     retry: () => void;
@@ -521,6 +565,8 @@ export default function (pi) {
     const registrationEpoch = channelEpoch;
     const expectedSessionGeneration = channelSessionGeneration;
     const ifDraftEmpty = frame.if_draft_empty === true;
+    // Sampled synchronously at receipt, before any ledger or UI work, so neither can extend it.
+    const admitBy = ifDraftEmpty ? admissionDeadline(frame, monotonicNow()) : undefined;
     const prior = ledger.get(requestId);
     if (prior) {
       if (prior.text !== frame.text || prior.ifDraftEmpty !== ifDraftEmpty) {
@@ -576,8 +622,8 @@ export default function (pi) {
         return receiptForError("session_changed", expectedSessionGeneration);
       }
       if (ifDraftEmpty) {
-        if (!Number.isSafeInteger(frame.deadline_ms)) return receiptForError("unknown", expectedSessionGeneration);
-        if (Date.now() >= frame.deadline_ms) return receiptForError("expired", expectedSessionGeneration);
+        if (admitBy === undefined) return receiptForError("unknown", expectedSessionGeneration);
+        if (!beforeDeadline(admitBy)) return receiptForError("expired", expectedSessionGeneration);
         const state = readDraftSnapshot();
         if (!state) return receiptForError("unknown", expectedSessionGeneration);
         if (!state.empty) return receiptForError("draft_present", expectedSessionGeneration);
@@ -585,7 +631,7 @@ export default function (pi) {
         // non-undefined hold must refuse admission; only draft queries require the known union.
         if (state.hold !== undefined) return receiptForError("ui_hold", expectedSessionGeneration);
         // Slow synchronous UI implementations cannot extend the first-reservation deadline.
-        if (Date.now() >= frame.deadline_ms) return receiptForError("expired", expectedSessionGeneration);
+        if (!beforeDeadline(admitBy)) return receiptForError("expired", expectedSessionGeneration);
       }
       try {
         // This is the receipt-returning Pi ingress. The old void API is intentionally not a
@@ -613,17 +659,15 @@ export default function (pi) {
     const holdForSessionReady = (
       receipt: Record<string, any> | undefined,
     ): Promise<Record<string, any> | undefined> | undefined => {
-      const expiresAt = Number.isSafeInteger(frame.deadline_ms)
-        ? frame.deadline_ms - HELD_DELIVERY_ACK_MARGIN_MS
-        : Number.NaN;
       if (
+        admitBy === undefined ||
         !sessionReadySupported ||
         receipt?.status !== "rejected" ||
         receipt.reason !== "session_changed" ||
         receipt.duplicate === true ||
         held.has(requestId) ||
         held.size >= MAX_CHANNEL_INFLIGHT ||
-        !(Date.now() < expiresAt)
+        !beforeDeadline(admitBy, HELD_DELIVERY_ACK_MARGIN_MS)
       ) return undefined;
       return new Promise((resolve) => {
         const delivery: HeldDelivery = {
@@ -631,7 +675,7 @@ export default function (pi) {
           socket,
           registrationEpoch,
           sessionGeneration: expectedSessionGeneration,
-          expiresAt,
+          deadline: admitBy,
           // Called from the session_ready callback: admit observes the editor/hold and invokes
           // submitUserMessage there, synchronously, exactly as the first attempt does.
           retry: () => resolve(admit(true)),
@@ -645,7 +689,7 @@ export default function (pi) {
         // settles it with Pi's refusal. It never re-attempts admission.
         const timer = inLoadScope(() => setTimeout(() => {
           if (held.get(requestId) === delivery) takeHeld(requestId)?.refuse();
-        }, Math.max(0, expiresAt - Date.now())));
+        }, msUntilDeadline(admitBy, HELD_DELIVERY_ACK_MARGIN_MS)));
         if (!timer) {
           resolve(receipt);
           return;
@@ -990,7 +1034,7 @@ export default function (pi) {
         if (!delivery) continue;
         if (
           event?.sessionGeneration === delivery.sessionGeneration &&
-          Date.now() < delivery.expiresAt &&
+          beforeDeadline(delivery.deadline, HELD_DELIVERY_ACK_MARGIN_MS) &&
           heldDeliveryLive(delivery)
         ) {
           delivery.retry();
