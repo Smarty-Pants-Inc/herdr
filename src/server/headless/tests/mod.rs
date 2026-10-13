@@ -265,6 +265,7 @@ async fn headless_api_reads_latest_title_without_spinner_event_flooding() {
 fn headless_pane_list(server: &mut HeadlessServer) -> Vec<api::schema::PaneInfo> {
     let (respond_to, response_rx) = std::sync::mpsc::channel();
     server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+        peer_pidfd: None,
         context: crate::api::ApiRequestContext::default(),
         request: api::schema::Request {
             id: "list-titles".into(),
@@ -323,6 +324,7 @@ fn headless_api_request_drains_all_pending_internal_events_before_reading_state(
     let (respond_to, response_rx) = std::sync::mpsc::channel();
     assert!(
         server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+            peer_pidfd: None,
             context: crate::api::ApiRequestContext::default(),
             request: api::schema::Request {
                 id: "headless_stop_after_events".into(),
@@ -2151,6 +2153,7 @@ async fn client_local_navigation_does_not_emit_global_focus_transitions() {
     server.handle_client_shell_api_request(
         62,
         crate::api::ApiRequestMessage {
+            peer_pidfd: None,
             context: crate::api::ApiRequestContext::default(),
             request: crate::api::schema::Request {
                 id: "focus-own-tab".into(),
@@ -2244,6 +2247,7 @@ async fn client_local_navigation_emits_pane_focused_only_when_that_client_moves(
         server.handle_client_shell_api_request(
             client_id,
             api::ApiRequestMessage {
+                peer_pidfd: None,
                 context: crate::api::ApiRequestContext::default(),
                 request: api::schema::Request {
                     id: "navigate".into(),
@@ -2369,6 +2373,7 @@ async fn repeated_layout_action_reapplies_controller_geometry() {
     assert!(server.handle_client_shell_api_request(
         65,
         crate::api::ApiRequestMessage {
+            peer_pidfd: None,
             context: crate::api::ApiRequestContext::default(),
             request: crate::api::schema::Request {
                 id: "resize-layout".into(),
@@ -2578,6 +2583,7 @@ async fn public_close_reapplies_controller_geometry() {
     let (respond_to, _response_rx) = std::sync::mpsc::channel();
     assert!(
         server.handle_api_request_with_shutdown_check(crate::api::ApiRequestMessage {
+            peer_pidfd: None,
             context: crate::api::ApiRequestContext::default(),
             request: crate::api::schema::Request {
                 id: "public-close-geometry".into(),
@@ -2778,6 +2784,7 @@ async fn public_background_tab_create_preserves_client_locations() {
 
     let (respond_to, _response_rx) = std::sync::mpsc::channel();
     server.handle_api_request_with_shutdown_check(crate::api::ApiRequestMessage {
+        peer_pidfd: None,
         context: crate::api::ApiRequestContext::default(),
         request: crate::api::schema::Request {
             id: "create-background-tab".into(),
@@ -2828,6 +2835,7 @@ async fn public_workspace_focus_preserves_each_clients_remembered_tabs() {
 
     let (respond_to, _response_rx) = std::sync::mpsc::channel();
     server.handle_api_request_with_shutdown_check(crate::api::ApiRequestMessage {
+        peer_pidfd: None,
         context: crate::api::ApiRequestContext::default(),
         request: crate::api::schema::Request {
             id: "focus-second-workspace".into(),
@@ -2911,6 +2919,7 @@ async fn public_agent_focus_replaces_a_diverged_client_shell_projection() {
         .unwrap();
     let (respond_to, response_rx) = std::sync::mpsc::channel();
     server.handle_api_request_with_shutdown_check(crate::api::ApiRequestMessage {
+        peer_pidfd: None,
         context: crate::api::ApiRequestContext::default(),
         request: crate::api::schema::Request {
             id: "focus-first-agent".into(),
@@ -2988,6 +2997,7 @@ async fn public_api_focus_replaces_every_client_shell_projection() {
 
     let (respond_to, _response_rx) = std::sync::mpsc::channel();
     server.handle_api_request_with_shutdown_check(crate::api::ApiRequestMessage {
+        peer_pidfd: None,
         context: crate::api::ApiRequestContext::default(),
         request: crate::api::schema::Request {
             id: "test.client.shell.workspace.focus".into(),
@@ -3627,6 +3637,7 @@ async fn worktree_discovery_does_not_block_client_typing() {
         let (entered, release) = crate::worktree::test_list_gate::block(&repo);
         let (respond_to, response_rx) = std::sync::mpsc::channel();
         server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+            peer_pidfd: None,
             context: crate::api::ApiRequestContext::default(),
             request: api::schema::Request {
                 id: "blocked-read".into(),
@@ -5387,6 +5398,7 @@ fn windows_shutdown_probe_preserves_panes_and_agent_sessions() {
                 server.app.event_tx.try_send(death()).unwrap();
                 let (respond_to, response_rx) = std::sync::mpsc::channel();
                 server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+                    peer_pidfd: None,
                     context: api::ApiRequestContext::default(),
                     request: api::schema::Request {
                         id: "shutdown-race".into(),
@@ -7906,6 +7918,7 @@ fn notification_show_api_forwards_one_semantic_client_notification() {
 
     let (respond_to, response_rx) = std::sync::mpsc::channel();
     let changed = server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+        peer_pidfd: None,
         context: crate::api::ApiRequestContext::default(),
         request: api::schema::Request {
             id: "notify".into(),
@@ -7969,6 +7982,7 @@ fn notification_show_api_preserves_colon_in_forwarded_title() {
 
     let (respond_to, response_rx) = std::sync::mpsc::channel();
     let changed = server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+        peer_pidfd: None,
         context: crate::api::ApiRequestContext::default(),
         request: api::schema::Request {
             id: "notify".into(),
@@ -8015,6 +8029,7 @@ fn notification_show_api_validates_empty_title_before_disabled_delivery() {
 
     let (respond_to, response_rx) = std::sync::mpsc::channel();
     let changed = server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+        peer_pidfd: None,
         context: crate::api::ApiRequestContext::default(),
         request: api::schema::Request {
             id: "notify".into(),
@@ -8046,6 +8061,7 @@ fn notification_show_api_reports_no_foreground_client() {
 
     let (respond_to, response_rx) = std::sync::mpsc::channel();
     let changed = server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+        peer_pidfd: None,
         context: crate::api::ApiRequestContext::default(),
         request: api::schema::Request {
             id: "notify".into(),
@@ -8095,6 +8111,7 @@ fn notification_show_api_includes_sound_in_semantic_event() {
     let (respond_to, response_rx) = std::sync::mpsc::channel();
     assert!(
         server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+            peer_pidfd: None,
             context: crate::api::ApiRequestContext::default(),
             request: api::schema::Request {
                 id: "notify".into(),
@@ -8164,6 +8181,7 @@ fn completion_guard_server(writer: ClientWriter) -> (HeadlessServer, crate::layo
 fn completion_guard_api_report(server: &mut HeadlessServer, method: api::schema::Method) {
     let (respond_to, response_rx) = std::sync::mpsc::channel();
     server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+        peer_pidfd: None,
         context: crate::api::ApiRequestContext::default(),
         request: api::schema::Request {
             id: "completion-probe".into(),
@@ -8186,6 +8204,7 @@ fn report_agent_changed(
 ) -> bool {
     let (respond_to, response_rx) = std::sync::mpsc::channel();
     let changed = server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+        peer_pidfd: None,
         context: crate::api::ApiRequestContext::default(),
         request: api::schema::Request {
             id: format!("render-probe-{seq}"),
@@ -8279,6 +8298,7 @@ fn report_agent_session_with(
 ) -> bool {
     let (respond_to, response_rx) = std::sync::mpsc::channel();
     let changed = server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+        peer_pidfd: None,
         context: crate::api::ApiRequestContext::for_local_peer_pid(Some(std::process::id())),
         request: api::schema::Request {
             id: format!("session-probe-{seq}"),
@@ -8492,6 +8512,7 @@ fn api_report_agent_stores_valid_resume_argv_and_rejects_invalid() {
 
     let (respond_to, response_rx) = std::sync::mpsc::channel();
     server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+        peer_pidfd: None,
         context: api::ApiRequestContext::default(),
         request: api::schema::Request {
             id: "invalid-resume".into(),
@@ -8514,6 +8535,7 @@ fn api_report_agent_stores_valid_resume_argv_and_rejects_invalid() {
 
     let (respond_to, response_rx) = std::sync::mpsc::channel();
     server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+        peer_pidfd: None,
         context: api::ApiRequestContext::default(),
         request: api::schema::Request {
             id: "not-owner".into(),
@@ -8904,6 +8926,7 @@ fn stale_api_agent_report_does_not_forward_done_sound() {
 
     let (respond_to, response_rx) = std::sync::mpsc::channel();
     let changed = server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+        peer_pidfd: None,
         context: crate::api::ApiRequestContext::default(),
         request: api::schema::Request {
             id: "stale".into(),
@@ -9071,6 +9094,7 @@ impl CrossPaneGuardFixture {
         let (respond_to, response_rx) = std::sync::mpsc::channel();
         self.server
             .handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+                peer_pidfd: None,
                 request: api::schema::Request {
                     id: id.into(),
                     method,

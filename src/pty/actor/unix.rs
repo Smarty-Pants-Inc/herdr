@@ -848,18 +848,28 @@ impl PtyIoActorRunner {
         };
         self.check_consumer();
         let response = match operation {
-            ConsumerOperation::Enroll { peer } => {
+            ConsumerOperation::Enroll { peer: pidfd } => {
+                let pidns = crate::platform::input_consumer_pid_namespace();
                 let admission =
-                    crate::platform::input_consumer_incarnation(self.file.as_raw_fd(), peer)
-                        .and_then(|leader| {
+                    crate::platform::input_consumer_incarnation(self.file.as_raw_fd(), &pidfd)
+                        .and_then(|(peer, leader)| {
                             self.enroll_admission(leader, peer)?;
-                            crate::platform::input_consumer_snapshot(self.file.as_raw_fd(), peer)
+                            let snapshot = crate::platform::input_consumer_snapshot(
+                                self.file.as_raw_fd(),
+                                &pidfd,
+                            )?;
+                            Ok((peer, snapshot))
                         });
+                let admission = match (admission, pidns) {
+                    (Ok(admitted), Some(pidns)) => Ok((admitted, pidns)),
+                    (Err(err), _) => Err(err),
+                    (Ok(_), None) => Err(std::io::Error::other("peer_identity_unsupported")),
+                };
                 match admission {
                     Err(err) => ConsumerResponse::Refused {
                         reason: err.to_string(),
                     },
-                    Ok(snapshot) => {
+                    Ok(((peer, snapshot), pidns)) => {
                         let known = self
                             .enrolled_groups
                             .iter()
@@ -873,7 +883,7 @@ impl PtyIoActorRunner {
                                 reason: "incarnation_overflow".into(),
                             }
                         } else {
-                            let mut entropy = [0u8; 80];
+                            let mut entropy = [0u8; 48];
                             let tty = crate::platform::pane_tty_identity(self.file.as_raw_fd());
                             match (crate::platform::input_consumer_random(&mut entropy), tty) {
                                 (Err(_), _) => ConsumerResponse::Refused {
@@ -887,8 +897,8 @@ impl PtyIoActorRunner {
                                         bytes.iter().map(|b| format!("{b:02x}")).collect()
                                     }
                                     let epoch = hex(&entropy[..16]);
-                                    let epoch_key = hex(&entropy[16..48]);
-                                    let nonce = hex(&entropy[48..]);
+                                    let nonce = hex(&entropy[16..48]);
+                                    let peer_pid = snapshot.peer_pidfd.pid;
                                     if known {
                                         // Original consumer after its epoch
                                         // ended or was poisoned: fresh epoch.
@@ -896,10 +906,7 @@ impl PtyIoActorRunner {
                                     } else {
                                         self.enrolled_groups.push((snapshot.leader, peer));
                                     }
-                                    self.consumer = Some((
-                                        snapshot,
-                                        Ledger::new(epoch.clone(), epoch_key.clone()),
-                                    ));
+                                    self.consumer = Some((snapshot, Ledger::new(epoch.clone())));
                                     self.sanitizer.reset();
                                     self.pending_writes.push_back(PendingWrite {
                                         bytes: Bytes::from(format!(
@@ -912,9 +919,10 @@ impl PtyIoActorRunner {
                                         reply,
                                         ConsumerResponse::Enrolled {
                                             epoch,
-                                            epoch_key,
                                             nonce,
                                             tty,
+                                            peer_pid,
+                                            pidns,
                                         },
                                     ));
                                     return;
@@ -924,9 +932,13 @@ impl PtyIoActorRunner {
                     }
                 }
             }
-            ConsumerOperation::Cut(request) => match &mut self.consumer {
+            // Wrong peer, exited peer or wrong epoch: refused with no seq change,
+            // no audit record and no replay lookup (design item 4).
+            ConsumerOperation::Cut { request, peer_ino } => match &mut self.consumer {
                 Some((snapshot, ledger)) => {
-                    if !ledger.authentic(&request.epoch, &request.epoch_key) {
+                    if !crate::platform::input_consumer_pinned(snapshot, peer_ino)
+                        || request.epoch != ledger.epoch
+                    {
                         ConsumerResponse::Refused {
                             reason: "invalid_epoch".into(),
                         }
@@ -944,12 +956,10 @@ impl PtyIoActorRunner {
                     reason: "invalid_epoch".into(),
                 },
             },
-            ConsumerOperation::Release { epoch, epoch_key } => {
-                if self
-                    .consumer
-                    .as_ref()
-                    .is_some_and(|(_, l)| l.authentic(&epoch, &epoch_key))
-                {
+            ConsumerOperation::Release { epoch, peer_ino } => {
+                if self.consumer.as_ref().is_some_and(|(s, l)| {
+                    crate::platform::input_consumer_pinned(s, peer_ino) && l.epoch == epoch
+                }) {
                     self.end_consumer();
                     ConsumerResponse::Released
                 } else {
@@ -2739,11 +2749,9 @@ mod tests {
             .expect("before");
         data_tx
             .try_send(PtyIoDataCommand::Consumer {
-                operation: ConsumerOperation::Enroll {
-                    peer: crate::platform::ProcessIdentity {
-                        pid: 1,
-                        start_time: 0,
-                    },
+                operation: ConsumerOperation::Release {
+                    epoch: "e".into(),
+                    peer_ino: None,
                 },
                 audit: None,
                 reply,

@@ -48,7 +48,7 @@ fn input_cut_client_token_joins_private_durable_log_and_retry_is_once() {
     let token = "b63f127d944447329615b186a3abca28";
     let mut response = f.cut(json!({"token":token,"cut":input.len()}));
     // The child's _request is the actual RPC parameters, not a reconstructed
-    // expected record. Keep the bearer capability out of assertion diagnostics.
+    // expected record.
     assert_eq!(classification(&response), "client");
     let params = response
         .as_object_mut()
@@ -71,9 +71,9 @@ fn input_cut_client_token_joins_private_durable_log_and_retry_is_once() {
     for field in ["epoch", "seq", "token", "cut", "digest", "kind"] {
         assert_eq!(record[field], params[field], "audit join field {field}");
     }
-    // The log keeps the answer Pi verified, without its per-epoch MAC.
+    // The log keeps the answer Pi verified, without its signature.
     let mut answered = response["result"].clone();
-    answered.as_object_mut().unwrap().remove("mac");
+    answered.as_object_mut().unwrap().remove("sig");
     assert_eq!(record["result"], answered);
     let metadata = std::fs::metadata(f.consumer_audit_path()).unwrap();
     assert!(metadata.is_file());
@@ -86,8 +86,8 @@ fn input_cut_client_token_joins_private_durable_log_and_retry_is_once() {
             "audit leaked forbidden field/content"
         );
     }
+    assert!(enrollment.get("epoch_key").is_none());
     for secret in [
-        enrollment["epoch_key"].as_str().unwrap(),
         enrollment["nonce"].as_str().unwrap(),
         input,
         input.trim_end(),
@@ -531,4 +531,124 @@ fn input_cut_pane_children_and_server_never_hold_another_group() {
     let own = gids("self");
     assert_eq!(gids(&consumer), own);
     assert!(own.iter().all(|g| g == &own[0]), "{own:?}");
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest as _;
+    format!("{:x}", sha2::Sha256::digest(bytes))
+}
+
+/// H3/H6 (smarty-dev#2636 E′): another process forwards Pi's next cut and its
+/// release to the real socket, unchanged and modified. Every one is refused with
+/// `invalid_epoch`, no audit record is written, and the enrolled peer's own cut
+/// with the same seq and token still succeeds.
+#[test]
+fn input_cut_other_process_forwarding_the_epoch_is_refused_and_epoch_kept() {
+    let mut f = Fixture::new();
+    let enrollment = f.enroll();
+    let mut client = f.client();
+    client_text(&mut client, &f.pane, "a\r", false);
+    let bytes = f.wait_len(2);
+    let captured = json!({
+        "epoch": enrollment["epoch"], "seq": 1, "token": format!("{:032x}", 1),
+        "cut": 2, "digest": sha256_hex(&bytes), "kind": "submit",
+    });
+    let mut modified = captured.clone();
+    modified["kind"] = "discard".into();
+    for params in [captured, modified] {
+        let r = request(&f.api, "pane.input_consumer.cut", params);
+        assert_eq!(r["error"]["code"], "invalid_epoch", "{r}");
+    }
+    let r = request(
+        &f.api,
+        "pane.input_consumer.release",
+        json!({"epoch": enrollment["epoch"]}),
+    );
+    assert_eq!(r["error"]["code"], "invalid_epoch", "{r}");
+    assert!(
+        !f.consumer_audit_path().exists() || f.consumer_audit_records().1.is_empty(),
+        "a refused peer leaves no audit record"
+    );
+    let ok = f.cut(json!({}));
+    assert_eq!(classification(&ok), "client", "{ok}");
+    assert_eq!(ok["_request"]["seq"], 1);
+    assert_eq!(f.consumer_audit_records().1.len(), 1);
+}
+
+/// H4: every cut answer is signed: fresh, exact stored replay, an early
+/// `unknown` (`refuse_logged`) and a poisoned replay.
+#[test]
+fn input_cut_every_answer_kind_carries_a_verifying_signature() {
+    let mut f = Fixture::new();
+    f.enroll();
+    let mut client = f.client();
+    client_text(&mut client, &f.pane, "x\r", false);
+    f.wait_len(2);
+    let fresh = f.cut(json!({}));
+    assert_eq!(classification(&fresh), "client", "{fresh}");
+    let params = fresh["_request"].clone();
+    let replay = f.command(json!({"op":"rpc","method":"pane.input_consumer.cut","params":params}));
+    assert_eq!(classification(&replay), "client", "{replay}");
+    let stale = f.cut(json!({"seq": 9, "no_advance": true}));
+    unknown(&stale);
+    let mismatch = f.cut(json!({"seq": 2, "digest": "0".repeat(64)}));
+    unknown(&mismatch);
+    let poisoned =
+        f.command(json!({"op":"rpc","method":"pane.input_consumer.cut","params":params}));
+    unknown(&poisoned);
+}
+
+/// H7 steps 1-2: a connection made by a process that then exits, handed to its
+/// child, cannot cut the epoch enrolled afterwards: the pidfs inode names the
+/// connecting incarnation. Step 3 (forced PID reuse inside a user+pid
+/// namespace) is not automated here.
+#[test]
+fn input_cut_connection_inherited_from_an_exited_connector_is_refused() {
+    let mut f = Fixture::new();
+    let epoch_file = f.base.join("h7-epoch.json");
+    let out = f.base.join("h7-out.json");
+    let script = r#"
+import os, socket, sys, time, json
+api, epoch_file, out = sys.argv[1:]
+s = socket.socket(socket.AF_UNIX); s.connect(api)
+if os.fork(): os._exit(0)
+end = time.time() + 4
+while not os.path.exists(epoch_file) and time.time() < end: time.sleep(0.01)
+params = json.load(open(epoch_file))
+s.sendall((json.dumps(dict(id='h7', method='pane.input_consumer.cut', params=params)) + '\n').encode())
+b = b''
+while b'\n' not in b:
+    c = s.recv(65536)
+    if not c: break
+    b += c
+open(out + '.tmp', 'w').write(b.decode()); os.replace(out + '.tmp', out)
+"#;
+    let status = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(script)
+        .arg(&f.api)
+        .arg(&epoch_file)
+        .arg(&out)
+        .status()
+        .expect("connector");
+    assert!(status.success(), "the connector exits before enrollment");
+    let enrollment = f.enroll();
+    let mut client = f.client();
+    client_text(&mut client, &f.pane, "z\r", false);
+    let bytes = f.wait_len(2);
+    let params = json!({
+        "epoch": enrollment["epoch"], "seq": 1, "token": format!("{:032x}", 1),
+        "cut": 2, "digest": sha256_hex(&bytes), "kind": "submit",
+    });
+    std::fs::write(epoch_file.with_extension("tmp"), params.to_string()).unwrap();
+    std::fs::rename(epoch_file.with_extension("tmp"), &epoch_file).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(6);
+    while !out.exists() && std::time::Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    let r: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&out).expect("child answer")).unwrap();
+    assert_eq!(r["error"]["code"], "invalid_epoch", "{r}");
+    let ok = f.cut(json!({}));
+    assert_eq!(classification(&ok), "client", "{ok}");
 }

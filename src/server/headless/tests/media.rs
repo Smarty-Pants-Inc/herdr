@@ -53,6 +53,7 @@ fn media_api(
 ) -> std::sync::mpsc::Receiver<String> {
     let (respond_to, response_rx) = std::sync::mpsc::channel();
     server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+        peer_pidfd: None,
         context: crate::api::ApiRequestContext::default(),
         request: api::schema::Request {
             id: "media".into(),

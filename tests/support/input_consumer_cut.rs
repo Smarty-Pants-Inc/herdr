@@ -26,7 +26,7 @@ def rpc(method, params):
     s.close(); return json.loads(b.split(b'\n')[0])
 tty.setraw(0)
 st=os.fstat(0)
-save('ready',dict(pid=os.getpid(),pgid=os.getpgrp(),sid=os.getsid(0),foreground=os.tcgetpgrp(0),tty=os.ttyname(0),tty_dev=str(st.st_dev),tty_ino=str(st.st_ino),termios=termios.tcgetattr(0)))
+save('ready',dict(pid=os.getpid(),pidns=str(os.stat('/proc/self/ns/pid').st_ino),pgid=os.getpgrp(),sid=os.getsid(0),foreground=os.tcgetpgrp(0),tty=os.ttyname(0),tty_dev=str(st.st_dev),tty_ino=str(st.st_ino),termios=termios.tcgetattr(0)))
 raw=b''; epoch_bytes=b''; pre=b''; active=False; epoch=None; previous=0; seq=0; index=0
 end=time.monotonic()+100
 while time.monotonic()<end:
@@ -49,10 +49,10 @@ while time.monotonic()<end:
             a[field]|=getattr(termios,c['flag']); termios.tcsetattr(0,termios.TCSANOW,a)
         challenge=c.get('challenge',os.urandom(32).hex())
         out=rpc('pane.input_consumer.enroll',dict(pane_id=pane,challenge=challenge)); out['_challenge']=challenge
-        if 'result' in out and all(k in out['result'] for k in ['epoch','epoch_key','nonce']): epoch=out['result']
+        if 'result' in out and all(k in out['result'] for k in ['epoch','nonce','peer']): epoch=out['result']
     elif op=='cut':
         seq=c.get('seq',seq+1); cut=c.get('cut',len(epoch_bytes))
-        params=dict(epoch=epoch['epoch'],epoch_key=epoch['epoch_key'],seq=seq,token=c.get('token',('%032x'%seq)),cut=cut,digest=c.get('digest',hashlib.sha256(epoch_bytes[previous:cut]).hexdigest()),kind=c.get('kind','submit'))
+        params=dict(epoch=epoch['epoch'],seq=seq,token=c.get('token',('%032x'%seq)),cut=cut,digest=c.get('digest',hashlib.sha256(epoch_bytes[previous:cut]).hexdigest()),kind=c.get('kind','submit'))
         out=rpc('pane.input_consumer.cut',params); out['_request']=params
         if not c.get('no_advance'): previous=cut
     elif op=='rpc': out=rpc(c['method'],c['params']); out['_request']=c['params']
@@ -150,15 +150,22 @@ fn fields(list: &[&str]) -> Vec<u8> {
     out
 }
 
-fn unhex(s: &str) -> Vec<u8> {
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
-        .collect()
+thread_local! {
+    /// The server key of the fixture alive on this test thread.
+    static SERVER_PUB: std::cell::RefCell<Option<Vec<u8>>> = const { std::cell::RefCell::new(None) };
 }
 
-fn hexs(b: &[u8]) -> String {
-    b.iter().map(|b| format!("{b:02x}")).collect()
+fn verify_signature(message: &[u8], sig: &str) {
+    use base64::Engine as _;
+    let sig = base64::engine::general_purpose::STANDARD
+        .decode(sig)
+        .expect("base64 sig");
+    let public = SERVER_PUB
+        .with(|k| k.borrow().clone())
+        .expect("keyed fixture");
+    ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, public)
+        .verify(message, &sig)
+        .expect("answer signature verifies with the server key");
 }
 
 impl Fixture {
@@ -223,6 +230,7 @@ impl Fixture {
                 }
             }
         });
+        SERVER_PUB.with(|k| *k.borrow_mut() = server_pub.clone());
         let mut f = Self {
             base,
             api,
@@ -316,9 +324,10 @@ impl Fixture {
             r.get("error").is_none(),
             "pane.input_consumer.enroll is required on real PTY: {r}"
         );
-        for key in ["epoch", "epoch_key", "nonce", "sig"] {
+        for key in ["epoch", "nonce", "sig"] {
             assert!(r["result"][key].is_string(), "enroll contract {key}: {r}");
         }
+        assert!(r["result"].get("epoch_key").is_none(), "v2 has no key: {r}");
         self.verify_enroll(&r);
         let deadline = Instant::now() + Duration::from_secs(3);
         while Instant::now() < deadline {
@@ -330,10 +339,9 @@ impl Fixture {
         panic!("enroll did not write matching one-operation nonce marker");
     }
     /// Checks the answer exactly as Pi does: Ed25519 over Pi's field encoding, for this
-    /// consumer's own stdin tty.
+    /// consumer's own stdin tty, pid and pid namespace (H5).
     pub fn verify_enroll(&self, r: &Value) {
         use base64::Engine as _;
-        use sha2::Digest as _;
         let res = &r["result"];
         let ready = self.file("ready");
         assert_eq!(
@@ -344,16 +352,25 @@ impl Fixture {
             res["tty"]["ino"], ready["tty_ino"],
             "signed tty is the consumer's: {r}"
         );
-        let key = unhex(res["epoch_key"].as_str().unwrap());
+        assert_eq!(
+            res["peer"]["pid"],
+            ready["pid"].to_string(),
+            "signed peer is the consumer: {r}"
+        );
+        assert_eq!(
+            res["peer"]["pidns"], ready["pidns"],
+            "signed pidns is the consumer's: {r}"
+        );
         let message = fields(&[
-            "herdr-enroll-v1",
+            "herdr-enroll-v2",
             r["_challenge"].as_str().unwrap(),
             res["epoch"].as_str().unwrap(),
-            &hexs(&sha2::Sha256::digest(&key)),
             res["nonce"].as_str().unwrap(),
             &self.pane,
             res["tty"]["dev"].as_str().unwrap(),
             res["tty"]["ino"].as_str().unwrap(),
+            res["peer"]["pid"].as_str().unwrap(),
+            res["peer"]["pidns"].as_str().unwrap(),
         ]);
         let sig = base64::engine::general_purpose::STANDARD
             .decode(res["sig"].as_str().unwrap())
@@ -485,7 +502,8 @@ pub fn client_text(s: &mut UnixStream, pane: &str, text: &str, paste: bool) {
     s.flush().unwrap();
 }
 
-/// Pi's cut answer (`result`, `reason?`, `principal?`, `mac`); the MAC must verify.
+/// Pi's cut answer (`result`, `reason?`, `principal?`, `sig`); the Ed25519 signature
+/// must verify under the fixture's server key (H4).
 pub fn classification(r: &Value) -> &str {
     assert!(r.get("error").is_none(), "cut failed: {r}");
     let res = &r["result"];
@@ -493,7 +511,7 @@ pub fn classification(r: &Value) -> &str {
     let req = &r["_request"];
     let num = |v: &Value| v.as_u64().map(|n| n.to_string()).unwrap();
     let message = fields(&[
-        "herdr-cut-v1",
+        "herdr-cut-answer-v2",
         req["epoch"].as_str().unwrap(),
         &num(&req["seq"]),
         req["token"].as_str().unwrap(),
@@ -505,12 +523,8 @@ pub fn classification(r: &Value) -> &str {
         res["principal"]["smarty_id"].as_str().unwrap_or(""),
         res["principal"]["display_name"].as_str().unwrap_or(""),
     ]);
-    let key = ring::hmac::Key::new(
-        ring::hmac::HMAC_SHA256,
-        &unhex(req["epoch_key"].as_str().unwrap()),
-    );
-    ring::hmac::verify(&key, &message, &unhex(res["mac"].as_str().expect("mac")))
-        .expect("cut answer MAC verifies under the epoch key");
+    assert!(res.get("mac").is_none(), "v2 has no MAC: {r}");
+    verify_signature(&message, res["sig"].as_str().expect("cut answer needs sig"));
     kind
 }
 pub fn unknown(r: &Value) {
