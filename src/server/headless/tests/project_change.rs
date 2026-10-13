@@ -224,6 +224,7 @@ fn worktree_repin_start(
     fixture
         .server
         .handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+            peer_pidfd: None,
             context: api::ApiRequestContext::default(),
             request,
             respond_to,
@@ -1021,6 +1022,7 @@ fn public_method(
 ) -> Result<ResponseResult, ErrorResponse> {
     let (respond_to, response_rx) = std::sync::mpsc::channel();
     server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+        peer_pidfd: None,
         context: api::ApiRequestContext::default(),
         request: api::schema::Request {
             id: "project-check".into(),
@@ -2392,6 +2394,7 @@ fn project_receiver_method(
     server.handle_client_shell_api_request(
         client_id,
         api::ApiRequestMessage {
+            peer_pidfd: None,
             context: api::ApiRequestContext::default(),
             request: api::schema::Request {
                 id: "project-receiver".into(),

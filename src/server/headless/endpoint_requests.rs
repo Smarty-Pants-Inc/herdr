@@ -142,6 +142,7 @@ impl HeadlessServer {
             | self.handle_client_shell_api_request(
                 client_id,
                 api::ApiRequestMessage {
+                    peer_pidfd: None,
                     context,
                     request: *request,
                     respond_to,
