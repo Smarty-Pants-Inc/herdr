@@ -35,7 +35,7 @@ pub(crate) enum ExecutableIdentity {
     Server,
     Sshd,
     /// A uid-0 process whose exe link the unprivileged server cannot read.
-    /// Acceptable as the sshd priv process only because the journal source
+    /// Acceptable as the sshd priv process only because the sshd lookup helper
     /// then proves it with journald's trusted `_EXE=/usr/sbin/sshd` field.
     RootUnreadable,
     Other,
@@ -46,8 +46,6 @@ pub(crate) struct Process {
     pub parent: u32,
     pub uid: u32,
     pub start: u64,
-    /// Realtime microseconds corresponding to the pinned process start.
-    pub started_at: u64,
     pub exe: String,
     pub argv: Vec<String>,
     pub title: String,
@@ -55,30 +53,25 @@ pub(crate) struct Process {
     pub executable: ExecutableIdentity,
 }
 
+/// One sshd login as answered by the setgid `herdr-sshd-lookup` helper, which
+/// alone reads the journal (docs/next/sshd-lookup.md).
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct JournalQuery {
+pub(crate) struct SshdLogin {
     pub pid: u32,
-    pub uid: u32,
-    pub comm: String,
-    pub since: u64,
-    pub format: String,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct JournalRow {
-    pub pid: u32,
-    pub uid: u32,
-    pub comm: String,
-    pub timestamp: u64,
-    pub message: String,
+    pub user: String,
+    pub fingerprint: String,
+    pub source_ip: std::net::IpAddr,
 }
 
 /// Sources fail closed on unavailable, malformed, unbounded or untrusted data.
-/// Journal acquisition additionally verifies boot, executable, transport and
-/// monotonic/realtime metadata against the pinned authentication process.
+/// The sshd lookup helper verifies the login process and journald's trusted
+/// metadata itself; this server holds no journal access.
 pub(crate) trait Sources {
     fn proc(&mut self, pid: u32) -> Option<Process>;
-    fn journal(&mut self, query: JournalQuery) -> Option<Vec<JournalRow>>;
+    /// Ask the helper about the login behind this connection. The helper gets
+    /// the connection itself (fd 3), never a pid, and finds the priv process
+    /// from the kernel-attested peer.
+    fn sshd_login(&mut self) -> Option<SshdLogin>;
     fn whois(&mut self, ip: &str) -> Option<String>;
 }
 
@@ -178,29 +171,36 @@ pub(crate) fn match_factors(map: &LoadedMap, key: &str, stable_id: &str) -> Opti
     (map.nodes.get(stable_id)? == key_principal).then(|| key_principal.clone())
 }
 
-fn accepted_key(message: &str, user: &str) -> Option<(String, String)> {
-    let fields: Vec<_> = message.split_whitespace().collect();
-    if fields.len() != 11
-        || fields[0..3] != ["Accepted", "publickey", "for"]
-        || fields[3] != user
-        || fields[4] != "from"
-        || fields[6] != "port"
-        || fields[8] != "ssh2:"
-        || fields[7].parse::<u16>().ok().is_none_or(|p| p == 0)
-        || fields[9].is_empty()
-    {
+/// The helper's one JSON line: exactly these four fields, nothing else.
+pub(crate) fn parse_sshd_login(output: &[u8]) -> Option<SshdLogin> {
+    let line = std::str::from_utf8(output).ok()?.strip_suffix('\n')?;
+    if line.contains('\n') {
         return None;
     }
-    let fingerprint = fields[10].strip_prefix("SHA256:")?;
-    if fingerprint.is_empty()
-        || !fingerprint
+    let value: serde_json::Value = serde_json::from_str(line).ok()?;
+    let object = value.as_object()?;
+    if object.len() != 4 {
+        return None;
+    }
+    let text = |key| object.get(key)?.as_str();
+    let user = text("user")?;
+    let fingerprint = text("fingerprint")?;
+    let digest = fingerprint.strip_prefix("SHA256:")?;
+    if user.is_empty()
+        || user.chars().any(|c| c.is_whitespace() || c.is_control())
+        || digest.is_empty()
+        || !digest
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"+/=".contains(&b))
     {
         return None;
     }
-    let _: std::net::IpAddr = fields[5].parse().ok()?;
-    Some((fields[10].into(), fields[5].into()))
+    Some(SshdLogin {
+        pid: u32::try_from(object.get("pid")?.as_u64()?).ok()?,
+        user: user.into(),
+        fingerprint: fingerprint.into(),
+        source_ip: text("source_ip")?.parse().ok()?,
+    })
 }
 
 pub(crate) fn resolve(
@@ -252,32 +252,15 @@ pub(crate) fn resolve(
         }
     }
     let user = priv_user?;
-    let (priv_pid, priv_process) = chain.last()?;
-    let rows = sources.journal(JournalQuery {
-        pid: *priv_pid,
-        uid: 0,
-        comm: "sshd".into(),
-        since: priv_process.started_at,
-        format: "json".into(),
-    })?;
-    let mut accepted = None;
-    for row in rows {
-        if row.pid != *priv_pid
-            || row.uid != 0
-            || row.comm != "sshd"
-            || row.timestamp < priv_process.started_at
-        {
-            return None;
-        }
-        if row.message.starts_with("Accepted publickey ") {
-            if accepted.is_some() {
-                return None;
-            }
-            accepted = Some(accepted_key(&row.message, &user)?);
-        }
+    let (priv_pid, _) = chain.last()?;
+    // The helper walked from the connection's peer on its own; it must name
+    // the same priv process as this server's walk.
+    let login = sources.sshd_login()?;
+    if login.pid != *priv_pid || login.user != user {
+        return None;
     }
-    let (key, ip) = accepted?;
-    let address: std::net::IpAddr = ip.parse().ok()?;
+    let (key, address) = (login.fingerprint, login.source_ip);
+    let ip = address.to_string();
     if !tailnet_address(address) {
         return None;
     }
@@ -351,14 +334,13 @@ mod tests {
 
     // Every vector exercises the production parser, resolver or cache.
     use super::{
-        load_map, match_factors, resolve, AcceptedPeer, ExecutableIdentity, JournalQuery,
-        JournalRow, LoadedMap, MapCache, MapImage, Process, Sources,
+        load_map, match_factors, parse_sshd_login, resolve, AcceptedPeer, ExecutableIdentity,
+        LoadedMap, MapCache, MapImage, Process, Sources, SshdLogin,
     };
     use crate::pty::input_consumer::Principal;
 
     const VALID_MAP: &str = r#"{"version":1,"principals":[{"smarty_id":"paul","display_name":"Paul","ssh_keys":["SHA256:paul"],"tailscale_nodes":["nPaul"]},{"smarty_id":"kate","display_name":"Kate","ssh_keys":["SHA256:kate"],"tailscale_nodes":["nKate"]}]}"#;
-    const ACCEPTED: &str =
-        "Accepted publickey for paul from 100.64.0.7 port 1234 ssh2: ED25519 SHA256:paul";
+    const HELPER_LINE: &str = "{\"pid\":20,\"user\":\"paul\",\"fingerprint\":\"SHA256:paul\",\"source_ip\":\"100.64.0.7\"}\n";
     const WHOIS: &str = r#"{"Node":{"StableID":"nPaul","ID":777,"Name":"untrusted-host-name","Addresses":["100.64.0.7/32"]}}"#;
 
     fn paul() -> Principal {
@@ -403,10 +385,10 @@ mod tests {
         processes: BTreeMap<u32, Process>,
         changed_on_reread: BTreeMap<u32, Process>,
         reads: BTreeMap<u32, usize>,
-        rows: Option<Vec<JournalRow>>,
+        login: Option<SshdLogin>,
         whois_json: Option<String>,
         proc_calls: Vec<u32>,
-        journal_calls: Vec<JournalQuery>,
+        login_calls: usize,
         whois_calls: Vec<String>,
     }
 
@@ -422,9 +404,9 @@ mod tests {
             }
             self.processes.get(&pid).cloned()
         }
-        fn journal(&mut self, query: JournalQuery) -> Option<Vec<JournalRow>> {
-            self.journal_calls.push(query);
-            self.rows.clone()
+        fn sshd_login(&mut self) -> Option<SshdLogin> {
+            self.login_calls += 1;
+            self.login.clone()
         }
         fn whois(&mut self, ip: &str) -> Option<String> {
             self.whois_calls.push(ip.into());
@@ -437,7 +419,6 @@ mod tests {
             parent,
             uid,
             start: 100,
-            started_at: 100,
             executable: match exe {
                 "/usr/local/bin/herdr" => ExecutableIdentity::Server,
                 "/usr/sbin/sshd" => ExecutableIdentity::Sshd,
@@ -474,16 +455,10 @@ mod tests {
             .into(),
             changed_on_reread: BTreeMap::new(),
             reads: BTreeMap::new(),
-            rows: Some(vec![JournalRow {
-                pid: 20,
-                uid: 0,
-                comm: "sshd".into(),
-                timestamp: 101,
-                message: ACCEPTED.into(),
-            }]),
+            login: parse_sshd_login(HELPER_LINE.as_bytes()),
             whois_json: Some(WHOIS.into()),
             proc_calls: Vec::new(),
-            journal_calls: Vec::new(),
+            login_calls: 0,
             whois_calls: Vec::new(),
         }
     }
@@ -655,19 +630,10 @@ mod tests {
     }
 
     #[test]
-    fn trusted_sources_resolve_and_query_root_journal_since_process_start() {
+    fn trusted_sources_resolve_and_ask_the_helper_once() {
         let mut f = sources();
         assert_eq!(resolve(peer(), &trusted_map(), &mut f), Some(paul()));
-        assert_eq!(
-            f.journal_calls,
-            vec![JournalQuery {
-                pid: 20,
-                uid: 0,
-                comm: "sshd".into(),
-                since: 100,
-                format: "json".into()
-            }]
-        );
+        assert_eq!(f.login_calls, 1);
         assert_eq!(f.whois_calls, vec!["100.64.0.7"]);
         assert!(f.proc_calls.contains(&40));
     }
@@ -745,12 +711,12 @@ mod tests {
         }
     );
     rejected_source!(
-        unreadable_root_priv_without_journal_proof_is_unmapped,
+        unreadable_root_priv_without_helper_proof_is_unmapped,
         |f: &mut FakeSources, _: &mut AcceptedPeer| {
             f.processes.get_mut(&20).unwrap().executable = ExecutableIdentity::RootUnreadable;
-            // The Linux source returns None when any row lacks trusted
+            // The helper prints nothing when any row lacks trusted
             // `_EXE=/usr/sbin/sshd`, `_BOOT_ID` or the other pinned fields.
-            f.rows = None;
+            f.login = None;
         }
     );
     rejected_source!(
@@ -759,14 +725,6 @@ mod tests {
             let p = f.processes.get_mut(&20).unwrap();
             p.executable = ExecutableIdentity::RootUnreadable;
             p.uid = 1000;
-        }
-    );
-    rejected_source!(
-        unreadable_root_priv_two_accepted_records_is_unmapped,
-        |f: &mut FakeSources, _: &mut AcceptedPeer| {
-            f.processes.get_mut(&20).unwrap().executable = ExecutableIdentity::RootUnreadable;
-            let row = f.rows.as_ref().unwrap()[0].clone();
-            f.rows.as_mut().unwrap().push(row);
         }
     );
     rejected_source!(
@@ -780,13 +738,12 @@ mod tests {
     );
 
     #[test]
-    fn unreadable_root_priv_with_one_trusted_journal_record_maps() {
+    fn unreadable_root_priv_with_one_helper_answer_maps() {
         let mut f = sources();
         f.processes.get_mut(&20).unwrap().executable = ExecutableIdentity::RootUnreadable;
         f.processes.get_mut(&20).unwrap().exe = String::new();
         assert_eq!(resolve(peer(), &trusted_map(), &mut f), Some(paul()));
-        assert_eq!(f.journal_calls.len(), 1);
-        assert_eq!(f.journal_calls[0].pid, 20);
+        assert_eq!(f.login_calls, 1);
     }
 
     rejected_source!(
@@ -796,60 +753,64 @@ mod tests {
         }
     );
     rejected_source!(
-        journal_uid_not_zero_is_unmapped,
+        helper_answer_for_another_priv_pid_is_unmapped,
         |f: &mut FakeSources, _: &mut AcceptedPeer| {
-            f.rows.as_mut().unwrap()[0].uid = 1000;
+            // Another live login of the same user: the helper walked from the
+            // connection's peer to a priv this server's walk did not find.
+            f.processes.insert(
+                21,
+                process(1, 0, "/usr/sbin/sshd", &["sshd"], "sshd: paul [priv]"),
+            );
+            f.login.as_mut().unwrap().pid = 21;
         }
     );
     rejected_source!(
-        journal_wrong_pid_is_unmapped,
+        helper_answer_for_another_user_is_unmapped,
         |f: &mut FakeSources, _: &mut AcceptedPeer| {
-            f.rows.as_mut().unwrap()[0].pid = 19;
+            f.login.as_mut().unwrap().user = "kate".into();
         }
     );
     rejected_source!(
-        journal_wrong_comm_is_unmapped,
+        helper_missing_or_failed_is_unmapped,
         |f: &mut FakeSources, _: &mut AcceptedPeer| {
-            f.rows.as_mut().unwrap()[0].comm = "bash".into();
+            f.login = None;
         }
     );
-    rejected_source!(
-        journal_before_priv_start_is_unmapped,
-        |f: &mut FakeSources, _: &mut AcceptedPeer| {
-            f.rows.as_mut().unwrap()[0].timestamp = 99;
+
+    #[test]
+    fn helper_line_is_exactly_four_fields_in_one_line() {
+        let login = parse_sshd_login(HELPER_LINE.as_bytes()).expect("valid line");
+        assert_eq!(
+            login,
+            SshdLogin {
+                pid: 20,
+                user: "paul".into(),
+                fingerprint: "SHA256:paul".into(),
+                source_ip: "100.64.0.7".parse().unwrap(),
+            }
+        );
+        let extra = HELPER_LINE.replace("}\n", ",\"MESSAGE\":\"x\"}\n");
+        let two = format!("{HELPER_LINE}{HELPER_LINE}");
+        for bad in [
+            "",
+            "\n",
+            HELPER_LINE.trim_end(),
+            &two,
+            &extra,
+            &HELPER_LINE.replace("SHA256:paul", "MD5:paul"),
+            &HELPER_LINE.replace("SHA256:paul", "SHA256:"),
+            &HELPER_LINE.replace("SHA256:paul", "SHA256:pa ul"),
+            &HELPER_LINE.replace("100.64.0.7", "host.example"),
+            &HELPER_LINE.replace("\"paul\"", "\"pa ul\""),
+            &HELPER_LINE.replace("\"paul\"", "\"\""),
+            &HELPER_LINE.replace("20", "\"20\""),
+            &HELPER_LINE.replace("20", "-20"),
+            &HELPER_LINE.replace("20", "4294967296"),
+        ] {
+            assert_eq!(parse_sshd_login(bad.as_bytes()), None, "{bad:?}");
         }
-    );
-    rejected_source!(
-        journal_user_mismatch_is_unmapped,
-        |f: &mut FakeSources, _: &mut AcceptedPeer| {
-            f.rows.as_mut().unwrap()[0].message = ACCEPTED.replace("for paul", "for kate");
-        }
-    );
-    rejected_source!(
-        journal_missing_is_unmapped,
-        |f: &mut FakeSources, _: &mut AcceptedPeer| {
-            f.rows = None;
-        }
-    );
-    rejected_source!(
-        zero_accepted_lines_is_unmapped,
-        |f: &mut FakeSources, _: &mut AcceptedPeer| {
-            f.rows = Some(Vec::new());
-        }
-    );
-    rejected_source!(
-        control_master_multiple_accepted_lines_is_unmapped,
-        |f: &mut FakeSources, _: &mut AcceptedPeer| {
-            let row = f.rows.as_ref().unwrap()[0].clone();
-            f.rows.as_mut().unwrap().push(row);
-        }
-    );
-    rejected_source!(
-        malformed_accepted_line_is_unmapped,
-        |f: &mut FakeSources, _: &mut AcceptedPeer| {
-            f.rows.as_mut().unwrap()[0].message = "Accepted password for paul".into();
-        }
-    );
+    }
+
     rejected_source!(
         whois_unavailable_is_unmapped,
         |f: &mut FakeSources, _: &mut AcceptedPeer| {
@@ -895,7 +856,7 @@ mod tests {
     rejected_source!(
         node_alone_is_unmapped,
         |f: &mut FakeSources, _: &mut AcceptedPeer| {
-            f.rows.as_mut().unwrap()[0].message = ACCEPTED.replace("SHA256:paul", "SHA256:unknown");
+            f.login.as_mut().unwrap().fingerprint = "SHA256:unknown".into();
         }
     );
     rejected_source!(
@@ -948,17 +909,8 @@ mod tests {
         p.server_pid = 30;
         assert_eq!(resolve(p, &trusted_map(), &mut f), None);
         assert!(!f.proc_calls.contains(&20));
-        assert!(f.journal_calls.is_empty());
+        assert_eq!(f.login_calls, 0);
         assert!(f.whois_calls.is_empty());
-    }
-
-    #[test]
-    fn ignores_unrelated_journal_messages_not_additional_acceptances() {
-        let mut f = sources();
-        let mut row = f.rows.as_ref().unwrap()[0].clone();
-        row.message = "pam_unix(sshd:session): session opened for user paul".into();
-        f.rows.as_mut().unwrap().push(row);
-        assert_eq!(resolve(peer(), &trusted_map(), &mut f), Some(paul()));
     }
 
     #[test]
@@ -1053,7 +1005,7 @@ mod tests {
         f.whois_json = Some(WHOIS.replace("100.64.0.7/32", "100.64.0.8/32"));
         assert_eq!(resolve(peer(), &trusted_map(), &mut f), None);
         let mut f = sources();
-        f.rows.as_mut().unwrap()[0].message = ACCEPTED.replace("100.64.0.7", "127.0.0.1");
+        f.login.as_mut().unwrap().source_ip = "127.0.0.1".parse().unwrap();
         assert_eq!(resolve(peer(), &trusted_map(), &mut f), None);
         assert!(f.whois_calls.is_empty());
     }

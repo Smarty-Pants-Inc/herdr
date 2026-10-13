@@ -16,6 +16,8 @@ use windows_sys::Win32::{
     },
 };
 
+// CLI fixtures include this shared helper; the binary uses create_config_temporary instead.
+#[allow(dead_code)]
 pub(crate) fn create_private_file(path: &Path) -> io::Result<File> {
     let sddl = U16CString::from_str("D:P(A;;GA;;;SY)(A;;GA;;;OW)").map_err(io::Error::other)?;
     let descriptor = SecurityDescriptor::deserialize(&sddl)?;

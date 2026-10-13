@@ -509,6 +509,8 @@ Choose `herdr` for an in-app toast, `terminal` for an outer-terminal notificatio
 
 On macOS, `system` tries `terminal-notifier` first and falls back to `/usr/bin/osascript` when it is unavailable or fails. The fallback appears as Script Editor in Notification Center and cannot activate the hosting terminal. Install `terminal-notifier` with `brew install terminal-notifier`. For a supported, detected terminal, it can activate the terminal app when you click the notification. Alternatively, choose `terminal` to let a supported outer terminal own the notification.
 
+On Windows, `system` notifications remain in Notification Center. Clicking one selects its originating pane in the running Herdr client and brings its terminal window forward when Windows exposes that window. A click cannot reopen a closed client or select a pane from a restarted server. Windows Terminal can bring the owning window forward, but cannot reliably select a different outer terminal tab.
+
 ## Sound
 
 Sound notifications play through the local Herdr client. Custom sounds must be mp3 files; Herdr resolves relative paths from the config file's directory.
@@ -571,7 +573,7 @@ startup_per_agent_delay_ms = 100
 
 Automatic restores start one agent at a time, 100 milliseconds apart by default, to reduce startup contention. The first eligible agent starts immediately. Set `startup_per_agent_delay_ms = 0` to disable spacing. Manual launches and explicit terminal attaches are unaffected. Restart the Herdr server to apply changes.
 
-Only panes with a valid native session reference from an official integration can resume; other panes restore as normal shells. See [Session state and restore](/docs/session-state/) for supported Agents and persistence behavior.
+Herdr resumes an agent pane in one of two ways. If the agent reported its own resume command (see [Add Herdr support to your agent](/docs/add-herdr-support/)) and the saved command is still valid, Herdr runs that command in the pane's directory. Otherwise, Herdr uses a valid native session reference from an official integration. `resume_agents_on_restore` controls both paths. Other panes restore as normal shells. See [Session state and restore](/docs/session-state/) for supported Agents and persistence behavior.
 
 ## IME cursor tracking
 

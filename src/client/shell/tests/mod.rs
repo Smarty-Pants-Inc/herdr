@@ -194,6 +194,7 @@ fn pane_scroll_result(
             state_labels: HashMap::new(),
             tokens: HashMap::new(),
             agent_session: None,
+            agent_session_id: None,
             scroll: Some(crate::api::schema::PaneScrollInfo {
                 offset_from_bottom,
                 max_offset_from_bottom,
@@ -253,6 +254,7 @@ mod endpoint_requests;
 mod endpoints;
 mod graphics;
 mod grouped_sidebar;
+mod input_conformance;
 #[path = "input.rs"]
 mod input_domain;
 mod keybindings_settings;

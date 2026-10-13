@@ -106,25 +106,43 @@ impl HeadlessServer {
             let deferred_worktree = matches!(
                 &request.method,
                 api::schema::Method::WorktreeCreate(_)
+                    | api::schema::Method::WorktreeCreateProjectChecked(_)
                     | api::schema::Method::WorktreeRemove(_)
                     | api::schema::Method::WorktreeList(_)
                     | api::schema::Method::WorktreeOpen(_)
+                    | api::schema::Method::WorktreeOpenProjectChecked(_)
             );
             let deferred_navigation = match &request.method {
                 api::schema::Method::WorktreeCreate(params) => params.focus,
                 api::schema::Method::WorktreeOpen(params) => params.focus,
+                api::schema::Method::WorktreeCreateProjectChecked(params) => params.params.focus,
+                api::schema::Method::WorktreeOpenProjectChecked(params) => params.params.focus,
                 _ => false,
             };
             client.shell_deferred_navigation_request_id =
                 deferred_worktree.then(|| api_request_id.clone());
             client.shell_deferred_navigation_response = deferred_navigation.then(Vec::new);
         }
+        // ponytail: smarty-dev#8152: the lane's trusted flag is not proof of an
+        // operator, since any same-user process (also one inside a pane) can
+        // open the owner-readable client socket. Only `pane.clear_input_poison`
+        // gets the accept-pinned peer context, so its handler classifies the
+        // client by the same ancestry policy as a public API caller. Every other
+        // endpoint method keeps the default context and its existing behavior.
+        let context = match &request.method {
+            api::schema::Method::PaneClearInputPoison(_) => self
+                .clients
+                .get(&client_id)
+                .map(|client| client.shell_peer_context)
+                .unwrap_or_default(),
+            _ => crate::api::ApiRequestContext::default(),
+        };
         let foreground_changed = self.promote_client_to_foreground(client_id);
         foreground_changed
             | self.handle_client_shell_api_request(
                 client_id,
                 api::ApiRequestMessage {
-                    context: crate::api::ApiRequestContext::default(),
+                    context,
                     request: *request,
                     respond_to,
                     response_write_complete: None,

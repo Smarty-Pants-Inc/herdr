@@ -710,6 +710,55 @@
             },
             {
               "properties": {
+                "agent": {
+                  "type": "string"
+                },
+                "agent_session_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "pane_id": {
+                  "type": "string"
+                },
+                "previous_agent_session_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "previous_session_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "session_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "pane_agent_session_changed",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "pane_id",
+                "workspace_id",
+                "agent",
+                "session_id",
+                "previous_session_id",
+                "agent_session_id",
+                "previous_agent_session_id"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
                 "layout": {
                   "$ref": "#/schemas/event/$defs/PaneLayoutSnapshot"
                 },
@@ -753,6 +802,7 @@
             "pane_exited",
             "pane_agent_detected",
             "pane_agent_status_changed",
+            "pane_agent_session_changed",
             "layout_updated"
           ],
           "type": "string"
@@ -773,6 +823,13 @@
                 {
                   "type": "null"
                 }
+              ]
+            },
+            "agent_session_id": {
+              "description": "Actual ID from the accepted current report, independent of its resume path.",
+              "type": [
+                "string",
+                "null"
               ]
             },
             "agent_status": {
@@ -1228,11 +1285,88 @@
     },
     "request": {
       "$defs": {
+        "AgentChannelInfoParams": {
+          "properties": {
+            "target": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "target"
+          ],
+          "type": "object"
+        },
+        "AgentDraftStateParams": {
+          "additionalProperties": false,
+          "description": "A read-only observation, never authority for a later prompt. Callers are\nauthorized exactly like `agent.prompt`: an attributed agent may observe its own\npane, and another pane only with explicit `allow_cross_pane`.",
+          "properties": {
+            "allow_cross_pane": {
+              "type": "boolean"
+            },
+            "target": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "target"
+          ],
+          "type": "object"
+        },
+        "AgentPromptGuardedParams": {
+          "properties": {
+            "allow_cross_pane": {
+              "type": "boolean"
+            },
+            "expected_registration_epoch": {
+              "type": "string"
+            },
+            "expected_terminal": {
+              "type": "string"
+            },
+            "if_draft_empty": {
+              "type": "boolean"
+            },
+            "request_id": {
+              "type": "string"
+            },
+            "target": {
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            },
+            "timeout_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "target",
+            "text",
+            "expected_terminal",
+            "expected_registration_epoch",
+            "request_id"
+          ],
+          "type": "object"
+        },
         "AgentPromptParams": {
           "properties": {
             "allow_cross_pane": {
               "description": "Deliberately allow an agent-originated request to target another pane.",
               "type": "boolean"
+            },
+            "expected_agent_session_id": {
+              "description": "Refuse input unless the resolved agent still reports this session ID.",
+              "type": "string"
+            },
+            "expected_agent_status": {
+              "$ref": "#/schemas/request/$defs/AgentStatus",
+              "description": "Refuse input unless the pane's detected agent status still matches.\nRequires `expected_agent_session_id`. Detection uses hooks and screen\nsignals; idle is the last observed state, not a readiness reservation."
+            },
+            "expected_pane_id": {
+              "description": "Refuse input unless the target alias resolves to this pane.",
+              "type": "string"
             },
             "target": {
               "type": "string"
@@ -1304,6 +1438,26 @@
           "required": [
             "target",
             "source"
+          ],
+          "type": "object"
+        },
+        "AgentRegisterSelfParams": {
+          "properties": {
+            "draft_guard": {
+              "type": "boolean"
+            },
+            "pane_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "session_generation": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "session_generation"
           ],
           "type": "object"
         },
@@ -3397,6 +3551,9 @@
               "description": "Deliberately allow an agent-originated request to target another pane.",
               "type": "boolean"
             },
+            "expected_agent_session_id": {
+              "type": "string"
+            },
             "keys": {
               "items": {
                 "type": "string"
@@ -3418,6 +3575,9 @@
             "allow_cross_pane": {
               "description": "Deliberately allow an agent-originated request to target another pane.",
               "type": "boolean"
+            },
+            "expected_agent_session_id": {
+              "type": "string"
             },
             "pane_id": {
               "type": "string"
@@ -4530,6 +4690,22 @@
                   "type": "string"
                 },
                 "type": {
+                  "const": "pane.agent_session_changed",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "pane_id"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "pane_id": {
+                  "type": "string"
+                },
+                "type": {
                   "const": "pane.scroll_changed",
                   "type": "string"
                 }
@@ -4904,6 +5080,60 @@
           },
           "type": "object"
         },
+        "WorktreeCreateProjectCheckedParams": {
+          "description": "Project-checked creation, separate from the frozen legacy endpoint shape.",
+          "properties": {
+            "allow_project_change": {
+              "default": false,
+              "description": "Explicit permission to change ownership of a surviving agent session.",
+              "type": "boolean"
+            },
+            "base": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "branch": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "cwd": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "focus": {
+              "default": false,
+              "type": "boolean"
+            },
+            "label": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "path": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "trust_repository": {
+              "type": "boolean"
+            },
+            "workspace_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "type": "object"
+        },
         "WorktreeListParams": {
           "properties": {
             "cwd": {
@@ -4926,6 +5156,54 @@
         },
         "WorktreeOpenParams": {
           "properties": {
+            "branch": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "cwd": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "focus": {
+              "default": false,
+              "type": "boolean"
+            },
+            "label": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "path": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "trust_repository": {
+              "type": "boolean"
+            },
+            "workspace_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "type": "object"
+        },
+        "WorktreeOpenProjectCheckedParams": {
+          "description": "Project-checked opening, separate from the frozen legacy endpoint shape.",
+          "properties": {
+            "allow_project_change": {
+              "default": false,
+              "description": "Explicit permission to change ownership of a surviving agent session.",
+              "type": "boolean"
+            },
             "branch": {
               "type": [
                 "string",
@@ -5454,6 +5732,23 @@
           "type": "object"
         },
         {
+          "description": "Project-checked creation; older servers reject instead of ignoring permission.",
+          "properties": {
+            "method": {
+              "const": "worktree.create_project_checked",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/WorktreeCreateProjectCheckedParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
           "properties": {
             "method": {
               "const": "worktree.open",
@@ -5461,6 +5756,23 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/WorktreeOpenParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Project-checked opening; older servers reject instead of ignoring permission.",
+          "properties": {
+            "method": {
+              "const": "worktree.open_project_checked",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/WorktreeOpenProjectCheckedParams"
             }
           },
           "required": [
@@ -5809,6 +6121,104 @@
         {
           "properties": {
             "method": {
+              "const": "agent.register_self",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentRegisterSelfParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "agent.channel_info",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentChannelInfoParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "agent.draft_state",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentDraftStateParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "agent.prompt_guarded",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentPromptGuardedParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Local JSON only; older servers reject instead of ignoring identity guards.",
+          "properties": {
+            "method": {
+              "const": "agent.prompt_session_checked",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentPromptParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Local JSON only; requires status and session expectations. Older servers\nreject instead of silently ignoring the detected-status guard.",
+          "properties": {
+            "method": {
+              "const": "agent.prompt_status_checked",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentPromptParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "agent.wait",
               "type": "string"
             },
@@ -6132,6 +6542,22 @@
         {
           "properties": {
             "method": {
+              "const": "pane.clear_input_poison",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneTarget"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "pane.edit_scrollback",
               "type": "string"
             },
@@ -6405,7 +6831,39 @@
         {
           "properties": {
             "method": {
+              "const": "pane.send_text_session_checked",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneSendTextParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "pane.send_keys",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneSendKeysParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "pane.send_keys_session_checked",
               "type": "string"
             },
             "params": {
@@ -6955,6 +7413,55 @@
           ],
           "type": "string"
         },
+        "PaneAgentSessionChangedEvent": {
+          "description": "The agent in a pane reported a session different from the pane's previous\none: a new session value, or the same value with a different actual agent\nsession id (set, cleared, or replaced). A repeated report of the current\nsession with the same actual id emits nothing.",
+          "properties": {
+            "agent": {
+              "type": "string"
+            },
+            "agent_session_id": {
+              "description": "The actual agent session id from the accepted current report, the same\nvalue as `pane get`'s `agent_session_id`. `null` when no actual id is\nbound: e.g. an initial path-only report, or a report for a different\nsession without an id; a path-only report of the already-bound session\nkeeps its id.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "pane_id": {
+              "type": "string"
+            },
+            "previous_agent_session_id": {
+              "description": "The pane's actual agent session id before this report, or `null`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "previous_session_id": {
+              "description": "`null` when the pane had no reported session before.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "session_id": {
+              "description": "The reported session value: the agent session id or, when the report\ncarried only a path, the session path.",
+              "type": "string"
+            },
+            "workspace_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pane_id",
+            "workspace_id",
+            "agent",
+            "session_id",
+            "previous_session_id",
+            "agent_session_id",
+            "previous_agent_session_id"
+          ],
+          "type": "object"
+        },
         "PaneAgentStatusChangedEvent": {
           "properties": {
             "agent": {
@@ -7128,6 +7635,9 @@
             },
             {
               "$ref": "#/schemas/subscription_event/$defs/PaneScrollChangedEvent"
+            },
+            {
+              "$ref": "#/schemas/subscription_event/$defs/PaneAgentSessionChangedEvent"
             }
           ]
         },
@@ -7135,6 +7645,7 @@
           "enum": [
             "pane.output_matched",
             "pane.agent_status_changed",
+            "pane.agent_session_changed",
             "pane.scroll_changed"
           ],
           "type": "string"
@@ -7174,6 +7685,13 @@
                 {
                   "type": "null"
                 }
+              ]
+            },
+            "agent_session_id": {
+              "description": "Actual ID from the accepted current report, independent of its resume path.",
+              "type": [
+                "string",
+                "null"
               ]
             },
             "agent_status": {
@@ -8041,6 +8559,55 @@
             },
             {
               "properties": {
+                "agent": {
+                  "type": "string"
+                },
+                "agent_session_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "pane_id": {
+                  "type": "string"
+                },
+                "previous_agent_session_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "previous_session_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "session_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "pane_agent_session_changed",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "pane_id",
+                "workspace_id",
+                "agent",
+                "session_id",
+                "previous_session_id",
+                "agent_session_id",
+                "previous_agent_session_id"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
                 "layout": {
                   "$ref": "#/schemas/success_response/$defs/PaneLayoutSnapshot"
                 },
@@ -8099,6 +8666,7 @@
             "pane_exited",
             "pane_agent_detected",
             "pane_agent_status_changed",
+            "pane_agent_session_changed",
             "layout_updated"
           ],
           "type": "string"
@@ -8510,6 +9078,13 @@
                 {
                   "type": "null"
                 }
+              ]
+            },
+            "agent_session_id": {
+              "description": "Actual ID from the accepted current report, independent of its resume path.",
+              "type": [
+                "string",
+                "null"
               ]
             },
             "agent_status": {
@@ -11167,6 +11742,16 @@
                 "integer",
                 "null"
               ]
+            },
+            "expected_agent_session_guard": {
+              "default": false,
+              "description": "Supports the local JSON session-checked prompt, text and key methods.",
+              "type": "boolean"
+            },
+            "expected_agent_status_guard": {
+              "default": false,
+              "description": "Supports the detected-agent-status guard on local JSON prompts.",
+              "type": "boolean"
             },
             "expected_terminal_guard": {
               "default": false,

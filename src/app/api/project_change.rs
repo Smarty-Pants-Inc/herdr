@@ -222,9 +222,12 @@ impl App {
                         continue;
                     };
                     let target_ws = &after[target_idx];
-                    if target_ws.id == ws.id && before_first[ws_idx] == after_first[target_idx] {
-                        // No association/first-Pi change: unrelated unknown projects
-                        // and root-shell cwd changes must not block this command.
+                    if target_ws.id == ws.id
+                        && before_first[ws_idx] == after_first[target_idx]
+                        && target_ws.checkout_path == ws.checkout_path
+                    {
+                        // No association/first-Pi/checkout change: unrelated unknown
+                        // projects and root-shell cwd changes must not block this command.
                         continue;
                     }
                     let Some(session) = terminals
@@ -273,8 +276,15 @@ impl App {
             }
         }
         if !allow_project_change && !changes.is_empty() {
-            let hint = if checked_method == "pane.move_project_checked" {
-                "--allow-project-change (API: pane.move_project_checked with allow_project_change=true)".to_string()
+            let hint = if matches!(
+                checked_method,
+                "pane.move_project_checked"
+                    | "worktree.open_project_checked"
+                    | "worktree.create_project_checked"
+            ) {
+                format!(
+                    "--allow-project-change (API: {checked_method} with allow_project_change=true)"
+                )
             } else {
                 format!("{checked_method} with allow_project_change=true")
             };

@@ -485,12 +485,33 @@ impl TerminalRuntime {
     pub(crate) fn input_consumer_epoch_matches(&self, epoch: &str) -> bool {
         self.0.input_consumer_epoch_matches(epoch)
     }
+    pub(crate) fn input_is_poisoned(&self) -> bool {
+        self.0.input_is_poisoned()
+    }
+    pub(crate) fn clear_input_poison(&self) -> std::io::Result<()> {
+        self.0.clear_input_poison()
+    }
+    #[cfg(test)]
+    pub(crate) fn test_set_input_poisoned(&self, poisoned: bool) {
+        self.0.test_set_input_poisoned(poisoned);
+    }
     pub(crate) fn try_send_bytes_with_source(
         &self,
         bytes: Bytes,
         source: crate::pty::input_consumer::InputSource,
     ) -> Result<(), mpsc::error::TrySendError<Bytes>> {
         self.0.try_send_bytes_with_source(bytes, source)
+    }
+    pub(crate) fn queue_guarded_user_input_submission_with_source(
+        &self,
+        text: Bytes,
+        enter: Bytes,
+        delay: std::time::Duration,
+        guard: crate::pty::actor::SessionInputGuard,
+        source: crate::pty::input_consumer::InputSource,
+    ) -> std::io::Result<std::sync::mpsc::Receiver<std::io::Result<()>>> {
+        self.0
+            .queue_guarded_user_input_submission_with_source(text, enter, delay, guard, source)
     }
     pub(crate) fn queue_user_input_submission_with_source(
         &self,
@@ -509,6 +530,9 @@ impl TerminalRuntime {
         source: crate::pty::input_consumer::InputSource,
     ) -> Result<bool, mpsc::error::TrySendError<Bytes>> {
         self.0.try_send_paste_with_source(text, source)
+    }
+    pub(crate) fn initial_focus_pending(&self) -> bool {
+        self.0.initial_focus_pending()
     }
     pub(crate) fn try_send_focus_event_with_source(
         &self,
@@ -621,6 +645,13 @@ impl TerminalRuntime {
         self.0.child_process_identity()
     }
 
+    pub(crate) fn session_reporter_is_foreground(
+        &self,
+        reporter: crate::platform::ProcessIdentity,
+    ) -> bool {
+        self.0.session_reporter_is_foreground(reporter)
+    }
+
     pub(crate) fn current_size(&self) -> (u16, u16) {
         self.0.current_size()
     }
@@ -632,6 +663,28 @@ impl TerminalRuntime {
 
 #[cfg(test)]
 impl TerminalRuntime {
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn test_set_before_write(
+        &self,
+        hook: Box<dyn FnMut(usize) + Send>,
+    ) -> std::io::Result<()> {
+        self.0.test_set_before_write(hook)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn test_start_basic_detection(&mut self) -> mpsc::Receiver<crate::events::AppEvent> {
+        self.0.test_start_basic_detection()
+    }
+
+    #[cfg(unix)]
+    pub(crate) async fn test_wait_for_detection_reads(&self, expected: usize) {
+        self.0.test_wait_for_detection_reads(expected).await;
+    }
+
+    pub(crate) fn test_scroll_metrics_reads(&self) -> usize {
+        self.0.test_scroll_metrics_reads()
+    }
+
     #[cfg(unix)]
     pub(crate) fn test_enable_kitty_source_forwarding(&self) {
         self.0.test_enable_kitty_source_forwarding();

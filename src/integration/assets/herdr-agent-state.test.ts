@@ -1,4 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { rm } from "node:fs/promises";
 import net, { createServer, type Server } from "node:net";
 import { tmpdir } from "node:os";
@@ -18,8 +19,13 @@ const originalEnvironment = {
 let server: Server | undefined;
 let socketPath: string | undefined;
 let importCounter = 0;
+const channelCleanups: Array<() => void> = [];
+const channelServerSockets = new Set<net.Socket>();
 
 afterEach(async () => {
+  for (const cleanup of channelCleanups.splice(0)) cleanup();
+  for (const socket of channelServerSockets) socket.destroy();
+  channelServerSockets.clear();
   await new Promise<void>((resolve, reject) => {
     if (!server) {
       resolve();
@@ -164,6 +170,111 @@ test("OpenCode stays disabled without the Herdr socket environment", async () =>
 });
 
 for (const integration of integrations) {
+  for (const phase of ["startup", "same-path ID change"] as const) {
+    test(`${integration.name} reports both session ID and path on ${phase}`, async () => {
+      const requests = await startRecordingServer(
+        `${integration.name.toLowerCase().replaceAll(" ", "-")}-session-ref`,
+      );
+      const { handlers, pi } = createExtensionHarness();
+      const { default: install } = await importFresh(integration.modulePath);
+      install(pi);
+
+      const sessionPath = "/tmp/herdr-resume-session.jsonl";
+      let sessionId = "actual-session-id";
+      const context = {
+        ...piContext(() => true),
+        sessionManager: {
+          getSessionFile: () => sessionPath,
+          getSessionId: () => sessionId,
+        },
+      };
+      await handlers.get("session_start")?.({ reason: "startup" }, context);
+      await waitFor(() => requests.length === 2);
+
+      if (phase === "same-path ID change") {
+        sessionId = "replacement-session-id";
+        await handlers.get("agent_start")?.({}, context);
+        await waitFor(() => requests.length === 4);
+      }
+
+      const phaseRequests = phase === "startup" ? requests : requests.slice(2);
+      const agent = integration.name === "Pi" ? "pi" : "omp";
+      for (const method of ["pane.report_agent_session", "pane.report_agent"]) {
+        const request = phaseRequests.find(
+          (request) => isRecord(request) && request.method === method,
+        );
+        expect(isRecord(request) && isRecord(request.params)).toBe(true);
+        if (!isRecord(request) || !isRecord(request.params)) {
+          throw new Error(`Missing ${method} parameters`);
+        }
+        expect(request.params).toMatchObject({
+          pane_id: "test:p1",
+          source: `herdr:${agent}`,
+          agent,
+          agent_session_id: sessionId,
+          agent_session_path: sessionPath,
+        });
+        if (method === "pane.report_agent") {
+          expect(request.params.state).toBe(phase === "startup" ? "idle" : "working");
+        } else {
+          expect(request.params.session_start_source).toBe(
+            phase === "startup" || agent === "omp" ? "startup" : undefined,
+          );
+        }
+      }
+      const sequences = requests.map((request) =>
+        isRecord(request) && isRecord(request.params) ? request.params.seq : undefined,
+      );
+      expect(sequences.every((seq) => typeof seq === "number")).toBe(true);
+      expect(new Set(sequences).size).toBe(requests.length);
+      if (phase === "same-path ID change") {
+        expect(Math.min(...(sequences.slice(2) as number[]))).toBeGreaterThan(
+          Math.max(...(sequences.slice(0, 2) as number[])),
+        );
+      }
+    });
+  }
+
+  for (const sessionRef of [
+    { name: "ID only", id: "actual-session-id", path: undefined },
+    { name: "path only", id: undefined, path: "/tmp/herdr-resume-session.jsonl" },
+    { name: "no reference", id: undefined, path: undefined },
+  ]) {
+    test(`${integration.name} preserves ${sessionRef.name} session reporting`, async () => {
+      const requests = await startRecordingServer(
+        `${integration.name.toLowerCase().replaceAll(" ", "-")}-partial-session-ref`,
+      );
+      const { handlers, pi } = createExtensionHarness();
+      const { default: install } = await importFresh(integration.modulePath);
+      install(pi);
+      await handlers.get("session_start")?.(
+        { reason: "startup" },
+        {
+          ...piContext(() => true),
+          sessionManager: {
+            getSessionFile: () => sessionRef.path,
+            getSessionId: () => sessionRef.id,
+          },
+        },
+      );
+      const hasRef = sessionRef.id !== undefined || sessionRef.path !== undefined;
+      await waitFor(() => requests.length === (hasRef ? 2 : 1));
+      expect(requests.map((request) => isRecord(request) ? request.method : undefined)).toEqual(
+        hasRef ? ["pane.report_agent_session", "pane.report_agent"] : ["pane.report_agent"],
+      );
+      for (const request of requests) {
+        expect(isRecord(request) && isRecord(request.params)).toBe(true);
+        if (!isRecord(request) || !isRecord(request.params)) {
+          throw new Error("Missing report parameters");
+        }
+        expect(request.params.agent_session_id).toBe(sessionRef.id);
+        expect(request.params.agent_session_path).toBe(sessionRef.path);
+        expect(Object.hasOwn(request.params, "agent_session_id")).toBe(sessionRef.id !== undefined);
+        expect(Object.hasOwn(request.params, "agent_session_path")).toBe(sessionRef.path !== undefined);
+      }
+    });
+  }
+
   test(`${integration.name} maps the Windows socket marker path to a named pipe endpoint`, async () => {
     const markerPath = `herdr-${integration.name.toLowerCase().replaceAll(" ", "-")}-${process.pid}.sock`;
     configureIntegrationEnvironment(markerPath);
@@ -293,6 +404,61 @@ test("Pi reports a Windows session path", async () => {
   await waitFor(() => requests.length === 2);
 
   expect(requests.map(requestSessionPath)).toEqual([sessionPath, sessionPath]);
+});
+
+// smarty-dev#10398: an unset or empty HERDR_PANE_ID must not silence the extension. Herdr rebinds
+// a report with an unknown or empty pane_id to the reporting process's pane.
+for (const [label, paneIdValue] of [
+  ["unset", undefined],
+  ["empty", ""],
+] as const) {
+  test(`Pi still reports its session and state with pane_id "" when HERDR_PANE_ID is ${label}`, async () => {
+    const requests = await startRecordingServer(`pi-no-pane-id-${label}`);
+    if (paneIdValue === undefined) {
+      delete process.env.HERDR_PANE_ID;
+    } else {
+      process.env.HERDR_PANE_ID = paneIdValue;
+    }
+    const { handlers, pi } = createExtensionHarness();
+    const { default: install } = await importFresh("./pi/herdr-agent-state.ts");
+    install(pi);
+
+    await handlers.get("session_start")?.(
+      { reason: "startup" },
+      {
+        ...piContext(() => true),
+        sessionManager: {
+          getSessionFile: () => "/home/user/.pi/agent/sessions/pi-session.jsonl",
+          getSessionId: () => "pi-session",
+        },
+      },
+    );
+    await waitFor(() => requests.length === 2);
+
+    const methods = requests.map((request) => (isRecord(request) ? request.method : undefined));
+    expect(methods.sort()).toEqual(["pane.report_agent", "pane.report_agent_session"]);
+    for (const request of requests) {
+      expect(isRecord(request) && isRecord(request.params) && request.params.pane_id).toBe("");
+      expect(isRecord(request) && isRecord(request.params) && request.params.agent_session_id).toBe(
+        "pi-session",
+      );
+    }
+    expect(requestStates(requests)).toEqual(["idle"]);
+  });
+}
+
+test("Pi stays disabled without HERDR_ENV or the Herdr socket even when HERDR_PANE_ID is set", async () => {
+  const requests = await startRecordingServer("pi-disabled");
+  for (const unset of ["HERDR_ENV", "HERDR_SOCKET_PATH"]) {
+    configureIntegrationEnvironment(socketPath!);
+    delete process.env[unset];
+    const { handlers, pi } = createExtensionHarness();
+    const { default: install } = await importFresh("./pi/herdr-agent-state.ts");
+    install(pi);
+    expect(handlers.size).toBe(0);
+  }
+  await Bun.sleep(25);
+  expect(requests).toEqual([]);
 });
 
 test("Pi reports idle only after the agent settles", async () => {
@@ -682,3 +848,1741 @@ function requestSessionPath(request: unknown): unknown {
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
+
+// These tests exercise the managed asset's wire/forwarding contract only. Receipt fixtures are
+// not evidence of Pi core admission, queue retention, hook/compaction behavior or real turns.
+// Registered-channel cases need an established Unix channel (Linux/macOS support). The managed
+// asset deliberately refuses to register on Windows, where transport-pinned peer identity is
+// unsupported. Only cases that need registration use this gate; state/no-channel controls run
+// everywhere. Capture the host platform before any individual test mocks process.platform.
+const registeredChannelTest = test.skipIf(originalPlatform === "win32");
+type AdmissionRequest = {
+  registrationEpoch: string;
+  requestId: string;
+  sessionGeneration: string;
+  text: string;
+  deliverAs: "followUp";
+  expandPromptTemplates: false;
+};
+type AdmissionReceipt = {
+  status: "accepted" | "queued" | "rejected";
+  sessionGeneration: string;
+  reason?: string;
+  duplicate?: true;
+};
+
+type ChannelConnection = {
+  socket: net.Socket;
+  registration: Record<string, any>;
+  epoch: string;
+  generation: string;
+  closed: boolean;
+  acks: Record<string, any>[];
+  draftStates: Record<string, any>[];
+};
+
+async function startChannelServer(
+  respond?: (connection: ChannelConnection, response: Record<string, any>) => void,
+) {
+  const recordingSocketPath = join(tmpdir(), `herdr-pi-channel-${process.pid}-${++importCounter}.sock`);
+  socketPath = recordingSocketPath;
+  await rm(recordingSocketPath, { force: true });
+  const connections: ChannelConnection[] = [];
+  const reports: Record<string, any>[] = [];
+  server = createServer((socket) => {
+    channelServerSockets.add(socket);
+    let connection: ChannelConnection | undefined;
+    let buffer = "";
+    socket.setEncoding("utf8");
+    socket.on("close", () => {
+      channelServerSockets.delete(socket);
+      if (connection) connection.closed = true;
+    });
+    socket.on("error", () => {});
+    socket.on("data", (chunk) => {
+      buffer += chunk;
+      for (;;) {
+        const newline = buffer.indexOf("\n");
+        if (newline < 0) break;
+        const request = JSON.parse(buffer.slice(0, newline));
+        buffer = buffer.slice(newline + 1);
+        if (request.method === "agent.register_self") {
+          connection = {
+            socket,
+            registration: request,
+            epoch: `epoch-${connections.length + 1}`,
+            generation: request.params.session_generation,
+            closed: false,
+            acks: [],
+            draftStates: [],
+          };
+          connections.push(connection);
+          const response = {
+            id: request.id,
+            result: {
+              terminal_id: "terminal-pi",
+              registration_epoch: connection.epoch,
+              session_generation: connection.generation,
+              ready: true,
+            },
+          };
+          if (respond) respond(connection, response);
+          else socket.write(`${JSON.stringify(response)}\n`);
+        } else if (request.type === "ack" && connection) {
+          connection.acks.push(request);
+        } else if (request.type === "draft_state" && connection) {
+          connection.draftStates.push(request);
+        } else {
+          reports.push(request);
+          socket.end("{}\n");
+        }
+      }
+    });
+  });
+  await new Promise<void>((resolve, reject) => {
+    server!.once("error", reject);
+    server!.listen(originalPlatform === "win32" ? `\\\\.\\pipe\\${recordingSocketPath}` : recordingSocketPath, resolve);
+  });
+  configureIntegrationEnvironment(recordingSocketPath);
+  return { connections, reports };
+}
+
+function channelContext(generation = "session-1") {
+  return { ...piContext(() => true), userMessageSessionGeneration: generation };
+}
+
+async function loadChannelAsset(
+  submit?: (request: AdmissionRequest) => Promise<AdmissionReceipt | unknown>,
+  hostCapabilities?: Record<string, unknown>,
+) {
+  const harness = createExtensionHarness();
+  const calls: AdmissionRequest[] = [];
+  const pi = {
+    ...harness.pi,
+    ...(hostCapabilities ? { hostCapabilities } : {}),
+    submitUserMessage: submit ? async (request: AdmissionRequest) => {
+      calls.push(request);
+      return submit(request);
+    } : undefined,
+  };
+  const { default: install } = await importFresh("./pi/herdr-agent-state.ts");
+  install(pi);
+  const shutdown = () => { harness.handlers.get("session_shutdown")?.({ reason: "quit" }, {}); };
+  channelCleanups.push(shutdown);
+  return { ...harness, pi, calls, shutdown };
+}
+
+function accepted(request: AdmissionRequest): Promise<AdmissionReceipt> {
+  return Promise.resolve({ status: "accepted", sessionGeneration: request.sessionGeneration });
+}
+
+function delivery(connection: ChannelConnection, requestId = "request-1", text = "hello") {
+  return {
+    type: "deliver",
+    registration_epoch: connection.epoch,
+    request_id: requestId,
+    session_generation: connection.generation,
+    text,
+  };
+}
+
+function deliver(connection: ChannelConnection, requestId = "request-1", text = "hello") {
+  connection.socket.write(`${JSON.stringify(delivery(connection, requestId, text))}\n`);
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason: unknown) => void;
+  const promise = new Promise<T>((res, rej) => { resolve = res; reject = rej; });
+  return { promise, resolve, reject };
+}
+
+for (const missing of ["api", "generation", "empty-generation"] as const) {
+  test(`Pi does not advertise a channel without receipt ${missing}`, async () => {
+    const { connections, reports } = await startChannelServer();
+    const { handlers, pi, calls } = await loadChannelAsset(missing === "api" ? undefined : accepted);
+    let fallbackCalls = 0;
+    Object.assign(pi, { sendUserMessage: () => { fallbackCalls += 1; } });
+    const context: Record<string, unknown> = channelContext();
+    if (missing === "generation") delete context.userMessageSessionGeneration;
+    if (missing === "empty-generation") context.userMessageSessionGeneration = "";
+    await handlers.get("session_start")?.({ reason: "startup" }, context);
+    await waitFor(() => reports.length === 1);
+    expect(connections).toEqual([]);
+    expect(calls).toEqual([]);
+    expect(fallbackCalls).toBe(0);
+    expect(requestStates(reports)).toEqual(["idle"]);
+  });
+}
+
+for (const mode of ["rpc", "print", "json", undefined]) {
+  test(`Pi receipt channel stays disabled for headless mode ${mode}`, async () => {
+    const { connections, reports } = await startChannelServer();
+    const { handlers, calls } = await loadChannelAsset(accepted);
+    await handlers.get("session_start")?.({}, { ...channelContext(), mode, hasUI: true });
+    handlers.get("agent_start")?.({}, channelContext());
+    await Bun.sleep(30);
+    expect(connections).toEqual([]);
+    expect(reports).toEqual([]);
+    expect(calls).toEqual([]);
+  });
+}
+
+registeredChannelTest("Pi opens its channel connection in-process at extension load and registers only at TUI session_start, with no inherited pane/pid assertion", async () => {
+  const { connections, reports } = await startChannelServer();
+  process.env.HERDR_PANE_ID = "stale:p999";
+  const connectionPids: number[] = [];
+  net.createConnection = ((...args: unknown[]) => {
+    connectionPids.push(process.pid);
+    return Reflect.apply(originalCreateConnection, net, args);
+  }) as typeof net.createConnection;
+  const { handlers, calls } = await loadChannelAsset(accepted);
+  handlers.get("agent_start")?.({}, channelContext());
+  await Bun.sleep(30);
+  expect(connectionPids).toEqual([process.pid]); // The channel connection, opened at load.
+  expect(connections).toEqual([]); // No registration before session_start.
+  expect(reports).toEqual([]);
+  await handlers.get("session_start")?.({}, channelContext());
+  await waitFor(() => connections.length === 1 && reports.length === 1);
+  // session_start registers over the load-time connection; only the state report connects.
+  expect(connectionPids).toEqual([process.pid, process.pid]);
+  expect(connections[0].registration.params).toEqual({ session_generation: "session-1" });
+  expect(calls).toEqual([]); // Ready registration is not an input receipt.
+});
+
+registeredChannelTest("Pi registers its channel without HERDR_PANE_ID, since Herdr attributes the peer itself (smarty-dev#10398)", async () => {
+  const { connections, reports } = await startChannelServer();
+  delete process.env.HERDR_PANE_ID;
+  const { handlers, calls } = await loadChannelAsset(accepted);
+  await handlers.get("session_start")?.({}, channelContext());
+  await waitFor(() => connections.length === 1 && reports.length === 1);
+  expect(connections[0].registration.params).toEqual({ session_generation: "session-1" });
+  expect(calls).toEqual([]);
+});
+
+// Pi runs a native /new, /resume or /fork session_start inside a temporary input fence. Input
+// whose async context descends from that callback is refused for good once the fence ends
+// (pi#163 security r3). This fixture models only that async-context rule, not Pi admission.
+function inputFenceFixture() {
+  const fence = new AsyncLocalStorage<{ active: boolean }>();
+  const submit = (request: AdmissionRequest): Promise<AdmissionReceipt> => {
+    const scope = fence.getStore();
+    if (scope && !scope.active) {
+      return Promise.resolve({
+        status: "rejected", reason: "session_changed", sessionGeneration: request.sessionGeneration,
+      });
+    }
+    return accepted(request);
+  };
+  const fenced = async (operation: () => unknown) => {
+    const scope = { active: true };
+    try {
+      return await fence.run(scope, async () => await operation());
+    } finally {
+      scope.active = false;
+    }
+  };
+  return { submit, fenced };
+}
+
+registeredChannelTest("Pi channel ingress never descends from a fenced session_start, across replacement and reconnect", async () => {
+  const { connections } = await startChannelServer();
+  const { submit, fenced } = inputFenceFixture();
+  const asset = await loadChannelAsset(submit);
+  await fenced(() => asset.handlers.get("session_start")?.({}, channelContext()));
+  await waitFor(() => connections.length === 1);
+  deliver(connections[0], "first");
+  await waitFor(() => connections[0].acks.length === 1);
+  expect(connections[0].acks[0]).toMatchObject({ request_id: "first", status: "accepted" });
+  // A native /new: the old registration is retired inside the fence, yet the replacement
+  // connection and its reader still run outside it.
+  await fenced(() => asset.handlers.get("session_start")?.({ reason: "new" }, channelContext("session-2")));
+  await waitFor(() => connections.length === 2 && connections[0].closed);
+  deliver(connections[1], "second");
+  await waitFor(() => connections[1].acks.length === 1);
+  expect(connections[1].acks[0]).toMatchObject({
+    request_id: "second", status: "accepted", session_generation: "session-2",
+  });
+  // Transport loss after a fenced session_start reconnects outside the fence too.
+  connections[1].socket.destroy();
+  await waitFor(() => connections.length === 3);
+  deliver(connections[2], "third");
+  await waitFor(() => connections[2].acks.length === 1);
+  expect(connections[2].acks[0]).toMatchObject({ request_id: "third", status: "accepted" });
+  expect(asset.calls.map((call) => call.requestId)).toEqual(["first", "second", "third"]);
+});
+
+registeredChannelTest("Pi reconnects outside the fence when the load-time connection closed before a fenced session_start", async () => {
+  const { connections } = await startChannelServer();
+  const clients: net.Socket[] = [];
+  net.createConnection = ((...args: unknown[]) => {
+    const socket = Reflect.apply(originalCreateConnection, net, args);
+    clients.push(socket);
+    return socket;
+  }) as typeof net.createConnection;
+  const { submit, fenced } = inputFenceFixture();
+  const asset = await loadChannelAsset(submit);
+  expect(clients).toHaveLength(1);
+  clients[0].destroy(); // e.g. Herdr's initial-request timeout before a slow startup finished.
+  await Bun.sleep(30);
+  expect(clients).toHaveLength(1); // No session wants a channel yet: nothing reconnects.
+  await fenced(() => asset.handlers.get("session_start")?.({}, channelContext()));
+  await waitFor(() => connections.length === 1);
+  deliver(connections[0], "fresh");
+  await waitFor(() => connections[0].acks.length === 1);
+  expect(connections[0].acks[0]).toMatchObject({ request_id: "fresh", status: "accepted" });
+});
+
+test("Pi Windows state reports still work but never advertise the unsupported receipt channel", async () => {
+  const { connections, reports } = await startChannelServer();
+  const recordingSocketPath = process.env.HERDR_SOCKET_PATH!;
+  const pipeEndpoint = `\\\\.\\pipe\\${recordingSocketPath}`;
+  Object.defineProperty(process, "platform", { value: "win32" });
+  const endpoints: unknown[] = [];
+  net.createConnection = ((...args: unknown[]) => {
+    endpoints.push(args[0]);
+    // Test-only platform seam: on Unix, redirect this exact named-pipe endpoint to the
+    // recording Unix socket. On Windows, use the real named pipe. This is not native
+    // Windows qualification when run on Unix, nor a simulated registered channel.
+    if (originalPlatform !== "win32" && args[0] === pipeEndpoint) args[0] = recordingSocketPath;
+    return Reflect.apply(originalCreateConnection, net, args);
+  }) as typeof net.createConnection;
+  const { handlers, pi, calls } = await loadChannelAsset(accepted);
+  let fallbackCalls = 0;
+  Object.assign(pi, { sendUserMessage: () => { fallbackCalls += 1; } });
+  await handlers.get("session_start")?.({}, channelContext());
+  await waitFor(() => reports.length === 1);
+  handlers.get("agent_start")?.({}, channelContext());
+  await waitFor(() => reports.length === 2);
+  await handlers.get("session_start")?.({ reason: "new" }, channelContext("session-2"));
+  await waitFor(() => reports.length === 3);
+  await Bun.sleep(300); // Beyond the reconnect delay: feature presence must not trigger a retry.
+  expect(requestStates(reports)).toEqual(["idle", "working", "idle"]);
+  expect(reports.map((report) => report.method)).toEqual(Array(3).fill("pane.report_agent"));
+  expect(endpoints).toEqual(Array(3).fill(pipeEndpoint));
+  expect(connections).toEqual([]);
+  expect(calls).toEqual([]);
+  expect(fallbackCalls).toBe(0);
+});
+
+registeredChannelTest("Pi waits for a whole correlated registration response then forwards split UTF-8 delivery literally", async () => {
+  let finishRegistration!: () => void;
+  const { connections } = await startChannelServer((connection, response) => {
+    const line = `${JSON.stringify(response)}\n`;
+    connection.socket.write(line.slice(0, -1));
+    finishRegistration = () => connection.socket.write("\n");
+  });
+  const { handlers, calls } = await loadChannelAsset(accepted);
+  await handlers.get("session_start")?.({}, channelContext());
+  await waitFor(() => connections.length === 1);
+  await Bun.sleep(20);
+  expect(calls).toEqual([]);
+  finishRegistration();
+  const literal = "/skill ${HOME}; echo shell\n\\n template {name} 🐑";
+  const bytes = Buffer.from(`${JSON.stringify(delivery(connections[0], "literal", literal))}\n`);
+  const split = bytes.indexOf(Buffer.from("🐑")) + 2;
+  connections[0].socket.write(bytes.subarray(0, split));
+  await Bun.sleep(20);
+  expect(calls).toEqual([]);
+  connections[0].socket.write(bytes.subarray(split, bytes.length - 1));
+  await Bun.sleep(20);
+  expect(calls).toEqual([]);
+  connections[0].socket.write(bytes.subarray(bytes.length - 1));
+  await waitFor(() => connections[0].acks.length === 1);
+  expect(calls).toEqual([{
+    registrationEpoch: "epoch-1", requestId: "literal", sessionGeneration: "session-1",
+    text: literal, deliverAs: "followUp", expandPromptTemplates: false,
+  }]);
+  expect(connections[0].acks).toEqual([{
+    type: "ack", registration_epoch: "epoch-1", request_id: "literal",
+    session_generation: "session-1", status: "accepted",
+  }]);
+});
+
+for (const receipt of [
+  { status: "accepted", duplicate: true },
+  { status: "queued", duplicate: true },
+  ...["no_session", "session_changed", "payload_mismatch", "shutting_down", "admission_refused", "unsupported", "unknown", "draft_present", "ui_hold", "expired"]
+    .map((reason) => ({ status: "rejected", reason, duplicate: true })),
+] as const) {
+  registeredChannelTest(`Pi maps typed ${receipt.status} ${"reason" in receipt ? receipt.reason : "receipt"} to snake_case ACK`, async () => {
+    const { connections } = await startChannelServer();
+    const { handlers } = await loadChannelAsset(async (request) => ({
+      ...receipt, sessionGeneration: request.sessionGeneration,
+    }));
+    await handlers.get("session_start")?.({}, channelContext());
+    await waitFor(() => connections.length === 1);
+    deliver(connections[0]);
+    await waitFor(() => connections[0].acks.length === 1);
+    expect(connections[0].acks[0]).toEqual({
+      type: "ack", registration_epoch: "epoch-1", request_id: "request-1",
+      session_generation: "session-1", ...receipt,
+    });
+    expect(connections[0].acks[0]).not.toHaveProperty("sessionGeneration");
+  });
+}
+
+registeredChannelTest("Pi coalesces pending/completed duplicates and rejects changed payload without another ingress attempt", async () => {
+  const { connections } = await startChannelServer();
+  const pending = deferred<AdmissionReceipt>();
+  const { handlers, calls } = await loadChannelAsset(() => pending.promise);
+  await handlers.get("session_start")?.({}, channelContext());
+  await waitFor(() => connections.length === 1);
+  const connection = connections[0];
+  deliver(connection);
+  await waitFor(() => calls.length === 1);
+  for (let index = 0; index < 50; index += 1) deliver(connection);
+  deliver(connection, "request-1", "changed");
+  await waitFor(() => connection.acks.length === 1);
+  expect(connection.acks[0].status).toBe("rejected");
+  expect(connection.acks[0].reason).toBe("payload_mismatch");
+  pending.resolve({ status: "queued", sessionGeneration: "session-1" });
+  await waitFor(() => connection.acks.length === 2);
+  expect(connection.acks[1]).toMatchObject({ status: "queued", duplicate: true });
+  deliver(connection);
+  await waitFor(() => connection.acks.length === 3);
+  expect(connection.acks[2]).toMatchObject({ status: "queued", duplicate: true });
+  deliver(connection, "request-1", "changed-again");
+  await waitFor(() => connection.acks.length === 4);
+  expect(connection.acks[3].reason).toBe("payload_mismatch");
+  expect(calls).toHaveLength(1);
+});
+
+registeredChannelTest("Pi never invokes ingress for mismatched epoch/session or malformed delivery IDs", async () => {
+  const { connections } = await startChannelServer();
+  const { handlers, calls } = await loadChannelAsset(accepted);
+  await handlers.get("session_start")?.({}, channelContext());
+  await waitFor(() => connections.length === 1);
+  const connection = connections[0];
+  const valid = delivery(connection);
+  for (const frame of [
+    { ...valid, registration_epoch: "obsolete" },
+    { ...valid, session_generation: "obsolete" },
+    { ...valid, request_id: "" },
+    { ...valid, request_id: null },
+    { ...valid, request_id: "x".repeat(1025) },
+    { ...valid, text: "" },
+    { ...valid, text: 123 },
+    { ...valid, type: "other" },
+  ]) connection.socket.write(`${JSON.stringify(frame)}\n`);
+  await Bun.sleep(30);
+  expect(calls).toEqual([]);
+  expect(connection.acks).toEqual([]);
+  deliver(connection, "valid");
+  await waitFor(() => connection.acks.length === 1);
+  expect(calls).toHaveLength(1);
+});
+
+for (const malformed of ["wrong-id", "wrong-generation", "not-ready", "no-terminal", "error", "arbitrary-json"]) {
+  registeredChannelTest(`Pi rejects complete registration ${malformed} instead of advertising readiness`, async () => {
+    const { connections } = await startChannelServer((connection, response) => {
+      if (malformed === "wrong-id") response.id = "foreign-registration";
+      if (malformed === "wrong-generation") response.result.session_generation = "foreign-session";
+      if (malformed === "not-ready") response.result.ready = false;
+      if (malformed === "no-terminal") delete response.result.terminal_id;
+      if (malformed === "error") response.error = { code: "unsupported" };
+      if (malformed === "arbitrary-json") response = { hello: true };
+      connection.socket.write(`${JSON.stringify(response)}\n`);
+    });
+    const { handlers, calls } = await loadChannelAsset(accepted);
+    await handlers.get("session_start")?.({}, channelContext());
+    await waitFor(() => connections.length === 1 && connections[0].closed);
+    await Bun.sleep(300);
+    expect(connections).toHaveLength(1);
+    expect(calls).toEqual([]);
+  });
+}
+
+for (const malformed of ["oversized-complete", "oversized-partial", "oversized-unicode", "invalid-json", "invalid-utf8"]) {
+  registeredChannelTest(`Pi drops ${malformed} delivery without submitting a partial frame`, async () => {
+    const { connections } = await startChannelServer();
+    const { handlers, calls, shutdown } = await loadChannelAsset(accepted);
+    await handlers.get("session_start")?.({}, channelContext());
+    await waitFor(() => connections.length === 1);
+    const connection = connections[0];
+    if (malformed === "oversized-complete") deliver(connection, "large", "x".repeat(65536));
+    if (malformed === "oversized-partial") connection.socket.write("x".repeat(65537));
+    if (malformed === "oversized-unicode") deliver(connection, "large", "🐑".repeat(17000));
+    if (malformed === "invalid-json") connection.socket.write("{bad}\n");
+    if (malformed === "invalid-utf8") connection.socket.write(Buffer.from([0xff, 10]));
+    await waitFor(() => connection.closed);
+    shutdown();
+    expect(calls).toEqual([]);
+    expect(connection.acks).toEqual([]);
+  });
+}
+
+registeredChannelTest("Pi keeps 32 inflight slots and retains capacity-rejected request IDs without later admission", async () => {
+  const { connections } = await startChannelServer();
+  const pending = deferred<AdmissionReceipt>();
+  const { handlers, calls } = await loadChannelAsset(() => pending.promise);
+  await handlers.get("session_start")?.({}, channelContext());
+  await waitFor(() => connections.length === 1);
+  const connection = connections[0];
+  for (let index = 0; index < 32; index += 1) deliver(connection, `pending-${index}`);
+  await waitFor(() => calls.length === 32);
+  deliver(connection, "overflow");
+  await waitFor(() => connection.acks.length === 1);
+  expect(connection.acks[0]).toMatchObject({ request_id: "overflow", status: "rejected", reason: "admission_refused" });
+  pending.resolve({ status: "accepted", sessionGeneration: "session-1" });
+  await waitFor(() => connection.acks.length === 33);
+  deliver(connection, "overflow");
+  await waitFor(() => connection.acks.length === 34);
+  expect(connection.acks[33]).toMatchObject({ status: "rejected", reason: "admission_refused", duplicate: true });
+  deliver(connection, "overflow", "changed");
+  await waitFor(() => connection.acks.length === 35);
+  expect(connection.acks[34].reason).toBe("payload_mismatch");
+  expect(calls).toHaveLength(32);
+});
+
+registeredChannelTest("Pi retains all 256 epoch ledger entries and revokes rather than evicting on exhaustion", async () => {
+  const { connections } = await startChannelServer();
+  const { handlers, calls } = await loadChannelAsset(accepted);
+  await handlers.get("session_start")?.({}, channelContext());
+  await waitFor(() => connections.length === 1);
+  const connection = connections[0];
+  for (let index = 0; index < 256; index += 1) {
+    deliver(connection, `request-${index}`);
+    await waitFor(() => connection.acks.length === index + 1);
+  }
+  deliver(connection, "request-0");
+  await waitFor(() => connection.acks.length === 257);
+  expect(connection.acks[256]).toMatchObject({ status: "accepted", duplicate: true });
+  expect(calls).toHaveLength(256);
+  deliver(connection, "request-overflow");
+  await waitFor(() => connection.closed);
+  expect(calls).toHaveLength(256);
+  await waitFor(() => connections.length === 2);
+  const fresh = connections[1];
+  fresh.socket.write(`${JSON.stringify(delivery(connection, "request-0"))}\n`);
+  fresh.socket.write(`${JSON.stringify(delivery(connection, "request-overflow"))}\n`);
+  deliver(fresh, "after-capacity");
+  await waitFor(() => fresh.acks.length === 1);
+  deliver(fresh, "after-capacity");
+  await waitFor(() => fresh.acks.length === 2);
+  expect(fresh.acks[1]).toMatchObject({ status: "accepted", duplicate: true });
+  expect(calls).toHaveLength(257);
+  expect(calls[256].registrationEpoch).toBe(fresh.epoch);
+});
+
+for (const broken of ["throw", "void", "bad-status", "bad-reason", "foreign-generation"]) {
+  registeredChannelTest(`Pi treats ${broken} ingress outcome as unknown: no invented rejection or replay`, async () => {
+    const { connections } = await startChannelServer();
+    const { handlers, calls } = await loadChannelAsset(async (request) => {
+      if (broken === "throw") throw new Error("admission may already have occurred");
+      if (broken === "void") return undefined;
+      if (broken === "bad-status") return { status: "done", sessionGeneration: request.sessionGeneration };
+      if (broken === "bad-reason") return { status: "rejected", reason: "invented", sessionGeneration: request.sessionGeneration };
+      return { status: "accepted", sessionGeneration: "foreign-session" };
+    });
+    await handlers.get("session_start")?.({}, channelContext());
+    await waitFor(() => connections.length === 1);
+    deliver(connections[0]);
+    await waitFor(() => connections[0].closed && connections.length === 2);
+    expect(connections[0].acks).toEqual([]);
+    expect(connections[1].acks).toEqual([]);
+    expect(calls).toHaveLength(1);
+    expect(connections[1].epoch).not.toBe(connections[0].epoch);
+  });
+}
+
+registeredChannelTest("Pi never replays a lost receipt, fences an old callback after reconnect, and ignores stale epoch deliveries", async () => {
+  const { connections } = await startChannelServer();
+  const pending = deferred<AdmissionReceipt>();
+  const { handlers, calls } = await loadChannelAsset(() => pending.promise);
+  await handlers.get("session_start")?.({}, channelContext());
+  await waitFor(() => connections.length === 1);
+  const old = connections[0];
+  deliver(old);
+  await waitFor(() => calls.length === 1);
+  old.socket.destroy();
+  await waitFor(() => connections.length === 2);
+  const fresh = connections[1];
+  pending.resolve({ status: "accepted", sessionGeneration: "session-1" });
+  fresh.socket.write(`${JSON.stringify(delivery(old))}\n`);
+  await Bun.sleep(30);
+  expect(old.acks).toEqual([]);
+  expect(fresh.acks).toEqual([]);
+  expect(calls).toHaveLength(1);
+  deliver(fresh, "fresh-request");
+  await waitFor(() => fresh.acks.length === 1);
+  expect(calls[1].registrationEpoch).toBe(fresh.epoch);
+  expect(fresh.acks[0].request_id).toBe("fresh-request");
+});
+
+registeredChannelTest("Pi refuses reused registration epochs after reconnect", async () => {
+  const { connections } = await startChannelServer((connection, response) => {
+    response.result.registration_epoch = "same-epoch";
+    connection.epoch = "same-epoch";
+    connection.socket.write(`${JSON.stringify(response)}\n`);
+  });
+  const { handlers, calls } = await loadChannelAsset(accepted);
+  await handlers.get("session_start")?.({}, channelContext());
+  await waitFor(() => connections.length === 1);
+  deliver(connections[0]);
+  await waitFor(() => connections[0].acks.length === 1);
+  connections[0].socket.destroy();
+  await waitFor(() => connections.length === 2 && connections[1].closed);
+  expect(calls).toHaveLength(1);
+});
+
+registeredChannelTest("Pi reconnect attempt count is bounded and session shutdown cancels scheduled reconnect", async () => {
+  const { connections } = await startChannelServer();
+  const { handlers, shutdown } = await loadChannelAsset(accepted);
+  await handlers.get("session_start")?.({}, channelContext());
+  for (let index = 0; index < 3; index += 1) {
+    await waitFor(() => connections.length === index + 1);
+    await Bun.sleep(20); // allow the complete registration result to reach the receiver
+    connections[index].socket.destroy();
+    await waitFor(() => connections[index].closed);
+  }
+  await Bun.sleep(350);
+  expect(connections).toHaveLength(3); // Initial connection + two reconnects, never unbounded.
+  await handlers.get("session_start")?.({ reason: "new" }, channelContext("session-2"));
+  await waitFor(() => connections.length === 4);
+  await Bun.sleep(20);
+  connections[3].socket.destroy();
+  await waitFor(() => connections[3].closed);
+  shutdown();
+  shutdown();
+  await Bun.sleep(350);
+  expect(connections).toHaveLength(4);
+});
+
+registeredChannelTest("Pi session replacement closes/fences old callbacks and binds new ingress to the new generation", async () => {
+  const { connections } = await startChannelServer();
+  const oldReceipt = deferred<AdmissionReceipt>();
+  const { handlers, calls } = await loadChannelAsset((request) =>
+    request.sessionGeneration === "session-1" ? oldReceipt.promise : accepted(request));
+  await handlers.get("session_start")?.({}, channelContext());
+  await waitFor(() => connections.length === 1);
+  deliver(connections[0], "same-id");
+  await waitFor(() => calls.length === 1);
+  await handlers.get("session_start")?.({ reason: "new" }, channelContext("session-2"));
+  await waitFor(() => connections.length === 2 && connections[0].closed);
+  oldReceipt.resolve({ status: "accepted", sessionGeneration: "session-1" });
+  deliver(connections[1], "same-id");
+  await waitFor(() => connections[1].acks.length === 1);
+  expect(connections[0].acks).toEqual([]);
+  expect(connections[1].acks[0]).toMatchObject({ session_generation: "session-2", registration_epoch: "epoch-2" });
+  expect(calls.map((call) => call.sessionGeneration)).toEqual(["session-1", "session-2"]);
+});
+
+registeredChannelTest("Pi generation changes observed during delayed admission cannot ACK or reconnect into a replacement", async () => {
+  const { connections } = await startChannelServer();
+  const pending = deferred<AdmissionReceipt>();
+  const { handlers, calls } = await loadChannelAsset(() => pending.promise);
+  const context = channelContext();
+  await handlers.get("session_start")?.({}, context);
+  await waitFor(() => connections.length === 1);
+  deliver(connections[0]);
+  await waitFor(() => calls.length === 1);
+  context.userMessageSessionGeneration = "session-2";
+  pending.resolve({ status: "accepted", sessionGeneration: "session-1" });
+  await waitFor(() => connections[0].closed);
+  await Bun.sleep(350);
+  expect(connections).toHaveLength(1);
+  expect(connections[0].acks).toEqual([]);
+  expect(calls[0].sessionGeneration).toBe("session-1");
+});
+
+registeredChannelTest("Pi incomplete registration times out and reconnects only within the bounded registration budget", async () => {
+  const { connections } = await startChannelServer((connection, response) => {
+    connection.socket.write(JSON.stringify(response)); // No newline: not a response yet.
+  });
+  const { handlers, calls, shutdown } = await loadChannelAsset(accepted);
+  await handlers.get("session_start")?.({}, channelContext());
+  await waitFor(() => connections.length === 1);
+  await waitFor(() => connections[0].closed && connections.length === 2, 3000);
+  shutdown();
+  expect(calls).toEqual([]);
+  expect(connections[0].acks).toEqual([]);
+  await waitFor(() => connections[1].closed);
+});
+
+registeredChannelTest("Pi partial delivery loss never invokes ingress or replays bytes on the fresh epoch", async () => {
+  const { connections } = await startChannelServer();
+  const { handlers, calls } = await loadChannelAsset(accepted);
+  await handlers.get("session_start")?.({}, channelContext());
+  await waitFor(() => connections.length === 1);
+  const line = `${JSON.stringify(delivery(connections[0]))}\n`;
+  connections[0].socket.write(line.slice(0, -4));
+  await Bun.sleep(20);
+  connections[0].socket.destroy();
+  await waitFor(() => connections.length === 2);
+  expect(calls).toEqual([]);
+  expect(connections[0].acks).toEqual([]);
+  deliver(connections[1]);
+  await waitFor(() => connections[1].acks.length === 1);
+  expect(calls).toHaveLength(1);
+  expect(calls[0].registrationEpoch).toBe(connections[1].epoch);
+});
+
+registeredChannelTest("Pi rejects session change while a split registration response is still pending", async () => {
+  let complete!: () => void;
+  const { connections } = await startChannelServer((connection, response) => {
+    connection.socket.write(JSON.stringify(response));
+    complete = () => connection.socket.write("\n");
+  });
+  const context = channelContext();
+  const { handlers, calls } = await loadChannelAsset(accepted);
+  await handlers.get("session_start")?.({}, context);
+  await waitFor(() => connections.length === 1);
+  context.userMessageSessionGeneration = "session-2";
+  complete();
+  await waitFor(() => connections[0].closed);
+  await Bun.sleep(300);
+  expect(connections).toHaveLength(1);
+  expect(calls).toEqual([]);
+});
+
+registeredChannelTest("Pi fences reserved but not invoked frames if the connection is destroyed during frame parsing", async () => {
+  const { connections } = await startChannelServer();
+  const { handlers, calls, shutdown } = await loadChannelAsset(accepted);
+  await handlers.get("session_start")?.({}, channelContext());
+  await waitFor(() => connections.length === 1);
+  connections[0].socket.write(`${JSON.stringify(delivery(connections[0]))}\n{bad}\n`);
+  await waitFor(() => connections[0].closed);
+  shutdown();
+  expect(calls).toEqual([]);
+  expect(connections[0].acks).toEqual([]);
+});
+
+registeredChannelTest("Pi shutdown between two reserved deliveries prevents the second ingress attempt", async () => {
+  const { connections } = await startChannelServer();
+  let shutdown!: () => void;
+  const asset = await loadChannelAsset(async (request) => {
+    shutdown();
+    return accepted(request);
+  });
+  shutdown = asset.shutdown;
+  await asset.handlers.get("session_start")?.({}, channelContext());
+  await waitFor(() => connections.length === 1);
+  connections[0].socket.write(
+    `${JSON.stringify(delivery(connections[0], "first"))}\n${JSON.stringify(delivery(connections[0], "second"))}\n`,
+  );
+  await waitFor(() => connections[0].closed);
+  expect(asset.calls.map((call) => call.requestId)).toEqual(["first"]);
+  expect(connections[0].acks).toEqual([]);
+});
+
+registeredChannelTest("Pi unresolved old-generation calls keep their capacity slots across replacement", async () => {
+  const { connections } = await startChannelServer();
+  const pending: Array<ReturnType<typeof deferred<AdmissionReceipt>>> = [];
+  const asset = await loadChannelAsset(() => {
+    const result = deferred<AdmissionReceipt>();
+    pending.push(result);
+    return result.promise;
+  });
+  await asset.handlers.get("session_start")?.({}, channelContext());
+  await waitFor(() => connections.length === 1);
+  for (let index = 0; index < 32; index += 1) deliver(connections[0], `old-${index}`);
+  await waitFor(() => asset.calls.length === 32);
+  await asset.handlers.get("session_start")?.({ reason: "new" }, channelContext("session-2"));
+  await waitFor(() => connections.length === 2);
+  deliver(connections[1], "at-capacity");
+  await waitFor(() => connections[1].acks.length === 1);
+  expect(connections[1].acks[0]).toMatchObject({ status: "rejected", reason: "admission_refused" });
+  pending[0].resolve({ status: "accepted", sessionGeneration: "session-1" });
+  await Bun.sleep(20);
+  deliver(connections[1], "fresh");
+  await waitFor(() => asset.calls.length === 33);
+  // Resolve another old callback; it may only free its own entry, not the same-ID fresh request.
+  pending[1].resolve({ status: "accepted", sessionGeneration: "session-1" });
+  pending[32].resolve({ status: "queued", sessionGeneration: "session-2" });
+  await waitFor(() => connections[1].acks.length === 2);
+  expect(connections[0].acks).toEqual([]);
+  expect(connections[1].acks[1]).toMatchObject({ request_id: "fresh", status: "queued", session_generation: "session-2" });
+  for (const result of pending) result.resolve({ status: "rejected", reason: "session_changed", sessionGeneration: "session-1" });
+});
+
+registeredChannelTest("Pi bounds its outgoing ACK buffer and drops a possibly admitted receipt without replay", async () => {
+  const { connections } = await startChannelServer();
+  let client: net.Socket | undefined;
+  net.createConnection = ((...args: unknown[]) => {
+    const socket = Reflect.apply(originalCreateConnection, net, args);
+    client ??= socket;
+    return socket;
+  }) as typeof net.createConnection;
+  const asset = await loadChannelAsset(accepted);
+  await asset.handlers.get("session_start")?.({}, channelContext());
+  await waitFor(() => connections.length === 1);
+  Object.defineProperty(client, "writableLength", { get: () => 65536, configurable: true });
+  deliver(connections[0]);
+  await waitFor(() => connections[0].closed && connections.length === 2);
+  expect(asset.calls).toHaveLength(1);
+  expect(connections[0].acks).toEqual([]);
+  expect(connections[1].acks).toEqual([]);
+});
+
+function rotate(connection: ChannelConnection, fields: Record<string, unknown> = {}) {
+  connection.socket.write(`${JSON.stringify({
+    type: "rotate",
+    registration_epoch: connection.epoch,
+    session_generation: connection.generation,
+    ...fields,
+  })}\n`);
+}
+
+registeredChannelTest("Pi accepts more than 256 clean rotations without replay or exhausting transport retries", async () => {
+  const { connections, reports } = await startChannelServer();
+  const asset = await loadChannelAsset(accepted);
+  await asset.handlers.get("session_start")?.({}, channelContext());
+  for (let index = 0; index <= 260; index += 1) {
+    await waitFor(() => connections.length === index + 1);
+    const connection = connections[index];
+    if (index > 0) {
+      connection.socket.write(`${JSON.stringify(delivery(connections[index - 1], "request-0"))}\n`);
+    }
+    const count = index === 0 ? 192 : 1;
+    for (let request = 0; request < count; request += 1) {
+      deliver(connection, `request-${request}`);
+      await waitFor(() => connection.acks.length === request + 1);
+    }
+    deliver(connection, "request-0");
+    await waitFor(() => connection.acks.length === count + 1);
+    expect(connection.acks[count]).toMatchObject({ status: "accepted", duplicate: true });
+    if (index < 260) {
+      rotate(connection);
+      await waitFor(() => connection.closed);
+    }
+  }
+  expect(asset.calls).toHaveLength(452);
+  expect(new Set(asset.calls.map((call) => `${call.registrationEpoch}:${call.requestId}`)).size).toBe(452);
+  expect(requestStates(reports)).toEqual(["idle"]);
+  expect(connections[260].closed).toBe(false);
+}, 120000);
+
+registeredChannelTest("Pi ignores invalid rotations without resetting the ordinary reconnect budget", async () => {
+  const { connections } = await startChannelServer();
+  const asset = await loadChannelAsset(accepted);
+  const context = channelContext();
+  await asset.handlers.get("session_start")?.({}, context);
+  for (let index = 0; index < 3; index += 1) {
+    await waitFor(() => connections.length === index + 1);
+    const connection = connections[index];
+    deliver(connection, "prove-ready");
+    await waitFor(() => connection.acks.length === 1);
+    if (index === 2) {
+      for (const fields of [
+        { registration_epoch: "old" }, { session_generation: "old" },
+        { registration_epoch: null }, { session_generation: null }, { type: "not-rotate" },
+      ]) rotate(connection, fields);
+      context.userMessageSessionGeneration = "changed";
+      rotate(connection);
+      await Bun.sleep(30);
+      expect(connection.closed).toBe(false);
+      context.userMessageSessionGeneration = connection.generation;
+      deliver(connection, "still-ready");
+      await waitFor(() => connection.acks.length === 2);
+    }
+    connection.socket.destroy();
+    await waitFor(() => connection.closed);
+  }
+  await Bun.sleep(350);
+  expect(connections).toHaveLength(3);
+  expect(asset.calls).toHaveLength(4);
+});
+
+for (const protectedEpoch of ["current", "previous"] as const) {
+  registeredChannelTest(`Pi refuses reused ${protectedEpoch} epochs after clean rotation`, async () => {
+    const { connections } = await startChannelServer((connection, response) => {
+      if (connections.length === 3) {
+        connection.epoch = protectedEpoch === "current" ? "epoch-2" : "epoch-1";
+        response.result.registration_epoch = connection.epoch;
+      }
+      connection.socket.write(`${JSON.stringify(response)}\n`);
+    });
+    const asset = await loadChannelAsset(accepted);
+    await asset.handlers.get("session_start")?.({}, channelContext());
+    for (let index = 0; index < 2; index += 1) {
+      await waitFor(() => connections.length === index + 1);
+      deliver(connections[index]);
+      await waitFor(() => connections[index].acks.length === 1);
+      rotate(connections[index]);
+    }
+    await waitFor(() => connections.length === 3 && connections[2].closed);
+    expect(asset.calls).toHaveLength(2);
+    expect(connections[2].acks).toEqual([]);
+  });
+}
+
+registeredChannelTest("Pi clean rotation fences unresolved old admissions without replaying prompts or ACKs", async () => {
+  const { connections } = await startChannelServer();
+  const pending = deferred<AdmissionReceipt>();
+  const asset = await loadChannelAsset((request) =>
+    request.registrationEpoch === "epoch-1" ? pending.promise : accepted(request));
+  await asset.handlers.get("session_start")?.({}, channelContext());
+  await waitFor(() => connections.length === 1);
+  const old = connections[0];
+  deliver(old, "uncertain");
+  await waitFor(() => asset.calls.length === 1);
+  rotate(old); // The server may have recorded a terminal unknown before Pi settles.
+  await waitFor(() => old.closed && connections.length === 2);
+  const fresh = connections[1];
+  fresh.socket.write(`${JSON.stringify(delivery(old, "uncertain"))}\n`);
+  pending.resolve({ status: "queued", sessionGeneration: old.generation });
+  await Bun.sleep(30);
+  expect(old.acks).toEqual([]);
+  expect(fresh.acks).toEqual([]);
+  expect(asset.calls).toHaveLength(1);
+  deliver(fresh, "fresh");
+  await waitFor(() => fresh.acks.length === 1);
+  expect(asset.calls).toHaveLength(2);
+  expect(fresh.acks[0]).toMatchObject({ request_id: "fresh", status: "accepted" });
+});
+
+registeredChannelTest("Pi drops trailing old deliveries after a complete split rotation control", async () => {
+  const { connections } = await startChannelServer();
+  const asset = await loadChannelAsset(accepted);
+  await asset.handlers.get("session_start")?.({}, channelContext());
+  await waitFor(() => connections.length === 1);
+  const old = connections[0];
+  deliver(old, "prove-ready");
+  await waitFor(() => old.acks.length === 1);
+  const control = JSON.stringify({ type: "rotate", registration_epoch: old.epoch, session_generation: old.generation });
+  old.socket.write(control);
+  await Bun.sleep(30);
+  expect(old.closed).toBe(false);
+  old.socket.write(`\n${JSON.stringify(delivery(old, "must-not-submit"))}\n`);
+  await waitFor(() => old.closed && connections.length === 2);
+  expect(asset.calls).toHaveLength(1);
+  expect(connections[1].acks).toEqual([]);
+  deliver(connections[1], "fresh");
+  await waitFor(() => connections[1].acks.length === 1);
+  expect(asset.calls).toHaveLength(2);
+});
+
+registeredChannelTest("Pi rolls its bounded epoch window through more than 256 registrations in one runtime", async () => {
+  const { connections, reports } = await startChannelServer();
+  const asset = await loadChannelAsset(accepted);
+  const context = channelContext();
+  for (let index = 0; index < 300; index += 1) {
+    await asset.handlers.get("session_start")?.({ reason: "reload" }, context);
+    await waitFor(() => connections.length === index + 1);
+    deliver(connections[index], "prove-ready");
+    await waitFor(() => connections[index].acks.length === 1);
+    deliver(connections[index], "prove-ready");
+    await waitFor(() => connections[index].acks.length === 2);
+    expect(connections[index].acks[1]).toMatchObject({ status: "accepted", duplicate: true });
+  }
+  expect(asset.calls).toHaveLength(300);
+  await waitFor(() => requestStates(reports).length === 300);
+  expect(requestStates(reports)).toEqual(Array(300).fill("idle"));
+  expect(connections[299].closed).toBe(false);
+}, 15000);
+
+for (const protectedEpoch of ["current", "previous", "unresolved"] as const) {
+  registeredChannelTest(`Pi refuses reused ${protectedEpoch} epochs inside its retained window`, async () => {
+    const freshCount = protectedEpoch === "unresolved" ? 260 : 2;
+    const { connections } = await startChannelServer((connection, response) => {
+      if (connections.length > freshCount) {
+        connection.epoch = protectedEpoch === "current" ? `epoch-${freshCount}` : "epoch-1";
+        response.result.registration_epoch = connection.epoch;
+      }
+      connection.socket.write(`${JSON.stringify(response)}\n`);
+    });
+    const pending = deferred<AdmissionReceipt>();
+    const asset = await loadChannelAsset((request) =>
+      protectedEpoch === "unresolved" && request.registrationEpoch === "epoch-1"
+        ? pending.promise : accepted(request));
+    const context = channelContext();
+    for (let index = 0; index < freshCount; index += 1) {
+      await asset.handlers.get("session_start")?.({ reason: "reload" }, context);
+      await waitFor(() => connections.length === index + 1);
+      deliver(connections[index], "same-id");
+      if (index === 0 && protectedEpoch === "unresolved") {
+        await waitFor(() => asset.calls.length === 1);
+      } else {
+        await waitFor(() => connections[index].acks.length === 1);
+      }
+    }
+    await asset.handlers.get("session_start")?.({ reason: "reload" }, context);
+    await waitFor(() => connections.length === freshCount + 1 && connections[freshCount].closed);
+    expect(asset.calls).toHaveLength(freshCount);
+    expect(connections[freshCount].acks).toEqual([]);
+    pending.resolve({ status: "queued", sessionGeneration: context.userMessageSessionGeneration });
+    await Bun.sleep(20);
+    if (protectedEpoch === "unresolved") expect(connections[0].acks).toEqual([]);
+  }, 15000);
+}
+
+registeredChannelTest("Pi retains 32 distinct unresolved epochs while fresh registrations and capacity receipts keep working", async () => {
+  const { connections } = await startChannelServer((connection, response) => {
+    if (connections.length === 37) {
+      connection.epoch = "epoch-1";
+      response.result.registration_epoch = connection.epoch;
+    }
+    connection.socket.write(`${JSON.stringify(response)}\n`);
+  });
+  const pending: Array<ReturnType<typeof deferred<AdmissionReceipt>>> = [];
+  const asset = await loadChannelAsset(() => {
+    const receipt = deferred<AdmissionReceipt>();
+    pending.push(receipt);
+    return receipt.promise;
+  });
+  const context = channelContext();
+  for (let index = 0; index < 36; index += 1) {
+    await asset.handlers.get("session_start")?.({ reason: "reload" }, context);
+    await waitFor(() => connections.length === index + 1);
+    deliver(connections[index], "same-id");
+    if (index < 32) {
+      await waitFor(() => asset.calls.length === index + 1);
+    } else {
+      await waitFor(() => connections[index].acks.length === 1);
+      expect(connections[index].acks[0]).toMatchObject({ status: "rejected", reason: "admission_refused" });
+      deliver(connections[index], "same-id");
+      await waitFor(() => connections[index].acks.length === 2);
+      expect(connections[index].acks[1]).toMatchObject({ status: "rejected", duplicate: true });
+    }
+  }
+  await asset.handlers.get("session_start")?.({ reason: "reload" }, context);
+  await waitFor(() => connections.length === 37 && connections[36].closed);
+  expect(asset.calls).toHaveLength(32);
+  for (const receipt of pending) {
+    receipt.resolve({ status: "queued", sessionGeneration: context.userMessageSessionGeneration });
+  }
+  await Bun.sleep(20);
+  for (const connection of connections.slice(0, 32)) expect(connection.acks).toEqual([]);
+});
+
+registeredChannelTest("Pi stale retired-epoch deliveries cannot replay IDs after the recent window rolls", async () => {
+  const { connections } = await startChannelServer();
+  const asset = await loadChannelAsset(accepted);
+  const context = channelContext();
+  for (let index = 0; index < 4; index += 1) {
+    await asset.handlers.get("session_start")?.({ reason: "reload" }, context);
+    await waitFor(() => connections.length === index + 1);
+    deliver(connections[index], "same-id", `text-${index}`);
+    await waitFor(() => connections[index].acks.length === 1);
+  }
+  const current = connections[3];
+  for (const old of connections.slice(0, 3)) {
+    current.socket.write(`${JSON.stringify(delivery(old, "same-id", "replay"))}\n`);
+  }
+  deliver(current, "same-id", "text-3");
+  deliver(current, "same-id", "changed");
+  await waitFor(() => current.acks.length === 3);
+  expect(current.acks[1]).toMatchObject({ status: "accepted", duplicate: true });
+  expect(current.acks[2]).toMatchObject({ status: "rejected", reason: "payload_mismatch" });
+  expect(asset.calls).toHaveLength(4);
+});
+
+registeredChannelTest("Pi frame buffer is per-frame, not a cap on coalesced complete deliveries", async () => {
+  const { connections } = await startChannelServer();
+  const asset = await loadChannelAsset(accepted);
+  await asset.handlers.get("session_start")?.({}, channelContext());
+  await waitFor(() => connections.length === 1);
+  const connection = connections[0];
+  // Each frame is 4 KiB, but the single write exceeds the 64 KiB partial-frame budget.
+  const batch = Array.from({ length: 20 }, (_, index) =>
+    `${JSON.stringify(delivery(connection, `batch-${index}`, "x".repeat(4096)))}\n`).join("");
+  connection.socket.write(batch);
+  await waitFor(() => connection.acks.length === 20);
+  expect(connection.closed).toBe(false);
+  expect(asset.calls).toHaveLength(20);
+});
+
+registeredChannelTest("Pi reload/session_shutdown idempotently closes the old socket and fences callbacks before a fresh asset opens", async () => {
+  const { connections, reports } = await startChannelServer();
+  const pending = deferred<AdmissionReceipt>();
+  const old = await loadChannelAsset(() => pending.promise);
+  await old.handlers.get("session_start")?.({}, channelContext());
+  await waitFor(() => connections.length === 1);
+  deliver(connections[0]);
+  await waitFor(() => old.calls.length === 1);
+  old.handlers.get("session_shutdown")?.({ reason: "reload" }, channelContext());
+  old.shutdown();
+  await waitFor(() => connections[0].closed);
+  const replacement = await loadChannelAsset(accepted);
+  await replacement.handlers.get("session_start")?.({ reason: "reload" }, channelContext("session-2"));
+  await waitFor(() => connections.length === 2);
+  pending.resolve({ status: "queued", sessionGeneration: "session-1" });
+  deliver(connections[1]);
+  await waitFor(() => connections[1].acks.length === 1);
+  expect(connections[0].acks).toEqual([]);
+  expect(old.calls).toHaveLength(1);
+  expect(replacement.calls).toHaveLength(1);
+  const before = reports.length;
+  old.handlers.get("agent_start")?.({}, channelContext());
+  await Bun.sleep(30);
+  expect(reports).toHaveLength(before);
+});
+
+// Draft access is deliberately a UI fixture, not terminal/screen capture. These tests prove
+// transport redaction and callback ordering; they do not qualify real Pi core admission.
+function draftContext(ui: Record<string, any> = {}) {
+  return {
+    ...channelContext(),
+    ui: { getEditorText: () => "", holdState: () => undefined, ...ui },
+  };
+}
+
+function guardedDeliver(connection: ChannelConnection, requestId = "guarded", text = "remote prompt", guard = true) {
+  connection.socket.write(`${JSON.stringify({
+    ...delivery(connection, requestId, text), if_draft_empty: guard,
+    ...(guard ? { deadline_ms: Date.now() + 60_000 } : {}),
+  })}\n`);
+}
+
+function queryDraft(connection: ChannelConnection, requestId = "draft-query", fields: Record<string, unknown> = {}) {
+  connection.socket.write(`${JSON.stringify({
+    type: "draft_state", registration_epoch: connection.epoch,
+    request_id: requestId, session_generation: connection.generation, ...fields,
+  })}\n`);
+}
+
+registeredChannelTest("Pi draft guard advertises only callable editor/hold APIs alongside receipt ingress", async () => {
+  const { connections } = await startChannelServer();
+  const asset = await loadChannelAsset(accepted);
+  const contexts = [
+    draftContext(), channelContext(), draftContext({ getEditorText: undefined }),
+    draftContext({ holdState: undefined }), draftContext({ getEditorText: "not callable" }),
+    draftContext({ holdState: "not callable" }),
+  ];
+  for (const [index, context] of contexts.entries()) {
+    await asset.handlers.get("session_start")?.({}, context);
+    await waitFor(() => connections.length === index + 1);
+    expect(connections[index].registration.params.draft_guard === true).toBe(index === 0);
+  }
+  expect(asset.calls).toEqual([]);
+});
+
+registeredChannelTest("Pi draft guard remains unregistered without receipt ingress even with UI APIs", async () => {
+  const { connections, reports } = await startChannelServer();
+  const asset = await loadChannelAsset();
+  await asset.handlers.get("session_start")?.({}, draftContext());
+  await waitFor(() => reports.length === 1);
+  expect(connections).toEqual([]);
+  expect(asset.calls).toEqual([]);
+});
+
+for (const draft of ["in-progress draft", " ", "\t\r\n  ", "\u00a0\u200b", "👩🏽‍💻 e\u0301 羊\n"]) {
+  registeredChannelTest(`Pi guarded nonempty draft stays byte-identical ${JSON.stringify(draft)}`, async () => {
+    const { connections } = await startChannelServer();
+    const asset = await loadChannelAsset(accepted);
+    let editor = draft;
+    let mutations = 0;
+    let fallbackCalls = 0;
+    Object.assign(asset.pi, { sendUserMessage: () => { fallbackCalls += 1; } });
+    await asset.handlers.get("session_start")?.({}, draftContext({
+      getEditorText: () => editor,
+      setEditorText: (value: string) => { mutations += 1; editor = value; },
+      pasteToEditor: (value: string) => { mutations += 1; editor += value; },
+    }));
+    await waitFor(() => connections.length === 1);
+    guardedDeliver(connections[0]);
+    await waitFor(() => connections[0].acks.length === 1);
+    expect(connections[0].acks[0]).toEqual({
+      type: "ack", registration_epoch: "epoch-1", request_id: "guarded",
+      session_generation: "session-1", status: "rejected", reason: "draft_present",
+    });
+    expect(Buffer.from(editor)).toEqual(Buffer.from(draft));
+    expect(asset.calls).toEqual([]);
+    expect(mutations).toBe(0);
+    expect(fallbackCalls).toBe(0);
+  });
+}
+
+registeredChannelTest("Pi guarded empty draft submits exactly once and leaves editor empty", async () => {
+  const { connections } = await startChannelServer();
+  let editor = "";
+  let mutations = 0;
+  const asset = await loadChannelAsset(async (request) => {
+    expect(editor).toBe("");
+    return accepted(request);
+  });
+  await asset.handlers.get("session_start")?.({}, draftContext({
+    getEditorText: () => editor,
+    setEditorText: (value: string) => { mutations += 1; editor = value; },
+    pasteToEditor: (value: string) => { mutations += 1; editor += value; },
+  }));
+  await waitFor(() => connections.length === 1);
+  guardedDeliver(connections[0]);
+  await waitFor(() => connections[0].acks.length === 1);
+  guardedDeliver(connections[0]);
+  await waitFor(() => connections[0].acks.length === 2);
+  expect(asset.calls).toEqual([{
+    registrationEpoch: "epoch-1", requestId: "guarded", sessionGeneration: "session-1",
+    text: "remote prompt", deliverAs: "followUp", expandPromptTemplates: false,
+  }]);
+  expect(connections[0].acks[1]).toMatchObject({ status: "accepted", duplicate: true });
+  expect(editor).toBe("");
+  expect(mutations).toBe(0);
+});
+
+// Pi keeps a receiving session's input fenced until every session_start handler of a native
+// /new, /resume or /fork has returned, without rotating the generation captured in session_start.
+// This fixture models that admission rule: refused as session_changed while held, admitted after.
+function lifecycleFenceFixture() {
+  const state = { held: false };
+  const submit = (request: AdmissionRequest): Promise<AdmissionReceipt> => state.held
+    ? Promise.resolve({ status: "rejected", reason: "session_changed", sessionGeneration: request.sessionGeneration })
+    : accepted(request);
+  return { state, submit };
+}
+
+// A Pi that announces the lifted fence with session_ready advertises it as a host capability.
+const SESSION_READY_PI = { sessionReadyEvent: true };
+
+// A native /new to session-2 whose input is still fenced by a slower session_start handler, with
+// this extension already registered for session-2 on a fresh connection.
+async function guardedChannelInsideNewFence(sessionReadyPi = true) {
+  const { connections } = await startChannelServer();
+  const { state, submit } = lifecycleFenceFixture();
+  const asset = await loadChannelAsset(submit, sessionReadyPi ? SESSION_READY_PI : {});
+  const draft = { editor: "" };
+  await asset.handlers.get("session_start")?.({}, draftContext({ getEditorText: () => draft.editor }));
+  await waitFor(() => connections.length === 1);
+  state.held = true;
+  const context: Record<string, any> = {
+    ...draftContext({ getEditorText: () => draft.editor }), userMessageSessionGeneration: "session-2",
+  };
+  await asset.handlers.get("session_start")?.({ reason: "new" }, context);
+  await waitFor(() => connections.length === 2 && connections[0].closed);
+  const sessionReady = (sessionGeneration = "session-2") =>
+    asset.handlers.get("session_ready")?.({ type: "session_ready", reason: "new", sessionGeneration }, context);
+  return { connection: connections[1], connections, state, asset, draft, context, sessionReady };
+}
+
+registeredChannelTest("Pi guarded delivery refused at the /new fence is held without polling, then admitted once on session_ready", async () => {
+  const { connection, connections, state, asset, sessionReady } = await guardedChannelInsideNewFence();
+  guardedDeliver(connection, "chan-3");
+  await waitFor(() => asset.calls.length === 1);
+  // Held: no ACK and no timer re-attempt while the fence is up.
+  await Bun.sleep(400);
+  expect(asset.calls).toHaveLength(1);
+  expect(connection.acks).toEqual([]);
+  state.held = false; // The remaining session_start handlers returned; Pi lifts the fence.
+  sessionReady();
+  // Re-attempted in the session_ready callback itself, before any microtask.
+  expect(asset.calls).toHaveLength(2);
+  await waitFor(() => connection.acks.length === 1);
+  expect(connection.acks[0]).toEqual({
+    type: "ack", registration_epoch: "epoch-2", request_id: "chan-3",
+    session_generation: "session-2", status: "accepted",
+  });
+  // Both attempts target the live generation; the redelivery uses a fresh Pi key.
+  expect(asset.calls[0].registrationEpoch).toBe("epoch-2");
+  expect(asset.calls[1].registrationEpoch).not.toBe("epoch-2");
+  for (const call of asset.calls) {
+    expect(call).toMatchObject({ requestId: "chan-3", sessionGeneration: "session-2", text: "remote prompt" });
+  }
+  // Once only: a later session_ready finds nothing held.
+  sessionReady();
+  await Bun.sleep(50);
+  expect(asset.calls).toHaveLength(2);
+  expect(connection.acks).toHaveLength(1);
+  // The same channel keeps admitting without another registration.
+  guardedDeliver(connection, "chan-4");
+  await waitFor(() => connection.acks.length === 2);
+  expect(connection.acks[1]).toMatchObject({ request_id: "chan-4", status: "accepted" });
+  expect(asset.calls).toHaveLength(3);
+  expect(connections).toHaveLength(2);
+});
+
+registeredChannelTest("Pi held guarded delivery rechecks the draft at session_ready and refuses draft_present without calling Pi", async () => {
+  const { connection, state, asset, draft, sessionReady } = await guardedChannelInsideNewFence();
+  guardedDeliver(connection, "draft");
+  await waitFor(() => asset.calls.length === 1);
+  draft.editor = "typed meanwhile";
+  await Bun.sleep(300);
+  expect(connection.acks).toEqual([]);
+  state.held = false;
+  sessionReady();
+  await waitFor(() => connection.acks.length === 1);
+  expect(connection.acks[0]).toMatchObject({ request_id: "draft", status: "rejected", reason: "draft_present" });
+  expect(asset.calls).toHaveLength(1);
+});
+
+registeredChannelTest("Pi held guarded delivery gets Pi's original refusal before its deadline when session_ready never comes", async () => {
+  const { connection, asset, sessionReady } = await guardedChannelInsideNewFence();
+  const deadline = Date.now() + 700;
+  connection.socket.write(`${JSON.stringify({
+    ...delivery(connection, "deadline", "remote prompt"), if_draft_empty: true, deadline_ms: deadline,
+  })}\n`);
+  await waitFor(() => asset.calls.length === 1);
+  await Bun.sleep(200);
+  expect(connection.acks).toEqual([]);
+  await waitFor(() => connection.acks.length === 1, 2_000);
+  // Acknowledged ahead of the deadline, so Herdr's own wait cannot report it as unknown.
+  expect(Date.now()).toBeLessThan(deadline);
+  expect(connection.acks[0]).toMatchObject({ request_id: "deadline", status: "rejected", reason: "session_changed" });
+  expect(asset.calls).toHaveLength(1);
+  // An expired hold is gone: a late session_ready does not deliver it.
+  sessionReady();
+  await Bun.sleep(50);
+  expect(asset.calls).toHaveLength(1);
+  expect(connection.acks).toHaveLength(1);
+  // Unguarded input is never held: its single deferred attempt's refusal passes through.
+  guardedDeliver(connection, "unguarded", "remote prompt", false);
+  await waitFor(() => connection.acks.length === 2);
+  expect(connection.acks[1]).toMatchObject({ request_id: "unguarded", status: "rejected", reason: "session_changed" });
+  sessionReady();
+  await Bun.sleep(50);
+  expect(asset.calls).toHaveLength(2);
+});
+
+registeredChannelTest("Pi held guarded delivery is not retried on a mismatched session_ready or a rotated generation", async () => {
+  const { connection, state, asset, context, sessionReady } = await guardedChannelInsideNewFence();
+  guardedDeliver(connection, "mismatch");
+  await waitFor(() => asset.calls.length === 1);
+  state.held = false;
+  sessionReady("session-other");
+  await waitFor(() => connection.acks.length === 1);
+  expect(connection.acks[0]).toMatchObject({ request_id: "mismatch", status: "rejected", reason: "session_changed" });
+  expect(asset.calls).toHaveLength(1);
+  // A real session change rotates the generation: never held, and no ACK for the dead generation.
+  asset.pi.submitUserMessage = async (request: AdmissionRequest) => {
+    asset.calls.push(request);
+    context.userMessageSessionGeneration = "session-rotated";
+    return { status: "rejected", reason: "session_changed", sessionGeneration: request.sessionGeneration };
+  };
+  guardedDeliver(connection, "rotated");
+  await waitFor(() => connection.closed);
+  sessionReady("session-2");
+  sessionReady("session-rotated");
+  await Bun.sleep(100);
+  expect(asset.calls).toHaveLength(2);
+  expect(connection.acks).toHaveLength(1);
+});
+
+registeredChannelTest("Pi without the session_ready capability passes the fence refusal through, with no retry", async () => {
+  const { connection, asset } = await guardedChannelInsideNewFence(false);
+  expect(asset.handlers.has("session_ready")).toBe(false);
+  guardedDeliver(connection, "old-pi");
+  await waitFor(() => connection.acks.length === 1);
+  expect(connection.acks[0]).toMatchObject({ request_id: "old-pi", status: "rejected", reason: "session_changed" });
+  await Bun.sleep(400);
+  expect(asset.calls).toHaveLength(1);
+  expect(connection.acks).toHaveLength(1);
+});
+
+registeredChannelTest("Pi guarded checks and invokes in the same socket callback before any microtask, then waits only for receipt", async () => {
+  const { connections } = await startChannelServer();
+  let insideData = false;
+  net.createConnection = ((...args: unknown[]) => {
+    const socket = Reflect.apply(originalCreateConnection, net, args) as net.Socket;
+    const on = socket.on;
+    socket.on = function (event: string, handler: (...values: any[]) => void) {
+      if (event !== "data") return Reflect.apply(on, this, [event, handler]);
+      return Reflect.apply(on, this, [event, (...values: any[]) => {
+        insideData = true;
+        try { handler(...values); } finally { insideData = false; }
+      }]);
+    } as typeof socket.on;
+    return socket;
+  }) as typeof net.createConnection;
+  const order: string[] = [];
+  const pending = deferred<AdmissionReceipt>();
+  const asset = await loadChannelAsset(() => {
+    expect(insideData).toBe(true);
+    order.push("submit");
+    return pending.promise;
+  });
+  await asset.handlers.get("session_start")?.({}, draftContext({
+    getEditorText() {
+      expect(insideData).toBe(true);
+      order.push("editor");
+      queueMicrotask(() => order.push("microtask"));
+      return "";
+    },
+    holdState() { expect(insideData).toBe(true); order.push("hold"); return undefined; },
+  }));
+  await waitFor(() => connections.length === 1);
+  guardedDeliver(connections[0]);
+  await waitFor(() => order.includes("microtask"));
+  expect(order).toEqual(["editor", "hold", "submit", "microtask"]);
+  expect(asset.calls).toHaveLength(1);
+  expect(connections[0].acks).toEqual([]);
+  pending.resolve({ status: "queued", sessionGeneration: "session-1" });
+  await waitFor(() => connections[0].acks.length === 1);
+  expect(connections[0].acks[0].status).toBe("queued");
+});
+
+for (const inputBeforeCheck of [true, false]) {
+  registeredChannelTest(`Pi guarded queued keystroke race isolates the prompt and preserves the draft (input before check: ${inputBeforeCheck})`, async () => {
+    const { connections } = await startChannelServer();
+    const queuedInput = " \tuser keystrokes 👩🏽‍💻 e\u0301\n";
+    const remotePrompt = "isolated remote follow-up";
+    let editor = "";
+    let mutations = 0;
+    const pending = deferred<AdmissionReceipt>();
+    const asset = await loadChannelAsset((request) => {
+      expect(editor).toBe("");
+      expect(request.text).toBe(remotePrompt);
+      return pending.promise;
+    });
+    await asset.handlers.get("session_start")?.({}, draftContext({
+      getEditorText: () => {
+        if (!inputBeforeCheck) queueMicrotask(() => { editor = queuedInput; });
+        return editor;
+      },
+      setEditorText: (value: string) => { mutations += 1; editor = value; },
+      pasteToEditor: (value: string) => { mutations += 1; editor += value; },
+    }));
+    await waitFor(() => connections.length === 1);
+    const connection = connections[0];
+    if (inputBeforeCheck) {
+      queueMicrotask(() => { editor = queuedInput; });
+      await Promise.resolve();
+    }
+    guardedDeliver(connection, "keystroke-race", remotePrompt);
+    await waitFor(() => editor === queuedInput && (inputBeforeCheck ? connection.acks.length === 1 : asset.calls.length === 1));
+    if (inputBeforeCheck) {
+      expect(asset.calls).toEqual([]);
+      expect(connection.acks[0]).toMatchObject({ status: "rejected", reason: "draft_present" });
+    } else {
+      expect(connection.acks).toEqual([]); // Awaiting only receipt cannot consume later keystrokes.
+      expect(asset.calls.map((request) => request.text)).toEqual([remotePrompt]);
+      pending.resolve({ status: "queued", sessionGeneration: "session-1" });
+      await waitFor(() => connection.acks.length === 1);
+      expect(connection.acks[0].status).toBe("queued");
+    }
+    expect(Buffer.from(editor)).toEqual(Buffer.from(queuedInput));
+    expect(mutations).toBe(0);
+  });
+}
+
+for (const hold of ["dialog", "custom", "editor"]) {
+  registeredChannelTest(`Pi guarded active ${hold} hold refuses ingress`, async () => {
+    const { connections } = await startChannelServer();
+    const asset = await loadChannelAsset(accepted);
+    await asset.handlers.get("session_start")?.({}, draftContext({ holdState: () => hold }));
+    await waitFor(() => connections.length === 1);
+    guardedDeliver(connections[0]);
+    await waitFor(() => connections[0].acks.length === 1);
+    expect(connections[0].acks[0]).toMatchObject({ status: "rejected", reason: "ui_hold" });
+    expect(asset.calls).toEqual([]);
+  });
+}
+
+const unavailableDraftUIs: Array<[string, () => Record<string, any> | undefined, string?]> = [
+  ["missing UI", () => undefined],
+  ["missing editor getter", () => ({ getEditorText: undefined, holdState: () => undefined })],
+  ["missing hold API", () => ({ getEditorText: () => "", holdState: undefined })],
+  ["throwing editor getter", () => ({ getEditorText: () => { throw new Error("secret draft"); }, holdState: () => undefined })],
+  ["throwing hold API", () => ({ getEditorText: () => "", holdState: () => { throw new Error("secret hold"); } })],
+  ["non-string editor", () => ({ getEditorText: () => 123, holdState: () => undefined })],
+  ["async editor", () => ({ getEditorText: async () => "", holdState: () => undefined })],
+  ["async hold", () => ({ getEditorText: () => "", holdState: async () => undefined }), "ui_hold"],
+  ["invalid hold", () => ({ getEditorText: () => "", holdState: () => "invented secret" }), "ui_hold"],
+  ["null hold", () => ({ getEditorText: () => "", holdState: () => null }), "ui_hold"],
+  ["false hold", () => ({ getEditorText: () => "", holdState: () => false }), "ui_hold"],
+  ["object hold", () => ({ getEditorText: () => "", holdState: () => ({ text: "secret hold" }) }), "ui_hold"],
+  ["throwing getter property", () => ({ get getEditorText() { throw new Error("secret property"); }, holdState: () => undefined })],
+  ["throwing hold property", () => ({ getEditorText: () => "", get holdState() { throw new Error("secret property"); } })],
+];
+
+for (const [name, makeUI, guardReason = "unknown"] of unavailableDraftUIs) {
+  registeredChannelTest(`Pi guarded and draft query fail closed (${guardReason}/unknown) for ${name}`, async () => {
+    const { connections } = await startChannelServer();
+    const asset = await loadChannelAsset(accepted);
+    const context = { ...channelContext(), ui: makeUI() };
+    await asset.handlers.get("session_start")?.({}, context);
+    await waitFor(() => connections.length === 1);
+    const connection = connections[0];
+    guardedDeliver(connection);
+    queryDraft(connection);
+    await waitFor(() => connection.acks.length === 1 && connection.draftStates.length === 1);
+    expect(connection.acks[0]).toMatchObject({ status: "rejected", reason: guardReason });
+    expect(connection.draftStates[0]).toEqual({
+      type: "draft_state", registration_epoch: "epoch-1", request_id: "draft-query",
+      session_generation: "session-1", unknown: true,
+    });
+    expect(asset.calls).toEqual([]);
+    expect(JSON.stringify([...connection.acks, ...connection.draftStates])).not.toContain("secret");
+  });
+}
+
+registeredChannelTest("Pi guarded APIs removed after registration fail closed without hiding unguarded ingress", async () => {
+  const { connections } = await startChannelServer();
+  const asset = await loadChannelAsset(accepted);
+  const context = draftContext();
+  await asset.handlers.get("session_start")?.({}, context);
+  await waitFor(() => connections.length === 1);
+  expect(connections[0].registration.params.draft_guard).toBe(true);
+  context.ui.holdState = undefined;
+  guardedDeliver(connections[0]);
+  await waitFor(() => connections[0].acks.length === 1);
+  expect(connections[0].acks[0].reason).toBe("unknown");
+  deliver(connections[0], "unguarded");
+  await waitFor(() => connections[0].acks.length === 2);
+  expect(asset.calls.map((call) => call.requestId)).toEqual(["unguarded"]);
+});
+
+for (const guardedFirst of [false, true]) {
+  registeredChannelTest(`Pi guarded duplicate flag mismatch is rejected pending and completed (${guardedFirst})`, async () => {
+    const { connections } = await startChannelServer();
+    const pending = deferred<AdmissionReceipt>();
+    const asset = await loadChannelAsset(() => pending.promise);
+    await asset.handlers.get("session_start")?.({}, draftContext());
+    await waitFor(() => connections.length === 1);
+    const connection = connections[0];
+    guardedDeliver(connection, "same-id", "hello", guardedFirst);
+    await waitFor(() => asset.calls.length === 1);
+    guardedDeliver(connection, "same-id", "hello", guardedFirst);
+    guardedDeliver(connection, "same-id", "hello", !guardedFirst);
+    // The mismatch ACK also fences parsing of the matching pending duplicate before receipt.
+    await waitFor(() => connection.acks.length === 1);
+    expect(connection.acks[0].reason).toBe("payload_mismatch");
+    pending.resolve({ status: "accepted", sessionGeneration: "session-1" });
+    await waitFor(() => connection.acks.length === 2);
+    expect(connection.acks[1]).toMatchObject({ status: "accepted", duplicate: true });
+    guardedDeliver(connection, "same-id", "hello", !guardedFirst);
+    await waitFor(() => connection.acks.length === 3);
+    expect(connection.acks[2].reason).toBe("payload_mismatch");
+    expect(asset.calls).toHaveLength(1);
+  });
+}
+
+registeredChannelTest("Pi guarded refusal is retained across draft edits; absent and false guards share old identity", async () => {
+  const { connections } = await startChannelServer();
+  const asset = await loadChannelAsset(accepted);
+  let editor = "private draft";
+  await asset.handlers.get("session_start")?.({}, draftContext({ getEditorText: () => editor }));
+  await waitFor(() => connections.length === 1);
+  const connection = connections[0];
+  guardedDeliver(connection);
+  await waitFor(() => connection.acks.length === 1);
+  editor = ""; // A user's later edit must not turn a retried rejection into an admission.
+  guardedDeliver(connection);
+  await waitFor(() => connection.acks.length === 2);
+  expect(connection.acks[1]).toMatchObject({ reason: "draft_present", duplicate: true });
+  guardedDeliver(connection, "guarded", "remote prompt", false);
+  await waitFor(() => connection.acks.length === 3);
+  expect(connection.acks[2].reason).toBe("payload_mismatch");
+  deliver(connection, "old", "hello");
+  await waitFor(() => connection.acks.length === 4);
+  guardedDeliver(connection, "old", "hello", false);
+  await waitFor(() => connection.acks.length === 5);
+  expect(connection.acks[4]).toMatchObject({ status: "accepted", duplicate: true });
+  expect(asset.calls).toHaveLength(1);
+});
+
+registeredChannelTest("Pi guarded retired-epoch requests are fenced even when the guard flag changes", async () => {
+  const { connections } = await startChannelServer();
+  const pending = deferred<AdmissionReceipt>();
+  const asset = await loadChannelAsset((request) => request.registrationEpoch === "epoch-1" ? pending.promise : accepted(request));
+  await asset.handlers.get("session_start")?.({}, draftContext());
+  await waitFor(() => connections.length === 1);
+  const old = connections[0];
+  guardedDeliver(old, "same-id", "hello");
+  await waitFor(() => asset.calls.length === 1);
+  rotate(old);
+  await waitFor(() => connections.length === 2 && old.closed);
+  const fresh = connections[1];
+  for (const guard of [true, false]) {
+    fresh.socket.write(`${JSON.stringify({ ...delivery(old, "same-id", "hello"), if_draft_empty: guard })}\n`);
+  }
+  pending.resolve({ status: "accepted", sessionGeneration: "session-1" });
+  await Bun.sleep(30);
+  expect(fresh.acks).toEqual([]);
+  expect(asset.calls).toHaveLength(1);
+  guardedDeliver(fresh, "same-id", "hello");
+  await waitFor(() => fresh.acks.length === 1);
+  guardedDeliver(fresh, "same-id", "hello", false);
+  await waitFor(() => fresh.acks.length === 2);
+  expect(fresh.acks[1].reason).toBe("payload_mismatch");
+  expect(asset.calls).toHaveLength(2);
+  expect(old.acks).toEqual([]);
+});
+
+registeredChannelTest("Pi guarded rejects nonboolean flags without interpreting truthy input as permission", async () => {
+  const { connections } = await startChannelServer();
+  const asset = await loadChannelAsset(accepted);
+  await asset.handlers.get("session_start")?.({}, draftContext());
+  await waitFor(() => connections.length === 1);
+  const connection = connections[0];
+  for (const flag of ["true", "false", 0, 1, null, {}, []]) {
+    connection.socket.write(`${JSON.stringify({ ...delivery(connection), if_draft_empty: flag })}\n`);
+  }
+  await Bun.sleep(30);
+  expect(asset.calls).toEqual([]);
+  expect(connection.acks).toEqual([]);
+});
+
+for (const [draft, hold] of [["", undefined], [" \n🐑e\u0301", "dialog"], ["secret: 🎉", "custom"], ["\t", "editor"]] as const) {
+  registeredChannelTest(`Pi draft query returns typed redacted read-only state ${JSON.stringify([draft, hold])}`, async () => {
+    const { connections } = await startChannelServer();
+    let mutations = 0;
+    const asset = await loadChannelAsset(accepted);
+    await asset.handlers.get("session_start")?.({}, draftContext({
+      getEditorText: () => draft, holdState: () => hold,
+      setEditorText: () => { mutations += 1; }, pasteToEditor: () => { mutations += 1; },
+    }));
+    await waitFor(() => connections.length === 1);
+    const connection = connections[0];
+    queryDraft(connection, "read-only", { text: "caller-supplied secret", empty: true, chars: 0, hold: null });
+    await waitFor(() => connection.draftStates.length === 1);
+    // Exact closed shape: no text and no size/count of the private draft.
+    expect(connection.draftStates[0]).toEqual({
+      type: "draft_state", registration_epoch: "epoch-1", request_id: "read-only",
+      session_generation: "session-1", empty: draft.length === 0, hold: hold ?? null,
+    });
+    expect(typeof connection.draftStates[0].empty).toBe("boolean");
+    expect(connection.draftStates[0]).not.toHaveProperty("chars");
+    expect(connection.draftStates[0]).not.toHaveProperty("text");
+    expect(connection.draftStates[0]).not.toHaveProperty("draft");
+    expect(JSON.stringify(connection.draftStates)).not.toContain("secret");
+    expect(asset.calls).toEqual([]);
+    expect(connection.acks).toEqual([]);
+    expect(mutations).toBe(0);
+  });
+}
+
+registeredChannelTest("Pi draft query is fresh, not a delivery reservation or permission for a later guarded prompt", async () => {
+  const { connections } = await startChannelServer();
+  const asset = await loadChannelAsset(accepted);
+  let editor = "";
+  await asset.handlers.get("session_start")?.({}, draftContext({ getEditorText: () => editor }));
+  await waitFor(() => connections.length === 1);
+  const connection = connections[0];
+  queryDraft(connection, "shared-id");
+  await waitFor(() => connection.draftStates.length === 1);
+  expect(connection.draftStates[0].empty).toBe(true);
+  editor = "user typed after the snapshot";
+  queryDraft(connection, "shared-id");
+  await waitFor(() => connection.draftStates.length === 2);
+  expect(connection.draftStates[1].empty).toBe(false);
+  guardedDeliver(connection, "shared-id", "hello");
+  await waitFor(() => connection.acks.length === 1);
+  expect(connection.acks[0].reason).toBe("draft_present");
+  expect(asset.calls).toEqual([]);
+});
+
+registeredChannelTest("Pi draft query ignores invalid correlation and changed session without observing the editor", async () => {
+  const { connections } = await startChannelServer();
+  const asset = await loadChannelAsset(accepted);
+  let reads = 0;
+  const context = draftContext({ getEditorText: () => { reads += 1; return "private"; } });
+  await asset.handlers.get("session_start")?.({}, context);
+  await waitFor(() => connections.length === 1);
+  const connection = connections[0];
+  for (const fields of [
+    { registration_epoch: "old" }, { session_generation: "old" }, { request_id: "" },
+    { request_id: 1 }, { request_id: null }, { request_id: "🐑".repeat(257) },
+    { registration_epoch: null }, { session_generation: null },
+  ]) queryDraft(connection, "invalid", fields);
+  context.userMessageSessionGeneration = "session-2";
+  queryDraft(connection);
+  await Bun.sleep(30);
+  expect(reads).toBe(0);
+  expect(connection.draftStates).toEqual([]);
+  expect(asset.calls).toEqual([]);
+});
+
+registeredChannelTest("Pi guarded expired delayed frame rejects before UI access and preserves draft byte-identically", async () => {
+  const { connections } = await startChannelServer();
+  const asset = await loadChannelAsset(accepted);
+  const editor = " \tprivate unsent draft 👩🏽‍💻 e\u0301\n";
+  let reads = 0;
+  let mutations = 0;
+  await asset.handlers.get("session_start")?.({}, draftContext({
+    getEditorText: () => { reads += 1; return editor; },
+    holdState: () => { reads += 1; return undefined; },
+    setEditorText: () => { mutations += 1; }, pasteToEditor: () => { mutations += 1; },
+  }));
+  await waitFor(() => connections.length === 1);
+  const connection = connections[0];
+  const frame = { ...delivery(connection, "expired"), if_draft_empty: true, deadline_ms: Date.now() + 10 };
+  const before = Buffer.from(editor);
+  await Bun.sleep(20); // A frame delayed in transit arrives after its first-reservation deadline.
+  connection.socket.write(`${JSON.stringify(frame)}\n`);
+  await waitFor(() => connection.acks.length === 1);
+  expect(connection.acks[0]).toMatchObject({ status: "rejected", reason: "expired" });
+  expect(asset.calls).toEqual([]);
+  expect(reads).toBe(0);
+  expect(mutations).toBe(0);
+  expect(Buffer.from(editor)).toEqual(before);
+  // Expiry is a retained result. A later timeout/deadline value is not payload identity and
+  // cannot renew the first reservation or change a rejected request into an admission.
+  guardedDeliver(connection, "expired", "hello");
+  await waitFor(() => connection.acks.length === 2);
+  expect(connection.acks[1]).toMatchObject({ reason: "expired", duplicate: true });
+  expect(asset.calls).toEqual([]);
+});
+
+for (const [name, deadline] of [
+  ["missing", undefined], ["null", null], ["string", "9999999999999"],
+  ["fractional", 9999999999999.5], ["unsafe", Number.MAX_SAFE_INTEGER + 1],
+  ["object", {}], ["array", []],
+] as const) {
+  registeredChannelTest(`Pi guarded deadline ${name} fails closed unknown before UI access`, async () => {
+    const { connections } = await startChannelServer();
+    const asset = await loadChannelAsset(accepted);
+    let reads = 0;
+    await asset.handlers.get("session_start")?.({}, draftContext({
+      getEditorText: () => { reads += 1; return "private draft"; },
+      holdState: () => { reads += 1; return undefined; },
+    }));
+    await waitFor(() => connections.length === 1);
+    const connection = connections[0];
+    connection.socket.write(`${JSON.stringify({ ...delivery(connection), if_draft_empty: true, deadline_ms: deadline })}\n`);
+    await waitFor(() => connection.acks.length === 1);
+    expect(connection.acks[0]).toMatchObject({ status: "rejected", reason: "unknown" });
+    expect(asset.calls).toEqual([]);
+    expect(reads).toBe(0);
+  });
+}
+
+registeredChannelTest("Pi guarded deadline elapsed during synchronous UI inspection refuses before submit", async () => {
+  const { connections } = await startChannelServer();
+  const asset = await loadChannelAsset(accepted);
+  const deadline = Date.now() + 60_000;
+  const originalNow = Date.now;
+  try {
+    await asset.handlers.get("session_start")?.({}, draftContext({
+      getEditorText: () => "",
+      holdState: () => {
+        Date.now = () => deadline;
+        queueMicrotask(() => { Date.now = originalNow; });
+        return undefined;
+      },
+    }));
+    await waitFor(() => connections.length === 1);
+    const connection = connections[0];
+    connection.socket.write(`${JSON.stringify({ ...delivery(connection), if_draft_empty: true, deadline_ms: deadline })}\n`);
+    await waitFor(() => connection.acks.length === 1);
+    expect(connection.acks[0]).toMatchObject({ status: "rejected", reason: "expired" });
+    expect(asset.calls).toEqual([]);
+  } finally {
+    Date.now = originalNow;
+  }
+});
+
+for (const deadline of ["1e999", "-1e999"]) {
+  registeredChannelTest(`Pi guarded deadline nonfinite ${deadline} fails closed unknown`, async () => {
+    const { connections } = await startChannelServer();
+    const asset = await loadChannelAsset(accepted);
+    await asset.handlers.get("session_start")?.({}, draftContext());
+    await waitFor(() => connections.length === 1);
+    const connection = connections[0];
+    // JSON.parse accepts exponent overflow as Infinity; validation must still reject it.
+    const frame = JSON.stringify({ ...delivery(connection), if_draft_empty: true, deadline_ms: "deadline-placeholder" });
+    connection.socket.write(`${frame.replace('"deadline-placeholder"', deadline)}\n`);
+    await waitFor(() => connection.acks.length === 1);
+    expect(connection.acks[0]).toMatchObject({ status: "rejected", reason: "unknown" });
+    expect(asset.calls).toEqual([]);
+  });
+}
+
+registeredChannelTest("Pi guarded expiry after possible admission does not invent a rejection or resubmit", async () => {
+  const { connections } = await startChannelServer();
+  const pending = deferred<AdmissionReceipt>();
+  const asset = await loadChannelAsset(() => pending.promise);
+  await asset.handlers.get("session_start")?.({}, draftContext());
+  await waitFor(() => connections.length === 1);
+  const connection = connections[0];
+  const deadline = Date.now() + 100;
+  connection.socket.write(`${JSON.stringify({ ...delivery(connection), if_draft_empty: true, deadline_ms: deadline })}\n`);
+  await waitFor(() => asset.calls.length === 1);
+  await Bun.sleep(Math.max(0, deadline - Date.now()) + 10);
+  expect(Date.now() >= deadline).toBe(true);
+  expect(connection.acks).toEqual([]); // No proof of non-admission while the receipt is pending.
+  pending.reject(new Error("possibly admitted before timeout"));
+  await waitFor(() => connection.closed && connections.length === 2);
+  expect(connection.acks).toEqual([]); // Herdr must retain delivery_unknown, never expired/zero sent.
+  expect(connections[1].acks).toEqual([]);
+  expect(asset.calls).toHaveLength(1);
+});

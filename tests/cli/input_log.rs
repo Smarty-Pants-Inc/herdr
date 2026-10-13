@@ -62,7 +62,12 @@ fn exited_receipt(path: &Path) -> serde_json::Value {
     );
     let receipt = receipt.unwrap();
     assert!(receipt["response"].get("error").is_none(), "{receipt}");
-    assert_eq!(receipt["response"]["result"]["type"], "ok", "{receipt}");
+    let expected = if receipt["method"] == "agent.prompt" {
+        "agent_prompted"
+    } else {
+        "ok"
+    };
+    assert_eq!(receipt["response"]["result"]["type"], expected, "{receipt}");
     let pid = receipt["pid"].as_u64().unwrap() as u32;
     assert!(
         wait_for_pid_exit(pid, Duration::from_secs(5)),
@@ -91,15 +96,17 @@ fn exercise_callers(base: &Path) {
     let caller_script = base.join("caller.py");
     fs::write(&caller_script, r#"import ctypes, json, os, pathlib, socket, sys
 sock, pane, receipt_path, text = sys.argv[1:5]
-if sys.argv[5:]:
+method = "agent.prompt" if sys.argv[5:] == ["agent.prompt"] else "pane.send_text"
+if sys.argv[5:] and method != "agent.prompt":
     libc = ctypes.CDLL(None, use_errno=True)
     if libc.prctl(15, ctypes.c_char_p(sys.argv[5].encode()), 0, 0, 0) != 0:
         raise OSError(ctypes.get_errno(), "PR_SET_NAME failed")
-origin = {"pid": os.getpid(), "ppid": os.getppid(), "exe": pathlib.Path(os.readlink("/proc/self/exe")).name, "comm": pathlib.Path("/proc/self/comm").read_text().strip()}
+origin = {"pid": os.getpid(), "ppid": os.getppid(), "sid": os.getsid(0), "method": method, "exe": pathlib.Path(os.readlink("/proc/self/exe")).name, "comm": pathlib.Path("/proc/self/comm").read_text().strip()}
 with socket.socket(socket.AF_UNIX) as connection:
     connection.settimeout(8)
     connection.connect(sock)
-    request = {"id": "input-log-e2e", "method": "pane.send_text", "params": {"pane_id": pane, "text": text, "allow_cross_pane": True}}
+    target_key = "target" if method == "agent.prompt" else "pane_id"
+    request = {"id": "input-log-e2e", "method": method, "params": {target_key: pane, "text": text, "allow_cross_pane": True}}
     connection.sendall((json.dumps(request) + "\n").encode())
     origin["response"] = json.loads(connection.makefile().readline())
 pathlib.Path(receipt_path).write_text(json.dumps(origin))
@@ -205,7 +212,67 @@ pathlib.Path(receipt_path).write_text(json.dumps(origin))
         "renamed caller's original input must reach the shell, not just return OK"
     );
 
-    // All three socket owners are gone now. Do not reconstruct their metadata from
+    // A detached caller deliberately carries a copied pane marker. The marker
+    // is not ancestry or attribution, even when it names a real agent pane.
+    // Use a harmless shell agent, not a paid coding-agent session.
+    let prompt_split = run_cli_json(
+        &socket_path,
+        &["pane", "split", caller_pane, "--direction", "right"],
+    );
+    let prompt_pane = prompt_split["result"]["pane"]["pane_id"].as_str().unwrap();
+    let ready = base.join("prompt-ready");
+    let target_script = base.join("prompt-target.sh");
+    fs::write(&target_script, format!(
+        "#!/bin/sh\nset -eu\n{herdr_bin} pane report-agent \"$HERDR_PANE_ID\" --source custom:input-log-target --agent pi --state idle >/dev/null\nprintf ready > {}\nwhile IFS= read -r _prompt; do :; done\n",
+        shell_quote(&ready),
+    )).unwrap();
+    let launched = run_cli(
+        &socket_path,
+        &[
+            "pane",
+            "run",
+            prompt_pane,
+            &format!("HERDR_AGENT=pi /bin/sh {}", shell_quote(&target_script)),
+        ],
+    );
+    assert!(
+        launched.status.success(),
+        "{}",
+        String::from_utf8_lossy(&launched.stderr)
+    );
+    assert!(wait_until(
+        Duration::from_secs(5),
+        Duration::from_millis(25),
+        || ready.exists()
+    ));
+    let detached_receipt = base.join("detached-receipt.json");
+    let mut detached = Command::new("/usr/bin/timeout");
+    crate::test_command::sanitize_command_env(&mut detached);
+    let output = detached
+        .args(["12s", "/usr/bin/setsid", "--fork", "--wait"])
+        .arg(&python)
+        .arg(&caller_script)
+        .arg(&socket_path)
+        .arg(prompt_pane)
+        .arg(&detached_receipt)
+        .args(["detached-origin-secret", "agent.prompt"])
+        .env("HERDR_ENV", "1")
+        .env("HERDR_PANE_ID", caller_pane)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let detached_origin = exited_receipt(&detached_receipt);
+    assert_eq!(
+        detached_origin["sid"], detached_origin["pid"],
+        "setsid caller owns its session"
+    );
+
+    // All four socket owners are gone now. Do not reconstruct their metadata from
     // /proc while reading: the durable records must already hold the evidence.
     let log_path = base
         .join("state")
@@ -220,7 +287,7 @@ pathlib.Path(receipt_path).write_text(json.dumps(origin))
         let matching: Vec<_> = records
             .iter()
             .filter(|line| {
-                line["method"] == "pane.send_text" && line["caller"]["pid"] == origin["pid"]
+                line["method"] == origin["method"] && line["caller"]["pid"] == origin["pid"]
             })
             .collect();
         assert_eq!(
@@ -238,12 +305,24 @@ pathlib.Path(receipt_path).write_text(json.dumps(origin))
     );
     assert_eq!(pane_record["caller"]["pane"], caller_pane);
     assert_eq!(pane_record["caller"]["agent"], "sender");
+    assert_eq!(pane_record["caller"]["ancestry"], "reached");
+    let server_pid = pane_record["caller"]["ancestry_root_pid"].as_u64().unwrap();
+    let server_exe = fs::read_link(format!("/proc/{server_pid}/exe")).unwrap();
+    assert_eq!(
+        server_exe,
+        fs::canonicalize(env!("CARGO_BIN_EXE_herdr")).unwrap()
+    );
     for (origin, _, unit) in &external_origins {
         let record = record_for(origin);
         eprintln!("external caller actual api-input.jsonl (systemd={systemd_available}): {record}");
         assert!(record["caller"]["pane"].is_null(), "{record}");
         assert!(record["caller"]["agent"].is_null(), "{record}");
         assert!(record["caller"]["session"].is_null(), "{record}");
+        assert_eq!(record["caller"]["ancestry"], "outside", "{record}");
+        assert!(
+            record["caller"]["ancestry_root_pid"].as_u64().is_some(),
+            "{record}"
+        );
         if systemd_available {
             assert_eq!(record["caller"]["unit"], format!("{unit}.scope"));
         }
@@ -265,5 +344,27 @@ pathlib.Path(receipt_path).write_text(json.dumps(origin))
             "caller.ppid must be captured before the caller exits"
         );
     }
+    let detached_record = record_for(&detached_origin);
+    eprintln!("detached copied-marker agent.prompt actual api-input.jsonl: {detached_record}");
+    assert_eq!(detached_record["caller"]["ancestry"], "outside");
+    assert_eq!(detached_record["caller"]["pane_env_present"], true);
+    assert!(detached_record["caller"]["pane"].is_null());
+    assert!(detached_record["caller"]["agent"].is_null());
+    assert_eq!(detached_record["target_pane"], prompt_pane);
+    assert_eq!(detached_record["bytes"], "detached-origin-secret".len());
+    let outside_root = detached_record["caller"]["ancestry_root_pid"]
+        .as_u64()
+        .unwrap();
+    assert_ne!(outside_root, server_pid);
+    for origin in std::iter::once(&pane_origin)
+        .chain(external_origins.iter().map(|(origin, _, _)| origin))
+        .chain(std::iter::once(&detached_origin))
+    {
+        assert_eq!(record_for(origin)["caller"]["sid"], origin["sid"]);
+    }
+    assert!(
+        !raw.contains("HERDR_PANE_ID"),
+        "environment key/value must not enter the log"
+    );
     drop(herdr);
 }

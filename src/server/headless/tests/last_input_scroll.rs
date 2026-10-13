@@ -37,6 +37,7 @@ fn setup() -> (
         .insert(terminal_id.clone(), runtime);
     let (writer, _control, _render) = test_client_writer();
     server.handle_server_event(ServerEvent::ClientShellConnected {
+        peer_context: crate::api::ApiRequestContext::default(),
         client_id: ALICE,
         surface_cols: 80,
         surface_rows: 23,

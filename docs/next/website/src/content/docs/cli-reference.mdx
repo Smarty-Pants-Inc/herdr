@@ -176,12 +176,14 @@ A workspace is a top-level project or work context. Creating one also creates it
 
 ```bash
 herdr worktree list [--workspace ID | --cwd PATH] [--trust-repository]
-herdr worktree create [--workspace ID | --cwd PATH] [--branch NAME] [--base REF] [--path PATH] [--label TEXT] [--focus] [--no-focus] [--trust-repository]
-herdr worktree open [--workspace ID | --cwd PATH] (--path PATH | --branch NAME) [--label TEXT] [--focus] [--no-focus] [--trust-repository]
+herdr worktree create [--workspace ID | --cwd PATH] [--branch NAME] [--base REF] [--path PATH] [--label TEXT] [--allow-project-change] [--focus] [--no-focus] [--trust-repository]
+herdr worktree open [--workspace ID | --cwd PATH] (--path PATH | --branch NAME) [--label TEXT] [--allow-project-change] [--focus] [--no-focus] [--trust-repository]
 herdr worktree remove --workspace ID [--force] [--trust-repository]
 ```
 
 Worktrees are normal Herdr workspaces with Git checkout provenance. `worktree create` creates a Git worktree checkout, opens it as a workspace, and groups it with the parent repo workspace. If `--branch` names an existing local branch, Herdr checks it out; otherwise it creates the branch from `--base` or `HEAD`. Without `--path`, Herdr creates the checkout under `<worktrees.directory>/<repo>/<branch-slug>`.
+
+`worktree create` and `worktree open` preserve project ownership for surviving agent sessions by default. Pass `--allow-project-change` only when you intentionally want to allow those sessions to change project ownership. This permission is separate from `--trust-repository`. Both commands always use `worktree.create_project_checked` / `worktree.open_project_checked`, including when permission is false. Older servers reject these methods; the CLI never retries the legacy methods.
 
 `workspace close` closes only Herdr state. Closing a primary workspace while linked-worktree workspaces are open requires `--group`; without it, the command leaves the group open and returns `workspace_group_close_required`. To delete the checkout, run `worktree remove`. It runs `git worktree remove`, never deletes the branch, and requires `--force` when Git refuses a dirty checkout.
 
@@ -225,6 +227,7 @@ herdr pane swap --source-pane ID --target-pane ID
 herdr pane move <pane_id> --tab <tab_id> --split right|down [--target-pane ID] [--ratio FLOAT] [--focus|--no-focus]
 herdr pane move <pane_id> --new-tab [--workspace ID] [--label TEXT] [--focus|--no-focus]
 herdr pane move <pane_id> --new-workspace [--label TEXT] [--tab-label TEXT] [--focus|--no-focus]
+herdr pane clear-input-poison <pane>
 herdr pane close <pane_id>
 ```
 
@@ -255,8 +258,8 @@ herdr pane read <pane_id> --source recent-unwrapped --lines 120
 Send input:
 
 ```bash
-herdr pane send-text <pane_id> <text>
-herdr pane send-keys <pane_id> <key> [key ...]
+herdr pane send-text <pane_id> [--expected-session ID] <text>
+herdr pane send-keys <pane_id> [--expected-session ID] <key> [key ...]
 herdr pane run <pane_id> [--expected-terminal TERMINAL_ID] <command>
 ```
 
@@ -271,6 +274,22 @@ aliases for `ctrl+c`.
 `pane run` honors live bracketed-paste mode and submits text plus Enter atomically. Prefer it over `send-text` plus `send-keys Enter` for commands; the separate send operations remain low-level and non-submitting.
 
 Use `--expected-terminal <terminal_id>` on `pane run` or `agent start` to refuse a stale pane target. Copy the opaque `terminal_id` from `pane get` or `pane list`; do not derive it from a pane ID, position, or agent name. The server checks the pane's current attachment before it sends input or binds an agent name. An unknown, malformed, or different identity returns `terminal_identity_mismatch` with no input or startup effects. The CLI returns `expected_terminal_unsupported` without sending the guarded operation if the server does not advertise support. It uses guarded method names so replacement by an older server cannot silently remove the check. Without this flag, existing behavior is unchanged. This guard pins the terminal, not the identity of a process or agent session running inside it.
+
+Use `--expected-session ID` on `agent prompt`, `pane send-text`, or `pane send-keys` to refuse input to a different reported native agent session. Copy the current `agent_session_id` from `pane get` or `agent get`. This is the reported ID, not `agent_session.value`: for Pi, that value can be a resume path while Herdr retains the reported ID separately. If no ID is reported, guarded input returns `agent_session_unknown`; a different ID returns `agent_session_mismatch`. These initial refusals reveal no actual ID and write zero input bytes.
+
+An `agent prompt` target can be an alias. Add `--expected-pane ID` to require that it still resolves to the observed pane; a different resolution returns `expected_pane_mismatch` with zero input bytes. Either expectation can be used alone or together, including with `--wait`. `pane send-text` and `pane send-keys` already target an exact normalized `pane_id`, so they do not accept `--expected-pane`.
+
+With `--expected-session`, the server pins the session reporter's process ID and start time at admission, then freshly checks that it is alive and in this PTY's foreground process group before every `write(2)`, including partial chunks, retries, any focus prefix, text, and the delayed Enter. Loss after admission returns `agent_session_lost`: remaining input and Enter are dropped, but partial text or a prefix may already have been written. If text-stage bytes have been written, Linux opens the exact PTY slave from the actor's master and calls `tcflush(slave, TCIFLUSH)` before completion to discard staged unread input. This flush is tty-wide and can also discard other already-staged unread input. It cannot recover bytes already consumed by a reader; the same Pi draft may remain.
+
+For `agent_session_lost`, `partial_text_consumed` is a boolean or `null`, and `flush_failed` reports whether the exact-slave open or `TCIFLUSH` failed. If flushing succeeds (or no text-stage bytes were written, so no flush is needed), `flush_failed` is `false`: `partial_text_consumed` is `true` if and only if text-stage bytes reached the PTY and may have been consumed, and `false` if and only if no text-stage bytes were written. This is not reader acknowledgment. If the exact-slave open or `TCIFLUSH` fails, the error has `partial_text_consumed: null` (unknown) and `flush_failed: true`. Guarded sends report the PTY actor's completion, not just successful enqueue; this is not an acknowledgment from the receiving agent. Do not automatically retry or remove the expectation after an error, because input may already be partial. The actual session ID is never disclosed in these errors.
+
+On an exact-slave open or `TCIFLUSH` failure, Herdr does **not** close the PTY master or terminate the user's process. It drops the remaining request without sending Enter and marks pane input **POISONED**. All PTY writes are refused, including client keystrokes and unguarded API sends. The server refuses input with the typed `pane_input_poisoned` error and sends `Notify`; display of the notice in an attached client is pending in [smarty-dev#7908](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/7908). The operator must explicitly clear the poison with `herdr pane clear-input-poison <pane>`. A later successful flush never automatically clears this state.
+
+Only an explicit operator action clears the poison: `herdr pane clear-input-poison <pane>` (API `pane.clear_input_poison`), run from the attached Herdr client or from a terminal outside every Herdr pane. A caller inside any pane, including the poisoned pane itself, is refused with `operator_origin_required` (`cross_pane_input_denied` for an agent targeting another pane, `input_origin_unknown` when the caller cannot be attributed); there is no `--allow-cross-pane` override. Before clearing, Herdr discards unread pane input once more (`TCIFLUSH`); if that fails, the clear is refused and the pane stays poisoned. **Warning:** text the foreground program already read stays in its own buffer, and a future Enter can submit it. Inspect the pane before clearing. Do not clear automatically or as a retry strategy.
+
+The initial check is atomic with Herdr's reported pane state at admission. It cannot detect a session change that the agent has not reported. Residual races remain: the final native-check/write gap between the fresh process/foreground check and `write(2)`, and the loss/flush/reader race in which a reader can consume staged bytes before the flush. Neither completion nor flushing guarantees zero total bytes written or consumed. The App-to-actor queue and delayed Enter wait are guarded, but do not eliminate these native races. The CLI requires `expected_agent_session_guard`, supported and advertised only on Linux. macOS and Windows fail closed; macOS is pending native proof. The CLI returns `expected_agent_session_unsupported` without sending the guarded operation when support is absent, and uses checked method names so a server replacement after the capability check fails closed. Omitting these flags preserves existing behavior and the separate cross-pane input policy.
+
+Known limitation: after suspension, resuming or reloading the same native session does not restore guarded-send eligibility; start a new session (`/new`) or restart the agent. See [the follow-up issue](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/7577).
 
 Report agent state from custom hooks:
 
@@ -344,7 +363,7 @@ herdr agent list
 herdr agent get <target>
 herdr agent read <target> [--source visible|recent|recent-unwrapped|detection] [--lines N] [--format text|ansi] [--ansi]
 herdr agent send-keys <target> <key> [key ...]
-herdr agent prompt <target> <text> [--wait] [--until STATUS]... [--timeout MS]
+herdr agent prompt <target> <text> [--if-draft-empty | [--expected-session ID] [--expected-pane ID] [--expected-status STATUS] [--wait [--until STATUS]... [--timeout MS]]] [--allow-cross-pane]
 herdr agent rename <target> <name>|--clear
 herdr agent focus <target>
 herdr agent wait <target> [--until STATUS]... [--timeout MS]
@@ -360,7 +379,19 @@ Agent targets are either a unique live agent name or the pane ID that currently 
 
 A successful start returns only after the expected agent owns the same terminal and is ready for interactive input. If detection reports `blocked` during startup, the command returns `agent_not_ready` immediately. The name remains available for `agent read` and `agent send-keys`, and becomes ready for prompts after detection reports `idle`. The default startup timeout is 30000 milliseconds; explicit values must be greater than 3000 and no more than 300000.
 
-`agent prompt` honors live bracketed-paste mode and writes text followed by delayed Enter as one ordered submission, including while the agent is working. Success without `--wait` acknowledges the writes, not the start of a turn. On Windows, Codex receives a paste boundary before Enter so submission does not depend on prompt size; the caller timeout includes submission time. If the agent is already `blocked`, it returns `agent_blocked` without sending input. With `--wait`, a prompt sent from another non-working state has up to five seconds after submission to produce an observed `working` or `blocked` state or Herdr returns `agent_prompt_stalled`; if the caller timeout expires first, Herdr returns the normal `timeout` error. This prevents unrelated `idle`, `done`, or session changes from completing the wait. After activity is observed, it waits for the first requested settled status. It does not track individual turns. If the agent is already working, completion of that active turn may satisfy the wait. `--until` narrows the matching states and is rejected unless `--wait` is also present. Standalone `agent wait` returns immediately when the current status matches. Both default to `idle`, `done`, or `blocked`; use `--until unknown` explicitly when needed.
+Without `--if-draft-empty`, `agent prompt` retains its legacy behavior: it honors live bracketed-paste mode and writes text followed by delayed Enter as one ordered submission, including while the agent is working. Success without `--wait` acknowledges the writes, not the start of a turn. On Windows, Codex receives a paste boundary before Enter so submission does not depend on prompt size; the caller timeout includes submission time. If the agent is already `blocked`, it returns `agent_blocked` without sending input. With `--wait`, a prompt sent from another non-working state has up to five seconds after submission to produce an observed `working` or `blocked` state or Herdr returns `agent_prompt_stalled`; if the caller timeout expires first, Herdr returns the normal `timeout` error. This prevents unrelated `idle`, `done`, or session changes from completing the wait. After activity is observed, it waits for the first requested settled status. It does not track individual turns. If the agent is already working, completion of that active turn may satisfy the wait. `--until` narrows the matching states and is rejected unless `--wait` is also present. Standalone `agent wait` returns immediately when the current status matches. Both default to `idle`, `done`, or `blocked`; use `--until unknown` explicitly when needed.
+
+Add `--expected-status idle` to `agent prompt` to refuse submission unless Herdr's **detected** agent state is idle at admission. An initial mismatch returns `expected_status_mismatch` with zero input bytes. This checks the effective state from hooks and screen detection, independently of whether the pane has been marked seen: an idle agent displayed as `done` still satisfies the idle expectation. Omitting the flag preserves existing prompting behavior, including prompting a working agent.
+
+```bash
+herdr agent prompt reviewer "Review the current diff" --expected-session "$session_id" --expected-status idle
+```
+
+`--expected-status` **requires `--expected-session`**; copy the reported `agent_session_id` from `agent get` into `session_id` for the example above. Status-only guards are not supported. The flag maps to the API's optional `expected_agent_status` field and requires `expected_agent_status_guard` support. If support is absent, the CLI returns `expected_agent_status_unsupported` without sending the prompt. Whenever `--expected-status` is supplied, the CLI uses `agent.prompt_status_checked`: older servers reject this method rather than silently ignoring the status field. There is no legacy retry; do not drop the expectation and retry automatically. `--expected-pane` and `--wait` can also be used.
+
+The detected-status predicate is checked alongside the existing session/reporter guard at admission and before PTY writes. A later detected-status mismatch also returns `expected_status_mismatch`, stops further request bytes, and sends no further Enter. Partial input may already have been written, so this later error does not promise zero total bytes. This is not a wait for idle.
+
+Detected idle is the **last observed state**, not transactional proof that the actual agent is not busy. Hooks and screen detection can lag, and the agent can become busy after a check. Destructive commands still require an agent-side busy check; this flag does not provide one. `--wait` observes activity and settled status after submission rather than strengthening this admission check.
 
 `idle` and `done` both mean ready for input. The CLI/API uses the server's seen state: `done` is idle but not yet marked seen, explicit `pane focus` / `agent focus` commands mark the target seen, and reads do not. Each TUI client tracks viewed completions independently, so its Done badge can differ from the CLI or another client. `blocked` means Herdr recognized an approval or question UI. `unknown` means an agent is present but Herdr cannot classify it confidently, not that its work succeeded.
 
@@ -369,6 +400,44 @@ A successful start returns only after the expected agent owns the same terminal 
 `agent explain` asks the running server to classify the same bottom-buffer detection snapshot used by screen detection, so live output reflects the server's active manifest cache. Because this uses the `agent.explain` socket method, restart or hand off to an updated server after upgrading Herdr before using live explain. Use `--file PATH --agent LABEL` to explain a saved fixture locally instead. The default output shows the agent, final state, manifest source and version, matched rule with its region evidence, and any fallback, skip, or warning reasons. Add `--verbose` for visible evidence flags, cached remote version, local override shadowing, remote update status, and the full evaluated-rules list with matcher and region evidence. Add `--json` for issue reports or tests.
 
 Use `pane send-text`, `pane send-keys`, `pane run`, and `terminal attach` for ordinary terminals, servers, tests, shells, or low-level terminal control. Use `pane run` when you want to submit a command with Enter.
+
+### Registered-channel prompts (unreleased)
+
+```bash
+herdr agent channel-info <target>
+herdr agent draft-state <target> [--allow-cross-pane]
+herdr agent prompt <target> <text> --if-draft-empty [--allow-cross-pane]
+herdr agent prompt-guarded <target> <text> --expected-terminal TERMINAL_ID --expected-registration-epoch EPOCH --request-id ID [--timeout-ms MS] [--allow-cross-pane] [--if-draft-empty]
+```
+
+These commands resolve a terminal without requiring agent screen detection. Use an explicit pane ID, opaque terminal ID, or unique live agent name. `channel-info` returns `terminal_id` and `ready`; a ready channel also includes `registration_epoch` and `session_generation`, with the boolean `draft_guard` capability when known. Missing or `false` `draft_guard` does not support draft guarding. The query does not register an agent. Copy the terminal and epoch from the same ready response, rather than deriving them from a name or pane position:
+
+```bash
+herdr agent channel-info w1:p1
+# Set these variables from result.terminal_id and result.registration_epoch.
+herdr agent prompt-guarded w1:p1 "Review this change" \
+  --expected-terminal "$terminal_id" \
+  --expected-registration-epoch "$registration_epoch" \
+  --request-id review-1 --timeout-ms 10000
+```
+
+`prompt-guarded` sends literal text over the agent's registered socket channel only. It never writes prompt text, preparatory bytes, or Enter to the PTY, changes input focus, or falls back to `agent prompt`. Without `--if-draft-empty`, the existing `agent prompt` behavior is unchanged. Target, text, both pins, and request ID must be nonempty. `--timeout-ms` waits for an admission receipt, not turn completion; it defaults to 10000 and accepts 1–300000 milliseconds. `--allow-cross-pane` explicitly opts into the existing cross-pane input policy; it does not bypass the channel or identity checks.
+
+`agent prompt --if-draft-empty` is a convenience route to the registered channel: it preflights `draft_guard: true`, copies the current terminal/epoch pins, and creates a request ID before calling `agent.prompt_guarded` with `if_draft_empty: true`. It never falls back to typing or legacy prompt delivery. This flag cannot be combined with legacy `--wait`, `--until`, or `--timeout`; such combinations are rejected before sending. For an explicit admission-receipt deadline, use `prompt-guarded --timeout-ms` instead.
+
+On `prompt-guarded`, `--if-draft-empty` also preflights the capability and retains the caller's explicit pins. Pi synchronously checks the editor draft and UI hold immediately before invoking its receipt-returning submit API, with no await or scheduling gap between check and invocation. It preserves the draft: it never clears, replaces, or types into the editor. A nonempty draft is rejected with `agent_prompt_rejected` and `error.reason: "draft_present"`; any non-`undefined` `holdState()` value with `"ui_hold"` (including `dialog`, `custom`, and `editor`); unavailable or unreadable state with `"unknown"`. No registered channel yields `"unregistered"`, and missing draft-guard support yields `"unsupported"`. These refusals do not submit a prompt. Guarding checks admission, not subsequent turn completion.
+
+Guarded frames carry a deadline; Pi synchronously rejects expired frames with `expired` before the checks and submit invocation, without submitting or mutating the editor. Missing or invalid guarded expiry is rejected with `unknown`. A typed failure before socket dispatch means nothing was sent; receipt loss after possible admission remains `delivery_unknown`, never a replay opportunity.
+
+`agent draft-state` is a read-only, redacted observation over the registered channel, with a default two-second query timeout. Its known result reports only whether the draft is empty and the UI hold (`null`, `"dialog"`, `"custom"`, or `"editor"`); it never returns draft text or character counts. Otherwise it returns `{status: "unknown", reason}` with `unregistered` (no channel), `unsupported` (no capability), `timeout` (no timely reply), or `unknown` (unobservable state). Unknown is not an empty draft. An agent querying its own pane is allowed by default; an agent querying another pane needs `--allow-cross-pane`. Ordinary external operators follow the same policy as `agent.prompt`. Authorization is checked before reservation or frame dispatch. A query is not authorization for a later send; the guarded prompt rechecks at admission.
+
+Success returns `status: "accepted"` (admitted to the active session's input) or `"queued"` (admitted to that session's follow-up queue), plus the pinned terminal, epoch, request ID, and session generation. Neither status promises that a model turn finished or succeeded. Within one epoch, the same request ID, exact text, and `if_draft_empty` value share the first outcome without another submission; changing the text or guard value returns `payload_mismatch`. A new ID is a new request, not a safe retry.
+
+Missing/disconnected channels, stale pins, and unsupported servers refuse without PTY input. If admission may have occurred but the receipt is lost, the result is `delivery_unknown`: **never automatically retry, change the ID/epoch to replay, or fall back to terminal input**. A transport failure can also leave admission unknown.
+
+Channels are supported on Linux and macOS only; Windows advertises registration and guarded-prompt capabilities as `false`, and `channel-info` returns `ready: false`. The managed Pi integration registers directly from TUI mode only when both `pi.submitUserMessage` and `ctx.userMessageSessionGeneration` are available. If either is missing, no channel is registered and guarded delivery refuses; the old `sendUserMessage` API is not a fallback. Pi advertises `draft_guard: true` only when synchronous `ctx.ui.getEditorText` and `ctx.ui.holdState` are also available alongside receipt-returning submission; an older registered integration may still lack that capability. There is no registration CLI.
+
+Reconnect, integration reload, or agent-session replacement requires a fresh registration epoch. Queued input belongs to its captured agent session and is cancelled rather than moved to a replacement session. Server restart, restore, live handoff, or terminal/root replacement does not preserve channels or old pins; uncertain deliveries are never replayed. Registration identifies a kernel socket peer under a cooperative same-user trust boundary, not authenticated Pi application identity. See [Registered agent channels](/docs/socket-api/#registered-agent-channels-unreleased) for the direct registration protocol and owner lifecycle.
 
 ## Direct terminal attach
 
@@ -470,13 +539,14 @@ Install, list, and remove plugins:
 
 ```bash
 herdr plugin install <owner>/<repo>[/subdir...] [--ref REF] [--yes]
+herdr plugin update [<plugin_id|owner/repo[/subdir...]>...] [--yes]
 herdr plugin list [--plugin ID] [--json]
 herdr plugin uninstall <plugin_id|owner/repo[/subdir...]>
 herdr plugin enable <plugin_id>
 herdr plugin disable <plugin_id>
 ```
 
-`plugin install` accepts GitHub shorthand only, such as `ogulcancelik/herdr-plugin-examples/worktree-bootstrap`. It uses `git`, shows a trust preview in interactive terminals, runs supported manifest build commands, and stores GitHub installs in a Herdr-managed directory. Use `--yes` for noninteractive installs. Reinstalling a GitHub-managed plugin replaces that managed checkout. Installing over a locally linked plugin is refused. Plugin manifests must declare `min_herdr_version`; install and link fail when the plugin requires a newer Herdr binary. `plugin list` is human-readable by default; pass `--json` for the raw API response.
+`plugin install` accepts GitHub shorthand only, such as `ogulcancelik/herdr-plugin-examples/worktree-bootstrap`. It uses `git`, shows a trust preview in interactive terminals, runs supported manifest build commands, and stores GitHub installs in a Herdr-managed directory. Use `--yes` for noninteractive installs. `plugin update` refreshes every GitHub-managed plugin when no targets are given, or only the listed plugin ids or GitHub sources. It preserves each install's requested ref, skips unchanged commits and ignores locally linked plugins during bulk updates. Reinstalling a GitHub-managed plugin creates a new installation directory. Running plugins keep their original files; new invocations use the new installation. Installing over a locally linked plugin is refused. Plugin manifests must declare `min_herdr_version`; install and link fail when the plugin requires a newer Herdr binary. `plugin list` is human-readable by default; pass `--json` for the raw API response.
 
 Plugin installation and enabled state are global to the current user. A plugin installed, linked, enabled, or disabled through one Herdr session is immediately available with the same state in every session.
 
@@ -487,7 +557,7 @@ herdr plugin link <path> [--disabled]
 herdr plugin unlink <plugin_id>
 ```
 
-`plugin link` accepts a plugin directory containing `herdr-plugin.toml` or a direct manifest path. Use it while authoring or testing a plugin from a local checkout. `plugin unlink` unregisters the plugin and leaves files alone. `plugin uninstall` unregisters a plugin and also removes Herdr-managed GitHub checkout files. For GitHub installs, uninstall accepts either the plugin id or the same `owner/repo[/subdir...]` shorthand used by install. Actions, event hooks, panes, and link handlers are declared in the manifest; runtime action registration is not part of v1.
+`plugin link` accepts a plugin directory containing `herdr-plugin.toml` or a direct manifest path. Use it while authoring or testing a plugin from a local checkout. `plugin unlink` and `plugin uninstall` unregister the plugin and leave files in place so running plugins can finish. Updates and reinstalls also retain previous installations; new invocations use the replacement without a config reload. A later successful installation/update or server startup removes obsolete managed installations after the servers using them have exited. Config reload does not release old installations. Plugins must stop detached background processes before their parent command or pane exits; processes surviving server exit are not protected from cleanup. Legacy installations without cleanup tracking and locally linked files are retained. For GitHub installs, uninstall accepts either the plugin id or the same `owner/repo[/subdir...]` shorthand used by install. Actions, event hooks, panes, and link handlers are declared in the manifest; runtime action registration is not part of v1.
 
 Config directory:
 
@@ -537,6 +607,8 @@ in pane or agent APIs. Native non-terminal plugin panes are outside plugin v1.
 
 New panes identify as `TERM_PROGRAM=herdr`, with `TERM_PROGRAM_VERSION` set to
 Herdr's version. They keep `TERM=xterm-256color` and `COLORTERM=truecolor`.
+They also get `fish_handle_reflow=0`, because Herdr reflows text on resize;
+an inherited or explicit `fish_handle_reflow` value is kept.
 Herdr removes inherited outer-terminal session markers (iTerm2, WezTerm, Kitty,
 Windows Terminal, tmux, screen, and Zellij), iTerm2's `LC_TERMINAL` identity,
 and known Claude Code, Codex, and OMP session markers before applying explicit

@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+pub mod agent_channel;
 pub mod agents;
 pub mod commands;
 pub mod common;
@@ -16,6 +17,7 @@ pub mod tabs;
 pub mod workspaces;
 pub mod worktrees;
 
+pub use agent_channel::*;
 pub use agents::*;
 pub use commands::*;
 pub use common::*;
@@ -32,6 +34,10 @@ pub use tabs::*;
 pub use workspaces::*;
 pub use worktrees::*;
 
+pub const PANE_INPUT_POISON_NOTICE: &str = "Input is blocked because a failed flush may have left staged text on the line. Inspect or discard that text before explicitly clearing input poison.";
+pub const PANE_INPUT_POISON_CLEAR_WARNING: &str =
+    "Clearing input poison first discards unread pane input (TCIFLUSH) and refuses if that fails; text a program already read may remain in its own buffer.";
+
 fn is_false(value: &bool) -> bool {
     !*value
 }
@@ -42,6 +48,15 @@ where
     D: serde::Deserializer<'de>,
 {
     String::deserialize(deserializer).map(Some)
+}
+
+fn deserialize_expected_agent_status<'de, D>(
+    deserializer: D,
+) -> Result<Option<AgentStatus>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    AgentStatus::deserialize(deserializer).map(Some)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -124,8 +139,14 @@ pub enum Method {
     WorktreeList(WorktreeListParams),
     #[serde(rename = "worktree.create")]
     WorktreeCreate(WorktreeCreateParams),
+    /// Project-checked creation; older servers reject instead of ignoring permission.
+    #[serde(rename = "worktree.create_project_checked")]
+    WorktreeCreateProjectChecked(WorktreeCreateProjectCheckedParams),
     #[serde(rename = "worktree.open")]
     WorktreeOpen(WorktreeOpenParams),
+    /// Project-checked opening; older servers reject instead of ignoring permission.
+    #[serde(rename = "worktree.open_project_checked")]
+    WorktreeOpenProjectChecked(WorktreeOpenProjectCheckedParams),
     #[serde(rename = "worktree.remove")]
     WorktreeRemove(WorktreeRemoveParams),
     #[serde(rename = "tab.create")]
@@ -169,6 +190,21 @@ pub enum Method {
     AgentStartGuarded(AgentStartParams),
     #[serde(rename = "agent.prompt")]
     AgentPrompt(AgentPromptParams),
+    #[serde(rename = "agent.register_self")]
+    AgentRegisterSelf(AgentRegisterSelfParams),
+    #[serde(rename = "agent.channel_info")]
+    AgentChannelInfo(AgentChannelInfoParams),
+    #[serde(rename = "agent.draft_state")]
+    AgentDraftState(AgentDraftStateParams),
+    #[serde(rename = "agent.prompt_guarded")]
+    AgentPromptGuarded(AgentPromptGuardedParams),
+    /// Local JSON only; older servers reject instead of ignoring identity guards.
+    #[serde(rename = "agent.prompt_session_checked")]
+    AgentPromptSessionChecked(AgentPromptParams),
+    /// Local JSON only; requires status and session expectations. Older servers
+    /// reject instead of silently ignoring the detected-status guard.
+    #[serde(rename = "agent.prompt_status_checked")]
+    AgentPromptStatusChecked(AgentPromptParams),
     #[serde(rename = "agent.wait")]
     AgentWait(AgentWaitParams),
     #[serde(rename = "pane.split")]
@@ -212,6 +248,8 @@ pub enum Method {
     PaneScroll(PaneScrollParams),
     #[serde(rename = "pane.clear")]
     PaneClear(PaneTarget),
+    #[serde(rename = "pane.clear_input_poison")]
+    PaneClearInputPoison(PaneTarget),
     #[serde(rename = "pane.edit_scrollback")]
     PaneEditScrollback(PaneTarget),
     #[serde(rename = "pane.selection.read")]
@@ -247,8 +285,12 @@ pub enum Method {
     PaneRename(PaneRenameParams),
     #[serde(rename = "pane.send_text")]
     PaneSendText(PaneSendTextParams),
+    #[serde(rename = "pane.send_text_session_checked")]
+    PaneSendTextSessionChecked(PaneSendTextParams),
     #[serde(rename = "pane.send_keys")]
     PaneSendKeys(PaneSendKeysParams),
+    #[serde(rename = "pane.send_keys_session_checked")]
+    PaneSendKeysSessionChecked(PaneSendKeysParams),
     #[serde(rename = "pane.send_input")]
     PaneSendInput(PaneSendInputParams),
     /// Requires `expected_terminal`; older servers reject instead of ignoring the guard.

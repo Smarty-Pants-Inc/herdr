@@ -97,17 +97,106 @@ herdr pane read w1:p2 --source recent --lines 50
 | 客户端 | `client.window_title.set`、`client.window_title.clear` |
 | 会话 | `session.snapshot` |
 | 工作区 | `workspace.create`、`workspace.list`、`workspace.get`、`workspace.focus`、`workspace.rename`、`workspace.move`、`workspace.move_block`、`workspace.report_metadata`、`workspace.close` |
-| Worktree | `worktree.list`、`worktree.create`、`worktree.open`、`worktree.remove` |
+| Worktree | `worktree.list`、`worktree.create`、`worktree.create_project_checked`、`worktree.open`、`worktree.open_project_checked`、`worktree.remove` |
 | 标签页 | `tab.create`、`tab.list`、`tab.get`、`tab.focus`、`tab.rename`、`tab.move`、`tab.close` |
-| 窗格 | `pane.split`、`pane.swap`、`pane.move`、`pane.zoom`、`pane.layout`、`pane.process_info`、`pane.neighbor`、`pane.edges`、`pane.focus_direction`、`pane.resize`、`pane.list`、`pane.current`、`pane.get`、`pane.last_input`、`pane.rename`、`pane.send_text`、`pane.send_keys`、`pane.send_input`、`pane.send_input_guarded`、`pane.read`、`pane.report_agent`、`pane.report_agent_session`、`pane.report_metadata`、`pane.clear_agent_authority`、`pane.release_agent`、`pane.close`、`pane.wait_for_output` |
+| 窗格 | `pane.split`、`pane.swap`、`pane.move`、`pane.zoom`、`pane.layout`、`pane.process_info`、`pane.neighbor`、`pane.edges`、`pane.focus_direction`、`pane.resize`、`pane.list`、`pane.current`、`pane.get`、`pane.last_input`、`pane.rename`、`pane.send_text`、`pane.send_text_session_checked`、`pane.send_keys`、`pane.send_keys_session_checked`、`pane.send_input`、`pane.send_input_guarded`、`pane.read`、`pane.report_agent`、`pane.report_agent_session`、`pane.report_metadata`、`pane.clear_agent_authority`、`pane.release_agent`、`pane.close`、`pane.wait_for_output` |
 | 输入消费者（仅本地 JSON） | `pane.input_consumer.enroll`、`pane.input_consumer.cut`、`pane.input_consumer.release` |
 | 弹窗 | `popup.close` |
 | 布局 | `layout.export`、`layout.apply`、`layout.apply_restorable`、`layout.set_split_ratio` |
-| 智能体 | `agent.list`、`agent.get`、`agent.read`、`agent.explain`、`agent.send_keys`、`agent.prompt`、`agent.wait`、`agent.rename`、`agent.focus`、`agent.start`、`agent.start_guarded` |
+| 智能体 | `agent.list`、`agent.get`、`agent.read`、`agent.explain`、`agent.send_keys`、`agent.prompt`、`agent.prompt_session_checked`、`agent.register_self`、`agent.channel_info`、`agent.draft_state`、`agent.prompt_guarded`、`agent.wait`、`agent.rename`、`agent.focus`、`agent.start`、`agent.start_guarded` |
 | 事件 | `events.subscribe`、`events.wait` |
 | 集成 | `integration.install`、`integration.uninstall` |
 | 插件 | `plugin.link`、`plugin.list`、`plugin.unlink`、`plugin.enable`、`plugin.disable`、`plugin.action.list`、`plugin.action.invoke`、`plugin.log.list`、`plugin.pane.open`、`plugin.pane.focus`、`plugin.pane.close` |
 | 媒体 | `pane.media_open`、`media.answer`、`media.mute`、`media.state`、`media.close` |
+
+### 已注册智能体通道（未发布）
+
+已注册通道是仅限 socket 的提示投递路径。它不会写入 PTY 文本、准备字节、输入焦点事件、转义序列或 Enter，也绝不回退到 `agent.prompt`。没有注册 CLI：智能体集成直接在持久的本地 socket 上自行注册。
+
+使用前检查 `ping.result.capabilities.agent_channel_methods`。在支持的 Linux 和 macOS 服务器上，它包含 `agent.register_self`、`agent.channel_info`、`agent.draft_state` 和 `agent.prompt_guarded`。Windows 的 `agent_registration_channel` 和 `guarded_agent_prompt` 为 `false`；`agent.channel_info` 仍可查询，但返回 `ready: false`，不会尝试投递。
+
+#### 注册与发现
+
+`agent.register_self` 只接受持久直接本地 socket 上的第一个请求。服务器使用内核身份和经过检查的祖先进程关系，将 socket 对端归属到恰好一个实时窗格；调用方提供的进程 ID、可执行文件名、标题、脚本和智能体检测都不是注册依据。例如：
+
+```json
+{"id":"register","method":"agent.register_self","params":{"session_generation":"pi-session-token","pane_id":"w1:p1","draft_guard":true}}
+```
+
+`pane_id` 可选，只断言对端当前窗格，不用于选择窗格。可选的布尔值 `draft_guard` 声明草稿状态查询和守卫接纳能力；缺失或 `false` 表示不支持。Pi 只有在提供同步的 `ctx.ui.getEditorText` 和 `ctx.ui.holdState`，以及带回执的 `pi.submitUserMessage` 时才声明 `true`。成功响应表示连接已准备好接收投递，不表示任何提示已被接纳：
+
+```json
+{"id":"register","result":{"terminal_id":"term_opaque","registration_epoch":"epoch_opaque","session_generation":"pi-session-token","ready":true}}
+```
+
+使用 `agent.channel_info` 在不依赖智能体屏幕检测的情况下发现当前终端通道：
+
+```json
+{"id":"info","method":"agent.channel_info","params":{"target":"w1:p1"}}
+```
+
+就绪结果包含 `terminal_id`、`registration_epoch` 和 `session_generation`，能力已知时还包含布尔值 `draft_guard`；通道缺失、过期、断开、不支持或尚未注册时返回 `ready: false`。调用方必须固定此响应中的终端和注册 epoch，并在投递时原样传入。同一实时对端重新注册时，会先撤销旧 epoch，再激活新 epoch；其他实时对端会被拒绝。断开会撤销就绪状态，但保留实时所有者的占用；只有确认进程死亡后才会释放，无法确定存活状态时拒绝接管。终端/根进程替换、交接、恢复和工作区销毁都会撤销通道。
+
+注册响应之后 socket 仍保持打开。服务器到智能体的投递和智能体到服务器的确认使用有界的换行分隔 JSON 帧：
+
+```json
+{"type":"deliver","registration_epoch":"epoch_opaque","request_id":"caller-key","session_generation":"pi-session-token","text":"literal message"}
+{"type":"ack","registration_epoch":"epoch_opaque","request_id":"caller-key","session_generation":"pi-session-token","status":"accepted"}
+```
+
+ACK 必须匹配实时连接、epoch、请求 ID 和会话代数。ACK 的 `status` 为 `accepted`、`queued` 或 `rejected`；`rejected` 必须带有类型化的 `reason`，`duplicate: true` 可选。拒绝的 ACK 会变为带该 `reason` 的 `agent_prompt_rejected` 错误，而不是成功回执。
+
+只有完整帧才会提交。帧大小、并发请求、回执等待方和每个 epoch 的去重账本都有上限；容量耗尽时拒绝，不会驱逐仍可复用的去重键。服务器在发送前预留 `(registration_epoch, request_id, exact text, if_draft_empty)`。服务器和 Pi 都将守卫值纳入载荷身份，包括保留的旧 epoch 条目。相同载荷的重复请求共享首次回执并标记 `duplicate`；载荷改变时以 `payload_mismatch` 拒绝。新的请求 ID 绝不是自动重试。
+
+#### 隐藏文本的草稿状态查询
+
+`agent.draft_state` 要求 `target`，并接受可选布尔值 `allow_cross_pane`（默认 `false`）作为显式跨窗格许可；查询同一窗格无需许可。它观察已注册接收端的编辑器和 UI hold，不作修改。默认查询超时为两秒。绝不返回草稿文本：
+
+```json
+{"id":"draft","method":"agent.draft_state","params":{"target":"w1:p1"}}
+{"id":"draft","result":{"status":"known","empty":true,"hold":null}}
+{"id":"draft","result":{"status":"unknown","reason":"unsupported"}}
+```
+
+`status: "known"` 中，`empty` 是布尔值，`hold` 为 `null`（无 hold）、`"dialog"`、`"custom"` 或 `"editor"`。结果不包含草稿文本或字符数。`status: "unknown"` 有类型化 `reason`：`unregistered`（无注册通道）、`unsupported`（缺少草稿守卫能力）、`timeout`（未及时回复）或 `unknown`（状态不可观察）。unknown 不能视为空。智能体默认可查询自己的窗格；查询其他窗格需要 `allow_cross_pane: true`。普通外部操作员遵循与 `agent.prompt` 相同的策略。授权在预留或发送帧之前检查。归属或连接不确定时拒绝操作。这次观察不是预留，也不是后续提示的授权；绝不把缓存状态当作后续安全投递的凭据。
+
+在已有注册 socket 上，查询和回复使用相同的 epoch、请求 ID 和会话代数：
+
+```json
+{"type":"draft_state","registration_epoch":"epoch_opaque","request_id":"draft-key","session_generation":"pi-session-token"}
+{"type":"draft_state","registration_epoch":"epoch_opaque","request_id":"draft-key","session_generation":"pi-session-token","empty":true,"hold":null}
+{"type":"draft_state","registration_epoch":"epoch_opaque","request_id":"draft-key","session_generation":"pi-session-token","unknown":true}
+```
+
+已知或未知回复只使用其中一种。服务器校验关联、界限和类型，绝不将意外的草稿文本暴露在 API 结果中。查询共用有限的发送和等待预算。
+
+#### 守卫投递与接纳
+
+`agent.prompt_guarded` 要求目标、字面 `text`、`expected_terminal`、`expected_registration_epoch` 和调用方唯一的 `request_id`。`timeout_ms` 默认 10000，必须在 1 到 300000 之间；`allow_cross_pane` 可选，但不会绕过通道校验。可选布尔值 `if_draft_empty` 默认为 `false`：
+
+```json
+{"id":"deliver-1","method":"agent.prompt_guarded","params":{"target":"w1:p1","text":"Review this change","expected_terminal":"term_opaque","expected_registration_epoch":"epoch_opaque","request_id":"review-1","timeout_ms":10000,"if_draft_empty":true}}
+```
+
+请求 `if_draft_empty: true` 前必须确认 `agent.channel_info.result.draft_guard == true`；否则旧服务器可能忽略新字段。CLI 的 `agent prompt --if-draft-empty` 和 `agent prompt-guarded --if-draft-empty` 都会预检能力，不会回退到键入或原有路径。便捷 `agent prompt` 标志不能与 `--wait`、`--until`、`--timeout` 组合。不带该标志时，原有 `agent prompt` 行为不变；原始 `agent.prompt` 不是草稿守卫方法。
+
+请求守卫时，`deliver` 帧增加 `if_draft_empty: true` 和 `deadline_ms`；无守卫帧省略守卫标志。`deadline_ms` 是服务器首次预留时固定的绝对 Unix 纪元毫秒期限，不是新的公开 API 参数。重复请求保留首次期限；调用方超时不同不改变载荷身份。Pi 在编辑器/hold 检查和 submit 调用前同步校验期限：`Date.now() >= deadline_ms` 以 `expired` 拒绝，不提交也不修改编辑器；守卫期限缺失或无效以 `unknown` 拒绝。
+
+Pi 在调用 `pi.submitUserMessage` 前同步检查编辑器和 hold，检查与调用间无 await 或调度间隙，调用后再等待回执。绝不修改编辑器，也不使用键入或原有入口。非空草稿以 `draft_present` 拒绝，任何非 `undefined` 的 `holdState()` 值都以 `ui_hold` 拒绝（包括 `dialog`、`custom`、`editor`），getter 缺失、异常、非字符串草稿或不可观察的状态以 `unknown` 拒绝。这些都成为带类型化 `error.reason` 的 `agent_prompt_rejected` 错误。缺少注册或能力分别以 `unregistered` 或 `unsupported` 拒绝。这些接纳前拒绝不会提交任何提示，并保留草稿；之前的草稿查询不能绕过检查。
+
+服务器会重新检查终端连接、窗格祖先关系、所有者存活状态、前台资格、epoch 以及 socket 写入边界。只有固定通道仍有效时才发送帧。成功响应是接纳回执：
+
+```json
+{"id":"deliver-1","result":{"terminal_id":"term_opaque","registration_epoch":"epoch_opaque","request_id":"review-1","status":"accepted","session_generation":"pi-session-token"}}
+```
+
+`accepted` 表示已接纳到活动 Pi 会话输入；`queued` 表示已进入该会话的后续队列。两者都不表示模型轮次已完成或成功。托管 Pi 集成只在 TUI 模式注册，并检测 `pi.submitUserMessage` 和 `ctx.userMessageSessionGeneration`。任一缺失或会话处于 headless 模式时，都不注册接收器，守卫投递会拒绝；旧的无返回值 `sendUserMessage` API 绝不会作为回退。
+
+Pi 使用 `registrationEpoch`、`requestId`、`sessionGeneration`、字面 `text`、`deliverAs: "followUp"` 和 `expandPromptTemplates: false` 调用带回执的入口。它返回 `accepted`、`queued` 或带类型的 `rejected` 原因，例如 `no_session`、`session_changed`、`payload_mismatch`、`shutting_down`、`admission_refused` 或 `unsupported`。被输入钩子消费或拒绝的内容不是已接纳的用户消息。排队工作绑定到捕获的会话代数；会话替换时取消，不会改投到新会话。
+
+socket 发送前的类型化失败表示没有发送任何内容。如果 socket 在可能发送前关闭或超时，投递会失败并保持拒绝。如果可能已经接纳但 ACK 丢失，结果为 `delivery_unknown`，既不是成功也不能证明未投递。绝不自动重试、重放旧 epoch、创建新的请求 ID 重新发送或回退到 PTY 输入。通道对保留的 epoch 账本提供至多一次尝试，但不承诺崩溃时的恰好一次。
+
+身份边界是合作式同用户边界：内核对端身份能证明进程和窗格归属，但不能证明该进程就是 Pi，也不能阻止同用户对端伪造协议。现有所有者冲突可防止意外接管，而不是防御恶意同用户冒充。重连、重载或会话替换需要重新注册；服务器重启、恢复、交接或终端/根进程替换不会保留通道或固定标识。新的 epoch 和会话代数围栏防止迟到的帧和 ACK 跨越这些边界；未知投递绝不重放。
 
 `agent.wait` 由服务器拥有并由事件驱动。它会固定到已解析的窗格占用者,因此替换后的智能体不能满足该等待。`agent.prompt` 接受可选的 `wait` 对象,其中包含 `until` 和 `timeout_ms`;这样可在一个请求中提交提示并开始等待,避免两个独立调用之间的竞态。如果解析出的智能体已经是 `blocked`,`agent.prompt` 不会发送输入或开始等待,而是返回 `agent_blocked`。
 
@@ -279,6 +368,50 @@ principal 由服务器解析，每个客户端连接只绑定一次。在 Linux 
 
 该守卫标识的是终端，而不是终端内的智能体名称、进程或原生智能体会话。它不会改变单独的跨窗格输入策略。
 
+### 预期智能体会话守卫
+
+`agent.prompt`、`pane.send_text` 和 `pane.send_keys` 接受可选的 `expected_agent_session_id` 字符串。请从当前的 `pane.get` 或 `agent.get` 记录复制 `agent_session_id`，不要使用 `agent_session.value`。对于 Pi，后者可以是恢复路径；服务器会单独保留上报的原生 ID。没有上报 ID 时返回 `agent_session_unknown`；ID 不同时返回 `agent_session_mismatch`。这些初始拒绝不会写入任何输入字节，也绝不包含实际 ID。
+
+服务器将已接受的会话上报绑定到本地套接字连接方的进程 ID 和启动时间。接受请求时，它会用实时原生检查，而不是缓存的智能体检测结果，确认同一个进程仍存活，并属于该窗格 PTY 当前的前台进程组。上报进程已退出、已暂停、转入后台、未绑定或被替换时，即使退出检测尚未更新窗格，也会初始拒绝并返回 `agent_session_unknown`，不写入任何输入字节。此检查仅支持 Linux；macOS、Windows 和未支持的平台在无法确认安全时会以 `expected_agent_session_unsupported` 拒绝。macOS 的原生证明尚待实现。短生命周期的钩子上报进程退出后，不能授权之后的守卫发送。省略会话预期值时，不应用此进程检查。
+
+固定的上报者和预期 ID 随请求传入 PTY actor。在每次 `write(2)` 前，actor 都针对自身的 PTY master 重新执行实时原生检查，包括部分写入、重试、任何焦点前缀、文本和延迟 300 ms 的 Enter。接受后若失去所有权，会返回 `agent_session_lost`，丢弃剩余输入和 Enter。可能已经写入部分文本或前缀。如果已写入文本阶段的字节，Linux 会从 actor 的 PTY master 打开其对应的确切 slave，并在返回完成结果前调用 `tcflush(slave, TCIFLUSH)`，丢弃已暂存但尚未读取的输入。此刷新作用于整个 tty，也可能丢弃其他已经暂存的未读输入。它无法撤回读取方已经消费的字节；同一个 Pi 草稿可能仍然保留。此错误不保证总写入或总消费字节数为零。
+
+`agent_session_lost` 的 `error.partial_text_consumed` 为布尔值或 `null`，`error.flush_failed` 表示打开确切 slave 或执行 `TCIFLUSH` 是否失败。刷新成功时（或未写入文本阶段的字节、无需刷新时），`flush_failed` 为 `false`：当且仅当文本阶段的字节已到达 PTY、可能已被消费时，`partial_text_consumed` 为 `true`；当且仅当没有写入任何文本阶段的字节时，为 `false`。这不是读取方的接收确认。如果打开确切 slave 或执行 `TCIFLUSH` 失败，错误返回 `partial_text_consumed: null`（未知）和 `flush_failed: true`。会话守卫下的文本和按键发送会等待 actor 的类型化完成结果，而非在入队时返回成功。完成确认的是 PTY 写入，而不是接收方智能体的确认。丢失错误只会显示预期 ID，绝不显示实际 ID；出错后不要自动重试或降级为 unchecked 操作。
+
+如果打开确切 slave 或执行 `TCIFLUSH` 失败，Herdr 不会关闭 PTY master，也不会终止用户进程。它会丢弃剩余请求、不发送 Enter，并将窗格输入标记为 **POISONED**。所有 PTY 写入都会被服务器以类型化错误 `pane_input_poisoned` 拒绝，包括客户端按键和无守卫的 API 发送；服务器还会发送 `Notify`。操作员须显式执行 `herdr pane clear-input-poison <pane>` 才能清除；在已连接客户端中显示该通知的功能仍待 [smarty-dev#7908](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/7908) 实现。之后刷新成功也绝不会自动清除此状态。
+
+只有操作员显式调用 `pane.clear_input_poison`（指定 `pane_id`），或执行 CLI `herdr pane clear-input-poison <pane>` 才能清除，且须来自已连接的 Herdr 客户端或任何 Herdr 窗格之外的调用方。任何窗格内的调用方（包括被污染的窗格本身）都会收到 `operator_origin_required`（智能体针对其他窗格时为 `cross_pane_input_denied`，无法归属的调用方为 `input_origin_unknown`）；`allow_cross_pane` 不适用。清除前 Herdr 会再次丢弃窗格中未读取的输入（`TCIFLUSH`）；若失败，请求返回 `pane_clear_input_poison_failed`，窗格保持污染状态。**警告：** 前台程序已读取的文本仍留在其自身缓冲区，之后的 Enter 可能提交它。清除前请检查窗格。不要自动清除，也不要将清除作为重试策略。
+
+```json
+{"id":"clear_input_poison","method":"pane.clear_input_poison","params":{"pane_id":"w1:p1"}}
+```
+
+内置的 Pi 集成版本 11 和 OMP 集成版本 12 会上报原生 ID 和未改变的恢复路径。旧的仅上报路径的集成会返回 `agent_session_unknown`；请运行 `herdr integration install pi` 或 `herdr integration install omp` 重新安装更新后的集成，再在安全的停顿点重启或重新加载该智能体，以加载更新的钩子并上报 ID。这一步加载钩子并不等于从暂停中恢复：恢复或重新加载同一个原生会话不会恢复带守卫发送的资格。请开启新会话（`/new`）或重启智能体；参见[后续问题](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/7577)。
+
+`agent.prompt` 还接受 `expected_pane_id`，要求其目标（包括别名）解析到该精确窗格。解析到不同窗格时初始拒绝并返回 `expected_pane_mismatch`，不写入任何输入字节。这些预期条件可以单独或一起使用，也可与可选的 `wait` 对象一起使用。窗格发送操作已指定精确的 `pane_id`，没有 `expected_pane_id` 字段。初始检查与接受请求时 Herdr 的已上报窗格状态是原子的，但不是与智能体尚未上报的内部会话变化保持原子性。仍有两类残余竞态：最后一次实时进程／前台原生检查与 `write(2)` 之间的检查／写入间隙，以及所有权丢失／刷新／读取方之间的竞态；读取方可能在刷新前消费已暂存的字节。完成结果和刷新都不保证总写入或总消费字节数为零。App 到 actor 的队列和延迟 Enter 的等待受守卫保护，但不能消除这些原生竞态。省略预期条件会保留现有行为，不改变跨窗格输入策略。
+
+请检查 `ping.result.capabilities.expected_agent_session_guard == true`（仅 Linux 支持并通告 `true`；macOS 和 Windows 通告 `false`，在无法确认安全时拒绝操作，macOS 的原生证明尚待实现）。带守卫的操作使用 `agent.prompt_session_checked`、`pane.send_text_session_checked` 和 `pane.send_keys_session_checked`。checked prompt 方法要求至少一个预期条件；checked 窗格发送方法要求 `expected_agent_session_id`。旧服务器会以 `invalid_request` 拒绝这些名称，而不是静默忽略守卫；即使在 ping 和操作之间被替换也是如此。拒绝后不要回退到 unchecked 方法。CLI 在使用 `--expected-session` 或 `agent prompt --expected-pane` 时使用这些别名；缺少该能力时，它返回 `expected_agent_session_unsupported`，不发送操作。
+
+```json
+{"id":"checked_prompt","method":"agent.prompt_session_checked","params":{"target":"worker","text":"review this change","expected_agent_session_id":"reported_id_from_agent_get","expected_pane_id":"w1:p1","wait":{"until":["idle"],"timeout_ms":30000}}}
+{"id":"checked_text","method":"pane.send_text_session_checked","params":{"pane_id":"w1:p1","text":"hello","expected_agent_session_id":"reported_id_from_pane_get"}}
+{"id":"checked_keys","method":"pane.send_keys_session_checked","params":{"pane_id":"w1:p1","keys":["Enter"],"expected_agent_session_id":"reported_id_from_pane_get"}}
+```
+
+### 检测到的智能体状态预期守卫
+
+智能体提示 params 接受可选的 `expected_agent_status` 字段，但**必须提供 `expected_agent_session_id`**。不支持仅指定状态的守卫：状态预期没有会话预期时，返回 `invalid_request`。将状态设为 `"idle"`，可要求 Herdr 在接受请求时**检测到的**智能体状态为 idle。初始不匹配会在写入任何输入字节前返回 `expected_status_mismatch`。省略该字段会保留现有提示行为；显式 `null`、非字符串或未知状态会导致 `invalid_request`，而不是无守卫提示。
+
+请检查 `ping.result.capabilities.expected_agent_status_guard == true`，并使用 `agent.prompt_status_checked` 发送状态守卫提示。该方法要求同时提供 `expected_agent_status` 和 `expected_agent_session_id`。包括仅支持会话守卫的服务器在内，旧服务器会拒绝未知方法，而不是静默忽略状态字段。只要指定 `--expected-status`，CLI 就使用此方法；不支持时返回 `expected_agent_status_unsupported`。不会用旧方法重试；不要静默移除预期条件，也不要在拒绝后回退到其他提示方法。支持此能力的服务器也会强制执行 `agent.prompt` 或 `agent.prompt_session_checked` 上提供的该字段，但仅凭这些名称不能保证旧服务器会执行检查。
+
+```json
+{"id":"status_checked_prompt","method":"agent.prompt_status_checked","params":{"target":"worker","text":"review this change","expected_agent_session_id":"reported_id_from_agent_get","expected_agent_status":"idle"}}
+```
+
+该比较使用钩子和屏幕检测得出的有效检测状态，而非窗格的已查看状态或 `done` 显示。显示为 `done` 的 idle 智能体满足 `"idle"`。除必需的会话预期外，还可提供 `expected_pane_id` 和可选的 `wait` 对象。检测状态条件附着在现有会话／上报者守卫上，在接受请求时和 PTY 写入前检查。后续检测状态不匹配也会返回 `expected_status_mismatch`，停止请求的剩余字节，不再发送 Enter。可能已经写入部分输入；此后续错误不保证总写入字节数为零。会话所有权丢失仍是单独的 `agent_session_lost` 错误。
+
+检测到的 idle 是**最后观察到的状态**，并非实际智能体不忙的事务性证明。钩子和屏幕观察可能滞后，智能体也可能在检查后变忙。破坏性命令仍需要智能体侧的忙碌检查。这不是等待 idle 的操作，`wait` 仍观察提交后的活动和稳定状态。
+
 `pane.send_keys` 和 `pane.send_input.keys` 接受 Herdr 组合键字符串: 普通可打印键、`enter` 和 `esc` 这类特殊键、`ctrl+h`、`control+j`、`alt+x`、`shift+tab` 这类修饰组合键、`f1` 这类功能键,以及 `minus` 和 `plus` 这类命名标点。它们不接受 `prefix+` 绑定字符串。
 
 ```json
@@ -427,6 +560,17 @@ herdr notification show "build failed" --body "api workspace" --position top-lef
 `client.window_title.clear` 把标题交还给 `ui.window_title`。响应是 `type: "client_window_title"`,带 `changed` 和 `set`、`cleared` 或 `no_foreground_client` 之一的 reason。
 
 Worktree 方法把 Git 检出作为 Herdr 工作区管理。`worktree.create` 创建检出,并返回新的 `workspace`、`tab`、`root_pane` 和 `worktree` 记录。请求的分支已在本地存在时检出它;否则从请求的 base 或 `HEAD` 创建分支。`worktree.open` 打开已有检出,或返回已打开的工作区。`worktree.remove` 对关联的子工作区运行 `git worktree remove`,从不删除分支。
+
+`worktree.create_project_checked` 和 `worktree.open_project_checked` 是经过安全检查的别名。它们使用与旧方法相同的扁平参数和响应，并添加可选的 `allow_project_change`（默认 `false`）。它们保留仍存续的智能体会话的项目归属；当变更需要明确许可时，返回 `project_change_refused`。只有有意改变归属时才设置 `allow_project_change: true`；它不授予仓库信任。旧的 `worktree.create` 和 `worktree.open` 保持原参数形状不变，且不授予此许可。
+
+CLI 即使不带 `--allow-project-change` 也始终使用经过检查的方法名。端点客户端必须在 welcome 的 `methods` 列表中检查相应方法名。旧服务器会拒绝这些方法；切勿回退到旧名称，也不要向旧方法发送许可字段。
+
+```json
+{"id":"checked_create","method":"worktree.create_project_checked","params":{"workspace_id":"w1","branch":"worktree/api","allow_project_change":true}}
+{"id":"checked_open","method":"worktree.open_project_checked","params":{"workspace_id":"w1","branch":"worktree/api","allow_project_change":false}}
+```
+
+下文的来源选择、路径规则、响应记录和生命周期事件也适用于经过检查的别名。
 
 从来源工作区创建 worktree:
 
@@ -606,9 +750,25 @@ action = "bootstrap"
 {"id":"req_plugin_invoke","method":"plugin.action.invoke","params":{"action_id":"example.worktree-bootstrap.bootstrap","context":{"invocation_source":"keybinding"}}}
 ```
 
-`plugin.action.invoke` 解析清单动作,启动清单命令,并返回 Herdr 构建的调用上下文和已启动命令的日志记录。缺失的上下文字段会从活动工作区、标签页、聚焦窗格、worktree 来源信息和请求 id 补全。调用被禁用插件的动作返回 `plugin_disabled` 错误。
+`plugin.action.invoke` 解析清单动作,启动清单命令,并返回 Herdr 构建的调用上下文和已启动命令的日志记录。调用窗格由 Herdr 验证的调用进程归属决定,而不是请求中的 ID 或 UI 焦点。即使未提供窗格 ID,Herdr 也会从该窗格构建工作区、标签页、cwd、智能体和 worktree 字段。对于已归属窗格的调用方,`context.focused_pane_id` 只是待验证的声明;不能解析为调用方自身窗格的 ID 会返回 `invoking_pane_mismatch`。没有窗格归属的调用方无论提供什么窗格 ID,都会得到全局动作,不接收窗格、工作区或标签页字段。调用方提供的派生字段会被忽略,但调用元数据仍可使用。调用被禁用插件的动作返回 `plugin_disabled` 错误。
 
 Herdr 注入 `HERDR_SOCKET_PATH`、`HERDR_BIN_PATH`、`HERDR_ENV=1`、`HERDR_PLUGIN_ID`、`HERDR_PLUGIN_ROOT`、`HERDR_PLUGIN_CONFIG_DIR`、`HERDR_PLUGIN_STATE_DIR`、`HERDR_PLUGIN_CONTEXT_JSON`,以及可用的 `HERDR_WORKSPACE_ID`、`HERDR_TAB_ID` 和 `HERDR_PANE_ID` 值。动作命令还收到 `HERDR_PLUGIN_ACTION_ID`;事件钩子收到 `HERDR_PLUGIN_EVENT` 和 `HERDR_PLUGIN_EVENT_JSON`;窗格命令收到 `HERDR_PLUGIN_ENTRYPOINT_ID`。
+
+插件动作命令通常还会收到秘密的 `HERDR_PLUGIN_ACTION_TOKEN`。本地 CLI 会自动
+在内容写入请求以及 `pane.split`、`tab.create`、`workspace.create` 和
+`workspace.create_linked` 中携带它。原始 API 客户端可在与 `id`、`method`、`params`
+同级的可选 `plugin_action_token` 字段中提供它;请求参数保持不变。不使用
+`allow_cross_pane` 时,有效令牌只授权写入动作的调用终端,以及由携带同一令牌的
+请求创建的终端。这些权限跟随稳定的终端身份,移动或重命名后仍然保留,但不会扩展到
+其他已有终端、被重用的公开 ID 或其他授权创建的终端。全局动作没有调用终端,只能
+写入它自己创建的终端。有效令牌指向其他已有终端时返回 `cross_pane_input_denied`。
+无效、过期、撤销、属于其他服务器或格式错误的令牌返回 `input_origin_unknown`。
+显式的 `allow_cross_pane` 仍是单独的覆盖选项。令牌只在发放它的服务器上、动作进程
+存活期间有效,最长十分钟。服务器最多保留 256 个授权(包括已撤销的);当有效或待定
+的授权占满且无法清理、无法生成安全随机数或无法绑定调用终端时,不会发放授权,
+用户调用的动作(无论是全局动作还是窗格动作)都不会启动。Herdr 会显示错误,说明
+该动作未能获得安全授权,请重试。启动钩子和事件钩子不会收到动作令牌。不要将令牌写入日志。
+同一 OS 用户的进程可能读取彼此的环境,因此它不是这些进程之间的隔离边界。
 
 列出最近的动作和事件命令日志:
 
@@ -806,6 +966,14 @@ workspace 的 get/list 响应会公开生成的 `tokens` 映射,空间侧边栏�
 
 第一个响应确认订阅。之后的行是推送的事件。所有条目都必须有效:如果引用的任何窗格不存在,Herdr 会拒绝整个请求,返回错误并关闭连接。请刷新窗格列表后重试,不要假定其他条目已经订阅。生命周期事件订阅从请求被接受时开始,不会重放在此之前保留的事件。
 
+订阅被拒绝时,服务器返回一个包含请求 `id` 和稳定 `error.code` 的错误响应,不开始数据流并关闭连接:
+
+- `invalid_request`:请求或订阅条目格式无效,或指定了此服务器不支持的订阅 `type`(例如向旧版 Herdr 请求 `pane.agent_session_changed`)。
+- `pane_not_found`:窗格范围的条目指定了不存在的窗格。
+- `server_unavailable`:服务器无法处理该请求,例如正在关闭。
+
+如果套接字不接受连接,则不会有任何响应;请视为服务器未运行。
+
 生命周期和智能体状态事件按有界批次发送,每个订阅内保持事件顺序。事件历史不是持久日志。如果订阅者落后到保留范围之外,包括订阅初始化期间,服务器会发送包含原请求 `id` 和 `error.code: "events_lost"` 的错误响应,然后关闭该订阅连接,而不是静默跳过缺失事件后继续发送。其他客户端的连接不受影响。各类事件共享历史缓冲,因此即使被淘汰的事件可能不匹配此订阅的过滤条件,仍会报告溢出。
 
 收到 `events_lost` 后,将缓存状态视为过期。建立新订阅并等待 `subscription_started`,然后持续读取,同时在另一条连接上请求 `session.snapshot`。通过服务器返回的当前状态重新核对缓存：用快照整体替换缓存,将收到的事件作为缓存失效通知并触发再次读取。串行执行刷新；如果读取期间又收到事件,完成后再次刷新。
@@ -814,7 +982,7 @@ workspace 的 get/list 响应会公开生成的 `tokens` 映射,空间侧边栏�
 
 工作区事件订阅包括 `workspace.created`、`workspace.updated`、`workspace.metadata_updated`、`workspace.renamed`、`workspace.moved`、`workspace.reordered`、`workspace.closed` 和 `workspace.focused`。`workspace.metadata_updated` 报告令牌变更和 TTL 到期,但不会调用插件事件钩子。其他工作区事件描述 Herdr UI/运行时的生命周期。当工作区属于 worktree 组时,`workspace.created` 包含可选的 `workspace.worktree` 来源信息。`workspace.moved` 包含被移动的 `workspace_id`、请求的 `insert_index` 和更新后的有序 `workspaces` 列表。`workspace.reordered` 包含原子移动的 `workspace_ids`、可选的 `before_workspace_id` 和服务器确认的有序 `workspaces` 列表。在移除前 Herdr 仍能识别时,`workspace.closed` 包含最终的 `workspace` 快照。
 标签页事件订阅包括 `tab.created`、`tab.closed`、`tab.focused`、`tab.renamed` 和 `tab.moved`。`tab.moved` 包含被移动的 `tab_id`、`workspace_id`、请求的 `insert_index` 和该工作区更新后的有序 `tabs` 列表。
-窗格事件订阅包括 `pane.created`、`pane.updated`、`pane.closed`、`pane.focused`、`pane.moved`、`pane.exited`、`pane.agent_detected`、`pane.output_matched`、`pane.agent_status_changed` 和 `pane.scroll_changed`。`pane.focused` 也会上报任意连接到此服务器的客户端手动选择窗格的变化，不会移动其他客户端的视图，且载荷不包含客户端身份。重复选择已选中的窗格不会再次发出事件。终端标题变化可能发出 `pane.updated`,但如果原始标题只有旋转指示符发生变化且 `terminal_title_stripped` 不变,则不会发出。`pane.scroll_changed` 只针对一个 `pane_id`,每当 Herdr 观察到滚动快照变化时,都会发出 `pane_id`、`workspace_id` 和当前 `scroll` 指标。
+窗格事件订阅包括 `pane.created`、`pane.updated`、`pane.closed`、`pane.focused`、`pane.moved`、`pane.exited`、`pane.agent_detected`、`pane.output_matched`、`pane.agent_status_changed`、`pane.agent_session_changed` 和 `pane.scroll_changed`。`pane.focused` 也会上报任意连接到此服务器的客户端手动选择窗格的变化，不会移动其他客户端的视图，且载荷不包含客户端身份。重复选择已选中的窗格不会再次发出事件。终端标题变化可能发出 `pane.updated`,但如果原始标题只有旋转指示符发生变化且 `terminal_title_stripped` 不变,则不会发出。`pane.scroll_changed` 只针对一个 `pane_id`,每当 Herdr 观察到滚动快照变化时,都会发出 `pane_id`、`workspace_id` 和当前 `scroll` 指标。`pane.agent_session_changed` 与 `pane.agent_status_changed` 一样只针对一个 `pane_id`。当该窗格中的智能体(通过 `pane.report_agent_session`,或携带会话的 `pane.report_agent`)报告的会话 id 与窗格当前会话不同时发出;同一会话以不同的实际智能体会话 id 报告时(id 被设置、清除或替换)也会发出。以相同的实际 id 再次报告当前会话不会发出事件。事件包含 `pane_id`、`workspace_id`、`agent`、`session_id`、`previous_session_id`、`agent_session_id` 和 `previous_agent_session_id`;窗格之前没有会话时 `previous_session_id` 为 `null`。`session_id` 与窗格的 `agent_session.value` 一致:即报告的 `agent_session_id`,对于 Pi 和 omp,如果报告了 `agent_session_path` 则为该路径。`agent_session_id` 是此次报告后 `pane get` 返回的 `agent_session_id` 实际 id,`previous_agent_session_id` 是报告前的实际 id;未绑定实际 id 时二者为 `null`(例如首次仅报告路径,或报告了不带 id 的另一个会话);仅以路径报告已绑定的同一会话会保留其 id。因此订阅者可以通过 `agent_session_id` 为 `null` 发现未携带实际 id 注册的会话。只跟踪 Herdr 官方智能体集成报告的会话。
 布局事件订阅包括 `layout.updated`。该事件携带一个标签页更新后的 `PaneLayoutSnapshot`。使用 `session.snapshot` 维护缓存的客户端应将该事件作为重新读取受影响布局的通知；延迟到达的载荷可能早于最新快照。
 
 Worktree 事件订阅包括 `worktree.created`、`worktree.opened` 和 `worktree.removed`。Worktree 事件描述 Git 检出的生命周期。`worktree.created` 包含打开的 `workspace` 和创建的 `worktree`。`worktree.opened` 包含目标 `workspace`、打开的 `worktree` 和 `already_open`。`worktree.removed` 包含 `workspace_id`、被移除的 `worktree` 和 `forced`。
@@ -823,9 +991,11 @@ Worktree 事件订阅包括 `worktree.created`、`worktree.opened` 和 `worktree
 
 ## API 输入日志
 
-在 `pane.send_text`、`pane.send_input`、`pane.send_keys`、`agent.send_keys` 或 `agent.prompt` 写入窗格之前，herdr 会向其状态目录中的 `api-input.jsonl`（例如 `~/.local/state/herdr/api-input.jsonl`，仅所有者可读）追加一行 JSON。该行记录时间（`ts_ms`）、方法、目标窗格和终端、字节数，以及 herdr 通过 socket 对端进程得知的调用方：pid、窗格、智能体名称和智能体会话。它从不记录文本。如果 herdr 无法写入该行，就会以 `input_log_unavailable` 拒绝该输入。
+在 `pane.send_text`、`pane.send_input`、`pane.send_keys`、`agent.send_keys` 或 `agent.prompt` 写入窗格之前，或 `agent.prompt_guarded` 向智能体通道投递之前，herdr 会向其状态目录中的 `api-input.jsonl`（例如 `~/.local/state/herdr/api-input.jsonl`，仅所有者可读）追加一行 JSON。该行记录时间（`ts_ms`）、方法、目标窗格和终端、字节数，以及 herdr 通过 socket 对端进程得知的调用方：pid、窗格、智能体名称和智能体会话。它从不记录文本。当日志达到 32 MiB 时，herdr 会在追加下一行之前将其重命名为 `api-input.jsonl.1`（替换上一代）。如果日志已满且轮转失败，herdr 会以 `input_log_full` 拒绝该输入，错误中包含日志路径和轮转错误。如果 herdr 因其他原因无法写入该行，就会以 `input_log_unavailable` 拒绝该输入。会话检查形式（`pane.send_text_session_checked`、`pane.send_keys_session_checked` 和 `agent.prompt_session_checked`）在其预期会话检查接受输入后，与对应的基础方法完全一样地以基础方法名记录。
 
 在 Linux 和 macOS 上，`caller.exe` 和 `caller.ppid` 记录写入时的可执行文件基本名称（不是可修改的进程标签）和父进程 PID，即使调用方不属于任何窗格。在 Linux 上，如果调用方的 cgroup 路径包含 systemd 的 `.service` 或 `.scope`，还会记录 `caller.unit`。无法获取的字段会省略；Windows 和其他平台不记录这些字段。元数据查询失败不会拒绝输入。键入的输入不会添加 API 日志记录。
+
+每条具有 socket 对端身份的记录都包含 `caller.ancestry`：`outside`（已证明调用方的祖先链不属于此服务器）、`unknown`（无法完成证明或平台不支持）或 `reached`（祖先遍历已到达此服务器）。该判定与窗格归属无关；`caller.pane` 为 null 本身并不代表任何祖先判定。输入守卫已在当前请求中取得证明时，日志会复用它。Linux 还记录 `caller.sid`（对端的 OS 会话 ID，与 `getsid` 返回的 ID 相同，从现有进程快照读取）和 `caller.ancestry_root_pid`（遍历中最后检查的已固定 PID：`reached` 时为服务器 PID，否则为证明停止前检查的最上层祖先进程）。这两个字段在无法获取时省略，其他平台不包含它们。`caller.ancestor_exe` 和 `caller.ancestor_pid` 标识可观测到的最近一个非 Herdr 祖先进程；`caller.pane_env_present` 仅记录是否存在 `HERDR_PANE_ID`，从不记录其值。这些诊断字段不授予权限，也不改变输入守卫。
 
 这样，读取智能体会话的一方无需在终端字节流中添加任何内容，就能区分 API 发送到窗格的轮次和在窗格中键入的轮次。
 

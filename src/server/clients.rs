@@ -133,6 +133,10 @@ impl ClientShellLocation {
 pub(crate) struct ClientConnection {
     /// Immutable accept-time binding; never derived from hello.user.
     pub(crate) principal: Option<crate::pty::input_consumer::Principal>,
+    /// smarty-dev#8152: accept-pinned client-shell peer context. Read only to
+    /// classify the caller of `pane.clear_input_poison`; default (unknown) for
+    /// terminal clients.
+    pub(crate) shell_peer_context: crate::api::ApiRequestContext,
     /// Whether this connection owns the Herdr shell or one direct terminal stream.
     pub(crate) mode: ClientConnectionMode,
     /// The client's terminal size after clamping.
@@ -227,6 +231,7 @@ impl ClientConnection {
     ) -> Self {
         Self {
             principal: None,
+            shell_peer_context: crate::api::ApiRequestContext::default(),
             mode,
             terminal_size,
             cell_size,

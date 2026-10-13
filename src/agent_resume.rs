@@ -153,8 +153,10 @@ pub fn persisted_session_from_launch_args(
 pub fn normalize_session_start_source(value: Option<String>) -> Option<String> {
     match value.as_deref().map(str::trim) {
         Some(
-            source @ ("startup" | "resume" | "clear" | "compact" | "branch" | "new" | "fork"
-            | "select"),
+            // ponytail: Pi's "reload" must survive normalization; dropping it to None made
+            // a /reload unable to anchor a pane (smarty-dev#10398).
+            source @ ("startup" | "reload" | "resume" | "clear" | "compact" | "branch" | "new"
+            | "fork" | "select"),
         ) => Some(source.to_string()),
         _ => None,
     }
@@ -164,7 +166,6 @@ pub fn is_reserved_native_state_source(source: &str, agent: &str) -> bool {
     matches!(
         (source, agent),
         ("herdr:claude", "claude")
-            | ("herdr:codex", "codex")
             | ("herdr:copilot", "copilot")
             | ("herdr:devin", "devin")
             | ("herdr:droid", "droid")
@@ -407,7 +408,7 @@ mod tests {
     #[test]
     fn native_state_reservation_excludes_full_lifecycle_sources() {
         assert!(is_reserved_native_state_source("herdr:claude", "claude"));
-        assert!(is_reserved_native_state_source("herdr:codex", "codex"));
+        assert!(!is_reserved_native_state_source("herdr:codex", "codex"));
         assert!(is_reserved_native_state_source("herdr:devin", "devin"));
         assert!(!is_reserved_native_state_source("herdr:kimi", "kimi"));
         assert!(!is_reserved_native_state_source(
@@ -830,6 +831,10 @@ mod tests {
         assert_eq!(
             normalize_session_start_source(Some("select".into())),
             Some("select".into())
+        );
+        assert_eq!(
+            normalize_session_start_source(Some("reload".into())),
+            Some("reload".into())
         );
         assert_eq!(
             normalize_session_start_source(Some(" resume ".into())),

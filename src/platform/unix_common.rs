@@ -65,6 +65,17 @@ pub(crate) fn read_fd(fd: std::os::fd::RawFd, data: &mut [u8]) -> std::io::Resul
     }
 }
 
+/// The tty's erase character (VERASE) on stdin, when one is set.
+pub(super) fn terminal_erase_byte() -> Option<u8> {
+    let mut termios: libc::termios = unsafe { std::mem::zeroed() };
+    if unsafe { libc::tcgetattr(libc::STDIN_FILENO, &mut termios) } != 0 {
+        return None;
+    }
+    let erase = termios.c_cc[libc::VERASE];
+    // 0 (Linux) and 0xff (BSD) disable the special character.
+    (erase != 0 && erase != 0xff).then_some(erase)
+}
+
 pub(crate) fn poll_fd_readable(fd: std::os::fd::RawFd, timeout_ms: i32) -> std::io::Result<bool> {
     let mut descriptor = libc::pollfd {
         fd,
@@ -82,6 +93,85 @@ pub(crate) fn poll_fd_readable(fd: std::os::fd::RawFd, timeout_ms: i32) -> std::
 pub(crate) fn shutdown_client_stream(stream: &crate::ipc::LocalStream) -> std::io::Result<()> {
     let crate::ipc::LocalStream::UdSocket(stream) = stream;
     stream.inner().shutdown(std::net::Shutdown::Both)
+}
+
+/// Fresh real streams with a small server send buffer; no fixture bytes are sent.
+#[cfg(test)]
+pub(crate) fn blocked_client_stream_pair_for_test(
+) -> std::io::Result<(crate::ipc::LocalStream, crate::ipc::LocalStream, usize)> {
+    use interprocess::os::unix::uds_local_socket;
+    use std::os::fd::AsRawFd as _;
+
+    let (client, server) = std::os::unix::net::UnixStream::pair()?;
+    let requested: libc::c_int = 4096;
+    // SAFETY: server owns a live socket and requested is a correctly sized int.
+    if unsafe {
+        libc::setsockopt(
+            server.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
+            std::ptr::from_ref(&requested).cast(),
+            std::mem::size_of_val(&requested) as libc::socklen_t,
+        )
+    } < 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut capacity: libc::c_int = 0;
+    let mut length = std::mem::size_of_val(&capacity) as libc::socklen_t;
+    // SAFETY: both output pointers refer to live, correctly sized storage.
+    if unsafe {
+        libc::getsockopt(
+            server.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
+            std::ptr::from_mut(&mut capacity).cast(),
+            &mut length,
+        )
+    } < 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    if capacity <= 0 {
+        return Err(std::io::Error::other("test socket has no send buffer"));
+    }
+    Ok((
+        uds_local_socket::Stream::from(client).into(),
+        uds_local_socket::Stream::from(server).into(),
+        capacity as usize,
+    ))
+}
+
+/// Non-consuming evidence that the sole frame reached the kernel and exhausted
+/// server write readiness. SO_SNDBUF includes kernel bookkeeping (not just bytes),
+/// so compare readiness, not FIONREAD against the reported accounting capacity.
+#[cfg(test)]
+pub(crate) fn client_stream_buffer_full_for_test(
+    client: &crate::ipc::LocalStream,
+    server: &crate::ipc::LocalStream,
+    _capacity: usize,
+) -> std::io::Result<bool> {
+    use std::os::fd::AsRawFd as _;
+
+    let crate::ipc::LocalStream::UdSocket(client) = client;
+    let crate::ipc::LocalStream::UdSocket(server) = server;
+    let mut available: libc::c_int = 0;
+    // SAFETY: FIONREAD only reports queued bytes into this live int; no read occurs.
+    if unsafe { libc::ioctl(client.inner().as_raw_fd(), libc::FIONREAD, &mut available) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut descriptor = libc::pollfd {
+        fd: server.inner().as_raw_fd(),
+        events: libc::POLLOUT,
+        revents: 0,
+    };
+    // SAFETY: the borrowed socket remains live and the array has one descriptor.
+    let ready = unsafe { libc::poll(&mut descriptor, 1, 0) };
+    if ready < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // A closed/error socket also wakes poll, so it cannot be mistaken for fullness.
+    Ok(available > 0 && ready == 0)
 }
 
 pub(crate) struct ClientStreamReader<'a>(pub(crate) &'a mut crate::ipc::LocalStream);
@@ -299,6 +389,77 @@ fn set_sigpipe_disposition(handler: libc::sighandler_t) {
         // fails, stdout retains the existing Rust behavior.
         libc::sigaction(libc::SIGPIPE, &action, std::ptr::null_mut());
     }
+}
+
+extern "C" fn discard_signal(_signal: libc::c_int) {}
+
+/// The server must outlive the terminal or shell that launched it, like tmux.
+/// Installed at process start so SIGHUP cannot stop the server before its event
+/// loop runs. A handler, unlike SIG_IGN, resets to the default on exec, so
+/// child processes keep normal hangup behavior.
+pub(crate) fn ignore_server_hangup() {
+    let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+    action.sa_sigaction = discard_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
+    action.sa_flags = libc::SA_RESTART;
+    unsafe {
+        libc::sigemptyset(&mut action.sa_mask);
+        libc::sigaction(libc::SIGHUP, &action, std::ptr::null_mut());
+    }
+}
+
+/// Routes SIGINT and SIGTERM to `on_quit`, and logs SIGHUP without stopping.
+pub(crate) fn spawn_server_signal_monitor(
+    on_quit: impl Fn(super::ServerQuitSignal) + Send + Sync + 'static,
+) {
+    use tokio::signal::unix::{signal, SignalKind};
+    use tracing::{info, warn};
+
+    let on_quit = std::sync::Arc::new(on_quit);
+    for (kind, quit_signal) in [
+        (SignalKind::interrupt(), super::ServerQuitSignal::Interrupt),
+        (SignalKind::terminate(), super::ServerQuitSignal::Terminate),
+    ] {
+        match signal(kind) {
+            Ok(mut stream) => {
+                let on_quit = on_quit.clone();
+                tokio::spawn(async move {
+                    while stream.recv().await.is_some() {
+                        on_quit(quit_signal);
+                    }
+                });
+            }
+            Err(err) => warn!(%err, signal = %quit_signal, "failed to install server stop handler"),
+        }
+    }
+    match signal(SignalKind::hangup()) {
+        Ok(mut stream) => {
+            tokio::spawn(async move {
+                while stream.recv().await.is_some() {
+                    info!("ignoring SIGHUP; server keeps running");
+                }
+            });
+        }
+        Err(err) => warn!(%err, "failed to install SIGHUP handler"),
+    }
+}
+
+/// Describes the process on the other end of a local socket, for logs.
+pub(crate) fn local_stream_peer_description(stream: &crate::ipc::LocalStream) -> Option<String> {
+    use std::os::fd::{AsFd as _, AsRawFd as _};
+
+    let crate::ipc::LocalStream::UdSocket(socket) = stream;
+    let pid = super::socket_peer_pid(socket.as_fd().as_raw_fd())?;
+    let Some((name, parent)) = super::process_name_and_parent(pid) else {
+        return Some(format!("pid {pid}"));
+    };
+    let mut description = format!("pid {pid} ({name})");
+    if parent > 1 {
+        description.push_str(&format!(", parent pid {parent}"));
+        if let Some((parent_name, _)) = super::process_name_and_parent(parent) {
+            description.push_str(&format!(" ({parent_name})"));
+        }
+    }
+    Some(description)
 }
 
 pub(crate) fn begin_cli_output() {
@@ -596,6 +757,31 @@ mod tests {
         assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
         assert!(read_session_snapshot_with_trust(&fifo).is_err());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn server_signal_monitor_survives_hangup_and_reports_terminate() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            spawn_server_signal_monitor(move |signal| {
+                let _ = tx.send(signal);
+            });
+
+            // An unhandled SIGHUP would end the test process here.
+            assert_eq!(unsafe { libc::kill(libc::getpid(), libc::SIGHUP) }, 0);
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            assert!(rx.try_recv().is_err());
+
+            assert_eq!(unsafe { libc::kill(libc::getpid(), libc::SIGTERM) }, 0);
+            let signal = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap();
+            assert_eq!(signal, Some(super::super::ServerQuitSignal::Terminate));
+        });
     }
 
     #[test]

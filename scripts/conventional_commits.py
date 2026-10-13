@@ -16,6 +16,8 @@ ALLOWED_TYPES = {
     "refactor",
     "chore",
     "release",
+    # Branch syncs use "merge: master into <branch>", not Git's default merge text.
+    "merge",
 }
 SUBJECT_RE = re.compile(r"^(?P<kind>[a-z]+)(?:\([^)]+\))?!?:\s+\S")
 MERGIFY_AUTHOR_EMAIL = "37929162+mergify[bot]@users.noreply.github.com"
@@ -86,6 +88,7 @@ def main() -> int:
             "commit subjects must use conventional commits because preview notes are generated from them."
         )
         print("example: fix(update): install selected channel")
+        print("branch sync example: merge: master into <branch>")
         print("expected: type(optional-scope): subject")
         print("allowed types: " + ", ".join(sorted(ALLOWED_TYPES)))
         return 1

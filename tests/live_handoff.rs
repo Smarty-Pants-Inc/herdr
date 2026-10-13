@@ -37,7 +37,7 @@ struct RequestError {
 impl Drop for SpawnedHerdr {
     fn drop(&mut self) {
         let pid = self.child.process_id();
-        let _ = self.child.kill();
+        support::stop_spawned_herdr(&mut *self.child);
         unregister_spawned_herdr_pid(pid);
     }
 }
@@ -459,10 +459,161 @@ fn wait_for_pid_marker(path: &Path, timeout: Duration) -> u32 {
         .unwrap_or_else(|| panic!("invalid PID marker at {}: {text:?}", path.display()))
 }
 
+struct PanicCleanupFixture {
+    base: PathBuf,
+    api_socket: PathBuf,
+    spawned: Option<SpawnedHerdr>,
+    registration: &'static str,
+}
+
+impl PanicCleanupFixture {
+    fn new(register_pid: bool) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let base = std::env::temp_dir().join(format!(
+            "hpc-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&base).expect("create private panic cleanup fixture");
+        let runtime_dir = base.join("runtime");
+        let mut fixture = Self {
+            api_socket: runtime_dir.join("herdr.sock"),
+            base,
+            spawned: None,
+            registration: if register_pid { "PID" } else { "runtime-only" },
+        };
+        fs::set_permissions(&fixture.base, fs::Permissions::from_mode(0o700)).unwrap();
+        register_runtime_dir(&runtime_dir);
+        fixture.spawned = Some(spawn_server(
+            &fixture.base.join("config"),
+            &runtime_dir,
+            &fixture.api_socket,
+        ));
+        if !register_pid {
+            unregister_spawned_herdr_pid(Some(fixture.pid()));
+        }
+        wait_for_socket(&fixture.api_socket, Duration::from_secs(10));
+        fixture.assert_running("before panic");
+        fixture
+    }
+
+    fn pid(&self) -> u32 {
+        self.spawned
+            .as_ref()
+            .expect("owned server")
+            .child
+            .process_id()
+            .expect("server PID")
+    }
+
+    fn assert_running(&mut self, phase: &str) {
+        let response = try_request(
+            &self.api_socket,
+            serde_json::json!({
+                "id": format!("test:panic-cleanup:{}:{phase}", self.registration),
+                "method": "ping",
+                "params": {}
+            }),
+        )
+        .unwrap_or_else(|error| panic!("{} server {phase}: {}", self.registration, error.message));
+        assert_ok(response);
+        assert!(
+            self.spawned
+                .as_mut()
+                .expect("owned server")
+                .child
+                .try_wait()
+                .expect("inspect server liveness")
+                .is_none(),
+            "{} server must stay alive {phase}",
+            self.registration
+        );
+    }
+}
+
+impl Drop for PanicCleanupFixture {
+    fn drop(&mut self) {
+        if let Some(mut spawned) = self.spawned.take() {
+            let _ = spawned.child.kill();
+            let _ = spawned.child.wait();
+            drop(spawned);
+        }
+        cleanup_test_base(&self.base);
+    }
+}
+
+#[test]
+fn caught_panic_preserves_other_threads_registered_servers() {
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (caught_tx, caught_rx) = mpsc::channel();
+
+    thread::scope(|scope| {
+        let owner = scope.spawn(move || {
+            let mut fixtures = [
+                PanicCleanupFixture::new(true),
+                PanicCleanupFixture::new(false),
+            ];
+            // Both servers have answered a real request and remain owned here
+            // until the peer confirms its panic hook and catch have completed.
+            ready_tx.send(()).expect("signal running servers");
+            caught_rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("peer caught its intentional panic");
+            for fixture in &mut fixtures {
+                fixture.assert_running("after peer caught panic");
+            }
+        });
+        let peer = scope.spawn(move || {
+            ready_rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("owner has running servers");
+            let panic = std::panic::catch_unwind(|| panic!("intentional peer panic"))
+                .expect_err("peer panic must be caught");
+            assert_eq!(
+                panic.downcast_ref::<&str>(),
+                Some(&"intentional peer panic")
+            );
+            caught_tx.send(()).expect("signal completed panic catch");
+        });
+        owner.join().expect("server owner thread succeeds");
+        peer.join().expect("panicking peer thread succeeds");
+    });
+}
+
+// Runtime-only cleanup currently discovers servers through /proc.
+#[cfg(target_os = "linux")]
+#[test]
+fn caught_panic_cleans_own_threads_registered_servers() {
+    thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                // Keep the guards outside the caught closure: only the hook,
+                // not unwinding their RAII guards, may terminate these servers.
+                let fixtures = [
+                    PanicCleanupFixture::new(true),
+                    PanicCleanupFixture::new(false),
+                ];
+                let pids = fixtures.each_ref().map(PanicCleanupFixture::pid);
+                let panic = std::panic::catch_unwind(|| panic!("intentional owner panic"))
+                    .expect_err("owner panic must be caught");
+                assert_eq!(panic.downcast_ref::<&str>(), Some(&"intentional owner panic"));
+                assert!(
+                    support::wait_until(Duration::from_secs(5), Duration::from_millis(25), || {
+                        pids.iter().all(|pid| !support::test_process_running(*pid))
+                    }),
+                    "panic hook must terminate both PID and runtime-only servers owned by its thread"
+                );
+                drop(fixtures);
+            })
+            .join()
+            .expect("panicking owner thread succeeds");
+    });
+}
+
 #[test]
 fn pid_marker_waits_for_complete_line() {
-    // Caught panics still run the cleanup hook; exclude active server fixtures.
-    let _guard = test_lock();
     let base = unique_test_dir();
     fs::create_dir_all(&base).unwrap();
     let marker = base.join("child.pid");
@@ -2653,6 +2804,473 @@ fn live_handoff_bad_expected_protocol_rolls_back_old_server() {
     cleanup_test_base(&base);
 }
 
+/// Runs the real operator CLI, `herdr server live-handoff`, against the test
+/// server, the way an operator (or the fleet) runs it.
+fn run_live_handoff_cli(
+    base: &Path,
+    config_home: &Path,
+    runtime_dir: &Path,
+    api_socket: &Path,
+    expected_version: &str,
+) -> std::process::Output {
+    crate::test_command::herdr_command()
+        .args([
+            "server",
+            "live-handoff",
+            "--import-exe",
+            env!("CARGO_BIN_EXE_herdr"),
+            "--expected-version",
+            expected_version,
+        ])
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", base)
+        .env("XDG_CONFIG_HOME", config_home)
+        .env("XDG_RUNTIME_DIR", runtime_dir)
+        .env("HERDR_SOCKET_PATH", api_socket)
+        .env(
+            "HERDR_CLIENT_SOCKET_PATH",
+            runtime_dir.join("herdr-client.sock"),
+        )
+        .output()
+        .unwrap()
+}
+
+fn assert_old_server_still_serving(runtime_dir: &Path, api_socket: &Path, old_pid: u32) {
+    wait_for_api(api_socket, Duration::from_secs(5));
+    let listed = request(
+        api_socket,
+        serde_json::json!({"id":"test:workspace:list","method":"workspace.list","params":{}}),
+    );
+    assert!(
+        listed.get("result").is_some(),
+        "API request failed: {listed}"
+    );
+    assert_eq!(
+        unsafe { libc::kill(old_pid as libc::pid_t, 0) },
+        0,
+        "old server {old_pid} is gone"
+    );
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+        support::herdr_server_pids_for_runtime_dir(runtime_dir).unwrap(),
+        vec![old_pid],
+        "a different server is serving the session"
+    );
+    #[cfg(not(target_os = "linux"))]
+    let _ = runtime_dir;
+}
+
+/// Runs a real operator CLI command against the test server.
+#[cfg(target_os = "linux")]
+fn run_cli(base: &Path, api_socket: &Path, args: &[&str]) -> std::process::Output {
+    crate::test_command::herdr_command()
+        .args(args)
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", base)
+        .env("HERDR_SOCKET_PATH", api_socket)
+        .output()
+        .unwrap()
+}
+
+/// A pane running a process titled `pi` (a Python script named `pi`) that reports a
+/// session with an ID, then reads prompts from its terminal into a file. With
+/// `self_report`, the process itself sends `pane.report_agent_session` over the API
+/// socket, so it is the reporter, alive and in the foreground, like Pi's extension.
+/// Otherwise it runs the real `herdr pane report-agent-session` CLI from inside the
+/// pane: that CLI process is the reporter, and it exits before the handoff.
+#[cfg(target_os = "linux")]
+fn start_reporting_pi(
+    base: &Path,
+    api_socket: &Path,
+    pane_id: &str,
+    name: &str,
+    self_report: bool,
+) -> (String, PathBuf) {
+    let dir = base.join(name);
+    fs::create_dir_all(&dir).unwrap();
+    let session_path = dir.join("session.jsonl");
+    let reported = dir.join("reported");
+    let prompts = dir.join("prompts");
+    let session_id = format!("{name}-session-id");
+    let script = r#"import json, socket, subprocess, sys
+sock, pane, path, sid, reported, prompts, herdr, self_report = sys.argv[1:9]
+if self_report == "1":
+    s = socket.socket(socket.AF_UNIX)
+    s.connect(sock)
+    s.sendall((json.dumps({"id": "pi:report", "method": "pane.report_agent_session", "params": {
+        "pane_id": pane, "source": "herdr:pi", "agent": "pi", "seq": 1,
+        "agent_session_path": path, "agent_session_id": sid,
+        "session_start_source": "startup"}}) + "\n").encode())
+    reply = s.makefile().readline()
+    s.close()
+else:
+    cli = subprocess.run([herdr, "pane", "report-agent-session", "--source=herdr:pi",
+        "--agent=pi", "--seq=1", "--agent-session-path=" + path,
+        "--agent-session-id=" + sid, "--session-start-source=startup", pane],
+        env={"HERDR_SOCKET_PATH": sock, "PATH": "/usr/bin:/bin"},
+        capture_output=True, text=True)
+    reply = json.dumps({"cli_exit": cli.returncode, "stderr": cli.stderr}) + "\n"
+with open(reported, "w") as f:
+    f.write(reply)
+for line in sys.stdin:
+    with open(prompts, "a") as f:
+        f.write(line)
+"#;
+    // Named `pi` so the server detects the pane as Pi (`python3 <script named pi>`).
+    let fake_pi = dir.join("pi");
+    fs::write(&fake_pi, script).unwrap();
+    let command = format!(
+        "python3 {} {} {} {} {} {} {} {} {}",
+        fake_pi.display(),
+        api_socket.display(),
+        pane_id,
+        session_path.display(),
+        session_id,
+        reported.display(),
+        prompts.display(),
+        env!("CARGO_BIN_EXE_herdr"),
+        if self_report { "1" } else { "0" },
+    );
+    assert_ok(request(
+        api_socket,
+        serde_json::json!({
+            "id": "test:pane:start-pi",
+            "method": "pane.send_input",
+            "params": {"pane_id": pane_id, "text": command, "keys": ["Enter"]}
+        }),
+    ));
+    let reply = wait_for_file_contains(&reported, "\n", Duration::from_secs(10));
+    assert!(
+        reply.contains("\"result\"") || reply.contains("\"cli_exit\": 0"),
+        "report failed: {reply}"
+    );
+    (session_id, prompts)
+}
+
+#[cfg(target_os = "linux")]
+fn pane_get(base: &Path, api_socket: &Path, pane_id: &str) -> serde_json::Value {
+    let output = run_cli(base, api_socket, &["pane", "get", pane_id]);
+    assert!(
+        output.status.success(),
+        "pane get: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["result"]["pane"].clone()
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_pane(
+    base: &Path,
+    api_socket: &Path,
+    pane_id: &str,
+    what: &str,
+    ready: impl Fn(&serde_json::Value) -> bool,
+) -> serde_json::Value {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let pane = pane_get(base, api_socket, pane_id);
+        if ready(&pane) {
+            return pane;
+        }
+        assert!(Instant::now() < deadline, "{what}: {pane}");
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// `herdr agent prompt <pane> <text> --expected-session <id>`, the #211 guard.
+#[cfg(target_os = "linux")]
+fn guarded_prompt(
+    base: &Path,
+    api_socket: &Path,
+    pane_id: &str,
+    text: &str,
+    session_id: &str,
+) -> std::process::Output {
+    run_cli(
+        base,
+        api_socket,
+        &[
+            "agent",
+            "prompt",
+            pane_id,
+            text,
+            "--expected-session",
+            session_id,
+        ],
+    )
+}
+
+/// smarty-dev#10527: a live handoff keeps a pane's reporter-bound agent session ID
+/// when the exact reporter process is still alive, so a Pi that never re-reports
+/// keeps its ID and `--expected-session` still works. A reporter that exited
+/// before the handoff transfers nothing: the ID is dropped and the guard refuses.
+#[cfg(target_os = "linux")]
+#[test]
+fn live_handoff_keeps_a_live_reporters_agent_session_id() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+
+    let spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    register_runtime_dir(&runtime_dir);
+    let old_pid = spawned.child.process_id().expect("old server pid");
+    let own_version = request(
+        &api_socket,
+        serde_json::json!({"id":"test:ping","method":"ping","params":{}}),
+    )["result"]["version"]
+        .as_str()
+        .expect("server version")
+        .to_string();
+    let created = request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:workspace:create",
+            "method": "workspace.create",
+            "params": {"cwd": "/tmp", "focus": true}
+        }),
+    );
+    let live_pane = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let split = request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:pane:split",
+            "method": "pane.split",
+            "params": {"target_pane_id": live_pane, "direction": "right", "focus": false}
+        }),
+    );
+    assert_ok(split.clone());
+    let exited_pane = split["result"]["pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let (live_id, live_prompts) = start_reporting_pi(&base, &api_socket, &live_pane, "live", true);
+    let (exited_id, exited_prompts) =
+        start_reporting_pi(&base, &api_socket, &exited_pane, "exited", false);
+    for (pane, id) in [(&live_pane, &live_id), (&exited_pane, &exited_id)] {
+        wait_for_pane(&base, &api_socket, pane, "before the handoff", |got| {
+            got["agent"] == "pi" && got["agent_session_id"] == id.as_str()
+        });
+    }
+    // Before the handoff the guard accepts the live reporter's pane.
+    let before = guarded_prompt(&base, &api_socket, &live_pane, "before", &live_id);
+    assert!(
+        before.status.success(),
+        "guarded prompt before the handoff: {}",
+        String::from_utf8_lossy(&before.stderr)
+    );
+    wait_for_file_contains(&live_prompts, "before", Duration::from_secs(10));
+
+    let output = run_live_handoff_cli(&base, &config_home, &runtime_dir, &api_socket, &own_version);
+    assert!(
+        output.status.success(),
+        "live handoff: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    drop(spawned);
+    let new_pid = wait_for_replacement_server_pid(&runtime_dir, old_pid, Duration::from_secs(10));
+    assert_ne!(new_pid, old_pid);
+    wait_for_api(&api_socket, Duration::from_secs(10));
+
+    // The live reporter's pane keeps the SAME id, with no new report.
+    let live = pane_get(&base, &api_socket, &live_pane);
+    assert_eq!(live["agent_session_id"], live_id.as_str(), "{live}");
+    assert_eq!(
+        live["agent_session"]["value"],
+        base.join("live/session.jsonl").to_str().unwrap(),
+        "{live}"
+    );
+    let after = guarded_prompt(&base, &api_socket, &live_pane, "after", &live_id);
+    assert!(
+        after.status.success(),
+        "guarded prompt after the handoff: {}",
+        String::from_utf8_lossy(&after.stderr)
+    );
+    wait_for_file_contains(&live_prompts, "after", Duration::from_secs(10));
+
+    // The exited reporter's id is dropped (its session path survives), and the
+    // guard refuses the prompt.
+    let exited = pane_get(&base, &api_socket, &exited_pane);
+    assert_eq!(
+        exited["agent_session_id"],
+        serde_json::Value::Null,
+        "{exited}"
+    );
+    assert_eq!(
+        exited["agent_session"]["value"],
+        base.join("exited/session.jsonl").to_str().unwrap(),
+        "{exited}"
+    );
+    let refused = guarded_prompt(&base, &api_socket, &exited_pane, "refused", &exited_id);
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(!refused.status.success(), "the guard accepted: {stderr}");
+    assert!(stderr.contains("agent_session_unknown"), "{stderr}");
+    // The old server exported it; the replacement's liveness proof refused it.
+    let log = wait_for_file_contains(
+        &config_home.join("herdr-dev/herdr-server.log"),
+        "dropped a live handoff agent session id",
+        Duration::from_secs(5),
+    );
+    let drops: Vec<&str> = log
+        .lines()
+        .filter(|line| line.contains("dropped a live handoff agent session id"))
+        .collect();
+    assert_eq!(drops.len(), 1, "{drops:?}");
+    assert!(drops[0].contains("ReporterGone"), "{drops:?}");
+    // The spawning server is the proven source: its bindings were not dropped.
+    assert!(!log.contains("source unproven"), "{log}");
+    assert!(!log.contains("pull path does not carry them"), "{log}");
+    thread::sleep(Duration::from_millis(300));
+    assert!(
+        !fs::read_to_string(&exited_prompts)
+            .unwrap_or_default()
+            .contains("refused"),
+        "a refused prompt reached the pane"
+    );
+
+    let _ = request(
+        &api_socket,
+        serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
+    );
+    cleanup_test_base(&base);
+}
+
+#[test]
+fn live_handoff_cli_version_mismatch_logs_one_rejection_and_keeps_old_server() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let log_path = config_home.join("herdr-dev/herdr-server.log");
+
+    let spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    register_runtime_dir(&runtime_dir);
+    let old_pid = spawned.child.process_id().expect("old server pid");
+
+    // First run: a plain version mismatch.
+    let output = run_live_handoff_cli(
+        &base,
+        &config_home,
+        &runtime_dir,
+        &api_socket,
+        "0.0.0-mismatch",
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "stderr: {stderr}");
+    let error: serde_json::Value = serde_json::from_str(
+        stderr
+            .lines()
+            .rev()
+            .find(|line| line.starts_with('{'))
+            .unwrap_or_else(|| panic!("no JSON error on stderr: {stderr}")),
+    )
+    .unwrap();
+    assert_eq!(error["error"]["code"], "handoff_failed", "stderr: {stderr}");
+    assert_old_server_still_serving(&runtime_dir, &api_socket, old_pid);
+
+    let log = wait_for_file_contains(&log_path, "handoff import rejected", Duration::from_secs(5));
+    let rejections: Vec<&str> = log
+        .lines()
+        .filter(|line| line.contains("handoff import rejected"))
+        .collect();
+    assert_eq!(rejections.len(), 1, "{rejections:?}");
+    assert!(
+        rejections[0].contains("expected herdr v0.0.0-mismatch"),
+        "rejection reason missing: {}",
+        rejections[0]
+    );
+
+    // Second run: sender text that tries to forge a log line.
+    let output = run_live_handoff_cli(
+        &base,
+        &config_home,
+        &runtime_dir,
+        &api_socket,
+        "0.9\r\nFAKE",
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "stderr: {stderr}");
+    assert!(stderr.contains("handoff_failed"), "stderr: {stderr}");
+    assert_old_server_still_serving(&runtime_dir, &api_socket, old_pid);
+
+    let log = wait_for_file_contains(
+        &log_path,
+        "expected herdr v0.9\\r\\nFAKE",
+        Duration::from_secs(5),
+    );
+    let escaped: Vec<&str> = log
+        .lines()
+        .filter(|line| {
+            line.contains("handoff import rejected")
+                && line.contains("expected herdr v0.9\\r\\nFAKE")
+        })
+        .collect();
+    assert_eq!(escaped.len(), 1, "{escaped:?}");
+    assert!(
+        !log.lines()
+            .any(|line| line.trim_start().starts_with("FAKE")),
+        "sender text forged a log line:\n{log}"
+    );
+
+    // Third run: hostile, oversized sender text (64 KiB, within ARG_MAX).
+    let hostile_version = format!("0.0.0\r\nFAKE-LINE forged{}", "x".repeat(64 * 1024));
+    let output = run_live_handoff_cli(
+        &base,
+        &config_home,
+        &runtime_dir,
+        &api_socket,
+        &hostile_version,
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "stderr: {stderr}");
+    assert!(stderr.contains("handoff_failed"), "stderr: {stderr}");
+    assert_old_server_still_serving(&runtime_dir, &api_socket, old_pid);
+
+    let log = wait_for_file_contains(
+        &log_path,
+        "expected herdr v0.0.0\\r\\nFAKE-LINE forged",
+        Duration::from_secs(5),
+    );
+    let rejections: Vec<&str> = log
+        .lines()
+        .filter(|line| line.contains("handoff import rejected"))
+        .collect();
+    assert_eq!(rejections.len(), 3, "{rejections:?}");
+    let line = rejections[2];
+    assert!(
+        line.contains("expected herdr v0.0.0\\r\\nFAKE-LINE forged"),
+        "escaped rejection reason missing: {line}"
+    );
+    assert!(line.contains("...[truncated]"), "{line}");
+    assert!(
+        line.len() < 2048,
+        "log line not bounded: {} bytes",
+        line.len()
+    );
+    assert!(
+        !log.lines()
+            .any(|line| line.trim_start().starts_with("FAKE-LINE")),
+        "sender text forged a log line"
+    );
+
+    let _ = request(
+        &api_socket,
+        serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
+    );
+    drop(spawned);
+    cleanup_test_base(&base);
+}
+
 fn live_handoff_import_failure_rolls_back_old_server_at(failure_point: &str) {
     let _lock = test_lock();
     let base = unique_test_dir();
@@ -3948,6 +4566,92 @@ fn pull_import_takes_over_the_running_server_with_its_panes() {
     cleanup_test_base(&base);
 }
 
+/// #252 review: a pull has no anchor to the intended source earlier than the
+/// pull itself, so it never carries agent session ids, even from a live
+/// reporter; only the push path (`live_handoff_keeps_a_live_reporters_agent_session_id`)
+/// does. Given just the source pid, the importer still pins the inode of the
+/// API socket it sends the request to, and the pull itself succeeds.
+#[cfg(target_os = "linux")]
+#[test]
+fn pull_import_drops_handoff_agent_session_ids() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let mut spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    register_runtime_dir(&runtime_dir);
+    let source_pid = spawned.child.process_id().unwrap();
+    let created = request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:workspace:create",
+            "method": "workspace.create",
+            "params": {"cwd": "/tmp", "focus": true}
+        }),
+    );
+    let pane = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (session_id, prompts) = start_reporting_pi(&base, &api_socket, &pane, "pulled", true);
+    wait_for_pane(&base, &api_socket, &pane, "before the pull", |got| {
+        got["agent"] == "pi" && got["agent_session_id"] == session_id.as_str()
+    });
+
+    let mut importer = spawn_pull_importer(
+        &base,
+        &api_socket,
+        &["--expect-source-pid".into(), source_pid.to_string()],
+        &[],
+    );
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while spawned.child.try_wait().unwrap().is_none() {
+        assert!(Instant::now() < deadline, "source server did not hand over");
+        thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        importer.0.try_wait().unwrap().is_none(),
+        "importer exited: {}",
+        stderr_of(&mut importer.0)
+    );
+    wait_for_api(&api_socket, Duration::from_secs(5));
+
+    // The id is dropped (the pane and its agent survive), and the #211 guard
+    // refuses a prompt that expects it.
+    let pulled = pane_get(&base, &api_socket, &pane);
+    assert_eq!(
+        pulled["agent_session_id"],
+        serde_json::Value::Null,
+        "{pulled}"
+    );
+    let refused = guarded_prompt(&base, &api_socket, &pane, "after-pull", &session_id);
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(!refused.status.success(), "the guard accepted: {stderr}");
+    assert!(stderr.contains("agent_session_unknown"), "{stderr}");
+    wait_for_file_contains(
+        &config_home.join("herdr-dev/herdr-server.log"),
+        "dropped handoff agent session ids: pull path does not carry them",
+        Duration::from_secs(5),
+    );
+    thread::sleep(Duration::from_millis(300));
+    assert!(
+        !fs::read_to_string(&prompts)
+            .unwrap_or_default()
+            .contains("after-pull"),
+        "a refused prompt reached the pane"
+    );
+
+    let _ = request(
+        &api_socket,
+        serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
+    );
+    assert!(wait_for_exit(&mut importer.0, Duration::from_secs(10)).success());
+    drop(spawned);
+    cleanup_test_base(&base);
+}
+
 // Linux pidfds let the source stop even an importer that never reads EOF.
 #[cfg(target_os = "linux")]
 #[test]
@@ -4086,4 +4790,239 @@ fn failed_pull_import_keeps_a_socket_report_split_across_the_rollback() {
     );
     drop(spawned);
     cleanup_test_base(&base);
+}
+
+// Linux SO_PEERCRED receipts prove that both reports and input came from the
+// same live pane descendant, not from the integration-test process.
+#[cfg(target_os = "linux")]
+#[test]
+fn two_live_handoffs_preserve_imported_agent_caller_attribution() {
+    let _lock = test_lock();
+    let allocation = std::process::Command::new("mktemp")
+        .arg("-d")
+        .arg(std::env::temp_dir().join("hla-XXXXXX"))
+        .output()
+        .expect("allocate private live attribution root");
+    assert!(allocation.status.success());
+    let base = PathBuf::from(String::from_utf8(allocation.stdout).unwrap().trim());
+    let mut cleanup = support::ScopedHandoffServer::new(&base);
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let app_dir = if cfg!(debug_assertions) {
+        "herdr-dev"
+    } else {
+        "herdr"
+    };
+    let log_path = base.join("state").join(app_dir).join("api-input.jsonl");
+    let script = base.join("caller.py");
+    fs::write(
+        &script,
+        r#"import json, os, pathlib, socket, struct, time
+root = pathlib.Path(__file__).parent
+pid = os.getpid()
+with (root / 'launches').open('a') as launches:
+    launches.write(str(pid) + '\n')
+(root / 'caller.pid').write_text(str(pid) + '\n')
+def call(phase, method, params):
+    with socket.socket(socket.AF_UNIX) as stream:
+        stream.settimeout(15)
+        stream.connect(str(root / 'runtime' / 'herdr.sock'))
+        server_pid = struct.unpack('3i', stream.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))[0]
+        stream.sendall((json.dumps({'id': phase + ':' + method, 'method': method, 'params': params}) + '\n').encode())
+        data = b''
+        while b'\n' not in data:
+            chunk = stream.recv(65536)
+            if not chunk:
+                raise RuntimeError('API closed before response')
+            data += chunk
+        return json.loads(data.split(b'\n')[0]), server_pid
+for phase, state in [('before', 'idle'), ('after-first', 'working'), ('after-second', 'idle')]:
+    deadline = time.monotonic() + 60
+    while not (root / phase).exists():
+        if time.monotonic() >= deadline:
+            raise RuntimeError('timed out waiting for ' + phase)
+        time.sleep(.025)
+    report, report_peer = call(phase, 'pane.report_agent', {
+        'pane_id': 'wzzzzzz:pzzzzzz', 'source': 'live-attribution-test',
+        'agent': 'pi', 'state': state})
+    sent, input_peer = call(phase, 'pane.send_input', {
+        'pane_id': (root / 'pane').read_text(), 'text': '', 'keys': ['Enter']})
+    receipt = {'pid': pid, 'report_peer_pid': report_peer, 'input_peer_pid': input_peer,
+               'report': report, 'input': sent}
+    temporary = root / (phase + '-result.tmp')
+    temporary.write_text(json.dumps(receipt) + '\n')
+    temporary.replace(root / (phase + '-result'))
+deadline = time.monotonic() + 60
+while not (root / 'exit').exists() and time.monotonic() < deadline:
+    time.sleep(.025)
+"#,
+    )
+    .unwrap();
+
+    // The existing command fixture removes every inherited HERDR_* first;
+    // HOME and every writable XDG path belong only to this private server.
+    let private_env = [
+        ("HOME", base.display().to_string()),
+        ("XDG_STATE_HOME", base.join("state").display().to_string()),
+        ("XDG_DATA_HOME", base.join("data").display().to_string()),
+        ("XDG_CACHE_HOME", base.join("cache").display().to_string()),
+        ("TMPDIR", base.display().to_string()),
+        ("PATH", "/usr/bin:/bin".to_string()),
+    ];
+    let extra_env: Vec<_> = private_env
+        .iter()
+        .map(|(key, value)| (*key, value.as_str()))
+        .collect();
+    register_runtime_dir(&runtime_dir);
+    let mut spawned = spawn_server_with_env(&config_home, &runtime_dir, &api_socket, &extra_env);
+    wait_for_api(&api_socket, Duration::from_secs(10));
+    let source_pid = spawned.child.process_id().expect("source server PID");
+    cleanup.track_original(source_pid);
+    let created = request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:attribution:create", "method": "workspace.create",
+            "params": {"cwd": base, "focus": true}
+        }),
+    );
+    assert_ok(created.clone());
+    let pane_id = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .expect("caller pane ID")
+        .to_string();
+    fs::write(base.join("pane"), &pane_id).unwrap();
+    assert_ne!(pane_id, "wzzzzzz:pzzzzzz");
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:attribution:start", "method": "pane.send_input",
+            "params": {"pane_id": pane_id, "text": format!("python3 {}", script.display()), "keys": ["Enter"]}
+        }),
+    ));
+    let caller_pid = wait_for_pid_marker(&base.join("caller.pid"), Duration::from_secs(5));
+    assert_ne!(caller_pid, std::process::id());
+    let startup = fs::read_to_string(base.join("launches")).unwrap();
+    assert_eq!(startup, format!("{caller_pid}\n"));
+    let mut server_pids = vec![source_pid];
+
+    for (index, (phase, state)) in [
+        ("before", "idle"),
+        ("after-first", "working"),
+        ("after-second", "idle"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if index > 0 {
+            let old_pid = *server_pids.last().unwrap();
+            // This existing guard records the importer before exec, so even a
+            // failed assertion owns and cleans the real detached replacement.
+            let importer_exe = cleanup.importer_exe();
+            assert_ok(request(
+                &api_socket,
+                serde_json::json!({
+                    "id": format!("test:attribution:handoff-{index}"),
+                    "method": "server.live_handoff", "params": {"import_exe": importer_exe}
+                }),
+            ));
+            wait_for_api(&api_socket, Duration::from_secs(10));
+            let replacement_pid = cleanup.track_importer();
+            assert!(
+                !server_pids.contains(&replacement_pid),
+                "servers must be three distinct processes: {server_pids:?}, {replacement_pid}"
+            );
+            if index == 1 {
+                assert!(
+                    support::wait_until(Duration::from_secs(10), Duration::from_millis(25), || {
+                        spawned.child.try_wait().unwrap().is_some()
+                    }),
+                    "original server did not exit"
+                );
+            } else {
+                assert!(
+                    support::wait_until(Duration::from_secs(10), Duration::from_millis(25), || {
+                        !support::test_process_running(old_pid)
+                    }),
+                    "first importer did not exit"
+                );
+            }
+            server_pids.push(replacement_pid);
+        }
+        assert!(
+            support::test_process_running(caller_pid),
+            "original pane caller must survive {phase}"
+        );
+        assert_eq!(
+            fs::read_to_string(base.join("launches")).unwrap(),
+            startup,
+            "pane caller must not relaunch at {phase}"
+        );
+        fs::write(base.join(phase), "go\n").unwrap();
+        let receipt: serde_json::Value = serde_json::from_str(&wait_for_file_contains(
+            &base.join(format!("{phase}-result")),
+            "\n",
+            Duration::from_secs(20),
+        ))
+        .unwrap();
+        eprintln!("{phase} real pane caller receipt: {receipt}");
+        assert_eq!(receipt["pid"], caller_pid);
+        assert_eq!(receipt["report_peer_pid"], *server_pids.last().unwrap());
+        assert_eq!(receipt["input_peer_pid"], *server_pids.last().unwrap());
+        assert_ok(receipt["report"].clone());
+        assert_ok(receipt["input"].clone());
+        let agents = request(
+            &api_socket,
+            serde_json::json!({"id":format!("test:attribution:agents-{phase}"),"method":"agent.list","params":{}}),
+        );
+        assert_ok(agents.clone());
+        assert!(
+            agents["result"]["agents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|agent| {
+                    agent["pane_id"] == pane_id
+                        && agent["agent"] == "pi"
+                        && agent["agent_status"] == state
+                }),
+            "stale-ID report must update this imported pane at {phase}: {agents}"
+        );
+
+        let raw = fs::read_to_string(&log_path).expect("private API input log");
+        let caller_rows: Vec<serde_json::Value> = raw
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|row| row["caller"]["pid"] == caller_pid)
+            .collect();
+        assert_eq!(
+            caller_rows.len(),
+            index + 1,
+            "one fresh accepted pane-origin input per phase: {caller_rows:?}"
+        );
+        let row = caller_rows.last().unwrap();
+        eprintln!("{phase} actual api-input.jsonl row: {row}");
+        assert_eq!(row["method"], "pane.send_input");
+        assert_eq!(row["bytes"], 1);
+        assert_eq!(row["target_pane"], pane_id);
+        assert_eq!(row["caller"]["pane"], pane_id, "{phase}: {row}");
+        if index == 0 {
+            assert_ok(request(
+                &api_socket,
+                serde_json::json!({"id":"test:attribution:rename","method":"agent.rename","params":{"target":pane_id,"name":"transferred-caller"}}),
+            ));
+        } else {
+            assert_eq!(
+                row["caller"]["agent"], "transferred-caller",
+                "{phase}: {row}"
+            );
+        }
+    }
+    assert_eq!(server_pids.len(), 3);
+    eprintln!("two real imports passed: server_pids={server_pids:?}, unchanged caller_pid={caller_pid}, pane={pane_id}");
+    fs::write(base.join("exit"), "exit\n").unwrap();
+    cleanup
+        .stop_and_cleanup()
+        .expect("stop all three owned server generations");
+    drop(spawned);
 }

@@ -78,6 +78,16 @@ class ConventionalCommitTests(unittest.TestCase):
             with self.subTest(subject=subject):
                 self.assertFalse(valid_subject(subject))
 
+    def test_branch_sync_subject_must_be_conventional(self) -> None:
+        self.assertFalse(valid_subject("Merge master-latest into ci/4346"))
+        self.assertTrue(valid_subject("merge: master into ci/4346"))
+        self.assertEqual(self.run_main("merge: master into ci/4346"), (0, ""))
+
+    def test_diagnostics_teach_branch_sync_subject(self) -> None:
+        status, diagnostics = self.run_main("Merge master-latest into ci/4346")
+        self.assertEqual(status, 1)
+        self.assertIn("merge: master into <branch>", diagnostics)
+
     def test_current_pr_title_subjects_pass_without_special_treatment(self) -> None:
         subjects = [
             "feat(attribution): expose client sender names per pane (#130)",

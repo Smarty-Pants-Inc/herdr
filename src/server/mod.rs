@@ -20,5 +20,6 @@ pub(crate) mod pane_input;
 #[cfg(test)]
 mod render_scale_benchmark;
 pub(crate) mod render_stream;
+pub(crate) mod shutdown;
 pub mod socket_paths;
 pub(crate) mod terminal_attach;

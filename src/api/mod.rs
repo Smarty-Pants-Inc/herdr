@@ -1,7 +1,10 @@
+pub(crate) mod agent_channel;
 pub mod client;
 mod event_hub;
 pub mod schema;
 mod server;
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use server::handle_connection as test_handle_connection;
 mod status;
 mod subscriptions;
 mod wait;
@@ -39,7 +42,9 @@ pub(crate) fn request_changes_ui(request: &Request) -> bool {
             | Method::WorkspaceReportMetadata(_)
             | Method::WorkspaceClose(_)
             | Method::WorktreeCreate(_)
+            | Method::WorktreeCreateProjectChecked(_)
             | Method::WorktreeOpen(_)
+            | Method::WorktreeOpenProjectChecked(_)
             | Method::WorktreeRemove(_)
             | Method::TabCreate(_)
             | Method::TabFocus(_)
@@ -58,6 +63,8 @@ pub(crate) fn request_changes_ui(request: &Request) -> bool {
             | Method::AgentStart(_)
             | Method::AgentStartGuarded(_)
             | Method::AgentPrompt(_)
+            | Method::AgentPromptSessionChecked(_)
+            | Method::AgentPromptStatusChecked(_)
             | Method::AgentSendKeys(_)
             | Method::PaneSplit(_)
             | Method::PaneSwap(_)
@@ -102,6 +109,13 @@ pub(crate) struct ApiRequestContext {
     /// origin. A captured marker that loses that live relationship is unknown,
     /// not ordinary.
     pub(crate) local_peer_pane_origin: crate::platform::PeerPaneOrigin,
+    /// Filled only while handling one request, never cached at accept time or
+    /// shared between requests. The input log reuses the guard's live proof.
+    pub(crate) server_ancestry: Option<crate::platform::ServerAncestryObservation>,
+    /// Optional plugin action grant presented on this request line only
+    /// (herdr-8592). Per-request, never sticky to the connection; Debug
+    /// redacts the secret.
+    pub(crate) plugin_action: crate::plugin_action_origin::PluginActionClaim,
 }
 
 impl ApiRequestContext {
@@ -113,6 +127,19 @@ impl ApiRequestContext {
         Self {
             local_peer_identity,
             local_peer_pane_origin,
+            server_ancestry: None,
+            plugin_action: crate::plugin_action_origin::PluginActionClaim::Absent,
+        }
+    }
+
+    /// Attach the claim parsed from this request's own line.
+    pub(crate) fn with_plugin_action(
+        self,
+        plugin_action: crate::plugin_action_origin::PluginActionClaim,
+    ) -> Self {
+        Self {
+            plugin_action,
+            ..self
         }
     }
 
@@ -154,6 +181,8 @@ mod context_tests {
         let captured = ApiRequestContext {
             local_peer_identity: Some(peer),
             local_peer_pane_origin: crate::platform::PeerPaneOrigin::HasPane,
+            server_ancestry: None,
+            plugin_action: crate::plugin_action_origin::PluginActionClaim::Malformed,
         };
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         sender.send(captured).expect("queue captured context");

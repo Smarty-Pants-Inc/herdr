@@ -30,7 +30,150 @@ use super::super::api_helpers::{
 use super::super::api_helpers::{METADATA_SOURCE_MAX_CHARS, METADATA_TTL_MAX_MS};
 use super::responses::{encode_error, encode_success};
 
+pub(super) enum SessionCheckedPaneInput {
+    Text(PaneSendTextParams),
+    Keys(PaneSendKeysParams),
+}
+
+/// Interpret only the actor's typed ownership failure as session loss. Generic
+/// permission errors must not be confused with proof that the guard was lost.
+pub(super) fn pane_input_completion_response(id: String, result: std::io::Result<()>) -> String {
+    match result {
+        Ok(()) => encode_success(id, ResponseResult::Ok {}),
+        Err(error) if crate::pty::actor::is_agent_session_lost(&error) => {
+            session_loss_response(id, &error)
+        }
+        Err(error) => {
+            let code = if crate::pty::actor::is_pane_input_poisoned(&error) {
+                "pane_input_poisoned"
+            } else if error.kind() == std::io::ErrorKind::TimedOut {
+                "timeout"
+            } else {
+                "pane_send_failed"
+            };
+            encode_error(id, code, error.to_string())
+        }
+    }
+}
+
+/// The loss-specific optional field does not alter the generic error body or
+/// any frozen endpoint codec. Other errors must not claim partial delivery.
+pub(super) fn session_loss_response(id: String, error: &std::io::Error) -> String {
+    let (partial, flush_failed) =
+        crate::pty::actor::agent_session_loss_details(error).unwrap_or((None, false));
+    serde_json::json!({
+        "id": id,
+        "error": {
+            "code": "agent_session_lost",
+            "message": error.to_string(),
+            "partial_text_consumed": partial,
+            "flush_failed": flush_failed
+        }
+    })
+    .to_string()
+}
+
+/// Private/direct String callers have no response sender. They must observe a
+/// bounded completion rather than claiming enqueue means delivery. Production
+/// server routes always wait on a response worker, never on the App loop.
+fn complete_direct_pane_input(
+    id: String,
+    completion: std::sync::mpsc::Receiver<std::io::Result<()>>,
+) -> String {
+    let result = completion
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap_or_else(|error| {
+            let kind = match error {
+                std::sync::mpsc::RecvTimeoutError::Timeout => std::io::ErrorKind::TimedOut,
+                std::sync::mpsc::RecvTimeoutError::Disconnected => std::io::ErrorKind::BrokenPipe,
+            };
+            Err(std::io::Error::new(kind, error))
+        });
+    pane_input_completion_response(id, result)
+}
+
+fn precheck_pane_input_poison(id: &str, poisoned: bool) -> Result<(), String> {
+    if poisoned {
+        Err(encode_error(
+            id.to_string(),
+            "pane_input_poisoned",
+            crate::api::schema::PANE_INPUT_POISON_NOTICE,
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+const OPERATOR_ORIGIN_REQUIRED_MESSAGE: &str = "only an operator can clear pane input poison: use the attached Herdr client or run the CLI outside every Herdr pane";
+const OPERATOR_ORIGIN_UNKNOWN_MESSAGE: &str = "cannot validate the caller's origin; clear pane input poison from the attached Herdr client or a terminal outside every Herdr pane";
+
 impl App {
+    /// smarty-dev#8152: clearing poison re-enables input that may still find
+    /// staged text, so it is an operator action. Every caller, on the public
+    /// API socket or the attached client's endpoint lane, is classified by the
+    /// same caller-origin policy as content writes from its accept-pinned peer;
+    /// the client lane's trusted flag alone proves nothing, because any
+    /// same-user process, also one inside a pane, can open the client socket.
+    /// A caller is an operator only with an ordinary origin and no pane of its
+    /// own (proven outside every pane). Every pane-attributed caller is
+    /// refused, including for its own pane: the poisoned pane's agent is the
+    /// party whose staged text the poison guards. An unattributable caller is
+    /// `input_origin_unknown`.
+    ///
+    /// ponytail: accepted residual. Attribution is by current ancestry, so a
+    /// pane process that strips its Herdr markers and escapes the server's
+    /// process tree (double fork + `setsid`) is classified as an ordinary
+    /// caller. That is the general ancestry-escape limit tracked in
+    /// smarty-dev#9333, not specific to this method: such a process is already
+    /// an ordinary caller for every content write (`input_guard.rs` returns
+    /// `None` for `InputOrigin::Ordinary`), so it can type into any unpoisoned
+    /// pane today. Clearing poison gives it nothing beyond that class; closing
+    /// the class (#9333) closes it here too.
+    pub(super) fn handle_pane_clear_input_poison(
+        &mut self,
+        id: String,
+        target: PaneTarget,
+        context: &mut crate::api::ApiRequestContext,
+    ) -> String {
+        use crate::app::terminal_targets::InputOrigin;
+        let denial = match self.input_origin_for_context_with_ancestry(context) {
+            InputOrigin::Ordinary if self.trusted_invoking_pane(*context).is_none() => None,
+            InputOrigin::Agent(source)
+                if self
+                    .parse_pane_id(&target.pane_id)
+                    .and_then(|(ws, pane)| self.terminal_target_for_pane(ws, pane))
+                    .is_some_and(|target| target.terminal_id != source.terminal_id) =>
+            {
+                Some((
+                    "cross_pane_input_denied",
+                    "agent-originated input cannot target a different pane",
+                ))
+            }
+            InputOrigin::Unknown => Some(("input_origin_unknown", OPERATOR_ORIGIN_UNKNOWN_MESSAGE)),
+            _ => Some(("operator_origin_required", OPERATOR_ORIGIN_REQUIRED_MESSAGE)),
+        };
+        if let Some((code, message)) = denial {
+            return encode_error(id, code, message);
+        }
+        let Some((ws_idx, pane_id)) = self.parse_pane_id(&target.pane_id) else {
+            return pane_not_found(id, &target.pane_id);
+        };
+        let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
+            return pane_not_found(id, &target.pane_id);
+        };
+        match runtime.clear_input_poison() {
+            Ok(()) => serde_json::json!({
+                "id": id,
+                "result": {
+                    "type": "ok",
+                    "message": crate::api::schema::PANE_INPUT_POISON_CLEAR_WARNING
+                }
+            })
+            .to_string(),
+            Err(error) => encode_error(id, "pane_clear_input_poison_failed", error.to_string()),
+        }
+    }
+
     pub(super) fn handle_pane_split(&mut self, id: String, params: PaneSplitParams) -> String {
         let target = if let Some(target_pane_id) = params.target_pane_id.as_deref() {
             self.parse_pane_id(target_pane_id)
@@ -52,7 +195,18 @@ impl App {
             Ok(env) => env,
             Err((code, message)) => return encode_error(id, &code, message),
         };
-        let (rows, cols) = self.state.estimate_pane_size();
+        let direction = match params.direction {
+            crate::api::schema::SplitDirection::Right => ratatui::layout::Direction::Horizontal,
+            crate::api::schema::SplitDirection::Down => ratatui::layout::Direction::Vertical,
+        };
+        let (rows, cols) = self
+            .state
+            .new_pane_size(crate::ui::NewPanePlacement::Split {
+                ws_idx,
+                target: target_pane_id,
+                direction,
+                ratio: params.ratio.unwrap_or(0.5),
+            });
         let split_cwd = params.cwd.map(std::path::PathBuf::from).or_else(|| {
             let follow_cwd = self.launch_cwd_for_pane_in_workspace(ws_idx, target_pane_id);
             Some(self.resolve_new_terminal_cwd(follow_cwd))
@@ -64,10 +218,6 @@ impl App {
         let previous_focus = self.state.current_pane_focus_target();
         let Some(ws) = self.state.workspaces.get_mut(ws_idx) else {
             return encode_error(id, "pane_not_found", "pane not found");
-        };
-        let direction = match params.direction {
-            crate::api::schema::SplitDirection::Right => ratatui::layout::Direction::Horizontal,
-            crate::api::schema::SplitDirection::Down => ratatui::layout::Direction::Vertical,
         };
         let shell_config = crate::pane::PaneShellConfig::new(&default_shell, self.state.shell_mode);
         let split_result = match params.ratio {
@@ -1219,6 +1369,8 @@ impl App {
             Err(message) => return encode_error(id, "project_change_refused", message),
         };
 
+        // The pin belongs to this attachment, never to the moved pane's successor location.
+        self.revoke_agent_channels_for_terminals([source_terminal_id.clone()]);
         let previous_focus = self.state.current_pane_focus_target();
         let taken = match self
             .state
@@ -1361,6 +1513,18 @@ impl App {
             self.state
                 .record_pane_focus_change(previous_focus, target_ws_idx, moved_pane_id);
             self.state.mode = crate::app::Mode::Terminal;
+        }
+        // Focus recording above can capture the moved pane in its old workspace.
+        if cross_workspace
+            && self
+                .state
+                .previous_pane_focus
+                .as_ref()
+                .is_some_and(|focus| {
+                    focus.workspace_id == previous_workspace_id && focus.pane_id == moved_pane_id
+                })
+        {
+            self.state.previous_pane_focus = None;
         }
         let created_workspace = created_workspace.then(|| self.workspace_info(target_ws_idx));
         let created_tab = if created_tab {
@@ -1643,6 +1807,7 @@ impl App {
         &mut self,
         id: String,
         params: PaneReportAgentParams,
+        context: crate::api::ApiRequestContext,
     ) -> String {
         let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
             return pane_not_found(id, &params.pane_id);
@@ -1656,12 +1821,18 @@ impl App {
         let report_is_newer = self
             .pane_terminal(ws_idx, pane_id)
             .is_some_and(|terminal| terminal.hook_report_is_newer(&params.source, params.seq));
+        let previous_report = self
+            .pane_terminal(ws_idx, pane_id)
+            .map(|terminal| (terminal.session_report_marker(), params.seq))
+            .unwrap_or_default();
+        let reported_id = params.agent_session_id.clone();
         let session_ref = crate::agent_resume::session_ref_from_report(
             &params.source,
             &agent_label,
             params.agent_session_id,
             params.agent_session_path,
         );
+        let previous_session = self.pane_agent_session_snapshot(pane_id);
         self.handle_internal_event(crate::events::AppEvent::HookStateReported {
             pane_id,
             session_ref: session_ref.clone(),
@@ -1671,6 +1842,17 @@ impl App {
             message: params.message,
             seq: params.seq,
         });
+        self.retain_session_report_id(
+            ws_idx,
+            pane_id,
+            previous_report,
+            &params.source,
+            &agent_label,
+            session_ref.as_ref(),
+            (reported_id, context.local_peer_identity),
+        );
+        // After the retain: only then is the report's actual id visible.
+        self.emit_pane_agent_session_changed(pane_id, previous_session);
         let applied =
             report_is_newer && self.session_report_applied(ws_idx, pane_id, session_ref.as_ref());
         self.report_agent_resume(
@@ -1688,6 +1870,7 @@ impl App {
         &mut self,
         id: String,
         params: PaneReportAgentSessionParams,
+        context: crate::api::ApiRequestContext,
     ) -> String {
         let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
             return pane_not_found(id, &params.pane_id);
@@ -1701,12 +1884,18 @@ impl App {
         let report_is_newer = self
             .pane_terminal(ws_idx, pane_id)
             .is_some_and(|terminal| terminal.hook_report_is_newer(&params.source, params.seq));
+        let previous_report = self
+            .pane_terminal(ws_idx, pane_id)
+            .map(|terminal| (terminal.session_report_marker(), params.seq))
+            .unwrap_or_default();
+        let reported_id = params.agent_session_id.clone();
         let session_ref = crate::agent_resume::session_ref_from_report(
             &params.source,
             &agent_label,
             params.agent_session_id,
             params.agent_session_path,
         );
+        let previous_session = self.pane_agent_session_snapshot(pane_id);
         self.handle_internal_event(crate::events::AppEvent::AgentSessionReported {
             pane_id,
             session_ref: session_ref.clone(),
@@ -1717,6 +1906,17 @@ impl App {
                 params.session_start_source,
             ),
         });
+        self.retain_session_report_id(
+            ws_idx,
+            pane_id,
+            previous_report,
+            &params.source,
+            &agent_label,
+            session_ref.as_ref(),
+            (reported_id, context.local_peer_identity),
+        );
+        // After the retain: only then is the report's actual id visible.
+        self.emit_pane_agent_session_changed(pane_id, previous_session);
         let applied =
             report_is_newer && self.session_report_applied(ws_idx, pane_id, session_ref.as_ref());
         self.report_agent_resume(
@@ -1728,6 +1928,32 @@ impl App {
             params.seq.filter(|_| applied),
             applied.then_some(params.resume_argv).flatten(),
         )
+    }
+
+    fn retain_session_report_id(
+        &mut self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+        previous_report: (crate::terminal::state::SessionReportMarker, Option<u64>),
+        source: &str,
+        agent: &str,
+        session_ref: Option<&crate::agent_resume::AgentSessionRef>,
+        report: (Option<String>, Option<crate::platform::ProcessIdentity>),
+    ) {
+        let (id, reporter) = report;
+        let Some(terminal_id) = self.state.terminal_id_for_pane(ws_idx, pane_id) else {
+            return;
+        };
+        if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
+            terminal.retain_reported_agent_session_id(
+                previous_report,
+                source,
+                agent,
+                session_ref,
+                id,
+                reporter,
+            );
+        }
     }
 
     /// A resume command belongs to the session it was reported with, so it is
@@ -1997,17 +2223,99 @@ impl App {
         encode_success(id, ResponseResult::Ok {})
     }
 
+    pub(super) fn queue_session_checked_pane_input(
+        &mut self,
+        id: String,
+        input: SessionCheckedPaneInput,
+        context: crate::api::ApiRequestContext,
+    ) -> Result<std::sync::mpsc::Receiver<std::io::Result<()>>, String> {
+        let (pane, expected, method) = match &input {
+            SessionCheckedPaneInput::Text(params) => (
+                &params.pane_id,
+                params.expected_agent_session_id.as_deref(),
+                "pane.send_text",
+            ),
+            SessionCheckedPaneInput::Keys(params) => (
+                &params.pane_id,
+                params.expected_agent_session_id.as_deref(),
+                "pane.send_keys",
+            ),
+        };
+        let Some((ws_idx, pane_id)) = self.parse_pane_id(pane) else {
+            return Err(pane_not_found(id, pane));
+        };
+        let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
+            return Err(pane_not_found(id, pane));
+        };
+        precheck_pane_input_poison(&id, runtime.input_is_poisoned())?;
+        let guard = self
+            .capture_expected_agent_session(expected, ws_idx, pane_id)
+            .map_err(|error| super::responses::encode_error_body(id.clone(), error))?;
+        let Some(guard) = guard else {
+            return Err(encode_error(
+                id,
+                "agent_session_unknown",
+                "session-checked input requires expected_agent_session_id",
+            ));
+        };
+        // Retain this checked runtime through logging and enqueue; never resolve
+        // the target again after logging or send keys as independent packets.
+        let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
+            return Err(pane_not_found(id, pane));
+        };
+        let bytes = match input {
+            SessionCheckedPaneInput::Text(params) => params.text.into_bytes(),
+            SessionCheckedPaneInput::Keys(params) => encode_api_keys(runtime, &params.keys)
+                .map_err(|key| {
+                    encode_error(id.clone(), "invalid_key", format!("unsupported key {key}"))
+                })?
+                .into_iter()
+                .flatten()
+                .collect(),
+        };
+        self.log_api_input(&id, method, ws_idx, pane_id, context, bytes.len())?;
+        let has_input = !bytes.is_empty();
+        let completion = runtime
+            .queue_guarded_user_input_submission_with_source(
+                Bytes::from(bytes),
+                Bytes::new(),
+                std::time::Duration::ZERO,
+                guard,
+                crate::pty::input_consumer::InputSource::Api,
+            )
+            .map_err(|error| pane_input_completion_response(id, Err(error)))?;
+        // An enqueue receipt invalidates the last-input generation; it does not
+        // claim bytes have reached the PTY. The response awaits actor completion.
+        if has_input {
+            self.accepted_api_inputs.push(pane_id);
+        }
+        Ok(completion)
+    }
+
     pub(super) fn handle_pane_send_text(
         &mut self,
         id: String,
         params: PaneSendTextParams,
         context: crate::api::ApiRequestContext,
     ) -> String {
+        if params.expected_agent_session_id.is_some() {
+            return match self.queue_session_checked_pane_input(
+                id.clone(),
+                SessionCheckedPaneInput::Text(params),
+                context,
+            ) {
+                Ok(completion) => complete_direct_pane_input(id, completion),
+                Err(response) => response,
+            };
+        }
         let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
-        if self.lookup_runtime_sender(ws_idx, pane_id).is_none() {
+        let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
             return pane_not_found(id, &params.pane_id);
+        };
+        if let Err(response) = precheck_pane_input_poison(&id, runtime.input_is_poisoned()) {
+            return response;
         }
         if let Err(response) = self.log_api_input(
             &id,
@@ -2061,6 +2369,9 @@ impl App {
         else {
             return pane_not_found(id, &params.pane_id);
         };
+        if let Err(response) = precheck_pane_input_poison(&id, runtime.input_is_poisoned()) {
+            return response;
+        }
         let bytes = match super::super::api_helpers::encode_api_input(
             runtime,
             &params.text,
@@ -2110,14 +2421,18 @@ impl App {
         };
         let workspace_id = self.public_workspace_id(ws_idx);
         let layout_update_target = self.layout_update_target_after_pane_removal(ws_idx, pane_id);
-        if self.state.close_pane_would_close_workspace(ws_idx, pane_id)
-            && self.state.confirm_implicit_worktree_group_close(ws_idx)
-        {
-            return Err(encode_error(
-                id,
-                "confirmation_required",
-                "closing this pane would close a worktree group",
-            ));
+        if self.state.close_pane_would_close_workspace(ws_idx, pane_id) {
+            self.require_restored_group_close_ready(
+                &id,
+                &self.state.workspace_close_indices(ws_idx),
+            )?;
+            if self.state.confirm_implicit_worktree_group_close(ws_idx) {
+                return Err(encode_error(
+                    id,
+                    "confirmation_required",
+                    "closing this pane would close a worktree group",
+                ));
+            }
         }
         let mut projected = self.project_topology();
         projected[ws_idx].remove_pane(pane_id);
@@ -2131,6 +2446,11 @@ impl App {
             .map_err(|message| encode_error(id.clone(), "project_change_refused", message))?;
         let workspace_snapshot = self.workspace_info(ws_idx);
         let terminal_id = self.state.terminal_id_for_pane(ws_idx, pane_id);
+        if self.state.close_pane_would_close_workspace(ws_idx, pane_id) {
+            self.revoke_agent_channels_for_workspace_close(ws_idx);
+        } else {
+            self.revoke_agent_channels_for_terminals(terminal_id.clone());
+        }
         let should_close_workspace = {
             let Some(ws) = self.state.workspaces.get_mut(ws_idx) else {
                 return Err(pane_not_found(id, &target.pane_id));
@@ -2182,12 +2502,25 @@ impl App {
         params: PaneSendKeysParams,
         context: crate::api::ApiRequestContext,
     ) -> String {
+        if params.expected_agent_session_id.is_some() {
+            return match self.queue_session_checked_pane_input(
+                id.clone(),
+                SessionCheckedPaneInput::Keys(params),
+                context,
+            ) {
+                Ok(completion) => complete_direct_pane_input(id, completion),
+                Err(response) => response,
+            };
+        }
         let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
         let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
+        if let Err(response) = precheck_pane_input_poison(&id, runtime.input_is_poisoned()) {
+            return response;
+        }
         let encoded_keys = match encode_api_keys(runtime, &params.keys) {
             Ok(encoded_keys) => encoded_keys,
             Err(key) => return encode_error(id, "invalid_key", format!("unsupported key {key}")),
@@ -2199,8 +2532,7 @@ impl App {
             return response;
         }
         let mut accepted_input = false;
-        for bytes in encoded_keys {
-            let has_input = !bytes.is_empty();
+        for bytes in encoded_keys.into_iter().filter(|bytes| !bytes.is_empty()) {
             if let Err(err) = runtime.try_send_bytes_with_source(
                 Bytes::from(bytes),
                 crate::pty::input_consumer::InputSource::Api,
@@ -2211,7 +2543,7 @@ impl App {
                 }
                 return encode_error(id, "pane_send_failed", err.to_string());
             }
-            accepted_input |= has_input;
+            accepted_input = true;
         }
         if accepted_input {
             self.accepted_api_inputs.push(pane_id);
@@ -2531,6 +2863,289 @@ mod tests {
         workspace::Workspace,
     };
 
+    fn test_guard() -> crate::pty::actor::SessionInputGuard {
+        crate::pty::actor::SessionInputGuard {
+            reporter: crate::platform::ProcessIdentity {
+                pid: 1,
+                start_time: 1,
+            },
+            expected_agent_session_id: "opaque-session".into(),
+            expected_agent_status: None,
+            agent_status: std::sync::Weak::new(),
+            status_mismatch: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            // Error classification and synthetic-channel rejection fixtures must
+            // fail closed; they never authorize a native PTY write.
+            binding_validity: std::sync::Weak::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn api_pane_input_poison_blocks_all_send_methods_until_explicit_clear() {
+        let (mut app, pane_id, mut rx) = app_with_send_key_runtime(8);
+        let internal_pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.terminal_id_for_pane(0, internal_pane_id).unwrap();
+        app.lookup_runtime_sender(0, internal_pane_id)
+            .unwrap()
+            .test_set_input_poisoned(true);
+        for method in [
+            "pane.send_text",
+            "pane.send_keys",
+            "pane.send_input",
+            "pane.send_input_guarded",
+            "pane.send_text_session_checked",
+            "pane.send_keys_session_checked",
+        ] {
+            let mut value = serde_json::json!({
+                "id": "poison", "method": method,
+                "params": {"pane_id": pane_id, "text": "must not send", "keys": ["Enter"],
+                    "allow_cross_pane": true, "expected_terminal": terminal_id.to_string()}
+            });
+            if method.ends_with("_session_checked") {
+                value["params"]["expected_agent_session_id"] = serde_json::json!("unknown-session");
+            }
+            let request = serde_json::from_value(value).unwrap();
+            let response: ErrorResponse =
+                serde_json::from_str(&app.handle_api_request(request)).unwrap();
+            let unsupported_guard = method.ends_with("_session_checked")
+                && !crate::platform::expected_agent_session_guard_supported();
+            assert_eq!(
+                response.error.code,
+                if unsupported_guard {
+                    "expected_agent_session_unsupported"
+                } else {
+                    "pane_input_poisoned"
+                },
+                "{method}"
+            );
+            if !unsupported_guard {
+                assert_eq!(
+                    response.error.message,
+                    crate::api::schema::PANE_INPUT_POISON_NOTICE
+                );
+            }
+            assert!(rx.try_recv().is_err());
+            assert!(app.accepted_api_inputs.is_empty());
+            assert!(app
+                .lookup_runtime_sender(0, internal_pane_id)
+                .unwrap()
+                .input_is_poisoned());
+        }
+        let clear = crate::api::schema::Request {
+            id: "clear".into(),
+            method: crate::api::schema::Method::PaneClearInputPoison(PaneTarget {
+                pane_id: pane_id.clone(),
+            }),
+        };
+        // smarty-dev#8152: a public caller whose origin cannot be proven is no
+        // operator; the poison stays.
+        let refused: ErrorResponse =
+            serde_json::from_str(&app.handle_api_request(clear.clone())).unwrap();
+        assert_eq!(refused.error.code, "input_origin_unknown");
+        assert!(app
+            .lookup_runtime_sender(0, internal_pane_id)
+            .unwrap()
+            .input_is_poisoned());
+        // The client lane's trusted flag alone is no operator proof: a
+        // client connection without a pinned peer is refused the same way.
+        let refused: ErrorResponse = serde_json::from_str(
+            &app.handle_trusted_client_shell_api_request_after_internal_events_drained(
+                clear.clone(),
+                Default::default(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(refused.error.code, "input_origin_unknown");
+        assert!(app
+            .lookup_runtime_sender(0, internal_pane_id)
+            .unwrap()
+            .input_is_poisoned());
+        // The attached client whose pinned peer is proven outside every pane
+        // is an operator.
+        let response = as_operator_client(&mut app, clear);
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(value["result"]["type"], "ok");
+        assert_eq!(
+            value["result"]["message"],
+            crate::api::schema::PANE_INPUT_POISON_CLEAR_WARNING
+        );
+        assert!(!app
+            .lookup_runtime_sender(0, internal_pane_id)
+            .unwrap()
+            .input_is_poisoned());
+        assert!(
+            rx.try_recv().is_err(),
+            "clear must not send or discard staged text"
+        );
+        let request = serde_json::from_value(serde_json::json!({
+            "id": "clean", "method": "pane.send_text", "params": {
+                "pane_id": pane_id, "text": "clean", "allow_cross_pane": true
+            }
+        }))
+        .unwrap();
+        let response: SuccessResponse =
+            serde_json::from_str(&app.handle_api_request(request)).unwrap();
+        assert_eq!(response.result, ResponseResult::Ok {});
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"clean"));
+        let _ = std::fs::remove_file(&app.api_input_log);
+    }
+
+    #[test]
+    fn pane_input_poison_precheck_is_typed_and_never_clears() {
+        for _ in 0..2 {
+            let response = precheck_pane_input_poison("poison", true).unwrap_err();
+            let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+            assert_eq!(error.id, "poison");
+            assert_eq!(error.error.code, "pane_input_poisoned");
+            assert_eq!(
+                error.error.message,
+                crate::api::schema::PANE_INPUT_POISON_NOTICE
+            );
+        }
+        assert!(precheck_pane_input_poison("clean", false).is_ok());
+    }
+
+    #[test]
+    fn clear_input_poison_api_rejects_missing_runtime_or_pane() {
+        let (mut app, pane_id) = app_with_test_workspace();
+        for target in [pane_id, "missing".into()] {
+            let request = crate::api::schema::Request {
+                id: "clear".into(),
+                method: crate::api::schema::Method::PaneClearInputPoison(PaneTarget {
+                    pane_id: target,
+                }),
+            };
+            let response: ErrorResponse =
+                serde_json::from_str(&as_operator_client(&mut app, request)).unwrap();
+            assert_eq!(response.error.code, "pane_not_found");
+        }
+    }
+
+    /// smarty-dev#8152: dispatches on the client lane with an accept-pinned peer
+    /// (this process, no Herdr markers) whose ancestry is observed outside the
+    /// server, i.e. an attached client run outside every pane.
+    fn as_operator_client(app: &mut App, request: crate::api::schema::Request) -> String {
+        let context = crate::api::ApiRequestContext {
+            local_peer_pane_origin: crate::platform::PeerPaneOrigin::Absent,
+            ..crate::api::ApiRequestContext::for_local_peer_pid(Some(std::process::id()))
+        };
+        let peer = context.local_peer_identity.expect("live peer");
+        crate::platform::with_server_ancestry_for_test(peer, Some(true), || {
+            app.handle_trusted_client_shell_api_request_after_internal_events_drained(
+                request, context,
+            )
+        })
+    }
+
+    #[test]
+    fn clear_input_poison_client_lane_classifies_its_peer() {
+        let (mut app, pane_id) = app_with_test_workspace();
+        let request = crate::api::schema::Request {
+            id: "clear".into(),
+            method: crate::api::schema::Method::PaneClearInputPoison(PaneTarget { pane_id }),
+        };
+        let context = crate::api::ApiRequestContext {
+            local_peer_pane_origin: crate::platform::PeerPaneOrigin::Absent,
+            ..crate::api::ApiRequestContext::for_local_peer_pid(Some(std::process::id()))
+        };
+        let peer = context.local_peer_identity.expect("live peer");
+        // Unobservable ancestry: unknown, not ordinary, on the client lane too.
+        let response: ErrorResponse = serde_json::from_str(
+            &crate::platform::with_server_ancestry_for_test(peer, None, || {
+                app.handle_trusted_client_shell_api_request_after_internal_events_drained(
+                    request.clone(),
+                    context,
+                )
+            }),
+        )
+        .unwrap();
+        assert_eq!(response.error.code, "input_origin_unknown");
+        // A peer whose launch markers say it was started in a pane needs a
+        // live pane link; without one it is unknown, never an operator.
+        let marked = crate::api::ApiRequestContext {
+            local_peer_pane_origin: crate::platform::PeerPaneOrigin::HasPane,
+            ..context
+        };
+        let response: ErrorResponse = serde_json::from_str(
+            &app.handle_trusted_client_shell_api_request_after_internal_events_drained(
+                request, marked,
+            ),
+        )
+        .unwrap();
+        assert_eq!(response.error.code, "input_origin_unknown");
+    }
+
+    #[test]
+    fn guarded_pane_completion_maps_only_typed_loss() {
+        let lost = crate::pty::actor::agent_session_lost(&test_guard(), false);
+        let response: ErrorResponse =
+            serde_json::from_str(&pane_input_completion_response("typed".into(), Err(lost)))
+                .unwrap();
+        assert_eq!(response.error.code, "agent_session_lost");
+        let encoded: serde_json::Value = serde_json::from_str(&pane_input_completion_response(
+            "partial".into(),
+            Err(crate::pty::actor::agent_session_lost(&test_guard(), true)),
+        ))
+        .unwrap();
+        assert_eq!(encoded["error"]["partial_text_consumed"], true);
+        let encoded: serde_json::Value = serde_json::from_str(&pane_input_completion_response(
+            "none".into(),
+            Err(crate::pty::actor::agent_session_lost(&test_guard(), false)),
+        ))
+        .unwrap();
+        assert_eq!(encoded["error"]["partial_text_consumed"], false);
+        assert_eq!(encoded["error"]["flush_failed"], false);
+        let generic_loss = std::io::Error::other("unknown delivery");
+        let encoded: serde_json::Value =
+            serde_json::from_str(&session_loss_response("unknown".into(), &generic_loss)).unwrap();
+        assert!(encoded["error"]["partial_text_consumed"].is_null());
+        assert_eq!(encoded["error"]["flush_failed"], false);
+        let generic = std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "agent session ownership was lost",
+        );
+        let response: ErrorResponse = serde_json::from_str(&pane_input_completion_response(
+            "generic".into(),
+            Err(generic),
+        ))
+        .unwrap();
+        assert_eq!(response.error.code, "pane_send_failed");
+    }
+
+    #[test]
+    fn direct_guarded_pane_response_observes_completion_not_enqueue() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(Err(crate::pty::actor::agent_session_lost(
+            &test_guard(),
+            false,
+        )))
+        .unwrap();
+        let response: ErrorResponse =
+            serde_json::from_str(&complete_direct_pane_input("lost".into(), rx)).unwrap();
+        assert_eq!(response.error.code, "agent_session_lost");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(Ok(())).unwrap();
+        let response: SuccessResponse =
+            serde_json::from_str(&complete_direct_pane_input("done".into(), rx)).unwrap();
+        assert!(matches!(response.result, ResponseResult::Ok {}));
+    }
+
+    #[tokio::test]
+    async fn synthetic_channel_cannot_authorize_guarded_input() {
+        let (runtime, mut rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        let error = runtime
+            .queue_guarded_user_input_submission_with_source(
+                Bytes::from_static(b"guarded text"),
+                Bytes::from_static(b"\r"),
+                std::time::Duration::ZERO,
+                test_guard(),
+                crate::pty::input_consumer::InputSource::Api,
+            )
+            .expect_err("a fake channel has no PTY ownership proof");
+        assert!(crate::pty::actor::is_agent_session_lost(&error));
+        assert!(rx.try_recv().is_err());
+    }
+
     fn app_with_test_workspace() -> (App, String) {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(
@@ -2637,6 +3252,7 @@ mod tests {
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "req".into(),
             method: crate::api::schema::Method::PaneSendKeys(PaneSendKeysParams {
+                expected_agent_session_id: None,
                 pane_id,
                 keys: vec![
                     "ctrl+h".into(),
@@ -2666,6 +3282,7 @@ mod tests {
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "req".into(),
             method: crate::api::schema::Method::PaneSendKeys(PaneSendKeysParams {
+                expected_agent_session_id: None,
                 pane_id,
                 keys: vec!["shift+tab".into()],
                 // Synthetic payload fixture explicitly opts out of origin policy.
@@ -3031,6 +3648,7 @@ mod tests {
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "req".into(),
             method: crate::api::schema::Method::PaneSendKeys(PaneSendKeysParams {
+                expected_agent_session_id: None,
                 pane_id,
                 keys: vec!["C-c".into(), "c-c".into(), "ctrl+c".into()],
                 // Synthetic payload fixture explicitly opts out of origin policy.
@@ -3048,7 +3666,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn api_pane_send_keys_preserves_super_chord_in_legacy_pane() {
+    async fn api_pane_send_keys_does_not_type_super_chord_into_legacy_pane() {
         let (mut app, pane_id, mut rx) = app_with_send_key_runtime(1);
         let internal_pane_id = app.state.workspaces[0].tabs[0].root_pane;
         assert_eq!(
@@ -3061,6 +3679,7 @@ mod tests {
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "req".into(),
             method: crate::api::schema::Method::PaneSendKeys(PaneSendKeysParams {
+                expected_agent_session_id: None,
                 pane_id,
                 keys: vec!["cmd+c".into()],
                 // Synthetic payload fixture explicitly opts out of origin policy.
@@ -3071,11 +3690,63 @@ mod tests {
         let success: SuccessResponse = serde_json::from_str(&response).unwrap();
         assert_eq!(success.id, "req");
         assert_eq!(success.result, ResponseResult::Ok {});
+        // Neither a bare "c" (#3710) nor a Kitty report the shell prints (#4356).
+        assert!(rx.try_recv().is_err());
+        assert!(app.accepted_api_inputs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn api_pane_send_keys_skips_empty_keys_and_records_partial_acceptance() {
+        let (mut app, pane_id, mut rx) = app_with_send_key_runtime(1);
+        let internal_pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "partial-keys".into(),
+            method: crate::api::schema::Method::PaneSendKeys(PaneSendKeysParams {
+                expected_agent_session_id: None,
+                pane_id,
+                keys: vec!["cmd+c".into(), "ctrl+x".into(), "ctrl+y".into()],
+                allow_cross_pane: true,
+            }),
+        });
+
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "pane_send_failed");
+        assert_eq!(rx.try_recv().unwrap(), bytes::Bytes::from_static(b"\x18"));
+        assert!(rx.try_recv().is_err());
+        assert_eq!(app.accepted_api_inputs, vec![internal_pane_id]);
+    }
+
+    #[tokio::test]
+    async fn api_pane_send_keys_reports_super_chord_to_kitty_pane() {
+        let (mut app, pane_id) = app_with_test_workspace();
+        let internal_pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let (runtime, mut rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                80,
+                24,
+                0,
+                b"\x1b[>1u",
+                1,
+            );
+        app.state.insert_test_runtime(internal_pane_id, runtime);
+
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "req".into(),
+            method: crate::api::schema::Method::PaneSendKeys(PaneSendKeysParams {
+                expected_agent_session_id: None,
+                pane_id,
+                keys: vec!["cmd+c".into()],
+                // Synthetic payload fixture explicitly opts out of origin policy.
+                allow_cross_pane: true,
+            }),
+        });
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(success.result, ResponseResult::Ok {});
         assert_eq!(
             rx.try_recv().unwrap(),
             bytes::Bytes::from_static(b"\x1b[99;9u")
         );
-        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -3085,6 +3756,7 @@ mod tests {
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "req".into(),
             method: crate::api::schema::Method::PaneSendKeys(PaneSendKeysParams {
+                expected_agent_session_id: None,
                 pane_id,
                 keys: vec!["+".into()],
                 // Synthetic payload fixture explicitly opts out of origin policy.
@@ -3116,6 +3788,7 @@ mod tests {
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "req".into(),
             method: crate::api::schema::Method::PaneSendKeys(PaneSendKeysParams {
+                expected_agent_session_id: None,
                 pane_id,
                 keys: vec!["shift+?".into()],
                 // Synthetic payload fixture explicitly opts out of origin policy.
@@ -3341,6 +4014,7 @@ mod tests {
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "req".into(),
             method: crate::api::schema::Method::PaneSendKeys(PaneSendKeysParams {
+                expected_agent_session_id: None,
                 pane_id,
                 keys: vec!["ctrl+h".into(), "not-a-key".into()],
                 // Synthetic payload fixture explicitly opts out of origin policy.
