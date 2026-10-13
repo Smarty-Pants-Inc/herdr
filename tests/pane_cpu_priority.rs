@@ -1,8 +1,9 @@
 //! Panes start at normal CPU priority even when the server runs idle (smarty-dev#11237).
 //!
-//! A real server is started under `chrt` and `nice`; panes are created and
-//! inspected through the `herdr` CLI, and the pane shell's scheduling policy
-//! and nice value are read from `/proc/<pid>/stat`.
+//! A real server is started in an idle or batch class that the test sets
+//! in-process (no `chrt` or `nice` binary, so the tests never skip); panes are
+//! created and inspected through the `herdr` CLI, and the pane shell's
+//! scheduling policy and nice value are read from `/proc/<pid>/stat`.
 
 #![cfg(target_os = "linux")]
 
@@ -11,21 +12,131 @@ pub mod support;
 pub mod test_command;
 
 use std::fs;
+use std::io;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use support::{
     cleanup_test_base, register_runtime_dir, register_spawned_herdr_pid,
     unregister_spawned_herdr_pid,
 };
 
-const SCHED_OTHER: i64 = 0;
-const SCHED_BATCH: i64 = 3;
-const SCHED_IDLE: i64 = 5;
+const SCHED_OTHER: i64 = libc::SCHED_OTHER as i64;
+const SCHED_BATCH: i64 = libc::SCHED_BATCH as i64;
+const SCHED_IDLE: i64 = libc::SCHED_IDLE as i64;
+
+/// The reduced CPU class a test server starts in.
+#[derive(Clone, Copy)]
+struct Class {
+    policy: libc::c_int,
+    nice: libc::c_int,
+}
+
+const IDLE_19: Class = Class {
+    policy: libc::SCHED_IDLE,
+    nice: 19,
+};
+const BATCH_5: Class = Class {
+    policy: libc::SCHED_BATCH,
+    nice: 5,
+};
+
+/// `class` with its nice raised to this thread's nice when that is higher, as
+/// `nice -n` would: an unprivileged child cannot lower the value it inherits.
+fn from_here(class: Class) -> Class {
+    // SAFETY: errno is thread-local; getpriority reads the calling thread.
+    let current = unsafe {
+        *libc::__errno_location() = 0;
+        libc::getpriority(libc::PRIO_PROCESS, 0)
+    };
+    let err = io::Error::last_os_error();
+    assert!(
+        current != -1 || err.raw_os_error() == Some(0),
+        "getpriority: {err}"
+    );
+    Class {
+        nice: class.nice.max(current),
+        ..class
+    }
+}
+
+/// Put the calling (forked, single-threaded) child in `class`.
+///
+/// Runs between fork and exec, so it calls only async-signal-safe syscalls.
+fn enter_class(class: Class) -> io::Result<()> {
+    let param = libc::sched_param { sched_priority: 0 };
+    // SAFETY: plain syscalls on the calling process with a valid pointer.
+    unsafe {
+        if libc::sched_setscheduler(0, class.policy, &param) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if libc::setpriority(libc::PRIO_PROCESS, 0, class.nice) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+/// Makes `command` start in `class`; `spawn` fails with the errno if the
+/// kernel refuses, so a test that cannot set up its class fails, never skips.
+fn in_class(command: &mut Command, class: Class) -> &mut Command {
+    let class = from_here(class);
+    // SAFETY: the hook calls only async-signal-safe syscalls.
+    unsafe { command.pre_exec(move || enter_class(class)) }
+}
+
+/// What an unprivileged process in `class` may do to itself on this host.
+#[derive(Clone, Copy)]
+enum Probe {
+    /// Leave the class for SCHED_OTHER.
+    LeavePolicy,
+    /// Lower its nice value to 0.
+    LowerNice,
+}
+
+const PROBE_REFUSED: i32 = 86;
+
+/// Whether a child in `class` may do `probe`. Panics if the class itself
+/// cannot be set.
+fn permitted_in(class: Class, probe: Probe) -> bool {
+    let class = from_here(class);
+    let mut command = Command::new("/bin/sh");
+    command
+        .args(["-c", "exit 0"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // SAFETY: the hook calls only async-signal-safe syscalls and `_exit`.
+    unsafe {
+        command.pre_exec(move || {
+            enter_class(class)?;
+            let param = libc::sched_param { sched_priority: 0 };
+            let result = match probe {
+                Probe::LeavePolicy => libc::sched_setscheduler(0, libc::SCHED_OTHER, &param),
+                Probe::LowerNice => libc::setpriority(libc::PRIO_PROCESS, 0, 0),
+            };
+            if result != 0 {
+                libc::_exit(PROBE_REFUSED);
+            }
+            Ok(())
+        });
+    }
+    let status = command
+        .status()
+        .unwrap_or_else(|err| panic!("cannot start a probe child in the test class: {err}"));
+    match status.code() {
+        Some(0) => true,
+        Some(PROBE_REFUSED) => false,
+        _ => panic!(
+            "probe child ended unexpectedly: {status:?} (signal {:?})",
+            status.signal()
+        ),
+    }
+}
 
 fn test_lock() -> MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -42,43 +153,15 @@ fn unique_test_dir(label: &str) -> PathBuf {
     PathBuf::from(format!("/tmp/hprio-{label}-{}-{nanos}", std::process::id()))
 }
 
-/// Whether `chrt` (util-linux) is installed; prints why the test is skipped if not.
-fn chrt_available() -> bool {
-    let available = Command::new("chrt")
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success());
-    if !available {
-        eprintln!(
-            "SKIP: chrt (util-linux) is not installed; cannot start a server at idle priority"
-        );
-    }
-    available
-}
-
-/// Whether this host lets an unprivileged process under `wrapper` run `probe`.
-fn permitted_under(wrapper: &[&str], probe: &str) -> bool {
-    Command::new(wrapper[0])
-        .args(&wrapper[1..])
-        .args(["sh", "-c", probe])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
-}
-
 struct Server {
-    _master: Box<dyn MasterPty + Send>,
-    child: Box<dyn Child + Send + Sync>,
+    child: Child,
     base: PathBuf,
     config_home: PathBuf,
     socket: PathBuf,
 }
 
 impl Server {
-    fn start(label: &str, wrapper: &[&str], config: &str) -> Self {
+    fn start(label: &str, class: Class, config: &str) -> Self {
         let base = unique_test_dir(label);
         let config_home = base.join("config");
         let runtime_dir = base.join("runtime");
@@ -92,30 +175,22 @@ impl Server {
         )
         .unwrap();
 
-        let pair = native_pty_system()
-            .openpty(PtySize {
-                rows: 24,
-                cols: 80,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .unwrap();
-        let mut cmd = CommandBuilder::new(wrapper[0]);
-        test_command::sanitize_pty_command_env(&mut cmd);
-        cmd.args(&wrapper[1..]);
-        cmd.arg(env!("CARGO_BIN_EXE_herdr"));
-        cmd.arg("server");
-        cmd.env("XDG_CONFIG_HOME", &config_home);
-        cmd.env("XDG_RUNTIME_DIR", &runtime_dir);
-        cmd.env("HERDR_SOCKET_PATH", &socket);
-        cmd.env_remove("HERDR_CLIENT_SOCKET_PATH");
-        cmd.env_remove("SSH_AUTH_SOCK");
-        cmd.env("SHELL", "/bin/sh");
-        cmd.env_remove("HERDR_ENV");
-        // `chrt` and `nice` exec herdr, so the pid is the server's.
-        let child = pair.slave.spawn_command(cmd).unwrap();
-        register_spawned_herdr_pid(child.process_id());
-        drop(pair.slave);
+        let mut cmd = test_command::herdr_command();
+        cmd.arg("server")
+            .env("XDG_CONFIG_HOME", &config_home)
+            .env("XDG_RUNTIME_DIR", &runtime_dir)
+            .env("HERDR_SOCKET_PATH", &socket)
+            .env_remove("HERDR_CLIENT_SOCKET_PATH")
+            .env_remove("SSH_AUTH_SOCK")
+            .env("SHELL", "/bin/sh")
+            .env_remove("HERDR_ENV")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let child = in_class(&mut cmd, class)
+            .spawn()
+            .unwrap_or_else(|err| panic!("cannot start the server in the test class: {err}"));
+        register_spawned_herdr_pid(Some(child.id()));
 
         let deadline = Instant::now() + Duration::from_secs(15);
         while std::os::unix::net::UnixStream::connect(&socket).is_err() {
@@ -123,7 +198,6 @@ impl Server {
             thread::sleep(Duration::from_millis(25));
         }
         Self {
-            _master: pair.master,
             child,
             base,
             config_home,
@@ -167,7 +241,7 @@ impl Server {
     }
 
     fn pid(&self) -> u32 {
-        self.child.process_id().expect("server pid")
+        self.child.id()
     }
 
     fn log(&self) -> String {
@@ -188,21 +262,19 @@ impl Server {
 
 impl Drop for Server {
     fn drop(&mut self) {
-        let pid = self.child.process_id();
-        support::stop_spawned_herdr(&mut *self.child);
-        if let Some(pid) = pid {
-            let deadline = Instant::now() + Duration::from_secs(2);
-            while Instant::now() < deadline {
-                let mut status = 0;
-                let result =
-                    unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };
-                if result == pid as libc::pid_t || result == -1 {
-                    break;
-                }
-                thread::sleep(Duration::from_millis(20));
-            }
+        let pid = self.child.id();
+        // SAFETY: signals only the server child this test spawned.
+        unsafe {
+            libc::kill(pid as libc::pid_t, libc::SIGTERM);
         }
-        unregister_spawned_herdr_pid(pid);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if !matches!(self.child.try_wait(), Ok(None)) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        unregister_spawned_herdr_pid(Some(pid));
         cleanup_test_base(&self.base);
     }
 }
@@ -226,14 +298,10 @@ fn pane_lines<'a>(log: &'a str, pid: u32, message: &str) -> Vec<&'a str> {
 #[test]
 fn pane_under_idle_server_starts_at_normal_priority_or_logs_the_refusal() {
     let _lock = test_lock();
-    if !chrt_available() {
-        return;
-    }
-    let wrapper = ["chrt", "--idle", "0", "nice", "-n", "19"];
     // The kernel lets a SCHED_IDLE task leave the class only within RLIMIT_NICE.
-    let leave_idle = permitted_under(&wrapper, "chrt --other -p 0 $$");
-    let lower_nice = permitted_under(&wrapper, "renice --priority 0 -p $$");
-    let server = Server::start("idle", &wrapper, "");
+    let leave_idle = permitted_in(IDLE_19, Probe::LeavePolicy);
+    let lower_nice = permitted_in(IDLE_19, Probe::LowerNice);
+    let server = Server::start("idle", IDLE_19, "");
 
     let startup = server.wait_for_log("reduced CPU priority");
     assert!(
@@ -281,12 +349,8 @@ fn pane_under_idle_server_starts_at_normal_priority_or_logs_the_refusal() {
 #[test]
 fn pane_under_batch_server_starts_at_sched_other_and_configured_nice() {
     let _lock = test_lock();
-    if !chrt_available() {
-        return;
-    }
     // Leaving SCHED_BATCH and raising a nice value never need privileges.
-    let wrapper = ["chrt", "--batch", "0", "nice", "-n", "5"];
-    let server = Server::start("batch", &wrapper, "[server]\npane_nice = 19\n");
+    let server = Server::start("batch", BATCH_5, "[server]\npane_nice = 19\n");
 
     let startup = server.wait_for_log("reduced CPU priority");
     assert!(
