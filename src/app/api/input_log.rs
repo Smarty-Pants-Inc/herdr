@@ -797,13 +797,33 @@ mod tests {
         }
     }
 
+    // Re-exec target for the presence peer. An exec of this unsigned test
+    // binary keeps its initial environment readable on Darwin, unlike Apple's
+    // protected /bin/sh, whose KERN_PROCARGS2 environment macOS hides.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn presence_peer_helper() {
+        if std::env::var_os("INPUT_LOG_PRESENCE_PEER").is_none() {
+            return;
+        }
+        let mut line = String::new();
+        let _ = std::io::stdin().read_line(&mut line);
+    }
+
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn assert_logged_pane_env_presence(marker: Option<&str>, expected: Option<bool>) {
-        let mut command = std::process::Command::new("/bin/sh");
+        let mut command =
+            std::process::Command::new(std::env::current_exe().expect("test executable"));
         command
-            .args(["-c", "read line"])
+            .args([
+                "--exact",
+                "app::api::input_log::tests::presence_peer_helper",
+                "--nocapture",
+            ])
             .env_clear()
-            .stdin(std::process::Stdio::piped());
+            .env("INPUT_LOG_PRESENCE_PEER", "1")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null());
         if let Some(marker) = marker {
             command.env("HERDR_PANE_ID", marker);
         }

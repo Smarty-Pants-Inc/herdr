@@ -134,6 +134,9 @@ fn observe_session_reporter_foreground(
 
 /// Linux consumer proof; unsupported platforms deliberately refuse.
 #[cfg(unix)]
+// Only the Linux consumer proof reads these fields; other Unix targets never
+// construct a snapshot because input_consumer_supported() is false there.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 #[derive(Debug, Clone)]
 pub(crate) struct InputConsumerSnapshot {
     pub peer: ProcessIdentity,

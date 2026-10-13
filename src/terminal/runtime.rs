@@ -663,7 +663,7 @@ impl TerminalRuntime {
 
 #[cfg(test)]
 impl TerminalRuntime {
-    #[cfg(all(test, unix))]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn test_set_before_write(
         &self,
         hook: Box<dyn FnMut(usize) + Send>,
