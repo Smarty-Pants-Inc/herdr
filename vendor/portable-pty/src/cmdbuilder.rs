@@ -231,6 +231,41 @@ fn get_base_env() -> BTreeMap<OsString, EnvEntry> {
     env
 }
 
+/// A callback run in the forked child immediately before `exec`.
+#[cfg(unix)]
+#[derive(Clone)]
+pub struct PreExecHook(std::sync::Arc<dyn Fn() + Send + Sync>);
+
+#[cfg(unix)]
+impl PreExecHook {
+    /// # Safety
+    ///
+    /// `hook` runs in the forked child of a possibly multi-threaded parent.
+    /// It must only call async-signal-safe functions: no allocation, locking
+    /// or logging.
+    pub unsafe fn new(hook: impl Fn() + Send + Sync + 'static) -> Self {
+        Self(std::sync::Arc::new(hook))
+    }
+
+    pub(crate) fn run(&self) {
+        (self.0)();
+    }
+}
+
+#[cfg(unix)]
+impl std::fmt::Debug for PreExecHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PreExecHook")
+    }
+}
+
+#[cfg(unix)]
+impl PartialEq for PreExecHook {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
 /// `CommandBuilder` is used to prepare a command to be spawned into a pty.
 /// The interface is intentionally similar to that of `std::process::Command`.
 #[derive(Clone, Debug, PartialEq)]
@@ -243,6 +278,9 @@ pub struct CommandBuilder {
     cwd: Option<OsString>,
     #[cfg(unix)]
     pub(crate) umask: Option<libc::mode_t>,
+    #[cfg(unix)]
+    #[cfg_attr(feature = "serde_support", serde(skip))]
+    pub(crate) pre_exec_hook: Option<PreExecHook>,
     controlling_tty: bool,
 }
 
@@ -258,6 +296,8 @@ impl CommandBuilder {
             cwd: None,
             #[cfg(unix)]
             umask: None,
+            #[cfg(unix)]
+            pre_exec_hook: None,
             controlling_tty: true,
         }
     }
@@ -272,6 +312,8 @@ impl CommandBuilder {
             cwd: None,
             #[cfg(unix)]
             umask: None,
+            #[cfg(unix)]
+            pre_exec_hook: None,
             controlling_tty: true,
         }
     }
@@ -301,6 +343,8 @@ impl CommandBuilder {
             cwd: None,
             #[cfg(unix)]
             umask: None,
+            #[cfg(unix)]
+            pre_exec_hook: None,
             controlling_tty: true,
         }
     }
@@ -467,6 +511,13 @@ impl CommandBuilder {
 impl CommandBuilder {
     pub fn umask(&mut self, mask: Option<libc::mode_t>) {
         self.umask = mask;
+    }
+
+    /// Run `hook` in the child after the session and controlling terminal
+    /// are established and before inherited descriptors are closed and the
+    /// program is executed. The hook cannot fail the spawn.
+    pub fn pre_exec_hook(&mut self, hook: Option<PreExecHook>) {
+        self.pre_exec_hook = hook;
     }
 
     fn resolve_path(&self) -> Option<&OsStr> {

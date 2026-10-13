@@ -238,6 +238,9 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # allow_unelevated_clients = false
 # headless_cols = 120
 # headless_rows = 40
+# Linux: nice value for new panes, which always start at SCHED_OTHER even
+# when the server itself runs at idle priority. Range -20..19.
+# pane_nice = 0
 
 # [worktrees]
 # directory = "~/.herdr/worktrees"

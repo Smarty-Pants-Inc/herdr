@@ -443,6 +443,7 @@ impl App {
     ) -> std::io::Result<Self> {
         let prefix_keys = config.prefix_keys();
         crate::kitty_graphics::set_enabled(config.kitty_graphics_enabled());
+        crate::platform::set_pane_nice(config.pane_nice());
         let (event_tx, event_rx) = mpsc::channel::<AppEvent>(APP_EVENT_CHANNEL_CAPACITY);
         let render_notify = Arc::new(Notify::new());
         let render_dirty = Arc::new(crate::render_signal::RenderSignal::new());
@@ -1029,6 +1030,8 @@ impl App {
             } else {
                 self.state.headless_size = config.headless_size();
             }
+            diagnostics.extend(config.invalid_pane_nice_diagnostic());
+            crate::platform::set_pane_nice(config.pane_nice());
         }
 
         if !invalid_section("advanced") {
