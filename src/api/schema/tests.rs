@@ -1320,6 +1320,7 @@ fn worktree_request_and_response_round_trip() {
                     checkout_path: "/worktrees/herdr/worktree-api".into(),
                     is_linked_worktree: true,
                 }),
+                cwd: Some("/worktrees/herdr/worktree-api".into()),
             },
             tab: TabInfo {
                 tab_id: "w_1:1".into(),
@@ -1408,6 +1409,7 @@ fn worktree_lifecycle_events_round_trip() {
             checkout_path: "/worktrees/herdr/worktree-api".into(),
             is_linked_worktree: true,
         }),
+        cwd: Some("/worktrees/herdr/worktree-api".into()),
     };
     let worktree = WorktreeInfo {
         path: "/worktrees/herdr/worktree-api".into(),

@@ -1139,6 +1139,13 @@
             "agent_status": {
               "$ref": "#/schemas/event/$defs/AgentStatus"
             },
+            "cwd": {
+              "description": "Current cwd of the workspace's root pane (first tab), else the cwd it was\ncreated in. Present even when `worktree` is absent: `worktree` reports only\na checkout opened through `worktree`/`workspace.create_linked`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "focused": {
               "type": "boolean"
             },
@@ -11917,6 +11924,13 @@
             },
             "agent_status": {
               "$ref": "#/schemas/success_response/$defs/AgentStatus"
+            },
+            "cwd": {
+              "description": "Current cwd of the workspace's root pane (first tab), else the cwd it was\ncreated in. Present even when `worktree` is absent: `worktree` reports only\na checkout opened through `worktree`/`workspace.create_linked`.",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "focused": {
               "type": "boolean"

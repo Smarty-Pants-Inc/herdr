@@ -73,6 +73,11 @@ pub struct WorkspaceInfo {
     pub tokens: HashMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree: Option<WorkspaceWorktreeInfo>,
+    /// Current cwd of the workspace's root pane (first tab), else the cwd it was
+    /// created in. Present even when `worktree` is absent: `worktree` reports only
+    /// a checkout opened through `worktree`/`workspace.create_linked`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

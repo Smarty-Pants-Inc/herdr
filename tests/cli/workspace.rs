@@ -90,6 +90,71 @@ fn workspace_and_pane_management_commands_work() {
     cleanup_spawned_herdr(herdr, base);
 }
 
+/// smarty-dev#2014: `workspace list` reports the root pane's cwd on every row,
+/// also when the workspace has no Herdr-opened `worktree`.
+#[test]
+fn workspace_list_reports_root_pane_cwd_for_plain_and_git_workspaces() {
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+    let plain = base.join("plain");
+    let repo = base.join("repo");
+    fs::create_dir_all(&plain).unwrap();
+    create_committed_repo(&repo);
+    let repo_path = repo.to_str().unwrap();
+
+    let herdr = spawn_herdr(&config_home, &runtime_dir, &socket_path);
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+
+    let create = |cwd: &str| {
+        let created = run_cli_json(&socket_path, &["workspace", "create", "--cwd", cwd]);
+        (
+            created["result"]["workspace"]["workspace_id"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+            created["result"]["root_pane"]["pane_id"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+        )
+    };
+    let (moved_id, moved_pane) = create(plain.to_str().unwrap());
+    let (at_repo_id, _) = create(repo_path);
+    let row = |id: &str| {
+        let listed = run_cli_json(&socket_path, &["workspace", "list"]);
+        listed["result"]["workspaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["workspace_id"] == id)
+            .cloned()
+            .unwrap()
+    };
+
+    assert_eq!(row(&moved_id)["cwd"], plain.to_str().unwrap());
+    let at_repo = row(&at_repo_id);
+    assert_eq!(at_repo["cwd"], repo_path);
+    // A plain `workspace create` in a checkout is not a Herdr-opened worktree.
+    assert!(at_repo.get("worktree").is_none(), "{at_repo}");
+
+    let ran = run_cli(
+        &socket_path,
+        &["pane", "run", &moved_pane, &format!("cd {repo_path}")],
+    );
+    assert!(ran.status.success());
+    assert!(
+        wait_until(Duration::from_secs(10), Duration::from_millis(50), || {
+            row(&moved_id)["cwd"] == repo_path
+        }),
+        "workspace row did not follow its root pane: {}",
+        row(&moved_id)
+    );
+
+    cleanup_spawned_herdr(herdr, base);
+}
+
 #[test]
 fn worktree_management_commands_work() {
     let base = unique_test_dir();
