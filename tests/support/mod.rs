@@ -157,7 +157,14 @@ fn process_start_identity(pid: u32) -> std::io::Result<Option<String>> {
 }
 
 fn owned_process_running(pid: u32, identity: &str) -> std::io::Result<bool> {
-    match process_start_identity(pid)? {
+    // Only recorded owners reach here. ESRCH means the proc entry opened for this
+    // PID was reaped mid-read (the owner exited on its own), not a recycled PID:
+    // the open file stays bound to the original process. Count it as stopped.
+    let current = match process_start_identity(pid) {
+        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => return Ok(false),
+        other => other?,
+    };
+    match current {
         None => Ok(false),
         Some(current) if current == identity => Ok(true),
         Some(_) => Err(std::io::Error::other(format!(
