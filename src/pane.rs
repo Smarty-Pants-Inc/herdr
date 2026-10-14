@@ -3078,7 +3078,7 @@ impl PaneRuntime {
         events: mpsc::Sender<AppEvent>,
         render_notify: Arc<Notify>,
         render_dirty: Arc<RenderSignal>,
-        cmd: CommandBuilder,
+        mut cmd: CommandBuilder,
         spawn_error_message: &'static str,
         initial_state: SpawnInitialState<'_>,
         agent_detection: AgentDetection,
@@ -3107,6 +3107,8 @@ impl PaneRuntime {
         let kitty_keyboard_flags = Arc::new(AtomicU16::new(0));
         let content_write_lock = Arc::new(Mutex::new(()));
 
+        // A pane never inherits the server's idle CPU class (smarty-dev#11237).
+        let scheduling = crate::platform::prepare_pane_spawn_scheduling(&mut cmd);
         // Backend diagnostics can contain executable paths or other launch recipe values.
         // Keep those details in the returned error for the caller, not in server logs.
         let spawned = crate::pty::backend::spawn_with_portable_pty(rows, cols, cmd).inspect_err(
@@ -3115,6 +3117,7 @@ impl PaneRuntime {
 
         // Pin the spawned instance before giving the child to a watcher that can reap it.
         let spawned_pid = spawned.child.process_id();
+        scheduling.report(pane_id.raw(), spawned_pid);
         let child_process_identity = spawned_pid.and_then(crate::platform::process_identity);
 
         // --- Child watcher task ---
