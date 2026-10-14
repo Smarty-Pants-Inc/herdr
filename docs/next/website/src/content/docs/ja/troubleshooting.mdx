@@ -95,6 +95,19 @@ herdr
 
 新しく起動したサーバーでも問題が起きる場合は、`herdr-server.log` の `could not select persistent user service context` を確認してください。必要な macOS API が利用できない場合、Herdr は継承したコンテキストを維持します。[Herdr issue #4100](https://github.com/herdrdev/herdr/issues/4100) を参照してください。
 
+## Linux のペインプロセスが 1 つの CPU しか使わない
+
+`taskset` や systemd の `CPUAffinity=` などで CPU アフィニティを制限して起動した Linux サーバーは、その制限を子プロセスに引き継ぐことがあります。Herdr はサーバーのアフィニティを変更せず、新しいペインのシェルがすべてのオンライン CPU を使えるようにリセットします。カーネルの cpuset 制限は引き続き適用されます。カーネルがリセットを拒否した場合、Herdr は警告をログに記録し、ペインの起動を続行します。
+
+対象ペイン内でアフィニティを確認し、オンライン CPU と比較してください:
+
+```bash
+grep Cpus_allowed_list /proc/self/status
+cat /sys/devices/system/cpu/online
+```
+
+ライブハンドオフは既存のシェルを再起動しないため、アフィニティは変わりません。サーバーの更新後に新しいペインを開くと新しい動作が適用されます。既存のペインプロセスは現在のアフィニティを維持します。
+
 ## `herdr` コマンドが見つからない
 
 ターミナルを再起動して環境を読み込み直し、Herdr のインストール先が `PATH` に含まれていることを確認してください。パッケージマネージャー経由のインストールは、そのパッケージマネージャーから更新して公開する必要があります。[インストール](/ja/docs/install/#verify)を参照してください。

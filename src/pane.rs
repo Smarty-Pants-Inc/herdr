@@ -3109,9 +3109,10 @@ impl PaneRuntime {
 
         // Backend diagnostics can contain executable paths or other launch recipe values.
         // Keep those details in the returned error for the caller, not in server logs.
-        let spawned = crate::pty::backend::spawn_with_portable_pty(rows, cols, cmd).inspect_err(
-            |err| error!(pane = pane_id.raw(), kind = ?err.kind(), "{spawn_error_message}"),
-        )?;
+        let spawned = crate::pty::backend::spawn_with_portable_pty(rows, cols, cmd, pane_id.raw())
+            .inspect_err(
+                |err| error!(pane = pane_id.raw(), kind = ?err.kind(), "{spawn_error_message}"),
+            )?;
 
         // Pin the spawned instance before giving the child to a watcher that can reap it.
         let spawned_pid = spawned.child.process_id();

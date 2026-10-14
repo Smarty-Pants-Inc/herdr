@@ -13,6 +13,7 @@ pub(crate) fn spawn_with_portable_pty(
     rows: u16,
     cols: u16,
     cmd: CommandBuilder,
+    pane_id: u32,
 ) -> std::io::Result<SpawnedPty> {
     let pty_system = native_pty_system();
     let pair = pty_system
@@ -29,10 +30,7 @@ pub(crate) fn spawn_with_portable_pty(
         .ok_or_else(|| std::io::Error::other("pty master fd is unavailable"))?;
     let actor_fd = fd::duplicate_cloexec_fd(master_fd)?;
     let actor_fd = unsafe { OwnedFd::from_raw_fd(actor_fd) };
-    let child = pair
-        .slave
-        .spawn_command(cmd)
-        .map_err(|err| std::io::Error::other(err.to_string()))?;
+    let child = crate::platform::spawn_pane_child(pair.slave.as_ref(), cmd, pane_id)?;
     drop(pair);
 
     Ok(SpawnedPty {

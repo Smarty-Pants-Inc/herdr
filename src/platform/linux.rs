@@ -35,6 +35,7 @@ mod config_file_tests;
 
 pub(super) mod client_identity;
 pub(super) mod input_consumer;
+pub(super) mod pane_cpu_affinity;
 pub(super) mod peer_pidfd;
 pub(super) mod server_key;
 

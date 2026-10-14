@@ -1,0 +1,73 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Subject: [PATCH] expose a Unix slave PTY pre-exec hook
+
+Let callers supply an async-signal-safe hook without changing CommandBuilder
+or imposing platform-specific child policy on portable-pty. Run the hook after
+terminal setup but before close_random_fds so callers can report results over
+inherited descriptors. The existing spawn_command path supplies no hook.
+
+Issue: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/12135
+Upstream discussion: none
+Upstream PR: none
+Vendored base: portable-pty 0.9.0
+---
+diff --git a/vendor/portable-pty/src/lib.rs b/vendor/portable-pty/src/lib.rs
+--- a/vendor/portable-pty/src/lib.rs
++++ b/vendor/portable-pty/src/lib.rs
+@@ -163,4 +163,22 @@ impl_downcast!(ChildKiller);
+ pub trait SlavePty {
+     /// Spawns the command specified by the provided CommandBuilder
+     fn spawn_command(&self, cmd: CommandBuilder) -> Result<Box<dyn Child + Send + Sync>, Error>;
++
++    /// Spawns with an additional hook after terminal setup and before inherited
++    /// descriptors are closed. An error from the hook aborts the spawn.
++    /// Implementations that cannot run a hook return an error without spawning.
++    ///
++    /// # Safety
++    ///
++    /// The hook runs in the child between fork and exec. It must obey the same
++    /// restrictions as `std::os::unix::process::CommandExt::pre_exec`: only
++    /// async-signal-safe operations, no allocation, locks, or unwinding.
++    #[cfg(unix)]
++    unsafe fn spawn_command_with_pre_exec(
++        &self,
++        _cmd: CommandBuilder,
++        _hook: Box<dyn FnMut() -> IoResult<()> + Send + Sync>,
++    ) -> Result<Box<dyn Child + Send + Sync>, Error> {
++        anyhow::bail!("this PTY implementation does not support a pre-exec hook")
++    }
+ }
+diff --git a/vendor/portable-pty/src/unix.rs b/vendor/portable-pty/src/unix.rs
+--- a/vendor/portable-pty/src/unix.rs
++++ b/vendor/portable-pty/src/unix.rs
+@@ -228,2 +228,6 @@ impl PtyFd {
+-    fn spawn_command(&self, builder: CommandBuilder) -> anyhow::Result<std::process::Child> {
++    fn spawn_command(
++        &self,
++        builder: CommandBuilder,
++        mut hook: Option<Box<dyn FnMut() -> io::Result<()> + Send + Sync>>,
++    ) -> anyhow::Result<std::process::Child> {
+         let configured_umask = builder.umask;
+@@ -276,1 +280,5 @@ impl PtyFd {
++                    if let Some(hook) = hook.as_mut() {
++                        hook()?;
++                    }
++
+                     close_random_fds();
+@@ -336,6 +344,15 @@ impl SlavePty for UnixSlavePty {
+         &self,
+         builder: CommandBuilder,
+     ) -> Result<Box<dyn Child + Send + Sync>, Error> {
+-        Ok(Box::new(self.fd.spawn_command(builder)?))
++        Ok(Box::new(self.fd.spawn_command(builder, None)?))
++    }
++
++    unsafe fn spawn_command_with_pre_exec(
++        &self,
++        builder: CommandBuilder,
++        hook: Box<dyn FnMut() -> io::Result<()> + Send + Sync>,
++    ) -> Result<Box<dyn Child + Send + Sync>, Error> {
++        // SAFETY: the caller guarantees the hook is safe between fork and exec.
++        Ok(Box::new(self.fd.spawn_command(builder, Some(hook))?))
+     }
+ }

@@ -95,6 +95,19 @@ herdr
 
 如果新启动的服务器仍出现此问题，请在 `herdr-server.log` 中查找 `could not select persistent user service context`。所需的 macOS API 不可用时，Herdr 会保留继承的上下文。详情见 [Herdr issue #4100](https://github.com/herdrdev/herdr/issues/4100)。
 
+## Linux 窗格进程只使用一个 CPU
+
+通过 `taskset` 或 systemd 的 `CPUAffinity=` 等方式限制 CPU 亲和性后启动的 Linux 服务器，可能会让子进程继承该限制。Herdr 会重置新窗格 shell 的亲和性，使其可以使用所有在线 CPU，而不改变服务器的亲和性。内核的 cpuset 限制仍然有效。如果内核拒绝重置，Herdr 会记录警告并继续启动窗格。
+
+在受影响的窗格中检查亲和性，并与在线 CPU 比较:
+
+```bash
+grep Cpus_allowed_list /proc/self/status
+cat /sys/devices/system/cpu/online
+```
+
+实时移交不会重新启动现有 shell，因此其亲和性不会改变。更新服务器后，请打开新窗格以使用新行为；现有窗格进程会保留当前亲和性。
+
 ## 找不到 `herdr` 命令
 
 重启终端以重新加载环境，然后确认 Herdr 安装目录位于 `PATH` 中。通过软件包管理器安装的 Herdr 必须通过该管理器更新并加入环境。见[安装 Herdr](/zh-cn/docs/install/#verify)。

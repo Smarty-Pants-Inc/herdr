@@ -168,3 +168,46 @@ cargo test --manifest-path vendor/portable-pty/Cargo.toml iter_full_env_
 The iterator regressions cover base and caller entries, preferred key casing,
 and non-Unicode keys and values on Unix and Windows. Run the vendor unit tests
 on both platforms.
+
+## 0005 expose a Unix slave PTY pre-exec hook
+
+status: active
+
+patch: `vendor/patches/portable-pty/0005-unix-pre-exec-hook.patch`
+
+issue: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/12135
+
+upstream discussion: none
+
+upstream pr: none
+
+vendored base: `portable-pty 0.9.0`
+
+local files:
+
+- `vendor/portable-pty/src/lib.rs`
+- `vendor/portable-pty/src/unix.rs`
+
+reason: Herdr must reset inherited Linux CPU affinity before a pane program
+executes or forks descendants. Expose a reusable, unsafe Unix-only slave spawn
+hook without adding Linux policy or closure state to `CommandBuilder`. The hook
+runs after terminal setup and before inherited descriptors are closed, allowing
+async-signal-safe result reporting to the parent. Ordinary `spawn_command` keeps
+its existing behavior; unsupported PTY implementations reject the hook without
+spawning.
+
+remove when: upstream `portable-pty` exposes an equivalent Unix slave pre-exec
+hook that runs before descriptor cleanup, and Herdr uses that upstream API, or
+Herdr replaces this launch path.
+
+verification:
+
+```sh
+python3 -m unittest scripts.test_vendor_portable_pty
+just test
+```
+
+Linux inline unit tests cover malformed sysfs CPU lists, sparse CPU indices
+above `CPU_SETSIZE`, and real affinity refusal with parent-readable errno while
+the hook still permits exec. Also validate a real pane launched by a pinned
+server, with inherited/cgroup CPU constraints and affinity visible at first exec.

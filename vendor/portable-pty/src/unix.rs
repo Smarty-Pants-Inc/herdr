@@ -225,7 +225,11 @@ impl PtyFd {
         })
     }
 
-    fn spawn_command(&self, builder: CommandBuilder) -> anyhow::Result<std::process::Child> {
+    fn spawn_command(
+        &self,
+        builder: CommandBuilder,
+        mut hook: Option<Box<dyn FnMut() -> io::Result<()> + Send + Sync>>,
+    ) -> anyhow::Result<std::process::Child> {
         let configured_umask = builder.umask;
 
         let mut cmd = builder.as_command()?;
@@ -271,6 +275,10 @@ impl PtyFd {
                         if libc::ioctl(0, libc::TIOCSCTTY as _, 0) == -1 {
                             return Err(io::Error::last_os_error());
                         }
+                    }
+
+                    if let Some(hook) = hook.as_mut() {
+                        hook()?;
                     }
 
                     close_random_fds();
@@ -336,7 +344,16 @@ impl SlavePty for UnixSlavePty {
         &self,
         builder: CommandBuilder,
     ) -> Result<Box<dyn Child + Send + Sync>, Error> {
-        Ok(Box::new(self.fd.spawn_command(builder)?))
+        Ok(Box::new(self.fd.spawn_command(builder, None)?))
+    }
+
+    unsafe fn spawn_command_with_pre_exec(
+        &self,
+        builder: CommandBuilder,
+        hook: Box<dyn FnMut() -> io::Result<()> + Send + Sync>,
+    ) -> Result<Box<dyn Child + Send + Sync>, Error> {
+        // SAFETY: the caller guarantees the hook is safe between fork and exec.
+        Ok(Box::new(self.fd.spawn_command(builder, Some(hook))?))
     }
 }
 

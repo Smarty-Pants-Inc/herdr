@@ -163,6 +163,24 @@ impl_downcast!(ChildKiller);
 pub trait SlavePty {
     /// Spawns the command specified by the provided CommandBuilder
     fn spawn_command(&self, cmd: CommandBuilder) -> Result<Box<dyn Child + Send + Sync>, Error>;
+
+    /// Spawns with an additional hook after terminal setup and before inherited
+    /// descriptors are closed. An error from the hook aborts the spawn.
+    /// Implementations that cannot run a hook return an error without spawning.
+    ///
+    /// # Safety
+    ///
+    /// The hook runs in the child between fork and exec. It must obey the same
+    /// restrictions as `std::os::unix::process::CommandExt::pre_exec`: only
+    /// async-signal-safe operations, no allocation, locks, or unwinding.
+    #[cfg(unix)]
+    unsafe fn spawn_command_with_pre_exec(
+        &self,
+        _cmd: CommandBuilder,
+        _hook: Box<dyn FnMut() -> IoResult<()> + Send + Sync>,
+    ) -> Result<Box<dyn Child + Send + Sync>, Error> {
+        anyhow::bail!("this PTY implementation does not support a pre-exec hook")
+    }
 }
 
 /// Represents the exit status of a child process.

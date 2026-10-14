@@ -1716,6 +1716,23 @@ pub(crate) fn pane_custom_command_pty_builder(command: &str) -> portable_pty::Co
     pane_custom_command_pty_builder_platform(command)
 }
 
+/// Spawn policy belongs to the platform, not the PTY implementation or client.
+pub(crate) fn spawn_pane_child(
+    slave: &dyn portable_pty::SlavePty,
+    command: portable_pty::CommandBuilder,
+    pane_id: u32,
+) -> std::io::Result<Box<dyn portable_pty::Child + Send + Sync>> {
+    #[cfg(target_os = "linux")]
+    return linux::pane_cpu_affinity::spawn_pane_child(slave, command, pane_id);
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pane_id;
+        slave
+            .spawn_command(command)
+            .map_err(|err| std::io::Error::other(err.to_string()))
+    }
+}
+
 pub(crate) fn apply_pane_runtime_marker(command: &mut portable_pty::CommandBuilder) {
     apply_pane_runtime_marker_platform(command);
 }

@@ -95,6 +95,19 @@ An older server can survive logout while losing user lookup and DNS. Symptoms in
 
 If a newly started server still has this problem, check `herdr-server.log` for `could not select persistent user service context`. Herdr keeps the inherited context if the required macOS APIs are unavailable. See [Herdr issue #4100](https://github.com/herdrdev/herdr/issues/4100).
 
+## Linux pane processes use only one CPU
+
+A Linux server started with a narrow CPU affinity, for example through `taskset` or systemd's `CPUAffinity=`, can pass that restriction to its child processes. Herdr resets new pane shells to use all online CPUs without changing the server's affinity. Kernel cpuset restrictions still apply. If the kernel refuses the reset, Herdr logs a warning and continues spawning the pane.
+
+Check the affinity inside the affected pane and compare it with the online CPUs:
+
+```bash
+grep Cpus_allowed_list /proc/self/status
+cat /sys/devices/system/cpu/online
+```
+
+Live handoff does not respawn existing shells, so their affinity is unchanged. After updating the server, open a new pane to get the new behavior; existing pane processes keep their current affinity.
+
 ## The `herdr` command is not found
 
 Restart the terminal so it reloads its environment, then confirm the Herdr install directory is on `PATH`. For package-manager installs, use that package manager to update Herdr and expose it on `PATH`. See [Install Herdr](/docs/install/#verify).
