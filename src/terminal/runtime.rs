@@ -513,6 +513,24 @@ impl TerminalRuntime {
         self.0
             .queue_guarded_user_input_submission_with_source(text, enter, delay, guard, source)
     }
+    pub(crate) fn queue_checked_user_input_submission_with_source(
+        &self,
+        text: Bytes,
+        enter: Bytes,
+        delay: std::time::Duration,
+        guard: Option<crate::pty::actor::SessionInputGuard>,
+        refuse_if_exists: Option<std::path::PathBuf>,
+        source: crate::pty::input_consumer::InputSource,
+    ) -> std::io::Result<std::sync::mpsc::Receiver<std::io::Result<()>>> {
+        self.0.queue_checked_user_input_submission_with_source(
+            text,
+            enter,
+            delay,
+            guard,
+            refuse_if_exists,
+            source,
+        )
+    }
     pub(crate) fn validate_input_submission(&self, bytes: &[u8]) -> std::io::Result<()> {
         self.0.validate_input_submission(bytes)
     }

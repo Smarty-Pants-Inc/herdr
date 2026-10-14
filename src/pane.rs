@@ -1943,6 +1943,36 @@ impl PaneRuntimeIo {
         }
     }
 
+    fn queue_checked_user_input_submission_with_source(
+        &self,
+        text: Bytes,
+        enter: Bytes,
+        delay: std::time::Duration,
+        guard: Option<crate::pty::actor::SessionInputGuard>,
+        refuse_if_exists: Option<std::path::PathBuf>,
+        source: crate::pty::input_consumer::InputSource,
+    ) -> std::io::Result<std::sync::mpsc::Receiver<std::io::Result<()>>> {
+        match self {
+            Self::Actor(actor) => actor.queue_checked_user_input_submission_with_source(
+                text,
+                enter,
+                delay,
+                guard,
+                refuse_if_exists,
+                source,
+            ),
+            // A synthetic channel has no PTY writer to check before.
+            #[cfg(test)]
+            Self::TestChannel { .. } => Err(match guard {
+                Some(guard) => crate::pty::actor::agent_session_lost(&guard, false),
+                None => std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "a synthetic channel has no PTY writer",
+                ),
+            }),
+        }
+    }
+
     fn queue_user_input_submission_with_source(
         &self,
         text: Bytes,
@@ -4164,6 +4194,24 @@ impl PaneRuntime {
             enter,
             delay,
             guard,
+            source.user(),
+        )
+    }
+    pub(crate) fn queue_checked_user_input_submission_with_source(
+        &self,
+        text: Bytes,
+        enter: Bytes,
+        delay: std::time::Duration,
+        guard: Option<crate::pty::actor::SessionInputGuard>,
+        refuse_if_exists: Option<std::path::PathBuf>,
+        source: crate::pty::input_consumer::InputSource,
+    ) -> std::io::Result<std::sync::mpsc::Receiver<std::io::Result<()>>> {
+        self.io.queue_checked_user_input_submission_with_source(
+            text,
+            enter,
+            delay,
+            guard,
+            refuse_if_exists,
             source.user(),
         )
     }

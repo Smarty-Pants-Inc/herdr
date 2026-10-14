@@ -3586,6 +3586,37 @@
           ],
           "type": "object"
         },
+        "PaneSendKeysPathCheckedParams": {
+          "description": "`pane.send_keys_path_checked`: `pane.send_keys` with the same\nbefore-first-byte `refuse_if_exists` guard as `pane.send_text_path_checked`.",
+          "properties": {
+            "allow_cross_pane": {
+              "description": "Deliberately allow an agent-originated request to target another pane.",
+              "type": "boolean"
+            },
+            "expected_agent_session_id": {
+              "type": "string"
+            },
+            "keys": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "pane_id": {
+              "type": "string"
+            },
+            "refuse_if_exists": {
+              "description": "Absolute path; until the first byte is written, `lstat` before each\nattempt refuses if it succeeds (`guard_path_present`) or fails other\nthan not-found (`guard_path_unverifiable`). No checks after that byte.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "pane_id",
+            "keys",
+            "refuse_if_exists"
+          ],
+          "type": "object"
+        },
         "PaneSendTextParams": {
           "properties": {
             "allow_cross_pane": {
@@ -3605,6 +3636,34 @@
           "required": [
             "pane_id",
             "text"
+          ],
+          "type": "object"
+        },
+        "PaneSendTextPathCheckedParams": {
+          "description": "`pane.send_text_path_checked`: `pane.send_text` with a path check before\neach write attempt until the first byte is successfully written. A present\n`refuse_if_exists` path refuses with `guard_path_present`, zero bytes and no\nflush. Once writing starts, a later claim does not interrupt the request.\nOlder servers reject the method name.",
+          "properties": {
+            "allow_cross_pane": {
+              "description": "Deliberately allow an agent-originated request to target another pane.",
+              "type": "boolean"
+            },
+            "expected_agent_session_id": {
+              "type": "string"
+            },
+            "pane_id": {
+              "type": "string"
+            },
+            "refuse_if_exists": {
+              "description": "Absolute path; until the first byte is written, `lstat` before each\nattempt refuses if it succeeds (`guard_path_present`) or fails other\nthan not-found (`guard_path_unverifiable`). No checks after that byte.",
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pane_id",
+            "text",
+            "refuse_if_exists"
           ],
           "type": "object"
         },
@@ -6884,6 +6943,40 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/PaneSendKeysParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Local JSON only; older servers reject instead of ignoring the path guard.",
+          "properties": {
+            "method": {
+              "const": "pane.send_text_path_checked",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneSendTextPathCheckedParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Local JSON only; older servers reject instead of ignoring the path guard.",
+          "properties": {
+            "method": {
+              "const": "pane.send_keys_path_checked",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneSendKeysPathCheckedParams"
             }
           },
           "required": [
@@ -11814,6 +11907,11 @@
             "pane_close_expected_terminal_guard": {
               "default": false,
               "description": "Supports the fail-closed `expected_terminal` guard on `pane.close` and `pane.close_guarded`.",
+              "type": "boolean"
+            },
+            "refuse_if_exists_guard": {
+              "default": false,
+              "description": "Supports the before-first-byte `refuse_if_exists` path guard on the\nlocal JSON `pane.send_text_path_checked` and `pane.send_keys_path_checked`\nmethods. Zero-byte retries recheck; a claim after the first written byte\ndoes not interrupt the request.",
               "type": "boolean"
             },
             "ssh_agent_registration": {

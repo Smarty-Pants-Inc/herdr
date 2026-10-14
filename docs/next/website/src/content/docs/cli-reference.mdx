@@ -260,8 +260,8 @@ herdr pane read <pane_id> --source recent-unwrapped --lines 120
 Send input:
 
 ```bash
-herdr pane send-text <pane_id> [--expected-session ID] <text>
-herdr pane send-keys <pane_id> [--expected-session ID] <key> [key ...]
+herdr pane send-text <pane_id> [--expected-session ID] [--refuse-if-exists PATH] <text>
+herdr pane send-keys <pane_id> [--expected-session ID] [--refuse-if-exists PATH] <key> [key ...]
 herdr pane run <pane_id> [--expected-terminal TERMINAL_ID] <command>
 ```
 
@@ -292,6 +292,8 @@ On an exact-slave open or `TCIFLUSH` failure, Herdr does **not** close the PTY m
 The initial check is atomic with Herdr's reported pane state at admission. It cannot detect a session change that the agent has not reported. Residual races remain: the final native-check/write gap between the fresh process/foreground check and `write(2)`, and the loss/flush/reader race in which a reader can consume staged bytes before the flush. Neither completion nor flushing guarantees zero total bytes written or consumed. The App-to-actor queue and delayed Enter wait are guarded, but do not eliminate these native races. The CLI requires `expected_agent_session_guard`, supported and advertised only on Linux. macOS and Windows fail closed; macOS is pending native proof. The CLI returns `expected_agent_session_unsupported` without sending the guarded operation when support is absent, and uses checked method names so a server replacement after the capability check fails closed. Omitting these flags preserves existing behavior and the separate cross-pane input policy.
 
 Known limitation: after suspension, resuming or reloading the same native session does not restore guarded-send eligibility; start a new session (`/new`) or restart the agent. See [the follow-up issue](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/7577).
+
+Use `--refuse-if-exists PATH` on `pane send-text` or `pane send-keys` to check PATH before each write attempt until the first request byte is successfully written, not at request-time admission. A claim present before the first byte is written prevents the request; once writing has begun, the request completes. If a write attempt returns `EAGAIN` (would block) or `EINTR` (interrupted) with zero bytes written, Herdr checks PATH again before retrying. A present path returns `guard_path_present` and exits 1, with zero request bytes written, `partial_text_consumed: false`, and `flush_failed: false`. If Herdr cannot check the path (for example, a parent directory is not searchable), it fails closed with `guard_path_unverifiable` and the same zero-byte fields. Only a missing path allows writing to start. Once started, partial chunks, retries, and any delayed Enter complete without another path check. The path guard never flushes unread input, so unrelated queued input survives. An independent `--expected-session` guard still checks each write and retains its own session-loss flush behavior. The separate `lstat` and first `write(2)` are not synchronization: a claim created between them can be missed (accepted technical risk [smarty-dev#12584](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/12584)). The CLI makes a relative PATH absolute against its own working directory. It needs the server capability `refuse_if_exists_guard` (Unix only) and returns `refuse_if_exists_unsupported` without sending when the capability is absent. It uses the checked methods `pane.send_text_path_checked` and `pane.send_keys_path_checked`, so an older server rejects the request and never ignores the flag. Without the flag, behavior is unchanged.
 
 Report agent state from custom hooks:
 
