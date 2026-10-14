@@ -1806,8 +1806,18 @@ fn drain_systemctl_stderr(
     }
 }
 
-/// Runs `systemctl --user --no-block start UNIT`, bounded to
-/// `SYSTEMCTL_START_TIMEOUT`.
+/// Selects a fixed system path, never PATH. Only an absent primary permits
+/// `/bin/systemctl`; permissions and execution failures do not trigger fallback.
+fn systemctl_executable() -> std::io::Result<&'static str> {
+    match std::fs::metadata("/usr/bin/systemctl") {
+        Ok(_) => Ok("/usr/bin/systemctl"),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok("/bin/systemctl"),
+        Err(err) => Err(err),
+    }
+}
+
+/// Runs `/usr/bin/systemctl` (or `/bin/systemctl` if the primary is absent) with
+/// `--user --no-block start -- UNIT`, bounded to `SYSTEMCTL_START_TIMEOUT`.
 ///
 /// `--no-block` only enqueues the start job; callers keep their own bounded
 /// socket-readiness wait. The unit name must already be validated. A spawn
@@ -1819,9 +1829,15 @@ fn drain_systemctl_stderr(
 pub(super) fn start_systemd_user_unit(unit: &str) -> std::io::Result<()> {
     use std::os::fd::AsRawFd;
 
-    let command_text = format!("`systemctl --user --no-block start {unit}`");
-    let child = Command::new("systemctl")
-        .args(["--user", "--no-block", "start", unit])
+    let executable = systemctl_executable().map_err(|err| {
+        std::io::Error::new(
+            err.kind(),
+            format!("cannot inspect /usr/bin/systemctl for server.systemd_unit {unit:?}: {err}"),
+        )
+    })?;
+    let command_text = format!("`{executable} --user --no-block start -- {unit}`");
+    let child = Command::new(executable)
+        .args(["--user", "--no-block", "start", "--", unit])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())

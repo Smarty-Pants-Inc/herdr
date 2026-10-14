@@ -1082,14 +1082,17 @@ pub struct ServerConfig {
     pub headless_cols: u16,
     /// Virtual terminal height used when no client is attached. Default: 40.
     pub headless_rows: u16,
-    /// Linux: systemd user unit that runs `herdr server`. When set, auto-start
-    /// queues it with `systemctl --user --no-block start <unit>`; the helper
-    /// child is bounded to 5 seconds and killed and reaped on timeout. Callers
-    /// then wait up to 15 seconds for the client socket, whose readiness
-    /// determines success. Default: unset. Kept as a plain string here; the
-    /// name is validated by `validated_systemd_unit` at the start gate so an
-    /// invalid name fails closed instead of making `Config::load` fall back to
-    /// defaults.
+    /// Linux: systemd user unit that runs `herdr server`. Auto-start executes
+    /// `/usr/bin/systemctl`, or `/bin/systemctl` only if the primary is absent,
+    /// never PATH, with `--user --no-block start -- <unit>`. The helper child
+    /// is bounded to 5 seconds and killed and reaped on timeout. Callers then
+    /// wait up to 15 seconds for the client socket; readiness determines success.
+    /// Default: unset. Deserialization rejects names starting with '-'.
+    /// `Config::load` returns defaults plus a parse-error diagnostic on that
+    /// rejection; the start gate refuses the diagnostic, never guessing the
+    /// detached path. Other malformed names remain plain strings and are
+    /// reported by `validated_systemd_unit` during load and refused at start.
+    #[serde(deserialize_with = "deserialize_systemd_unit")]
     pub systemd_unit: Option<String>,
 }
 
@@ -1097,7 +1100,10 @@ impl ServerConfig {
     /// Returns the configured systemd user unit after validating its name.
     ///
     /// The name becomes an argument to `systemctl`, so only a plain
-    /// name matching `[A-Za-z0-9@._-]+\.service` (ASCII only) is accepted.
+    /// name matching `[A-Za-z0-9@._-]+\.service` (ASCII only), without a
+    /// leading '-', is accepted. This also defends values built without
+    /// deserialization; auto-start never falls back to a detached daemon on
+    /// a validation error.
     pub fn validated_systemd_unit(&self) -> Result<Option<&str>, String> {
         let Some(unit) = self.systemd_unit.as_deref() else {
             return Ok(None);
@@ -1106,12 +1112,30 @@ impl ServerConfig {
     }
 }
 
+/// Rejects a leading '-' at the deserialization boundary. Other malformed
+/// names retain the existing load-diagnostic and start-gate validation path.
+fn deserialize_systemd_unit<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let unit = Option::<String>::deserialize(deserializer)?;
+    if let Some(name) = unit.as_deref() {
+        if name.starts_with('-') {
+            validate_systemd_unit_name(name).map_err(de::Error::custom)?;
+        }
+    }
+    Ok(unit)
+}
+
 fn validate_systemd_unit_name(unit: &str) -> Result<(), String> {
     let invalid = |reason: &str| {
         Err(format!(
-            "invalid server.systemd_unit {unit:?}: {reason}; expected a name like \"herdr.service\" using only ASCII letters, digits, '@', '.', '_' or '-'"
+            "invalid server.systemd_unit {unit:?}: {reason}; expected a name like \"herdr.service\" using only ASCII letters, digits, '@', '.', '_' or '-', without a leading '-'"
         ))
     };
+    if unit.starts_with('-') {
+        return invalid("must not start with '-'");
+    }
     let Some(stem) = unit.strip_suffix(".service") else {
         return invalid("must end with \".service\"");
     };
@@ -1414,48 +1438,27 @@ impl Default for AdvancedConfig {
 mod tests {
     use super::*;
 
-    fn server_with_unit(unit: Option<&str>) -> ServerConfig {
-        ServerConfig {
-            systemd_unit: unit.map(str::to_owned),
-            ..ServerConfig::default()
-        }
-    }
-
     #[test]
-    fn systemd_unit_absent_by_default_and_valid_names_pass() {
-        // Decision C: an absent key must keep the legacy detached-daemon path,
-        // and names inside the exact `[A-Za-z0-9@._-]+\.service` grammar are
-        // the only values allowed across the config -> systemctl argv boundary.
+    fn systemd_unit_name_validation_preserves_plain_service_grammar() {
+        // Decision C: trust-boundary table for the config -> systemctl argv
+        // grammar, including legal internal hyphens versus a leading '-'.
+        // E2E owns load diagnostics and launch refusal; this table checks the
+        // serde boundary and validator without duplicating process assertions.
         assert_eq!(ServerConfig::default().validated_systemd_unit(), Ok(None));
         let config: Config = toml::from_str("[server]\nheadless_cols = 100\n").unwrap();
         assert_eq!(config.server.validated_systemd_unit(), Ok(None));
-
         for unit in [
             "herdr.service",
             "herdr@main.service",
             "my_herdr-1.2.service",
-            "-herdr.service",
         ] {
-            assert_eq!(
-                server_with_unit(Some(unit)).validated_systemd_unit(),
-                Ok(Some(unit))
-            );
+            let config: Config =
+                toml::from_str(&format!("[server]\nsystemd_unit = {unit:?}\n")).unwrap();
+            assert_eq!(config.server.validated_systemd_unit(), Ok(Some(unit)));
         }
-    }
-
-    #[test]
-    fn systemd_unit_invalid_name_parses_but_fails_validation_naming_the_unit() {
-        // Decision C: the user-editable config becomes a systemctl argv element.
-        // Deserialization must still succeed (a serde failure would make
-        // Config::load silently fall back to defaults and re-enable the
-        // detached daemon), and the start gate must reject the name with an
-        // error that names it.
-        let config: Config = toml::from_str("[server]\nsystemd_unit = \"--now\"\n").unwrap();
-        let error = config.server.validated_systemd_unit().unwrap_err();
-        assert!(error.contains("\"--now\""), "{error}");
-        assert!(config.collect_diagnostics().contains(&error));
-
         for unit in [
+            "-herdr.service",
+            "--now",
             "",
             ".service",
             "herdr",
@@ -1468,13 +1471,25 @@ mod tests {
             "hérdr.service",
             "herdr$(x).service",
         ] {
-            let error = server_with_unit(Some(unit))
-                .validated_systemd_unit()
-                .expect_err(unit);
+            let server = ServerConfig {
+                systemd_unit: Some(unit.to_owned()),
+                ..ServerConfig::default()
+            };
+            let error = server.validated_systemd_unit().expect_err(unit);
             assert!(
                 error.contains(&format!("{unit:?}")),
                 "error must name the unit: {error}"
             );
+            let document = format!("[server]\nsystemd_unit = {unit:?}\n");
+            if unit.starts_with('-') {
+                let error = toml::from_str::<Config>(&document).unwrap_err().to_string();
+                assert!(error.contains("must not start with '-'"), "{error}");
+                assert!(error.contains(unit), "{error}");
+            } else {
+                let config: Config = toml::from_str(&document).unwrap();
+                assert_eq!(config.server.systemd_unit.as_deref(), Some(unit));
+                assert!(config.server.validated_systemd_unit().is_err());
+            }
         }
     }
 

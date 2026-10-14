@@ -197,8 +197,9 @@ fn validate_running_server_compatibility(saved_federation: bool) -> io::Result<(
 /// On platforms without systemd user units the optional key is ignored and the
 /// legacy detached daemon is spawned. Otherwise the effective config is loaded
 /// here (the remote bridge starts servers before any config is loaded). When
-/// `server.systemd_unit` is set, queues it with
-/// `systemctl --user --no-block start <unit>` through the platform layer. The
+/// `server.systemd_unit` is set, queues it through `/usr/bin/systemctl`, or
+/// `/bin/systemctl` only if the primary is absent, never PATH, using
+/// `--user --no-block start -- <unit>` through the platform layer. The
 /// helper child is bounded to 5 seconds and killed and reaped on timeout; the
 /// queued job is not proof of readiness. Callers wait up to 15 seconds for the
 /// client socket, whose readiness determines success. Request failures, an
@@ -227,7 +228,8 @@ fn configured_server_unit() -> io::Result<Option<String>> {
             || diagnostic.starts_with("config parse error:")
     }) {
         // Config::load fell back to defaults, which may have dropped a
-        // configured unit; never guess the detached path.
+        // configured unit (including a refused leading '-'); never guess
+        // the detached path, even during early SSH bootstrap.
         return Err(io::Error::other(format!(
             "refusing to auto-start the herdr server: cannot determine server.systemd_unit from {} ({error}); fix it with `herdr config check`",
             crate::config::config_path().display()

@@ -3,10 +3,13 @@
 //! The remote host runs `herdr remote-client-bridge` over SSH stdio; when no server is
 //! listening it must start one. These tests run the real binary against an isolated
 //! fixture (HOME, XDG dirs, `HERDR_CONFIG_PATH`, `HERDR_SOCKET_PATH` all under one unique
-//! directory below `std::env::temp_dir()`), with a fake `systemctl` first on the child's
-//! PATH. The fake records its argv and, in success mode, launches the real `herdr server`
-//! itself, so any daemon on the fixture socket is attributable to exactly one launcher.
-//! No live config, socket, systemd user manager or unit is touched.
+//! directory below `std::env::temp_dir()`). Bubblewrap bind-mounts a private fake over
+//! both trusted absolute `systemctl` paths in a process-local mount namespace; the host
+//! root stays read-only and only the fixture is writable. A separate PATH impostor must
+//! never run. The absolute fake records argv and launches the real `herdr server` in
+//! success mode, attributing the fixture socket to exactly one launcher. No live config,
+//! socket, systemd user manager or unit is touched. Expected skip: unavailable bubblewrap
+//! user/mount namespaces or pidfds; a `SKIP:` record is NOT green E2E proof.
 
 #![cfg(target_os = "linux")]
 
@@ -26,8 +29,45 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+// The success flow intentionally keeps a valid internal hyphen.
 const UNIT: &str = "herdr-e2e.service";
 const FAKE_PID_ENV: &str = "LUNIT_FAKE_SYSTEMCTL_PID";
+const BWRAP: &str = "/usr/bin/bwrap";
+const TRUSTED_SYSTEMCTL: [&str; 2] = ["/usr/bin/systemctl", "/bin/systemctl"];
+
+/// Same PID namespace and session as the runner: /proc, pidfds and SO_PEERCRED continue
+/// to identify host PIDs. Never use --unshare-pid, --new-session or a host-unit fallback.
+fn namespace_command(replacement: &Path, writable: Option<&Path>) -> Command {
+    let mut command = Command::new(BWRAP);
+    test_command::sanitize_command_env(&mut command);
+    command.args(["--ro-bind", "/", "/", "--unshare-user", "--dev", "/dev"]);
+    if let Some(dir) = writable {
+        command.arg("--bind").arg(dir).arg(dir);
+    }
+    // Binding both is safe on merged-/usr hosts too: both resolve to the same target
+    // and receive the same fake. A failed mount aborts bwrap; it never runs Herdr outside.
+    for target in TRUSTED_SYSTEMCTL {
+        command.arg("--ro-bind").arg(replacement).arg(target);
+    }
+    command
+}
+
+/// Probe the exact mount recipe with harmless true over BOTH candidates, before a
+/// fixture or Herdr exists. This never executes systemctl (real or fake).
+fn namespace_preflight() -> std::io::Result<()> {
+    let output = namespace_command(Path::new("/usr/bin/true"), None)
+        .args(["--", "/usr/bin/true"])
+        .stdin(Stdio::null())
+        .output()?;
+    if !output.status.success() {
+        return Err(std::io::Error::other(format!(
+            "{}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(())
+}
 
 enum Fake {
     Succeeds,
@@ -43,7 +83,9 @@ enum Fake {
 /// Expected skip: cleanup of the detached (`setsid`) daemon is only safe through a pidfd,
 /// so every process fixture requires `pidfd_open` + `pidfd_send_signal` (Linux 5.3+; every
 /// fleet Linux host has them). Without them `Fixture::new` prints a `SKIP:` line and returns
-/// `None` before creating files or spawning anything, and the test returns early. Rust has
+/// `None` before creating files or spawning anything. Namespace support is then probed
+/// with harmless true before creating the fixture or spawning Herdr; unavailable support
+/// also prints `SKIP:` and returns `None`. Rust has
 /// no dynamic skip, so such a test reports `ok`; the `SKIP:` line is the honest record that
 /// it proved nothing there. There is deliberately no PID/session/group fallback.
 struct Fixture {
@@ -64,9 +106,15 @@ fn pidfd_preflight(opener: PidfdOpener) -> std::io::Result<()> {
 }
 
 impl Fixture {
-    /// `None` (after a `SKIP:` line) when pidfds are unavailable; see the type docs.
+    /// `None` (after a `SKIP:` line) when pidfds or namespaces are unavailable.
     fn new(systemd_unit: Option<&str>, fake: Fake) -> Option<Self> {
-        Self::new_in(&std::env::temp_dir(), systemd_unit, fake, pidfd_open)
+        Self::new_in(
+            &std::env::temp_dir(),
+            systemd_unit,
+            fake,
+            pidfd_open,
+            namespace_preflight,
+        )
     }
 
     fn new_in(
@@ -74,12 +122,21 @@ impl Fixture {
         systemd_unit: Option<&str>,
         fake: Fake,
         opener: PidfdOpener,
+        namespace_probe: fn() -> std::io::Result<()>,
     ) -> Option<Self> {
         // Before any fixture file, server or bridge exists.
         if let Err(err) = pidfd_preflight(opener) {
             eprintln!(
                 "SKIP: pidfd_open/pidfd_send_signal unavailable ({err}); managed-unit process \
                  fixtures need pidfd-only cleanup, nothing was created, spawned or signalled"
+            );
+            return None;
+        }
+        if let Err(err) = namespace_probe() {
+            eprintln!(
+                "SKIP: bubblewrap user/mount namespace unavailable ({err}); trusted absolute \
+                 executables cannot be safely replaced, no fixture or Herdr was created; \
+                 this is not green E2E proof"
             );
             return None;
         }
@@ -95,7 +152,8 @@ impl Fixture {
         ));
         // create_dir (not create_dir_all) fails if the path exists, so the fixture is ours.
         fs::create_dir(&dir).expect("create unique fixture dir");
-        for sub in ["bin", "home", "cfg", "state", "data", "cache", "r"] {
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        for sub in ["bin", "home", "cfg", "state", "data", "cache", "r", "tmp"] {
             fs::create_dir(dir.join(sub)).unwrap();
         }
         fs::set_permissions(dir.join("r"), fs::Permissions::from_mode(0o700)).unwrap();
@@ -109,7 +167,7 @@ impl Fixture {
         let q = |p: &Path| format!("'{}'", p.display().to_string().replace('\'', "'\\''"));
         let action = match fake {
             Fake::Fails => {
-                "printf 'Failed to start %s: Unit %s not found.\\n' \"$4\" \"$4\" >&2\nexit 5\n"
+                "printf 'Failed to start %s: Unit %s not found.\\n' \"$5\" \"$5\" >&2\nexit 5\n"
                     .to_string()
             }
             Fake::Hangs => format!(
@@ -125,12 +183,23 @@ impl Fixture {
             ),
         };
         let script = format!(
-            "#!/bin/sh\n{{ for a do printf '%s\\n' \"$a\"; done; echo ---; }} >> {}\n{action}",
+            "#!/bin/sh\nprintf '%s\\n' \"$0\" >> {}\n{{ for a do printf '%s\\n' \"$a\"; done; echo ---; }} >> {}\n{action}",
+            q(&dir.join("absolute-systemctl.path")),
             q(&dir.join("systemctl.argv")),
         );
-        let fake_path = dir.join("bin/systemctl");
+        let fake_path = dir.join("trusted-systemctl");
         fs::write(&fake_path, script).unwrap();
         fs::set_permissions(&fake_path, fs::Permissions::from_mode(0o700)).unwrap();
+        let impostor = dir.join("bin/systemctl");
+        fs::write(
+            &impostor,
+            format!(
+                "#!/bin/sh\nprintf 'PATH impostor ran\\n' >> {}\nexit 97\n",
+                q(&dir.join("path-impostor.called"))
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&impostor, fs::Permissions::from_mode(0o700)).unwrap();
 
         Some(Self { dir, bridge: None })
     }
@@ -143,9 +212,11 @@ impl Fixture {
         self.dir.join("r/herdr-client.sock")
     }
 
-    /// A real `herdr` command with this fixture's isolated environment.
+    /// A real `herdr` command inside the preflighted namespace. Bwrap is the owned
+    /// group leader; its bridge/server child has the SAME host PID namespace.
     fn command(&self) -> Command {
-        let mut command = test_command::herdr_command();
+        let mut command = namespace_command(&self.dir.join("trusted-systemctl"), Some(&self.dir));
+        command.arg("--").arg(env!("CARGO_BIN_EXE_herdr"));
         let path = format!(
             "{}:{}",
             self.dir.join("bin").display(),
@@ -154,6 +225,7 @@ impl Fixture {
         command
             .current_dir(self.dir.join("home"))
             .env("PATH", path)
+            .env("TMPDIR", self.dir.join("tmp"))
             .env("HOME", self.dir.join("home"))
             .env("XDG_CONFIG_HOME", self.dir.join("cfg"))
             .env("XDG_STATE_HOME", self.dir.join("state"))
@@ -201,6 +273,10 @@ impl Fixture {
 
     /// Each fake invocation as its argv, in order.
     fn systemctl_calls(&self) -> Vec<Vec<String>> {
+        assert!(
+            !self.dir.join("path-impostor.called").exists(),
+            "PATH impostor must never run; only trusted absolute executables are allowed"
+        );
         let Ok(log) = fs::read_to_string(self.dir.join("systemctl.argv")) else {
             return Vec::new();
         };
@@ -406,7 +482,15 @@ fn configured_unit_is_started_through_systemctl_user_and_bridge_attaches() {
     let (reply, peer_pid) = ping(&fx.api_socket());
     let calls = fx.systemctl_calls();
     println!("systemctl argv: {calls:?}");
-    assert_eq!(calls, vec![vec!["--user", "--no-block", "start", UNIT]]);
+    assert_eq!(
+        calls,
+        vec![vec!["--user", "--no-block", "start", "--", UNIT]]
+    );
+    let invoked = fs::read_to_string(fx.dir.join("absolute-systemctl.path")).unwrap();
+    assert_eq!(
+        invoked.lines().collect::<Vec<_>>(),
+        vec![TRUSTED_SYSTEMCTL[0]]
+    );
     assert_eq!(reply, "pong");
 
     let fake_server = read_pid(&fx.dir.join("fake-server.pid"));
@@ -428,6 +512,11 @@ fn configured_unit_is_started_through_systemctl_user_and_bridge_attaches() {
     assert_eq!(marker, Some(fake_systemctl.to_string()));
     assert_eq!(sid, bridge_sid, "server inherited the fake's session");
     assert_ne!(sid, fake_server, "server is not a detached session leader");
+    assert_eq!(
+        unsafe { libc::getpgid(fake_server as libc::pid_t) },
+        fx.bridge_pid() as libc::pid_t,
+        "namespace bridge and fake-launched server remain in the owned process group"
+    );
 
     // The API can answer before the client listener is bound; wait for the
     // same readiness the real bridge waits for before checking its attachment.
@@ -462,13 +551,19 @@ fn failed_unit_start_reports_unit_and_launches_nothing() {
         output.status
     );
 
-    assert_eq!(calls, vec![vec!["--user", "--no-block", "start", UNIT]]);
+    assert_eq!(
+        calls,
+        vec![vec!["--user", "--no-block", "start", "--", UNIT]]
+    );
     assert!(!output.status.success());
     // The error names the systemctl action and unit, says it failed, and carries the
     // fake's own failure detail, so a bare mention of the unit is not enough.
     assert!(
-        stderr.contains(&format!("systemctl --user --no-block start {UNIT}")),
-        "error must name the systemctl action and unit: {stderr}"
+        stderr.contains(&format!(
+            "{} --user --no-block start -- {UNIT}",
+            TRUSTED_SYSTEMCTL[0]
+        )),
+        "error must name the absolute systemctl action and unit: {stderr}"
     );
     assert!(
         stderr.contains("failed"),
@@ -575,6 +670,53 @@ fn invalid_unit_name_is_rejected_before_any_launch() {
 }
 
 #[test]
+fn leading_dash_unit_is_rejected_at_config_load_before_any_launch() {
+    let bad = "-herdr.service";
+    let Some(mut fx) = Fixture::new(Some(bad), Fake::Succeeds) else {
+        return;
+    };
+    // Config check reads through the actual loader without reaching the start/argv gate.
+    // A runtime-only validation diagnostic is insufficient: this must be a parse error.
+    let checked = fx.command().args(["config", "check"]).output().unwrap();
+    let check_text = String::from_utf8_lossy(&checked.stdout);
+    println!(
+        "config check status: {}; stdout: {check_text}; stderr: {}",
+        checked.status,
+        stderr_of(&checked)
+    );
+    assert!(!checked.status.success(), "invalid config check must fail");
+    assert!(
+        check_text.contains("config parse error:")
+            && check_text.contains("systemd_unit")
+            && check_text.contains(bad),
+        "TOML deserialization must reject the setting, not only the start gate: {check_text}"
+    );
+
+    fx.spawn_bridge();
+    let output = fx.wait_bridge_exit();
+    let stderr = stderr_of(&output);
+    println!("bridge status: {}; stderr: {stderr}", output.status);
+    assert!(!output.status.success());
+    assert!(
+        stderr.contains("config parse error:")
+            && stderr.contains("systemd_unit")
+            && stderr.contains(bad),
+        "bridge must fail closed on the config/load error: {stderr}"
+    );
+    assert!(
+        fx.systemctl_calls().is_empty(),
+        "absolute fake must not run"
+    );
+    assert!(!fx.dir.join("absolute-systemctl.path").exists());
+    assert!(!fx.dir.join("fake-server.pid").exists());
+    assert!(
+        fx.fixture_servers().is_empty(),
+        "no detached fallback server"
+    );
+    assert!(!fx.api_socket().exists() && !fx.client_socket().exists());
+}
+
+#[test]
 fn hung_unit_start_times_out_and_kills_and_reaps_systemctl() {
     let Some(mut fx) = Fixture::new(Some(UNIT), Fake::Hangs) else {
         return;
@@ -629,7 +771,7 @@ fn hung_unit_start_times_out_and_kills_and_reaps_systemctl() {
 
     assert_eq!(
         fx.systemctl_calls(),
-        vec![vec!["--user", "--no-block", "start", UNIT]]
+        vec![vec!["--user", "--no-block", "start", "--", UNIT]]
     );
     assert!(exited, "hung systemctl was not killed");
     assert!(reaped, "killed systemctl was not reaped");
@@ -640,8 +782,11 @@ fn hung_unit_start_times_out_and_kills_and_reaps_systemctl() {
     );
     assert!(!output.status.success());
     assert!(
-        stderr.contains(&format!("systemctl --user --no-block start {UNIT}")),
-        "error must name the systemctl action and unit: {stderr}"
+        stderr.contains(&format!(
+            "{} --user --no-block start -- {UNIT}",
+            TRUSTED_SYSTEMCTL[0]
+        )),
+        "error must name the absolute systemctl action and unit: {stderr}"
     );
     let lower = stderr.to_lowercase();
     assert!(
@@ -682,24 +827,30 @@ fn cleanup_stops_pinned_fixture_server_and_spares_foreign_candidate() {
         .spawn()
         .expect("spawn foreign herdr server");
     let (_, foreign_peer) = ping(&other.api_socket());
-    assert_eq!(foreign_peer, foreign.id());
+    assert!(other.is_fixture_server(foreign_peer));
+    // The direct child is bwrap, not necessarily the server; SO_PEERCRED identifies
+    // the real server without guessing a child PID or translating namespaces.
 
     let observer = pidfd_open(server).expect("observe owned server");
     assert!(
-        fx.pin_fixture_server(foreign.id()).is_none(),
+        fx.pin_fixture_server(foreign_peer).is_none(),
         "a candidate whose marker is not ours must not be pinned"
     );
-    let stopped = fx.stop_fixture_servers(&[foreign.id(), server]);
+    let stopped = fx.stop_fixture_servers(&[foreign_peer, server]);
     let server_exited = pidfd_wait_exit(&observer, Duration::from_secs(1));
     let foreign_alive = foreign.try_wait().unwrap().is_none();
     let (foreign_reply, _) = ping(&other.api_socket());
     println!(
         "owned server {server}, foreign server {}; stopped {stopped:?}; owned exited \
          {server_exited}; foreign alive {foreign_alive}, replies {foreign_reply:?}",
-        foreign.id()
+        foreign_peer
     );
-    // Owned child, still unreaped: safe to kill by its handle.
-    let _ = foreign.kill();
+    // Other owns the foreign server. Its pidfd-only cleanup ends the server first,
+    // then bwrap exits with its child; killing only the wrapper could orphan it.
+    assert_eq!(
+        other.stop_fixture_servers(&[foreign_peer]),
+        vec![foreign_peer]
+    );
     let _ = foreign.wait();
 
     assert_eq!(
@@ -711,6 +862,43 @@ fn cleanup_stops_pinned_fixture_server_and_spares_foreign_candidate() {
     assert!(foreign_alive, "foreign process was signalled");
     assert_eq!(foreign_reply, "pong");
     assert!(fx.fixture_servers().is_empty());
+}
+
+#[test]
+fn unavailable_namespace_preflight_skips_before_creating_fixture_or_spawning_herdr() {
+    if let Err(err) = pidfd_preflight(pidfd_open) {
+        eprintln!("SKIP: pidfd preflight unavailable ({err}); namespace skip path unproven");
+        return;
+    }
+    static PROBES: AtomicU32 = AtomicU32::new(0);
+    fn unavailable() -> std::io::Result<()> {
+        PROBES.fetch_add(1, Ordering::Relaxed);
+        Err(std::io::Error::from_raw_os_error(libc::EPERM))
+    }
+    let root = std::env::temp_dir().join(format!(
+        "lmu-namespace-preflight-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    fs::create_dir(&root).expect("create unique namespace preflight root");
+    let fixture = Fixture::new_in(&root, Some(UNIT), Fake::Succeeds, pidfd_open, unavailable);
+    let created: Vec<_> = fs::read_dir(&root)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    let _ = fs::remove_dir(&root);
+    assert!(
+        fixture.is_none(),
+        "unsupported namespace must yield no fixture"
+    );
+    assert_eq!(PROBES.load(Ordering::Relaxed), 1);
+    assert!(
+        created.is_empty(),
+        "namespace skip created files: {created:?}"
+    );
 }
 
 #[test]
@@ -731,7 +919,16 @@ fn unavailable_pidfd_preflight_skips_before_creating_or_spawning_anything() {
     ));
     fs::create_dir(&root).expect("create unique preflight root");
 
-    let fixture = Fixture::new_in(&root, None, Fake::Succeeds, unavailable);
+    fn namespace_must_not_run() -> std::io::Result<()> {
+        panic!("namespace probe must follow successful pidfd preflight")
+    }
+    let fixture = Fixture::new_in(
+        &root,
+        None,
+        Fake::Succeeds,
+        unavailable,
+        namespace_must_not_run,
+    );
     let created: Vec<_> = fs::read_dir(&root)
         .map(|entries| entries.flatten().map(|e| e.file_name()).collect())
         .unwrap_or_default();
