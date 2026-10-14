@@ -1686,6 +1686,50 @@ pub(crate) fn process_identity_server_ancestry_observation(
     }
 }
 
+/// Most bytes of `systemctl` stderr kept in a start-failure error.
+const SYSTEMCTL_STDERR_LIMIT: usize = 1024;
+
+/// Runs `systemctl --user start UNIT` and waits for it to finish.
+///
+/// The unit name must already be validated. Any spawn failure or non-zero exit
+/// is returned as an error naming the unit; callers must not fall back to a
+/// detached daemon.
+pub(super) fn start_systemd_user_unit(unit: &str) -> std::io::Result<()> {
+    let output = Command::new("systemctl")
+        .args(["--user", "start", unit])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|err| {
+            std::io::Error::new(
+                err.kind(),
+                format!(
+                    "failed to run `systemctl --user start {unit}` for server.systemd_unit: {err}"
+                ),
+            )
+        })?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let mut detail = stderr.trim().to_string();
+    if detail.len() > SYSTEMCTL_STDERR_LIMIT {
+        let mut end = SYSTEMCTL_STDERR_LIMIT;
+        while !detail.is_char_boundary(end) {
+            end -= 1;
+        }
+        detail.truncate(end);
+        detail.push_str("...");
+    }
+    Err(std::io::Error::other(format!(
+        "`systemctl --user start {unit}` for server.systemd_unit failed ({}){}{}",
+        output.status,
+        if detail.is_empty() { "" } else { ": " },
+        detail
+    )))
+}
+
 fn process_session_id(pid: u32) -> Option<i32> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let rest = stat.get(stat.rfind(')')? + 2..)?;

@@ -77,6 +77,17 @@ headless_rows = 50
 
 With one attached client, all tabs follow its size. With multiple clients, each viewed tab follows the client that most recently focused, selected, or interacted with it. When all but one client detach, all tabs immediately return to the remaining client's size. When no clients remain, existing pane PTYs retain their last size and new headless layout uses the configured fallback.
 
+## Managed unit auto-start
+
+On Linux, set `server.systemd_unit` to have Herdr start a named systemd user unit when the local TUI or SSH bridge needs a server:
+
+```toml
+[server]
+systemd_unit = "herdr@default.service"
+```
+
+Other platforms ignore this setting. If you omit it on Linux, startup behavior is unchanged. If the unit fails to start, Herdr reports an error and does not fall back to starting a server outside systemd. If Herdr cannot read or parse the config, Linux auto-start is refused instead of using defaults that could start a server outside systemd. The unit name must match the ASCII pattern `[A-Za-z0-9@._-]+\.service`. Configure the unit to expose the correct session socket. Herdr does not promise that client environment variables are inherited by the unit, so configure the socket in the unit itself.
+
 ## Terminal defaults
 
 Set the executable Herdr uses for newly created interactive panes:

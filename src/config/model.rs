@@ -1082,6 +1082,46 @@ pub struct ServerConfig {
     pub headless_cols: u16,
     /// Virtual terminal height used when no client is attached. Default: 40.
     pub headless_rows: u16,
+    /// Linux: systemd user unit that runs `herdr server`. When set, auto-start
+    /// runs `systemctl --user start <unit>` instead of spawning a detached
+    /// daemon. Default: unset. Kept as a plain string here; the name is
+    /// validated by `validated_systemd_unit` at the start gate so an invalid
+    /// name fails closed instead of making `Config::load` fall back to defaults.
+    pub systemd_unit: Option<String>,
+}
+
+impl ServerConfig {
+    /// Returns the configured systemd user unit after validating its name.
+    ///
+    /// The name becomes an argument to `systemctl`, so only a plain
+    /// name matching `[A-Za-z0-9@._-]+\.service` (ASCII only) is accepted.
+    pub fn validated_systemd_unit(&self) -> Result<Option<&str>, String> {
+        let Some(unit) = self.systemd_unit.as_deref() else {
+            return Ok(None);
+        };
+        validate_systemd_unit_name(unit).map(|()| Some(unit))
+    }
+}
+
+fn validate_systemd_unit_name(unit: &str) -> Result<(), String> {
+    let invalid = |reason: &str| {
+        Err(format!(
+            "invalid server.systemd_unit {unit:?}: {reason}; expected a name like \"herdr.service\" using only ASCII letters, digits, '@', '.', '_' or '-'"
+        ))
+    };
+    let Some(stem) = unit.strip_suffix(".service") else {
+        return invalid("must end with \".service\"");
+    };
+    if stem.is_empty() {
+        return invalid("unit name is empty before \".service\"");
+    }
+    if !stem
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'@' | b'.' | b'_' | b'-'))
+    {
+        return invalid("contains a character outside [A-Za-z0-9@._-]");
+    }
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -1354,6 +1394,7 @@ impl Default for ServerConfig {
             allow_unelevated_clients: false,
             headless_cols: crate::config::DEFAULT_HEADLESS_COLS,
             headless_rows: crate::config::DEFAULT_HEADLESS_ROWS,
+            systemd_unit: None,
         }
     }
 }
@@ -1369,6 +1410,70 @@ impl Default for AdvancedConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn server_with_unit(unit: Option<&str>) -> ServerConfig {
+        ServerConfig {
+            systemd_unit: unit.map(str::to_owned),
+            ..ServerConfig::default()
+        }
+    }
+
+    #[test]
+    fn systemd_unit_absent_by_default_and_valid_names_pass() {
+        // Decision C: an absent key must keep the legacy detached-daemon path,
+        // and names inside the exact `[A-Za-z0-9@._-]+\.service` grammar are
+        // the only values allowed across the config -> systemctl argv boundary.
+        assert_eq!(ServerConfig::default().validated_systemd_unit(), Ok(None));
+        let config: Config = toml::from_str("[server]\nheadless_cols = 100\n").unwrap();
+        assert_eq!(config.server.validated_systemd_unit(), Ok(None));
+
+        for unit in [
+            "herdr.service",
+            "herdr@main.service",
+            "my_herdr-1.2.service",
+            "-herdr.service",
+        ] {
+            assert_eq!(
+                server_with_unit(Some(unit)).validated_systemd_unit(),
+                Ok(Some(unit))
+            );
+        }
+    }
+
+    #[test]
+    fn systemd_unit_invalid_name_parses_but_fails_validation_naming_the_unit() {
+        // Decision C: the user-editable config becomes a systemctl argv element.
+        // Deserialization must still succeed (a serde failure would make
+        // Config::load silently fall back to defaults and re-enable the
+        // detached daemon), and the start gate must reject the name with an
+        // error that names it.
+        let config: Config = toml::from_str("[server]\nsystemd_unit = \"--now\"\n").unwrap();
+        let error = config.server.validated_systemd_unit().unwrap_err();
+        assert!(error.contains("\"--now\""), "{error}");
+        assert!(config.collect_diagnostics().contains(&error));
+
+        for unit in [
+            "",
+            ".service",
+            "herdr",
+            "herdr.socket",
+            "herdr.service ",
+            "her dr.service",
+            "herdr;rm.service",
+            "../herdr.service",
+            "herdr\n.service",
+            "hérdr.service",
+            "herdr$(x).service",
+        ] {
+            let error = server_with_unit(Some(unit))
+                .validated_systemd_unit()
+                .expect_err(unit);
+            assert!(
+                error.contains(&format!("{unit:?}")),
+                "error must name the unit: {error}"
+            );
+        }
+    }
 
     #[test]
     fn update_config_defaults_and_parses() {

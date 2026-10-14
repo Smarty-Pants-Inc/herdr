@@ -191,7 +191,54 @@ fn validate_running_server_compatibility(saved_federation: bool) -> io::Result<(
 // Server spawning
 // ---------------------------------------------------------------------------
 
+/// Starts the herdr server through the single auto-start policy gate.
+///
+/// On platforms without systemd user units the optional key is ignored and the
+/// legacy detached daemon is spawned. Otherwise the effective config is loaded
+/// here (the remote bridge starts servers before any config is loaded). When
+/// `server.systemd_unit` is set, runs `systemctl --user start <unit>` through
+/// the platform layer; otherwise spawns the detached daemon. Unit failures, an
+/// invalid unit name, and an unreadable or unparsable config are returned and
+/// never fall back to a detached daemon. Callers then wait for the socket.
+pub fn start_server() -> io::Result<()> {
+    if !crate::platform::SYSTEMD_USER_UNITS_SUPPORTED {
+        return spawn_server_daemon().map(|_| ());
+    }
+    match configured_server_unit()? {
+        Some(unit) => {
+            info!(unit = %unit, "starting server through systemd user unit");
+            crate::platform::start_server_user_unit(&unit)
+        }
+        None => spawn_server_daemon().map(|_| ()),
+    }
+}
+
+/// Resolves `server.systemd_unit` from the effective config, failing closed
+/// whenever the config cannot prove the key is absent or valid.
+fn configured_server_unit() -> io::Result<Option<String>> {
+    let loaded = crate::config::Config::load();
+    if let Some(error) = loaded.diagnostics.iter().find(|diagnostic| {
+        diagnostic.starts_with("config read error:")
+            || diagnostic.starts_with("config parse error:")
+    }) {
+        // Config::load fell back to defaults, which may have dropped a
+        // configured unit; never guess the detached path.
+        return Err(io::Error::other(format!(
+            "refusing to auto-start the herdr server: cannot determine server.systemd_unit from {} ({error}); fix it with `herdr config check`",
+            crate::config::config_path().display()
+        )));
+    }
+    loaded
+        .config
+        .server
+        .validated_systemd_unit()
+        .map(|unit| unit.map(str::to_owned))
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
+}
+
 /// Spawns the herdr server as a background daemon process.
+///
+/// Only `start_server` may call this, so every auto-start honors the policy.
 ///
 /// The server process is fully detached:
 /// - Runs in its own session (setsid) so it survives the client exiting
@@ -201,7 +248,7 @@ fn validate_running_server_compatibility(saved_federation: bool) -> io::Result<(
 ///   this CLI invocation explicitly selected a session.
 ///
 /// Returns the PID of the spawned server process.
-pub fn spawn_server_daemon() -> io::Result<u32> {
+fn spawn_server_daemon() -> io::Result<u32> {
     let exe = std::env::current_exe().map_err(|err| {
         io::Error::new(
             err.kind(),
@@ -324,8 +371,7 @@ pub fn auto_detect_launch(saved_federation: bool) -> io::Result<()> {
             }
         } else {
             info!("no server running, spawning server daemon");
-            spawn_server_daemon()
-                .and_then(|_| wait_for_server_socket(&socket_path, SERVER_READY_TIMEOUT))
+            start_server().and_then(|()| wait_for_server_socket(&socket_path, SERVER_READY_TIMEOUT))
         }
     });
     if let Err(error) = startup {
