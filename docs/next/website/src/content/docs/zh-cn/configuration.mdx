@@ -86,7 +86,7 @@ headless_rows = 50
 systemd_unit = "herdr@default.service"
 ```
 
-其他平台会忽略此设置。在 Linux 上省略此设置时，启动行为保持不变。如果单元启动失败，Herdr 会报告错误，不会回退到启动 systemd 管理之外的服务器。如果 Herdr 无法读取或解析配置文件，Linux 上也会拒绝自动启动，以免使用可能启动 systemd 管理外服务器的默认值。单元名称必须匹配 ASCII 模式 `[A-Za-z0-9@._-]+\.service`。请配置该单元提供目标会话的正确 socket。Herdr 不保证客户端环境变量会传递给该单元，因此应在单元本身配置 socket。
+其他平台会忽略此设置。在 Linux 上省略此设置时，启动行为保持不变。Herdr 运行 `systemctl --user --no-block start UNIT`，这只会将启动作业加入队列。辅助子进程的运行时间限制为 5 秒；超时后会将其杀死并回收。随后 Herdr 最多等待 15 秒，直到配置会话的客户端 socket 就绪。socket 就绪才表示启动成功；请求失败或 socket 超时都会报错，且不会回退到启动 systemd 管理之外的服务器。如果 Herdr 无法读取或解析配置文件，Linux 上也会拒绝自动启动，以免使用可能启动 systemd 管理外服务器的默认值。单元名称必须匹配 ASCII 模式 `[A-Za-z0-9@._-]+\.service`。请配置该单元提供目标会话的正确 socket。Herdr 不保证客户端环境变量会传递给该单元，因此应在单元本身配置 socket。
 
 ## 终端默认值
 

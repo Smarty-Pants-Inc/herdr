@@ -86,7 +86,7 @@ On Linux, set `server.systemd_unit` to have Herdr start a named systemd user uni
 systemd_unit = "herdr@default.service"
 ```
 
-Other platforms ignore this setting. If you omit it on Linux, startup behavior is unchanged. If the unit fails to start, Herdr reports an error and does not fall back to starting a server outside systemd. If Herdr cannot read or parse the config, Linux auto-start is refused instead of using defaults that could start a server outside systemd. The unit name must match the ASCII pattern `[A-Za-z0-9@._-]+\.service`. Configure the unit to expose the correct session socket. Herdr does not promise that client environment variables are inherited by the unit, so configure the socket in the unit itself.
+Other platforms ignore this setting. On Linux, omitting it keeps the existing startup behavior. Herdr runs `systemctl --user --no-block start UNIT`, which only queues the start job; the helper child is bounded to 5 seconds and killed and reaped on timeout. Herdr then waits up to 15 seconds for the configured session's client socket. Socket readiness determines success; a failed request or timeout is an error, with no fallback to an unmanaged server. If Herdr cannot read or parse the config, Linux auto-start is refused rather than using defaults that could start a server outside systemd. The unit name must match the ASCII pattern `[A-Za-z0-9@._-]+\.service`. Configure the unit to expose the correct session socket. Herdr does not promise that client environment variables are inherited by the unit, so configure the socket in the unit itself.
 
 ## Terminal defaults
 

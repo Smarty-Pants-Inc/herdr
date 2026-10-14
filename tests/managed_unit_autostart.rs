@@ -15,11 +15,13 @@ pub mod test_command;
 
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
+use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -30,10 +32,13 @@ const FAKE_PID_ENV: &str = "LUNIT_FAKE_SYSTEMCTL_PID";
 enum Fake {
     Succeeds,
     Fails,
+    /// Records its own PID, then `exec sleep` in the same process (no grandchildren).
+    Hangs,
 }
 
-/// One owned fixture. Drop stops only the bridge child and servers whose environment names
-/// this fixture's unique socket, then removes only this fixture directory.
+/// One owned fixture. Drop stops only servers pinned by pidfd whose environment names this
+/// fixture's unique socket, then the bridge's own process group while the bridge is still
+/// unreaped, then removes only this fixture directory.
 struct Fixture {
     dir: PathBuf,
     bridge: Option<Child>,
@@ -67,9 +72,13 @@ impl Fixture {
         let q = |p: &Path| format!("'{}'", p.display().to_string().replace('\'', "'\\''"));
         let action = match fake {
             Fake::Fails => {
-                "printf 'Failed to start %s: Unit %s not found.\\n' \"$3\" \"$3\" >&2\nexit 5\n"
+                "printf 'Failed to start %s: Unit %s not found.\\n' \"$4\" \"$4\" >&2\nexit 5\n"
                     .to_string()
             }
+            Fake::Hangs => format!(
+                "printf '%s\\n' \"$$\" > {}\nexec sleep 60\n",
+                q(&dir.join("hang.pid"))
+            ),
             Fake::Succeeds => format!(
                 "{FAKE_PID_ENV}=$$\nexport {FAKE_PID_ENV}\nprintf '%s\\n' \"$$\" > {}\n{} server </dev/null >>{} 2>&1 &\nprintf '%s\\n' \"$!\" > {}\nexit 0\n",
                 q(&dir.join("fake-systemctl.pid")),
@@ -97,8 +106,8 @@ impl Fixture {
         self.dir.join("r/herdr-client.sock")
     }
 
-    /// The remote-host command `herdr --remote` runs over SSH, with an isolated environment.
-    fn spawn_bridge(&mut self) {
+    /// A real `herdr` command with this fixture's isolated environment.
+    fn command(&self) -> Command {
         let mut command = test_command::herdr_command();
         let path = format!(
             "{}:{}",
@@ -106,7 +115,6 @@ impl Fixture {
             std::env::var("PATH").unwrap_or_default()
         );
         command
-            .arg("remote-client-bridge")
             .current_dir(self.dir.join("home"))
             .env("PATH", path)
             .env("HOME", self.dir.join("home"))
@@ -119,7 +127,16 @@ impl Fixture {
             .env("HERDR_SOCKET_PATH", self.api_socket())
             .env_remove("SSH_AUTH_SOCK")
             .env_remove("DBUS_SESSION_BUS_ADDRESS")
-            .env_remove(FAKE_PID_ENV)
+            .env_remove(FAKE_PID_ENV);
+        command
+    }
+
+    /// The remote-host command `herdr --remote` runs over SSH, in its own process group.
+    fn spawn_bridge(&mut self) {
+        let mut command = self.command();
+        command
+            .arg("remote-client-bridge")
+            .process_group(0)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -155,54 +172,120 @@ impl Fixture {
             .collect()
     }
 
-    /// `herdr server` processes whose environment names this fixture's unique socket.
-    fn fixture_servers(&self) -> Vec<u32> {
+    /// Whether the process now at `pid` carries this fixture's unique socket marker.
+    fn has_marker(&self, pid: u32) -> bool {
         let needle = format!("HERDR_SOCKET_PATH={}", self.api_socket().display());
-        let mut pids = Vec::new();
-        for entry in fs::read_dir("/proc").into_iter().flatten().flatten() {
-            let Some(pid) = entry
-                .file_name()
-                .to_str()
-                .and_then(|n| n.parse::<u32>().ok())
-            else {
-                continue;
-            };
-            let (Ok(cmdline), Ok(environ)) = (
-                fs::read(format!("/proc/{pid}/cmdline")),
-                fs::read(format!("/proc/{pid}/environ")),
-            ) else {
-                continue;
-            };
-            let argv: Vec<&[u8]> = cmdline.split(|b| *b == 0).collect();
-            if argv.get(1) == Some(&&b"server"[..])
-                && environ.split(|b| *b == 0).any(|kv| kv == needle.as_bytes())
-            {
-                pids.push(pid);
+        fs::read(format!("/proc/{pid}/environ"))
+            .is_ok_and(|environ| environ.split(|b| *b == 0).any(|kv| kv == needle.as_bytes()))
+    }
+
+    /// Whether the process now at `pid` is a `herdr server` with this fixture's marker.
+    fn is_fixture_server(&self, pid: u32) -> bool {
+        fs::read(format!("/proc/{pid}/cmdline"))
+            .is_ok_and(|cmdline| cmdline.split(|b| *b == 0).nth(1) == Some(&b"server"[..]))
+            && self.has_marker(pid)
+    }
+
+    /// Inventory only: numeric PIDs of this fixture's servers. Never signal these directly.
+    fn fixture_servers(&self) -> Vec<u32> {
+        fs::read_dir("/proc")
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+            .filter(|&pid| self.is_fixture_server(pid))
+            .collect()
+    }
+
+    /// Pins a scanned candidate with a pidfd, then re-reads its marker. The pinned process
+    /// still being alive after the re-read proves the read was of the pinned process, not a
+    /// PID recycled in between; anything else is not ours.
+    fn pin_fixture_server(&self, pid: u32) -> Option<OwnedFd> {
+        let fd = match pidfd_open(pid) {
+            Ok(fd) => fd,
+            Err(err) => {
+                eprintln!(
+                    "fixture cleanup: skip pid {pid}, no pidfd ({err}); left to group teardown"
+                );
+                return None;
+            }
+        };
+        (self.is_fixture_server(pid) && pidfd_signal(&fd, 0).is_ok()).then_some(fd)
+    }
+
+    /// Stops the pinned fixture servers among `candidates`, signalling only through their
+    /// pidfds. Returns the candidates it owned.
+    fn stop_fixture_servers(&self, candidates: &[u32]) -> Vec<u32> {
+        let pinned: Vec<(u32, OwnedFd)> = candidates
+            .iter()
+            .filter_map(|&pid| Some((pid, self.pin_fixture_server(pid)?)))
+            .collect();
+        for (_, fd) in &pinned {
+            let _ = pidfd_signal(fd, libc::SIGTERM);
+        }
+        for (_, fd) in &pinned {
+            if !pidfd_wait_exit(fd, Duration::from_secs(3)) {
+                let _ = pidfd_signal(fd, libc::SIGKILL);
             }
         }
-        pids
+        pinned.into_iter().map(|(pid, _)| pid).collect()
     }
 }
 
 impl Drop for Fixture {
     fn drop(&mut self) {
+        self.stop_fixture_servers(&self.fixture_servers());
         if let Some(mut bridge) = self.bridge.take() {
-            let _ = bridge.kill();
+            // try_wait reaps an exited bridge; Ok(None) means it is unreaped, so its PID and
+            // therefore its process group ID cannot have been recycled.
+            if let Ok(None) = bridge.try_wait() {
+                unsafe { libc::killpg(bridge.id() as libc::pid_t, libc::SIGKILL) };
+            }
             let _ = bridge.wait();
-        }
-        let pids = self.fixture_servers();
-        for &pid in &pids {
-            unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
-        }
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while !self.fixture_servers().is_empty() && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(25));
-        }
-        for pid in self.fixture_servers() {
-            unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
         }
         let _ = fs::remove_dir_all(&self.dir);
     }
+}
+
+/// Pins the process now holding `pid`; the pidfd keeps targeting it after exit or PID reuse.
+fn pidfd_open(pid: u32) -> std::io::Result<OwnedFd> {
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(fd as i32) })
+}
+
+/// Signals exactly the pinned process (0 probes it). Fails with ESRCH once it is reaped.
+fn pidfd_signal(fd: &OwnedFd, signal: i32) -> std::io::Result<()> {
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            fd.as_raw_fd(),
+            signal,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        )
+    };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Whether the pinned process exits (its pidfd polls readable) within `timeout`.
+fn pidfd_wait_exit(fd: &OwnedFd, timeout: Duration) -> bool {
+    let mut pfd = libc::pollfd {
+        fd: fd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let rc = unsafe { libc::poll(&mut pfd, 1, timeout.as_millis() as i32) };
+    rc > 0 && pfd.revents & libc::POLLIN != 0
+}
+
+fn is_reaped(fd: &OwnedFd) -> bool {
+    matches!(pidfd_signal(fd, 0), Err(err) if err.raw_os_error() == Some(libc::ESRCH))
 }
 
 /// Real API round trip; returns the `result.type` and the server PID from SO_PEERCRED.
@@ -283,7 +366,7 @@ fn configured_unit_is_started_through_systemctl_user_and_bridge_attaches() {
     let (reply, peer_pid) = ping(&fx.api_socket());
     let calls = fx.systemctl_calls();
     println!("systemctl argv: {calls:?}");
-    assert_eq!(calls, vec![vec!["--user", "start", UNIT]]);
+    assert_eq!(calls, vec![vec!["--user", "--no-block", "start", UNIT]]);
     assert_eq!(reply, "pong");
 
     let fake_server = read_pid(&fx.dir.join("fake-server.pid"));
@@ -337,12 +420,12 @@ fn failed_unit_start_reports_unit_and_launches_nothing() {
         output.status
     );
 
-    assert_eq!(calls, vec![vec!["--user", "start", UNIT]]);
+    assert_eq!(calls, vec![vec!["--user", "--no-block", "start", UNIT]]);
     assert!(!output.status.success());
     // The error names the systemctl action and unit, says it failed, and carries the
     // fake's own failure detail, so a bare mention of the unit is not enough.
     assert!(
-        stderr.contains(&format!("systemctl --user start {UNIT}")),
+        stderr.contains(&format!("systemctl --user --no-block start {UNIT}")),
         "error must name the systemctl action and unit: {stderr}"
     );
     assert!(
@@ -441,4 +524,137 @@ fn invalid_unit_name_is_rejected_before_any_launch() {
         "no detached fallback server"
     );
     assert!(!fx.api_socket().exists() && !fx.client_socket().exists());
+}
+
+#[test]
+fn hung_unit_start_times_out_and_kills_and_reaps_systemctl() {
+    let mut fx = Fixture::new(Some(UNIT), Fake::Hangs);
+    let spawned = Instant::now();
+    fx.spawn_bridge();
+
+    // The fake records its own PID, then becomes `sleep 60` in place.
+    let pid_file = fx.dir.join("hang.pid");
+    let hang_pid = loop {
+        if let Some(pid) = fs::read_to_string(&pid_file)
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+        {
+            break pid;
+        }
+        assert!(
+            spawned.elapsed() < Duration::from_secs(10),
+            "fake never ran"
+        );
+        thread::sleep(Duration::from_millis(5));
+    };
+    let pinned_at = Instant::now();
+    let fd = pidfd_open(hang_pid).expect("pin hung fake systemctl");
+    assert!(
+        fx.has_marker(hang_pid) && pidfd_signal(&fd, 0).is_ok(),
+        "pinned process is this fixture's live fake systemctl"
+    );
+
+    let exited = pidfd_wait_exit(&fd, Duration::from_secs(10));
+    let exit_after = pinned_at.elapsed();
+    if !exited {
+        // Owned, pinned and marker-checked: stop it through the pidfd only.
+        let _ = pidfd_signal(&fd, libc::SIGKILL);
+    }
+    let bridge_state = fs::read_to_string(format!("/proc/{}/stat", fx.bridge_pid()));
+    let reaped_deadline = Instant::now() + Duration::from_secs(2);
+    while !is_reaped(&fd) && Instant::now() < reaped_deadline {
+        thread::sleep(Duration::from_millis(1));
+    }
+    let reaped = is_reaped(&fd);
+    let output = fx.wait_bridge_exit();
+    let total = spawned.elapsed();
+    let stderr = stderr_of(&output);
+    println!(
+        "systemctl argv: {:?}\nhung pid {hang_pid}: exited {exited} after {exit_after:?} \
+         from pin, reaped {reaped}; bridge stat when reaped-check began: {bridge_state:?}\n\
+         bridge status {} after {total:?}\nbridge stderr: {stderr}",
+        fx.systemctl_calls(),
+        output.status
+    );
+
+    assert_eq!(
+        fx.systemctl_calls(),
+        vec![vec!["--user", "--no-block", "start", UNIT]]
+    );
+    assert!(exited, "hung systemctl was not killed");
+    assert!(reaped, "killed systemctl was not reaped");
+    // The helper's deadline is 5s; the ceiling leaves room for a loaded host.
+    assert!(
+        exit_after >= Duration::from_secs(4) && total < Duration::from_secs(10),
+        "timeout should fire around 5s: killed after {exit_after:?}, bridge exit after {total:?}"
+    );
+    assert!(!output.status.success());
+    assert!(
+        stderr.contains(&format!("systemctl --user --no-block start {UNIT}")),
+        "error must name the systemctl action and unit: {stderr}"
+    );
+    let lower = stderr.to_lowercase();
+    assert!(
+        lower.contains("within 5s") || lower.contains("timed out") || lower.contains("timeout"),
+        "error must report the timeout: {stderr}"
+    );
+    assert!(!fx.dir.join("fake-server.pid").exists());
+    assert!(
+        fx.fixture_servers().is_empty(),
+        "no detached fallback server"
+    );
+    assert!(!fx.api_socket().exists() && !fx.client_socket().exists());
+}
+
+#[test]
+fn cleanup_stops_pinned_fixture_server_and_spares_foreign_candidate() {
+    // Owned: the real detached daemon of the no-unit flow (its own session, not in the
+    // bridge's group, so only a pidfd can stop it safely).
+    let mut fx = Fixture::new(None, Fake::Succeeds);
+    fx.spawn_bridge();
+    let (reply, server) = ping(&fx.api_socket());
+    assert_eq!(reply, "pong");
+    assert_eq!(fx.fixture_servers(), vec![server]);
+
+    // Foreign: a live real `herdr server` with the same argv shape but another fixture's
+    // marker, owned by this test as a direct child.
+    let other = Fixture::new(None, Fake::Succeeds);
+    let mut foreign = other
+        .command()
+        .arg("server")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn foreign herdr server");
+    let (_, foreign_peer) = ping(&other.api_socket());
+    assert_eq!(foreign_peer, foreign.id());
+
+    let observer = pidfd_open(server).expect("observe owned server");
+    assert!(
+        fx.pin_fixture_server(foreign.id()).is_none(),
+        "a candidate whose marker is not ours must not be pinned"
+    );
+    let stopped = fx.stop_fixture_servers(&[foreign.id(), server]);
+    let server_exited = pidfd_wait_exit(&observer, Duration::from_secs(1));
+    let foreign_alive = foreign.try_wait().unwrap().is_none();
+    let (foreign_reply, _) = ping(&other.api_socket());
+    println!(
+        "owned server {server}, foreign server {}; stopped {stopped:?}; owned exited \
+         {server_exited}; foreign alive {foreign_alive}, replies {foreign_reply:?}",
+        foreign.id()
+    );
+    // Owned child, still unreaped: safe to kill by its handle.
+    let _ = foreign.kill();
+    let _ = foreign.wait();
+
+    assert_eq!(
+        stopped,
+        vec![server],
+        "only the pinned owned server is stopped"
+    );
+    assert!(server_exited, "owned fixture server was terminated");
+    assert!(foreign_alive, "foreign process was signalled");
+    assert_eq!(foreign_reply, "pong");
+    assert!(fx.fixture_servers().is_empty());
 }

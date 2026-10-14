@@ -1083,10 +1083,13 @@ pub struct ServerConfig {
     /// Virtual terminal height used when no client is attached. Default: 40.
     pub headless_rows: u16,
     /// Linux: systemd user unit that runs `herdr server`. When set, auto-start
-    /// runs `systemctl --user start <unit>` instead of spawning a detached
-    /// daemon. Default: unset. Kept as a plain string here; the name is
-    /// validated by `validated_systemd_unit` at the start gate so an invalid
-    /// name fails closed instead of making `Config::load` fall back to defaults.
+    /// queues it with `systemctl --user --no-block start <unit>`; the helper
+    /// child is bounded to 5 seconds and killed and reaped on timeout. Callers
+    /// then wait up to 15 seconds for the client socket, whose readiness
+    /// determines success. Default: unset. Kept as a plain string here; the
+    /// name is validated by `validated_systemd_unit` at the start gate so an
+    /// invalid name fails closed instead of making `Config::load` fall back to
+    /// defaults.
     pub systemd_unit: Option<String>,
 }
 

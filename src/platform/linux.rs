@@ -1689,30 +1689,216 @@ pub(crate) fn process_identity_server_ancestry_observation(
 /// Most bytes of `systemctl` stderr kept in a start-failure error.
 const SYSTEMCTL_STDERR_LIMIT: usize = 1024;
 
-/// Runs `systemctl --user start UNIT` and waits for it to finish.
+/// Bytes of `systemctl` stderr retained before trimming and truncation.
+const SYSTEMCTL_STDERR_CAPTURE_LIMIT: usize = 2 * SYSTEMCTL_STDERR_LIMIT;
+
+/// Most stderr bytes read (kept or discarded) per drain pass, so a chatty
+/// writer cannot hold the loop past its deadline.
+const SYSTEMCTL_STDERR_DRAIN_PASS_LIMIT: usize = 64 * 1024;
+
+/// Longest a `systemctl --user --no-block start` client may run.
+const SYSTEMCTL_START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Longest sleep between `try_wait` polls of the `systemctl` client.
+const SYSTEMCTL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Owns the spawned `systemctl` client and kills and reaps it on every exit
+/// path that has not already reaped it. Only this CLI child is signalled, never
+/// the systemd unit.
+struct SystemctlChild {
+    child: std::process::Child,
+    reaped: bool,
+}
+
+impl SystemctlChild {
+    /// SIGKILLs and reaps the client. Marks it handled even on failure so Drop
+    /// does not repeat a failing attempt.
+    fn kill_and_reap(&mut self) -> std::io::Result<()> {
+        self.reaped = true;
+        if let Err(kill_err) = self.child.kill() {
+            // Kill only fails if the process cannot be signalled; reap it if it
+            // has already exited, otherwise report it instead of blocking.
+            return match self.child.try_wait() {
+                Ok(Some(_)) => Ok(()),
+                Ok(None) => Err(std::io::Error::new(
+                    kill_err.kind(),
+                    format!("kill of pid {} failed: {kill_err}", self.child.id()),
+                )),
+                Err(wait_err) => Err(std::io::Error::new(
+                    kill_err.kind(),
+                    format!(
+                        "kill of pid {} failed: {kill_err}; reap failed: {wait_err}",
+                        self.child.id()
+                    ),
+                )),
+            };
+        }
+        self.child.wait().map(|_| ()).map_err(|err| {
+            std::io::Error::new(
+                err.kind(),
+                format!("reap of pid {} failed: {err}", self.child.id()),
+            )
+        })
+    }
+
+    /// Suffix describing a failed kill/reap for an error message.
+    fn kill_and_reap_suffix(&mut self) -> String {
+        match self.kill_and_reap() {
+            Ok(()) => "; the systemctl client was killed and reaped".to_string(),
+            Err(err) => format!("; killing the systemctl client failed: {err}"),
+        }
+    }
+}
+
+impl Drop for SystemctlChild {
+    fn drop(&mut self) {
+        if self.reaped {
+            return;
+        }
+        let pid = self.child.id();
+        if let Err(err) = self.kill_and_reap() {
+            tracing::warn!(pid, %err, "failed to kill and reap systemctl client");
+        }
+    }
+}
+
+/// Reads available stderr without blocking. Keeps at most
+/// `SYSTEMCTL_STDERR_CAPTURE_LIMIT` bytes and discards the rest. Drops the pipe
+/// on EOF or a read error. Reads at most `SYSTEMCTL_STDERR_DRAIN_PASS_LIMIT`
+/// bytes per call, and with `stop_when_full` stops once the capture is full.
+fn drain_systemctl_stderr(
+    pipe: &mut Option<std::process::ChildStderr>,
+    captured: &mut Vec<u8>,
+    stop_when_full: bool,
+) {
+    let mut buf = [0u8; 512];
+    let mut read_this_pass = 0usize;
+    while let Some(stderr) = pipe.as_mut() {
+        if read_this_pass >= SYSTEMCTL_STDERR_DRAIN_PASS_LIMIT
+            || (stop_when_full && captured.len() >= SYSTEMCTL_STDERR_CAPTURE_LIMIT)
+        {
+            return;
+        }
+        match stderr.read(&mut buf) {
+            Ok(0) => *pipe = None,
+            Ok(n) => {
+                read_this_pass += n;
+                let keep = n.min(SYSTEMCTL_STDERR_CAPTURE_LIMIT.saturating_sub(captured.len()));
+                captured.extend_from_slice(&buf[..keep]);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => return,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => *pipe = None,
+        }
+    }
+}
+
+/// Runs `systemctl --user --no-block start UNIT`, bounded to
+/// `SYSTEMCTL_START_TIMEOUT`.
 ///
-/// The unit name must already be validated. Any spawn failure or non-zero exit
-/// is returned as an error naming the unit; callers must not fall back to a
-/// detached daemon.
+/// `--no-block` only enqueues the start job; callers keep their own bounded
+/// socket-readiness wait. The unit name must already be validated. A spawn
+/// failure, wait failure, timeout or non-zero exit is returned as an error
+/// naming the unit; callers must not fall back to a detached daemon. The
+/// `systemctl` client never outlives this call: every return after spawn kills
+/// (if needed) and reaps it. Stderr is read nonblocking and never waited on
+/// after exit, so a descendant holding the pipe cannot stall the call.
 pub(super) fn start_systemd_user_unit(unit: &str) -> std::io::Result<()> {
-    let output = Command::new("systemctl")
-        .args(["--user", "start", unit])
+    use std::os::fd::AsRawFd;
+
+    let command_text = format!("`systemctl --user --no-block start {unit}`");
+    let child = Command::new("systemctl")
+        .args(["--user", "--no-block", "start", unit])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
-        .output()
+        .spawn()
         .map_err(|err| {
             std::io::Error::new(
                 err.kind(),
-                format!(
-                    "failed to run `systemctl --user start {unit}` for server.systemd_unit: {err}"
-                ),
+                format!("failed to run {command_text} for server.systemd_unit: {err}"),
             )
         })?;
-    if output.status.success() {
+    let deadline = std::time::Instant::now() + SYSTEMCTL_START_TIMEOUT;
+    let mut guard = SystemctlChild {
+        child,
+        reaped: false,
+    };
+    let mut pipe = guard.child.stderr.take();
+    if let Some(stderr) = pipe.as_ref() {
+        let fd = stderr.as_raw_fd();
+        // SAFETY: fd is the open stderr pipe owned by `pipe`; F_GETFL/F_SETFL
+        // only change its status flags.
+        let nonblocking = unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            flags >= 0 && libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) >= 0
+        };
+        if !nonblocking {
+            let err = std::io::Error::last_os_error();
+            let suffix = guard.kill_and_reap_suffix();
+            return Err(std::io::Error::new(
+                err.kind(),
+                format!(
+                    "failed to make {command_text} stderr nonblocking for server.systemd_unit: {err}{suffix}"
+                ),
+            ));
+        }
+    }
+    let mut captured = Vec::new();
+    let status = loop {
+        drain_systemctl_stderr(&mut pipe, &mut captured, false);
+        match guard.child.try_wait() {
+            Ok(Some(status)) => {
+                guard.reaped = true;
+                drain_systemctl_stderr(&mut pipe, &mut captured, true);
+                break status;
+            }
+            Ok(None) => {}
+            Err(err) => {
+                let suffix = guard.kill_and_reap_suffix();
+                return Err(std::io::Error::new(
+                    err.kind(),
+                    format!(
+                        "failed to wait for {command_text} for server.systemd_unit: {err}{suffix}"
+                    ),
+                ));
+            }
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            let suffix = guard.kill_and_reap_suffix();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "{command_text} for server.systemd_unit did not exit within {}s{suffix}",
+                    SYSTEMCTL_START_TIMEOUT.as_secs()
+                ),
+            ));
+        }
+        let wait = (deadline - now).min(SYSTEMCTL_POLL_INTERVAL);
+        match pipe.as_ref() {
+            Some(stderr) => {
+                let mut pollfd = libc::pollfd {
+                    fd: stderr.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let timeout_ms = i32::try_from(wait.as_millis()).unwrap_or(i32::MAX).max(1);
+                // SAFETY: pollfd points to one valid entry for an fd owned by
+                // `pipe`; poll only writes `revents`. Errors (e.g. EINTR) just
+                // fall through to the next loop iteration.
+                unsafe {
+                    libc::poll(&mut pollfd, 1, timeout_ms);
+                }
+            }
+            None => std::thread::sleep(wait),
+        }
+    };
+    drop(pipe);
+    if status.success() {
         return Ok(());
     }
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = String::from_utf8_lossy(&captured);
     let mut detail = stderr.trim().to_string();
     if detail.len() > SYSTEMCTL_STDERR_LIMIT {
         let mut end = SYSTEMCTL_STDERR_LIMIT;
@@ -1723,8 +1909,8 @@ pub(super) fn start_systemd_user_unit(unit: &str) -> std::io::Result<()> {
         detail.push_str("...");
     }
     Err(std::io::Error::other(format!(
-        "`systemctl --user start {unit}` for server.systemd_unit failed ({}){}{}",
-        output.status,
+        "{command_text} for server.systemd_unit failed ({}){}{}",
+        status,
         if detail.is_empty() { "" } else { ": " },
         detail
     )))

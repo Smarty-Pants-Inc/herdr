@@ -2,7 +2,8 @@
 //!
 //! When the user runs `herdr` with no subcommand:
 //! 1. Check if a server is already listening on the client socket
-//! 2. If no server → spawn one as a background daemon → wait for socket readiness (up to 15s)
+//! 2. If no server → request a configured systemd unit start or spawn a
+//!    detached daemon → wait for socket readiness (up to 15s)
 //! 3. Attach as a client to the server
 
 use std::io;
@@ -196,10 +197,14 @@ fn validate_running_server_compatibility(saved_federation: bool) -> io::Result<(
 /// On platforms without systemd user units the optional key is ignored and the
 /// legacy detached daemon is spawned. Otherwise the effective config is loaded
 /// here (the remote bridge starts servers before any config is loaded). When
-/// `server.systemd_unit` is set, runs `systemctl --user start <unit>` through
-/// the platform layer; otherwise spawns the detached daemon. Unit failures, an
+/// `server.systemd_unit` is set, queues it with
+/// `systemctl --user --no-block start <unit>` through the platform layer. The
+/// helper child is bounded to 5 seconds and killed and reaped on timeout; the
+/// queued job is not proof of readiness. Callers wait up to 15 seconds for the
+/// client socket, whose readiness determines success. Request failures, an
 /// invalid unit name, and an unreadable or unparsable config are returned and
-/// never fall back to a detached daemon. Callers then wait for the socket.
+/// never fall back to a detached daemon. Without a configured unit, the
+/// detached daemon is spawned.
 pub fn start_server() -> io::Result<()> {
     if !crate::platform::SYSTEMD_USER_UNITS_SUPPORTED {
         return spawn_server_daemon().map(|_| ());

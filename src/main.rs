@@ -234,8 +234,10 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # Attached clients always use their own terminal size.
 [server]
 # Linux only: start this user systemd unit when the local TUI or SSH bridge needs a server.
-# Other platforms ignore this setting.
-# If the unit fails to start, Herdr reports an error and does not start an unmanaged server.
+# Other platforms ignore this setting. Herdr runs `systemctl --user --no-block start UNIT`
+# with a 5-second helper-child bound, killing and reaping it on timeout; this only queues
+# the start job. Herdr then waits up to 15 seconds for the client socket; readiness determines
+# success. A failed request or socket timeout is an error, with no unmanaged-server fallback.
 # If config cannot be read or parsed, Linux refuses auto-start rather than using defaults
 # that could start an unmanaged server. Configure the unit to expose the correct session socket.
 # Client environment variables are not promised to be inherited by the unit; configure the
