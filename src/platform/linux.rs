@@ -455,7 +455,58 @@ fn copy_config_xattrs(source: RawFd, destination: RawFd) -> std::io::Result<()> 
     Ok(())
 }
 
-pub fn raise_server_nofile_limit() {}
+/// systemd's default hard `NOFILE` (`DefaultLimitNOFILE=1024:524288`): the soft
+/// limit a service manager would grant on request, so a server autostarted from
+/// an SSH login (soft 1024) does not run out of descriptors with many panes.
+const SERVER_NOFILE_LIMIT_TARGET: libc::rlim_t = 524_288;
+
+pub fn raise_server_nofile_limit() {
+    match raise_nofile_limit(SERVER_NOFILE_LIMIT_TARGET) {
+        Ok(None) => {}
+        Ok(Some((previous, target))) => {
+            tracing::info!(previous, target, "raised server file descriptor soft limit")
+        }
+        Err(err) => tracing::warn!(err = %err, "failed to raise server file descriptor limit"),
+    }
+}
+
+fn raise_nofile_limit(
+    target: libc::rlim_t,
+) -> std::io::Result<Option<(libc::rlim_t, libc::rlim_t)>> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    // The hard limit is never changed.
+    let Some(target) = target_nofile_soft_limit(limit.rlim_cur, limit.rlim_max, target) else {
+        return Ok(None);
+    };
+
+    let previous = limit.rlim_cur;
+    limit.rlim_cur = target;
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    Ok(Some((previous, target)))
+}
+
+/// Soft limit to request, or `None` when the current soft limit already meets
+/// the capped target. Never exceeds `hard` and never lowers `current`.
+fn target_nofile_soft_limit(
+    current: libc::rlim_t,
+    hard: libc::rlim_t,
+    target: libc::rlim_t,
+) -> Option<libc::rlim_t> {
+    // RLIM_INFINITY exceeds the target on every Linux ABI, so min() also
+    // covers an unlimited hard limit.
+    let target = target.min(hard);
+    (current < target).then_some(target)
+}
 
 pub(crate) fn should_draw_host_cursor_by_default() -> bool {
     running_inside_wsl()
@@ -1697,6 +1748,39 @@ fn process_session_id(pid: u32) -> Option<i32> {
 mod tests {
     use super::*;
     use std::{cell::RefCell, collections::HashMap};
+
+    // Decision C: keep these pure tests. The real-server E2E covers
+    // 1024 -> 524288, 1024 -> 4096 and already-at-hard. An unprivileged lane
+    // (hard = soft = 524288) cannot reach the states below.
+
+    // Keep: a hard limit above the target needs privilege to set up.
+    #[test]
+    fn nofile_target_caps_at_target_when_hard_is_higher() {
+        assert_eq!(
+            target_nofile_soft_limit(1024, 1_048_576, SERVER_NOFILE_LIMIT_TARGET),
+            Some(SERVER_NOFILE_LIMIT_TARGET)
+        );
+    }
+
+    // Keep: the kernel rejects hard NOFILE above fs.nr_open, so an unlimited
+    // hard limit is unreachable in a real process.
+    #[test]
+    fn nofile_target_caps_at_target_when_hard_is_unlimited() {
+        assert_eq!(
+            target_nofile_soft_limit(1024, libc::RLIM_INFINITY, SERVER_NOFILE_LIMIT_TARGET),
+            Some(SERVER_NOFILE_LIMIT_TARGET)
+        );
+    }
+
+    // Keep: a soft limit above the target needs a hard limit above the target,
+    // which needs privilege to set up.
+    #[test]
+    fn nofile_target_does_not_lower_soft_limit_above_target() {
+        assert_eq!(
+            target_nofile_soft_limit(1_048_576, 1_048_576, SERVER_NOFILE_LIMIT_TARGET),
+            None
+        );
+    }
 
     #[test]
     fn caller_metadata_sid_matches_getsid_without_an_extra_production_syscall() {
