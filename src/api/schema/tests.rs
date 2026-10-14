@@ -71,11 +71,11 @@ fn input_consumer_local_methods_are_registered_and_not_endpoint_methods() {
         ),
         (
             "pane.input_consumer.cut",
-            serde_json::json!({"epoch":"e", "epoch_key":"k", "seq":1, "token":"t", "cut":2, "digest":"d", "kind":"submit"}),
+            serde_json::json!({"epoch":"e", "seq":1, "token":"t", "cut":2, "digest":"d", "kind":"submit"}),
         ),
         (
             "pane.input_consumer.release",
-            serde_json::json!({"epoch":"e", "epoch_key":"k"}),
+            serde_json::json!({"epoch":"e"}),
         ),
     ] {
         let value = serde_json::json!({"id":"consumer", "method":name, "params":params});
@@ -91,22 +91,14 @@ fn input_consumer_local_methods_are_registered_and_not_endpoint_methods() {
 #[test]
 fn input_consumer_params_require_capabilities_and_exclusive_end_counts() {
     let params = serde_json::json!({
-        "epoch": "epoch", "epoch_key": "key", "seq": 1, "token": "token",
+        "epoch": "epoch", "seq": 1, "token": "token",
         "cut": 2, "digest": "digest", "kind": "submit"
     });
     let cut: PaneInputConsumerCutParams = serde_json::from_value(params.clone()).unwrap();
     assert_eq!(cut.cut, 2); // a\r is two post-marker bytes, not byte index 1.
     assert_eq!(cut.kind, InputConsumerCutKind::Submit);
     assert_eq!(serde_json::to_value(&cut).unwrap(), params);
-    for field in [
-        "epoch",
-        "epoch_key",
-        "seq",
-        "token",
-        "cut",
-        "digest",
-        "kind",
-    ] {
+    for field in ["epoch", "seq", "token", "cut", "digest", "kind"] {
         let mut missing = params.clone();
         missing.as_object_mut().unwrap().remove(field);
         assert!(serde_json::from_value::<PaneInputConsumerCutParams>(missing).is_err());
@@ -114,6 +106,18 @@ fn input_consumer_params_require_capabilities_and_exclusive_end_counts() {
     let mut attributed = params.clone();
     attributed["pane_id"] = "p1".into();
     assert!(serde_json::from_value::<PaneInputConsumerCutParams>(attributed).is_err());
+    // H2: v2 has no bearer key; a v1 `epoch_key` is an unknown field.
+    let mut keyed = params.clone();
+    keyed["epoch_key"] = "k".into();
+    assert!(serde_json::from_value::<PaneInputConsumerCutParams>(keyed).is_err());
+    assert!(serde_json::from_value::<PaneInputConsumerReleaseParams>(
+        serde_json::json!({"epoch": "e", "epoch_key": "k"})
+    )
+    .is_err());
+    assert!(serde_json::from_value::<PaneInputConsumerEnrollParams>(
+        serde_json::json!({"pane_id": "p1"})
+    )
+    .is_err());
     let mut discard = params;
     discard["kind"] = "discard".into();
     assert_eq!(
@@ -124,12 +128,11 @@ fn input_consumer_params_require_capabilities_and_exclusive_end_counts() {
     );
     discard["kind"] = "keyboard".into();
     assert!(serde_json::from_value::<PaneInputConsumerCutParams>(discard).is_err());
+    assert!(
+        serde_json::from_value::<PaneInputConsumerReleaseParams>(serde_json::json!({})).is_err()
+    );
     assert!(serde_json::from_value::<PaneInputConsumerReleaseParams>(
-        serde_json::json!({"epoch": "e"})
-    )
-    .is_err());
-    assert!(serde_json::from_value::<PaneInputConsumerReleaseParams>(
-        serde_json::json!({"epoch": "e", "epoch_key": "k", "pane_id": "p1"})
+        serde_json::json!({"epoch": "e", "pane_id": "p1"})
     )
     .is_err());
 }
@@ -480,6 +483,41 @@ fn first_agent_session_event_with_null_previous_session_matches_schema() {
     assert_eq!(
         standalone.get("previous_agent_session_id"),
         Some(&serde_json::Value::Null)
+    );
+}
+
+#[test]
+fn agent_name_is_always_present_and_nullable_but_legacy_records_still_parse() {
+    // Older servers omitted the opt-in name for unnamed agents.
+    let legacy = serde_json::json!({
+        "terminal_id": "term_1",
+        "agent": "pi",
+        "agent_status": "idle",
+        "workspace_id": "w1",
+        "tab_id": "w1:t1",
+        "pane_id": "w1:p1",
+        "focused": false,
+        "revision": 0
+    });
+    let mut agent: AgentInfo = serde_json::from_value(legacy).unwrap();
+    assert_eq!(agent.name, None);
+    let unnamed = serde_json::to_value(&agent).unwrap();
+    assert_eq!(unnamed.get("name"), Some(&serde_json::Value::Null));
+    assert_eq!(serde_json::from_value::<AgentInfo>(unnamed).unwrap(), agent);
+
+    agent.name = Some("worker".into());
+    let named = serde_json::to_value(&agent).unwrap();
+    assert_eq!(named.get("name"), Some(&serde_json::json!("worker")));
+    assert_eq!(serde_json::from_value::<AgentInfo>(named).unwrap(), agent);
+
+    let schema = serde_json::to_value(schemars::schema_for!(AgentInfo)).unwrap();
+    assert!(schema["required"]
+        .as_array()
+        .unwrap()
+        .contains(&serde_json::json!("name")));
+    assert_eq!(
+        schema["properties"]["name"]["type"],
+        serde_json::json!(["string", "null"])
     );
 }
 

@@ -1,4 +1,4 @@
-//! Actor-local input attribution. Secrets and retained input never leave runtime memory.
+//! Actor-local input attribution. Retained input never leaves runtime memory.
 use serde::{Deserialize, Serialize};
 use std::{io, sync::Arc};
 
@@ -26,7 +26,6 @@ pub(crate) enum CutKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CutRequest {
     pub epoch: String,
-    pub epoch_key: String,
     pub seq: u64,
     pub token: String,
     pub cut: u64,
@@ -49,16 +48,19 @@ pub(crate) enum CutResult {
     expect(dead_code, reason = "read only by the Unix pane actor")
 )]
 pub(crate) enum ConsumerOperation {
-    Enroll {
-        peer: crate::platform::ProcessIdentity,
+    /// `peer` is the enroll connection's own `SO_PEERPIDFD`, kept for the epoch.
+    Enroll { peer: crate::platform::PeerPidfd },
+    /// `peer_ino` is this connection's pidfs inode, taken at accept; it must
+    /// name the enrolled incarnation (design item 4).
+    Cut {
+        request: CutRequest,
+        peer_ino: Option<u64>,
     },
-    Cut(CutRequest),
     Release {
         epoch: String,
-        epoch_key: String,
+        peer_ino: Option<u64>,
     },
 }
-// No Debug: enrollment response contains a bearer capability.
 // Only the Unix ledger (and API tests) build the success variants; other targets only refuse.
 #[cfg_attr(
     not(any(unix, test)),
@@ -70,10 +72,13 @@ pub(crate) enum ConsumerOperation {
 pub(crate) enum ConsumerResponse {
     Enrolled {
         epoch: String,
-        epoch_key: String,
         nonce: String,
         /// (st_dev, st_ino) of this pane's slave, from the actor's own master.
         tty: (u64, u64),
+        /// The enrolled peer's pid, from `PIDFD_GET_INFO` on its connection.
+        peer_pid: u32,
+        /// nsfs inode of the pid namespace `peer_pid` is reported in.
+        pidns: u64,
     },
     Cut(CutResult),
     Released,

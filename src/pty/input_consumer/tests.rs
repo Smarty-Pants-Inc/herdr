@@ -48,6 +48,13 @@ impl Peer {
     fn fd(&self) -> i32 {
         self.master.as_raw_fd().expect("master fd")
     }
+    /// Stands in for the consumer's socket `SO_PEERPIDFD`: the same pidfs inode.
+    fn pidfd(&self) -> crate::platform::PeerPidfd {
+        pidfd_of(self.identity)
+    }
+}
+fn pidfd_of(identity: crate::platform::ProcessIdentity) -> crate::platform::PeerPidfd {
+    crate::platform::peer_pidfd_for_test(identity.pid).expect("pidfs peer")
 }
 impl Drop for Peer {
     fn drop(&mut self) {
@@ -96,25 +103,30 @@ fn response(
         .recv_timeout(std::time::Duration::from_secs(3))
         .expect("response")
 }
-fn enroll(actor: &crate::pty::actor::PtyIoActorHandle, peer: &Peer) -> (String, String, String) {
-    match response(
-        actor,
-        ConsumerOperation::Enroll {
-            peer: peer.identity,
-        },
-    ) {
+/// Returns (epoch, the enrolled peer's pidfs inode, nonce).
+fn enroll(actor: &crate::pty::actor::PtyIoActorHandle, peer: &Peer) -> (String, u64, String) {
+    let pidfd = peer.pidfd();
+    let ino = pidfd.ino;
+    match response(actor, ConsumerOperation::Enroll { peer: pidfd }) {
         ConsumerResponse::Enrolled {
             epoch,
-            epoch_key,
             nonce,
             tty,
+            peer_pid,
+            pidns,
         } => {
             use std::os::unix::fs::MetadataExt;
             // The consumer's own stdin is the slave the server signs for.
             let own =
                 std::fs::metadata(format!("/proc/{}/fd/0", peer.identity.pid)).expect("peer stdin");
             assert_eq!(tty, (own.dev(), own.ino()));
-            (epoch, epoch_key, nonce)
+            // H5/H9: the signed peer is the enrolling pid, in our pid namespace.
+            assert_eq!(peer_pid, peer.identity.pid);
+            assert_eq!(
+                pidns,
+                std::fs::metadata("/proc/self/ns/pid").expect("pidns").ino()
+            );
+            (epoch, ino, nonce)
         }
         ConsumerResponse::Refused { reason } => {
             panic!("real raw peer enrollment refused: {reason}")
@@ -122,20 +134,27 @@ fn enroll(actor: &crate::pty::actor::PtyIoActorHandle, peer: &Peer) -> (String, 
         _ => panic!("wrong enrollment response"),
     }
 }
-fn cut(epoch: &str, key: &str, seq: u64, token: &str, end: u64, bytes: &[u8]) -> CutRequest {
+/// A cut from the connection whose pidfs inode is `ino`.
+fn cut(epoch: &str, ino: &u64, seq: u64, token: &str, end: u64, bytes: &[u8]) -> ConsumerOperation {
     use sha2::{Digest, Sha256};
-    CutRequest {
-        epoch: epoch.into(),
-        epoch_key: key.into(),
-        seq,
-        token: token.into(),
-        cut: end,
-        digest: format!("{:x}", Sha256::digest(bytes)),
-        kind: CutKind::Submit,
+    ConsumerOperation::Cut {
+        request: CutRequest {
+            epoch: epoch.into(),
+            seq,
+            token: token.into(),
+            cut: end,
+            digest: format!("{:x}", Sha256::digest(bytes)),
+            kind: CutKind::Submit,
+        },
+        peer_ino: Some(*ino),
     }
 }
-fn expect_cut(actor: &crate::pty::actor::PtyIoActorHandle, req: CutRequest, expected: CutResult) {
-    match response(actor, ConsumerOperation::Cut(req)) {
+fn expect_cut(
+    actor: &crate::pty::actor::PtyIoActorHandle,
+    req: ConsumerOperation,
+    expected: CutResult,
+) {
+    match response(actor, req) {
         ConsumerResponse::Cut(result) => assert_eq!(result, expected),
         _ => panic!("wrong cut response"),
     }
@@ -174,7 +193,7 @@ fn input_consumer_real_pty_ordered_marker_joined_cut_replay_and_digest() {
         [b"before".as_slice(), marker.as_bytes()].concat()
     );
     assert!(
-        matches!(response(&actor,ConsumerOperation::Enroll { peer:peer.identity }),ConsumerResponse::Refused { reason } if reason=="already_enrolled")
+        matches!(response(&actor,ConsumerOperation::Enroll { peer:peer.pidfd() }),ConsumerResponse::Refused { reason } if reason=="already_enrolled")
     );
     let client = InputSource::Client {
         connection_id: 7,
@@ -236,18 +255,95 @@ fn input_consumer_real_pty_split_reserved_introducer_cannot_forge_marker() {
 fn input_consumer_real_pty_raw_peer_is_admitted() {
     let peer = Peer::new(true);
     assert!(
-        crate::platform::input_consumer_snapshot(peer.fd(), peer.identity).is_ok(),
+        crate::platform::input_consumer_snapshot(peer.fd(), &peer.pidfd()).is_ok(),
         "raw controlling-tty foreground peer must enroll"
     );
 }
 #[test]
 fn input_consumer_real_pty_canonical_peer_is_refused() {
     let peer = Peer::new(false);
-    assert!(crate::platform::input_consumer_snapshot(peer.fd(), peer.identity).is_err());
+    assert!(crate::platform::input_consumer_snapshot(peer.fd(), &peer.pidfd()).is_err());
 }
 #[test]
 fn input_consumer_real_pty_other_session_is_refused() {
     let peer = Peer::new(true);
     let other = Peer::new(true);
-    assert!(crate::platform::input_consumer_snapshot(peer.fd(), other.identity).is_err());
+    assert!(crate::platform::input_consumer_snapshot(peer.fd(), &other.pidfd()).is_err());
+}
+/// H3: a cut or release from another process with the right epoch is refused
+/// with no seq change and no audit record; the enrolled peer's next cut succeeds.
+#[test]
+fn input_consumer_real_pty_second_process_with_right_epoch_is_refused() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let peer = Peer::new(true);
+    let (actor, rx) = actor(&peer);
+    let (epoch, ino, nonce) = enroll(&actor, &peer);
+    receive_bytes(&rx, format!("\x1b_herdr-epoch;{nonce}\x1b\\").len());
+    actor
+        .try_write_user_input_with_source(
+            bytes::Bytes::from_static(b"x\r"),
+            InputSource::Client {
+                connection_id: 1,
+                principal: None,
+            },
+        )
+        .expect("client");
+    let actual = receive_bytes(&rx, 2);
+    let other =
+        pidfd_of(crate::platform::process_identity(std::process::id()).expect("own identity"));
+    assert_ne!(other.ino, ino);
+    let calls = std::sync::Arc::new(AtomicUsize::new(0));
+    let count = std::sync::Arc::clone(&calls);
+    let audit: AuditSink = std::sync::Arc::new(move |_| {
+        count.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    });
+    for peer_ino in [Some(other.ino), None] {
+        let refused = actor
+            .queue_input_consumer_operation(
+                ConsumerOperation::Cut {
+                    request: CutRequest {
+                        epoch: epoch.clone(),
+                        seq: 1,
+                        token: "intruder".into(),
+                        cut: 2,
+                        digest: {
+                            use sha2::{Digest, Sha256};
+                            format!("{:x}", Sha256::digest(&actual))
+                        },
+                        kind: CutKind::Submit,
+                    },
+                    peer_ino,
+                },
+                Some(std::sync::Arc::clone(&audit)),
+            )
+            .expect("enqueue")
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .expect("answer");
+        assert!(
+            matches!(&refused, ConsumerResponse::Refused { reason } if reason == "invalid_epoch")
+        );
+        assert!(matches!(
+            response(
+                &actor,
+                ConsumerOperation::Release {
+                    epoch: epoch.clone(),
+                    peer_ino,
+                }
+            ),
+            ConsumerResponse::Refused { reason } if reason == "invalid_epoch"
+        ));
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "no audit record");
+    assert!(
+        actor.input_consumer_epoch_matches(&epoch),
+        "epoch not hijacked"
+    );
+    // Seq 1 is still next for the enrolled peer.
+    expect_cut(
+        &actor,
+        cut(&epoch, &ino, 1, "one", 2, &actual),
+        CutResult::Client { principal: None },
+    );
+    actor.shutdown();
 }

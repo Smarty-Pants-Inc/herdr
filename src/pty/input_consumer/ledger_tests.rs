@@ -6,7 +6,6 @@ use std::sync::{
 fn request(seq: u64, token: &str, cut: u64, bytes: &[u8]) -> CutRequest {
     CutRequest {
         epoch: "epoch".into(),
-        epoch_key: "secret".into(),
         seq,
         token: token.into(),
         cut,
@@ -68,7 +67,7 @@ fn input_consumer_ledger_sources_partial_cuts_and_after_cut_preserved() {
             unknown("empty_interval"),
         ),
     ] {
-        let mut ledger = Ledger::new("epoch".into(), "secret".into());
+        let mut ledger = Ledger::new("epoch".into());
         ledger.record(b"a", &sources[0], now);
         ledger.record(b"\r", &sources[1], now);
         assert_eq!(
@@ -78,7 +77,7 @@ fn input_consumer_ledger_sources_partial_cuts_and_after_cut_preserved() {
         assert_eq!(ledger.previous, 2);
         assert!(ledger.spans.is_empty());
     }
-    let mut ledger = Ledger::new("epoch".into(), "secret".into());
+    let mut ledger = Ledger::new("epoch".into());
     ledger.record(b"A\rB", &client(1), now);
     assert!(matches!(
         result(ledger.cut(request(1, "a", 2, b"A\r"), Some(&audit), now)),
@@ -97,16 +96,11 @@ fn input_consumer_ledger_exact_retry_conflict_kind_seq_and_durable_once() {
     let counted = Arc::clone(&calls);
     let audit: AuditSink = Arc::new(move |r| {
         let json = serde_json::to_string(r).expect("record json");
-        assert!(
-            !json.contains("secret")
-                && !json.contains("epoch_key")
-                && !json.contains("nonce")
-                && !json.contains("raw")
-        );
+        assert!(!json.contains("epoch_key") && !json.contains("nonce") && !json.contains("raw"));
         counted.fetch_add(1, Ordering::SeqCst);
         Ok(())
     });
-    let mut ledger = Ledger::new("epoch".into(), "secret".into());
+    let mut ledger = Ledger::new("epoch".into());
     ledger.record(b"x\r", &client(1), now);
     let req = request(1, "one", 2, b"x\r");
     let first = result(ledger.cut(req.clone(), Some(&audit), now));
@@ -171,7 +165,7 @@ fn input_consumer_ledger_exact_retry_conflict_kind_seq_and_durable_once() {
 fn input_consumer_ledger_early_unknown_with_failed_log_fails_closed() {
     let now = Instant::now();
     let failing: AuditSink = Arc::new(|_: &AuditRecord| Err(io::Error::other("disk")));
-    let mut ledger = Ledger::new("epoch".into(), "secret".into());
+    let mut ledger = Ledger::new("epoch".into());
     ledger.record(b"x\r", &client(1), now);
     assert_eq!(
         result(ledger.cut(request(5, "stale", 2, b"x\r"), Some(&failing), now)),
@@ -193,7 +187,7 @@ fn input_consumer_ledger_poisoned_replay_logs_its_changed_answer() {
         seen.lock().unwrap().push(r.clone());
         Ok(())
     });
-    let mut ledger = Ledger::new("epoch".into(), "secret".into());
+    let mut ledger = Ledger::new("epoch".into());
     ledger.record(b"x\r", &client(1), now);
     let req = request(1, "one", 2, b"x\r");
     let first = result(ledger.cut(req.clone(), Some(&audit), now));
@@ -221,7 +215,7 @@ fn input_consumer_ledger_poisoned_replay_logs_its_changed_answer() {
     }
     assert_eq!(records.lock().unwrap().len(), 2, "no amplification");
     // A failed log fails closed even on replay, and stores nothing.
-    let mut ledger = Ledger::new("epoch".into(), "secret".into());
+    let mut ledger = Ledger::new("epoch".into());
     ledger.record(b"x\r", &client(1), now);
     assert_eq!(result(ledger.cut(req.clone(), Some(&audit), now)), first);
     ledger.poison("termios_changed");
@@ -249,7 +243,7 @@ fn input_consumer_ledger_audit_failure_and_missing_sink_poison_no_attribution() 
         Some(Arc::new(|_: &AuditRecord| Err(io::Error::other("disk failure"))) as AuditSink),
     ] {
         let now = Instant::now();
-        let mut ledger = Ledger::new("epoch".into(), "secret".into());
+        let mut ledger = Ledger::new("epoch".into());
         ledger.record(b"x", &client(1), now);
         assert_eq!(
             result(ledger.cut(request(1, "x", 1, b"x"), audit.as_ref(), now)),
@@ -269,7 +263,7 @@ fn input_consumer_ledger_audit_failure_and_missing_sink_poison_no_attribution() 
 fn input_consumer_ledger_expiry_uses_endpoint_successful_write_not_latest_input() {
     let start = Instant::now();
     let audit = sink();
-    let mut ledger = Ledger::new("epoch".into(), "secret".into());
+    let mut ledger = Ledger::new("epoch".into());
     ledger.record(b"A\r", &client(1), start);
     ledger.record(b"B", &InputSource::Api, start + Duration::from_secs(29));
     assert_eq!(
@@ -280,7 +274,7 @@ fn input_consumer_ledger_expiry_uses_endpoint_successful_write_not_latest_input(
         )),
         unknown("cut_expired")
     );
-    let mut ledger = Ledger::new("epoch".into(), "secret".into());
+    let mut ledger = Ledger::new("epoch".into());
     ledger.record(b"A\r", &client(1), start);
     assert!(matches!(
         result(ledger.cut(
@@ -299,7 +293,7 @@ fn input_consumer_ledger_desync_and_old_cut_fail_closed() {
         (request(1, "t", 3, b"ab"), "cut_beyond_written"),
         (request(1, "t", 2, b"bad"), "digest_mismatch"),
     ] {
-        let mut ledger = Ledger::new("epoch".into(), "secret".into());
+        let mut ledger = Ledger::new("epoch".into());
         ledger.record(b"ab", &client(1), now);
         assert_eq!(result(ledger.cut(req, Some(&audit), now)), unknown(reason));
         assert_eq!(
@@ -307,10 +301,10 @@ fn input_consumer_ledger_desync_and_old_cut_fail_closed() {
             unknown(reason)
         );
     }
-    let mut ledger = Ledger::new("epoch".into(), "secret".into());
+    let mut ledger = Ledger::new("epoch".into());
     ledger.record(b"ab", &client(1), now);
     let mut wrong = request(1, "t", 2, b"ab");
-    wrong.epoch_key = "wrong".into();
+    wrong.epoch = "other".into();
     assert!(matches!(
         ledger.cut(wrong, Some(&audit), now),
         ConsumerResponse::Refused { .. }
@@ -332,18 +326,18 @@ fn input_consumer_ledger_desync_and_old_cut_fail_closed() {
 fn input_consumer_ledger_raw_and_replay_budget_no_eviction_and_retention() {
     let now = Instant::now();
     let audit = sink();
-    let mut ledger = Ledger::new("epoch".into(), "secret".into());
+    let mut ledger = Ledger::new("epoch".into());
     ledger.record(&vec![b'x'; BUDGET + 1], &client(1), now);
     assert_eq!(
         result(ledger.cut(request(1, "t", 1, b"x"), Some(&audit), now)),
         unknown("receipt_overflow")
     );
     assert!(ledger.spans.is_empty());
-    let mut ledger = Ledger::new("epoch".into(), "secret".into());
+    let mut ledger = Ledger::new("epoch".into());
     ledger.record(b"x", &client(1), now);
     ledger.expire(now + RETENTION + Duration::from_nanos(1));
     assert_eq!(ledger.poison.as_deref(), Some("receipt_expired"));
-    let mut ledger = Ledger::new("epoch".into(), "secret".into());
+    let mut ledger = Ledger::new("epoch".into());
     let mut seq = 1;
     loop {
         ledger.record(b"x", &client(1), now);
@@ -373,7 +367,7 @@ fn input_consumer_ledger_raw_and_replay_budget_no_eviction_and_retention() {
         CutResult::Unknown { .. }
     ));
     // Replay cap has its own reason when a pending new token would exceed it.
-    let mut ledger = Ledger::new("epoch".into(), "secret".into());
+    let mut ledger = Ledger::new("epoch".into());
     ledger.replay_cost = BUDGET - 100;
     assert_eq!(
         result(ledger.cut(request(1, "t", 0, b""), Some(&audit), now)),

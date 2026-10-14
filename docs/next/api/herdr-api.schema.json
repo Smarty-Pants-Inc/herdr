@@ -2872,9 +2872,6 @@
             "epoch": {
               "type": "string"
             },
-            "epoch_key": {
-              "type": "string"
-            },
             "kind": {
               "$ref": "#/schemas/request/$defs/InputConsumerCutKind"
             },
@@ -2889,7 +2886,6 @@
           },
           "required": [
             "epoch",
-            "epoch_key",
             "seq",
             "token",
             "cut",
@@ -2902,7 +2898,7 @@
           "additionalProperties": false,
           "properties": {
             "challenge": {
-              "description": "Fresh 256-bit consumer challenge as 64 lowercase hex characters.",
+              "description": "Fresh 256-bit consumer challenge as 64 lowercase hex characters; the\nanswer's Ed25519 `sig` covers it.",
               "type": "string"
             },
             "pane_id": {
@@ -2920,14 +2916,10 @@
           "properties": {
             "epoch": {
               "type": "string"
-            },
-            "epoch_key": {
-              "type": "string"
             }
           },
           "required": [
-            "epoch",
-            "epoch_key"
+            "epoch"
           ],
           "type": "object"
         },
@@ -7829,6 +7821,7 @@
               "type": "boolean"
             },
             "name": {
+              "description": "The pane's opt-in agent name; null when the pane's agent has no name.",
               "type": [
                 "string",
                 "null"
@@ -7897,6 +7890,7 @@
           },
           "required": [
             "terminal_id",
+            "name",
             "agent_status",
             "workspace_id",
             "tab_id",

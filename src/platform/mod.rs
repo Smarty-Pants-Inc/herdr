@@ -187,15 +187,104 @@ pub(crate) struct InputConsumerSnapshot {
     pub sid: u32,
     pub tty: u32,
     pub termios: Vec<u64>,
-    /// Peer and leader pidfds pinned at enroll. They let the per-event
-    /// liveness check use syscalls instead of /proc reads; `None` falls back
-    /// to the full /proc proof.
-    pub pidfds: Option<std::sync::Arc<[std::os::fd::OwnedFd; 2]>>,
+    /// The enroll connection's own `SO_PEERPIDFD`, retained for the epoch: only
+    /// this incarnation may cut or release (design item 4).
+    pub peer_pidfd: PeerPidfd,
+    /// Group leader pidfd. It lets the per-event liveness check use syscalls
+    /// instead of /proc reads; `None` falls back to the full /proc proof.
+    pub leader_pidfd: Option<std::sync::Arc<std::os::fd::OwnedFd>>,
+}
+
+/// The process that connected a local socket, pinned by its pidfs identity
+/// (`SO_PEERPIDFD`, smarty-dev#2636 E′). Captured at accept; only the input
+/// consumer reads it. Never captured off Linux, so the consumer refuses there.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Debug, Clone)]
+pub(crate) struct PeerPidfd {
+    /// pidfs inode: names one process incarnation for the boot (64-bit).
+    pub ino: u64,
+    /// The peer's pid in this server's active pid namespace (`PIDFD_GET_INFO`).
+    pub pid: u32,
+    #[cfg(target_os = "linux")]
+    pub(crate) fd: std::sync::Arc<std::os::fd::OwnedFd>,
+}
+
+/// Capture the pidfs identity of a local socket's peer. `None` when the
+/// kernel lacks `SO_PEERPIDFD`, pidfs or `PIDFD_GET_INFO`.
+#[cfg(unix)]
+pub(crate) fn local_socket_peer_pidfd(fd: std::os::fd::RawFd) -> Option<PeerPidfd> {
+    #[cfg(target_os = "linux")]
+    return linux::peer_pidfd::from_socket(fd)
+        .map_err(|err| tracing::debug!(%err, "local socket peer has no pidfs identity"))
+        .ok();
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = fd;
+        None
+    }
+}
+
+/// A validated pidfs pidfd for a live pid; tests stand in for a socket peer.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn peer_pidfd_for_test(pid: u32) -> std::io::Result<PeerPidfd> {
+    linux::peer_pidfd::open_for_test(pid)
+}
+
+/// nsfs inode of the server's active pid namespace, signed into the enroll
+/// transcript. `None` refuses enrollment.
+#[cfg(unix)]
+pub(crate) fn input_consumer_pid_namespace() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    return linux::peer_pidfd::server_pid_namespace();
+    #[cfg(not(target_os = "linux"))]
+    None
+}
+
+/// A cut or release comes from the enrolled incarnation: its connection's
+/// pidfs inode is the enroll connection's, and that process has not exited.
+#[cfg(unix)]
+pub(crate) fn input_consumer_pinned(s: &InputConsumerSnapshot, peer_ino: Option<u64>) -> bool {
+    #[cfg(target_os = "linux")]
+    return peer_ino == Some(s.peer_pidfd.ino) && linux::peer_pidfd::running(&s.peer_pidfd);
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (s, peer_ino);
+        false
+    }
 }
 
 /// Input-consumer cuts are Linux-server only in v2 (ruling r3 C).
 pub(crate) fn input_consumer_supported() -> bool {
     cfg!(target_os = "linux")
+}
+
+/// First call in `main`: the server reads its attestation key, then every mode drops a
+/// setgid group (smarty-dev#2636 r4). Must run before any config or environment path.
+pub(crate) fn acquire_server_key(args: &[std::ffi::OsString]) {
+    #[cfg(target_os = "linux")]
+    linux::server_key::acquire(args);
+    #[cfg(not(target_os = "linux"))]
+    let _ = args;
+}
+
+/// The server holds a usable attestation key; without it enroll is refused.
+pub(crate) fn server_key_available() -> bool {
+    #[cfg(target_os = "linux")]
+    return linux::server_key::available();
+    #[cfg(not(target_os = "linux"))]
+    false
+}
+
+/// Ed25519 signature over an input-consumer answer transcript: the enroll
+/// answer and each cut answer (domain-separated by their labels).
+pub(crate) fn server_key_sign(message: &[u8]) -> Option<Vec<u8>> {
+    #[cfg(target_os = "linux")]
+    return linux::server_key::sign(message);
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = message;
+        None
+    }
 }
 
 /// (st_dev, st_ino) of the pane slave, opened from the server's own master (TIOCGPTPEER).
@@ -228,10 +317,11 @@ pub(crate) fn flush_pty_input(master: std::os::fd::RawFd) -> std::io::Result<()>
 }
 
 #[cfg(unix)]
+/// (peer, group leader) identities of an enrolling pidfs peer.
 pub(crate) fn input_consumer_incarnation(
     fd: std::os::fd::RawFd,
-    peer: ProcessIdentity,
-) -> std::io::Result<ProcessIdentity> {
+    peer: &PeerPidfd,
+) -> std::io::Result<(ProcessIdentity, ProcessIdentity)> {
     #[cfg(target_os = "linux")]
     return linux::input_consumer::incarnation(fd, peer);
     #[cfg(not(target_os = "linux"))]
@@ -246,7 +336,7 @@ pub(crate) fn input_consumer_incarnation(
 #[cfg(unix)]
 pub(crate) fn input_consumer_snapshot(
     fd: std::os::fd::RawFd,
-    peer: ProcessIdentity,
+    peer: &PeerPidfd,
 ) -> std::io::Result<InputConsumerSnapshot> {
     #[cfg(target_os = "linux")]
     return linux::input_consumer::snapshot(fd, peer);
@@ -2052,10 +2142,6 @@ pub(crate) fn begin_cli_output() {}
 
 #[cfg(not(unix))]
 pub(crate) fn end_cli_output() {}
-
-/// Linux drops an inherited set-group-id at startup (herdr#188); elsewhere there is no guard.
-#[cfg(not(target_os = "linux"))]
-pub(crate) fn drop_inherited_group_privilege() {}
 
 #[cfg(target_os = "linux")]
 mod linux;

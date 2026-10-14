@@ -22,9 +22,9 @@ use crate::api::{
 };
 use crate::ipc::{
     bind_local_listener, is_connection_closed_error, local_stream_peer_closed,
-    local_stream_peer_identity, poll_local_stream_read, remove_socket_file_if_owned,
-    set_local_stream_polling, socket_file_identity, LocalStream, LocalStreamRead,
-    SocketFileIdentity,
+    local_stream_peer_identity, local_stream_peer_pidfd, poll_local_stream_read,
+    remove_socket_file_if_owned, set_local_stream_polling, socket_file_identity, LocalStream,
+    LocalStreamRead, SocketFileIdentity,
 };
 use crate::server::shutdown::{ServerStop, ShutdownReason};
 
@@ -158,7 +158,8 @@ fn default_capabilities() -> Option<ServerCapabilities> {
         expected_agent_status_guard: crate::platform::expected_agent_session_guard_supported(),
         // The Unix PTY writer checks the path before each write(2).
         refuse_if_exists_guard: cfg!(unix),
-        input_consumer: crate::platform::input_consumer_supported(),
+        input_consumer: crate::platform::input_consumer_supported()
+            && crate::platform::server_key_available(),
     })
 }
 
@@ -503,6 +504,9 @@ fn handle_connection_with_stop(
     if let Err(err) = stream.set_send_timeout(Some(STREAM_WRITE_TIMEOUT)) {
         debug!(err = %err, "api connection write timeout unavailable");
     }
+    // The input consumer pins cut and release to the enroll connection's pidfs
+    // identity; take it before the request is read (smarty-dev#2636 E′ item 4).
+    let peer_pidfd = local_stream_peer_pidfd(&stream);
 
     let Some(line) = read_initial_request_line(&mut stream)? else {
         return Ok(());
@@ -706,6 +710,43 @@ fn handle_connection_with_stop(
                 wait_for_output(request_id.clone(), params, &mut stream, api_tx, running)?;
             finish_wait_response(&mut stream, response, &request_id, method, changes_ui)
         }
+        method_body @ (Method::PaneInputConsumerEnroll(_)
+        | Method::PaneInputConsumerCut(_)
+        | Method::PaneInputConsumerRelease(_)) => {
+            let response = if server_stop.is_some_and(ServerStop::is_requested) {
+                error_response_json(
+                    request_id.clone(),
+                    "server_unavailable",
+                    "server is shutting down".into(),
+                )
+            } else {
+                dispatch_to_app(
+                    Request {
+                        id: request_id.clone(),
+                        method: method_body,
+                    },
+                    api_tx,
+                    None,
+                    context,
+                    peer_pidfd,
+                    None,
+                    None,
+                )
+            };
+            let result = write_text_line_allow_disconnect(&mut stream, &response);
+            match &result {
+                Ok(()) => crate::logging::api_request_completed(
+                    &request_id,
+                    method,
+                    api_response_outcome(&response),
+                    changes_ui,
+                ),
+                Err(err) => {
+                    crate::logging::api_request_failed(&request_id, method, &err.to_string())
+                }
+            }
+            result
+        }
         method_body => {
             let (response_write_tx, response_write_rx) = std::sync::mpsc::channel();
             let stop_caller = matches!(method_body, Method::ServerStop(_))
@@ -864,6 +905,7 @@ fn handle_request_with_context(
             let _ = api_tx.send(ApiRequestMessage {
                 request,
                 context,
+                peer_pidfd: None,
                 respond_to,
                 response_write_complete: None,
             });
@@ -891,6 +933,7 @@ fn handle_request_with_context(
         api_tx,
         None,
         context,
+        None,
         response_write_complete,
         None,
     )
@@ -911,6 +954,7 @@ fn dispatch_draft_state_with_timeout(
         api_tx,
         Some(timeout),
         context,
+        None,
         response_write_complete,
         Some(("timeout", "draft observation timed out")),
     );
@@ -1454,7 +1498,7 @@ pub(super) fn dispatch_to_app_with_timeout_and_context(
     timeout: Option<Duration>,
     context: ApiRequestContext,
 ) -> String {
-    dispatch_to_app(request, api_tx, timeout, context, None, None)
+    dispatch_to_app(request, api_tx, timeout, context, None, None, None)
 }
 
 pub(super) fn dispatch_to_app_with_caller_timeout(
@@ -1469,15 +1513,18 @@ pub(super) fn dispatch_to_app_with_caller_timeout(
         timeout,
         context,
         None,
+        None,
         Some(("timeout", "timed out waiting for agent status")),
     )
 }
 
+#[allow(clippy::too_many_arguments)] // One private dispatcher; each caller names its options.
 fn dispatch_to_app(
     request: Request,
     api_tx: &ApiRequestSender,
     timeout: Option<Duration>,
     context: ApiRequestContext,
+    peer_pidfd: Option<crate::platform::PeerPidfd>,
     response_write_complete: Option<std::sync::mpsc::Receiver<()>>,
     timeout_response: Option<(&str, &str)>,
 ) -> String {
@@ -1486,6 +1533,7 @@ fn dispatch_to_app(
     if let Err(err) = api_tx.send(ApiRequestMessage {
         request,
         context,
+        peer_pidfd,
         respond_to,
         response_write_complete,
     }) {
@@ -1577,9 +1625,12 @@ mod tests {
     use interprocess::local_socket::traits::Listener as _;
 
     #[test]
-    fn input_consumer_capability_is_advertised_only_on_linux() {
+    fn input_consumer_capability_requires_linux_and_the_server_key() {
         let caps = default_capabilities().expect("capabilities");
-        assert_eq!(caps.input_consumer, cfg!(target_os = "linux"));
+        assert_eq!(
+            caps.input_consumer,
+            cfg!(target_os = "linux") && crate::platform::server_key_available()
+        );
     }
 
     #[test]

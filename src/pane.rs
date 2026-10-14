@@ -316,6 +316,37 @@ async fn publish_agent_process_detected_event(
     }
 }
 
+/// Tells the server which exact agent process is in front, once per change,
+/// so a managed launch stays bound to the process it started.
+async fn publish_agent_process_identity_change(
+    state_events: &mpsc::Sender<AppEvent>,
+    pane_id: PaneId,
+    agent: Option<Agent>,
+    previous: Option<crate::platform::ProcessIdentity>,
+    current: Option<crate::platform::ProcessIdentity>,
+) {
+    let (Some(agent), Some(process)) = (agent, current) else {
+        return;
+    };
+    if previous == Some(process) {
+        return;
+    }
+    if let Err(e) = state_events
+        .send(AppEvent::AgentProcessIdentified {
+            pane_id,
+            agent,
+            process,
+        })
+        .await
+    {
+        warn!(
+            pane = pane_id.raw(),
+            err = %e,
+            "failed to deliver AgentProcessIdentified event"
+        );
+    }
+}
+
 async fn publish_codex_prompt_observation(
     state_events: &mpsc::Sender<AppEvent>,
     pane_id: PaneId,
@@ -1193,6 +1224,7 @@ fn spawn_basic_detection_task(
                     }
                 }
                 let previous_agent = agent_presence.current_agent();
+                let previous_process = agent_job.foreground_process();
                 let (foreground_action, changed) = observe_foreground_agent(
                     &mut agent_presence,
                     &mut agent_job,
@@ -1208,6 +1240,14 @@ fn spawn_basic_detection_task(
                     &PlatformAgentProcesses,
                     pane_id,
                 );
+                publish_agent_process_identity_change(
+                    &state_events,
+                    pane_id,
+                    agent_presence.current_agent(),
+                    previous_process,
+                    agent_job.foreground_process(),
+                )
+                .await;
                 last_foreground_pgid = tracked_process_group_id;
                 if new_agent.is_some() {
                     acquisition_started_at = None;
@@ -3443,6 +3483,7 @@ impl PaneRuntime {
                             }
 
                             let previous_agent = agent_presence.current_agent();
+                            let previous_process = agent_job.foreground_process();
                             let (foreground_action, changed) = observe_foreground_agent(
                                 &mut agent_presence,
                                 &mut agent_job,
@@ -3458,6 +3499,14 @@ impl PaneRuntime {
                                 &PlatformAgentProcesses,
                                 pane_id,
                             );
+                            publish_agent_process_identity_change(
+                                &state_events,
+                                pane_id,
+                                agent_presence.current_agent(),
+                                previous_process,
+                                agent_job.foreground_process(),
+                            )
+                            .await;
                             last_foreground_pgid = tracked_process_group_id;
                             if new_agent.is_some() {
                                 acquisition_started_at = None;
