@@ -1,9 +1,9 @@
 use crate::api::schema::{
     EmptyParams, Method, PaneFocusDirectionParams, PaneInputSetParams, PaneMoveParams,
-    PaneRenameParams, PaneResizeParams, PaneSplitParams, PaneSwapParams, PaneTarget,
-    PaneZoomParams, Request, TabCreateParams, TabListParams, TabRenameParams, TabTarget,
-    WorkspaceCloseParams, WorkspaceCreateParams, WorkspaceRenameParams, WorkspaceTarget,
-    WorktreeListParams, WorktreeRemoveParams,
+    PaneRenameParams, PaneResizeParams, PaneSplitParams, PaneSwapParams, PaneZoomParams, Request,
+    TabCreateParams, TabListParams, TabRenameParams, TabTarget, WorkspaceCloseParams,
+    WorkspaceCreateParams, WorkspaceRenameParams, WorkspaceTarget, WorktreeListParams,
+    WorktreeRemoveParams,
 };
 
 fn print_method_response(id: &'static str, method: Method) -> std::io::Result<i32> {
@@ -140,6 +140,7 @@ pub(super) fn pane_move(params: PaneMoveParams) -> std::io::Result<i32> {
     print_method_response("cli:pane:move", Method::PaneMoveProjectChecked(params))
 }
 
-pub(super) fn pane_close(pane_id: String) -> std::io::Result<i32> {
-    print_method_response("cli:pane:close", Method::PaneClose(PaneTarget { pane_id }))
+pub(super) fn pane_close(params: crate::api::schema::PaneCloseParams) -> std::io::Result<i32> {
+    // With expected_terminal, send_request upgrades this to pane.close_guarded.
+    print_method_response("cli:pane:close", Method::PaneClose(params))
 }
