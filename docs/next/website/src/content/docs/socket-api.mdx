@@ -218,6 +218,8 @@ The identity boundary is cooperative and same-user: kernel peer identity proves 
 
 `workspace.move_block` atomically moves the ordered `workspace_ids` before `before_workspace_id`; omit the anchor to move the block to the end. The ids must be unique and the anchor cannot be part of the block. The response contains the authoritative ordered workspace list.
 
+Every workspace record carries exactly one path. The `worktree` object appears only for a checkout that Herdr opened as a worktree (`worktree.create`, `worktree.open` or `workspace.create_linked`); its `checkout_path` is the workspace's path. `cwd` is present only when the workspace has no `worktree`: it is the current working directory of the workspace's root pane (the first pane of its first tab), or the directory it was created in. A workspace created with `workspace.create` in a Git checkout has `cwd` but no `worktree`.
+
 `session.snapshot` returns a one-time bootstrap snapshot for clients that keep
 their own local runtime cache. The response includes version/protocol metadata,
 focused workspace/tab/pane ids, workspace records, tab records, pane records,
