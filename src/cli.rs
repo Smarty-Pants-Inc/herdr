@@ -824,6 +824,31 @@ fn guarded_request(
         }
         return Ok(None);
     }
+
+    // An older server ignores expected_terminal on pane.close and would close a
+    // re-occupied pane, so a guarded close always uses pane.close_guarded.
+    let close_guarded = match &request.method {
+        Method::PaneClose(params) if params.expected_terminal.is_some() => {
+            Some(Method::PaneCloseGuarded(params.clone()))
+        }
+        Method::PaneCloseGuarded(_) => Some(request.method.clone()),
+        _ => None,
+    };
+    if let Some(method) = close_guarded {
+        if !capabilities.is_some_and(|caps| caps.pane_close_expected_terminal_guard) {
+            return Err(serde_json::json!({
+                "id": request.id,
+                "error": {
+                    "code": "expected_terminal_unsupported",
+                    "message": "server does not advertise pane_close_expected_terminal_guard; the pane was not closed",
+                },
+            }));
+        }
+        return Ok(Some(Request {
+            id: request.id.clone(),
+            method,
+        }));
+    }
     let (method, needs_terminal_guard, needs_session_guard, needs_status_guard) = match &request
         .method
     {
@@ -1330,6 +1355,44 @@ mod tests {
             serde_json::to_value(guarded).unwrap()["method"],
             "pane.send_input_guarded"
         );
+    }
+
+    #[test]
+    fn pane_close_terminal_guard_needs_its_own_capability_and_fail_closed_alias() {
+        let guarded: super::Request = serde_json::from_value(serde_json::json!({
+            "id": "close", "method": "pane.close",
+            "params": {"pane_id": "w1:p2", "expected_terminal": "term_opaque"}
+        }))
+        .unwrap();
+        // Servers from before this guard advertise expected_terminal_guard but would
+        // ignore the field on pane.close: that capability alone must not suffice.
+        let input_only = serde_json::from_value::<crate::api::schema::ServerCapabilities>(
+            serde_json::json!({"live_handoff": false, "expected_terminal_guard": true}),
+        )
+        .unwrap();
+        for caps in [None, Some(&input_only)] {
+            let refused = super::guarded_request(&guarded, caps).unwrap_err();
+            assert_eq!(refused["id"], "close");
+            assert_eq!(refused["error"]["code"], "expected_terminal_unsupported");
+        }
+        let close_caps = serde_json::from_value::<crate::api::schema::ServerCapabilities>(
+            serde_json::json!({"live_handoff": false, "pane_close_expected_terminal_guard": true}),
+        )
+        .unwrap();
+        let sent = serde_json::to_value(
+            super::guarded_request(&guarded, Some(&close_caps))
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(sent["method"], "pane.close_guarded");
+        assert_eq!(sent["params"]["expected_terminal"], "term_opaque");
+        assert_eq!(sent["params"]["pane_id"], "w1:p2");
+        let plain: super::Request = serde_json::from_value(serde_json::json!({
+            "id": "close", "method": "pane.close", "params": {"pane_id": "w1:p2"}
+        }))
+        .unwrap();
+        assert!(super::guarded_request(&plain, None).unwrap().is_none());
     }
 
     #[test]

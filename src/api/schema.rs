@@ -315,7 +315,10 @@ pub enum Method {
     #[serde(rename = "pane.release_agent")]
     PaneReleaseAgent(PaneReleaseAgentParams),
     #[serde(rename = "pane.close")]
-    PaneClose(PaneTarget),
+    PaneClose(PaneCloseParams),
+    /// Requires `expected_terminal`; older servers reject instead of ignoring the guard.
+    #[serde(rename = "pane.close_guarded")]
+    PaneCloseGuarded(PaneCloseParams),
     #[serde(rename = "popup.close")]
     PopupClose(EmptyParams),
     #[serde(rename = "events.subscribe")]

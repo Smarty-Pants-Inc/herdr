@@ -103,7 +103,7 @@ Raw socket method names use dot notation:
 | Workspace | `workspace.create`, `workspace.create_linked`, `workspace.list`, `workspace.get`, `workspace.focus`, `workspace.rename`, `workspace.move`, `workspace.move_block`, `workspace.report_metadata`, `workspace.close` |
 | Worktree | `worktree.list`, `worktree.create`, `worktree.create_project_checked`, `worktree.open`, `worktree.open_project_checked`, `worktree.remove` |
 | Tab | `tab.create`, `tab.list`, `tab.get`, `tab.focus`, `tab.rename`, `tab.move`, `tab.close` |
-| Pane | `pane.split`, `pane.swap`, `pane.move`, `pane.zoom`, `pane.layout`, `pane.process_info`, `pane.neighbor`, `pane.edges`, `pane.focus_direction`, `pane.resize`, `pane.list`, `pane.current`, `pane.get`, `pane.last_input`, `pane.rename`, `pane.send_text`, `pane.send_text_session_checked`, `pane.send_keys`, `pane.send_keys_session_checked`, `pane.send_text_path_checked`, `pane.send_keys_path_checked`, `pane.send_input`, `pane.send_input_guarded`, `pane.read`, `pane.report_agent`, `pane.report_agent_session`, `pane.report_metadata`, `pane.clear_agent_authority`, `pane.release_agent`, `pane.close`, `pane.wait_for_output` |
+| Pane | `pane.split`, `pane.swap`, `pane.move`, `pane.zoom`, `pane.layout`, `pane.process_info`, `pane.neighbor`, `pane.edges`, `pane.focus_direction`, `pane.resize`, `pane.list`, `pane.current`, `pane.get`, `pane.last_input`, `pane.rename`, `pane.send_text`, `pane.send_text_session_checked`, `pane.send_keys`, `pane.send_keys_session_checked`, `pane.send_text_path_checked`, `pane.send_keys_path_checked`, `pane.send_input`, `pane.send_input_guarded`, `pane.read`, `pane.report_agent`, `pane.report_agent_session`, `pane.report_metadata`, `pane.clear_agent_authority`, `pane.release_agent`, `pane.close`, `pane.close_guarded`, `pane.wait_for_output` |
 | Input consumer (local JSON only) | `pane.input_consumer.enroll`, `pane.input_consumer.cut`, `pane.input_consumer.release` |
 | Popup | `popup.close` |
 | Layout | `layout.export`, `layout.apply`, `layout.apply_restorable`, `layout.set_split_ratio` |
@@ -217,6 +217,8 @@ The identity boundary is cooperative and same-user: kernel peer identity proves 
 `agent.wait` is server-owned and event-driven. It pins the resolved pane occupant so a replacement cannot satisfy the wait. `agent.prompt` accepts an optional `wait` object with `until` and `timeout_ms`; this submits the prompt and starts the wait in one request, avoiding a race between separate calls. If the resolved agent is already `blocked`, `agent.prompt` returns `agent_blocked` without sending input or starting the wait.
 
 `workspace.move_block` atomically moves the ordered `workspace_ids` before `before_workspace_id`; omit the anchor to move the block to the end. The ids must be unique and the anchor cannot be part of the block. The response contains the authoritative ordered workspace list.
+
+Every workspace record carries exactly one path. The `worktree` object appears only for a checkout that Herdr opened as a worktree (`worktree.create`, `worktree.open` or `workspace.create_linked`); its `checkout_path` is the workspace's path. `cwd` is present only when the workspace has no `worktree`: it is the current working directory of the workspace's root pane (the first pane of its first tab), or the directory it was created in. A workspace created with `workspace.create` in a Git checkout has `cwd` but no `worktree`.
 
 `session.snapshot` returns a one-time bootstrap snapshot for clients that keep
 their own local runtime cache. The response includes version/protocol metadata,
@@ -504,6 +506,12 @@ Check `ping.result.capabilities.expected_terminal_guard == true` before using th
 ```
 
 The guard identifies a terminal, not an agent name, process, or native agent session inside that terminal. It does not change the separate cross-pane input policy.
+
+`pane.close` accepts the same optional `expected_terminal` string. The server checks it and closes the pane in the same step, so another terminal cannot take the pane in between. A missing pane, unknown identity, malformed string, or different attachment returns `terminal_identity_mismatch` and closes nothing. Omit the field to keep the unguarded close. An older server ignores this field on `pane.close`, so check `ping.result.capabilities.pane_close_expected_terminal_guard == true` and send `pane.close_guarded`, which requires `expected_terminal` and which an older server rejects. `expected_terminal_guard` alone does not mean a server supports the close guard. The CLI uses `pane.close_guarded` for `pane close --expected-terminal` and refuses unsupported servers with `expected_terminal_unsupported`.
+
+```json
+{"id":"guarded_close","method":"pane.close_guarded","params":{"pane_id":"w1:p1","expected_terminal":"term_opaque_from_pane_get"}}
+```
 
 ### Expected agent session guard
 

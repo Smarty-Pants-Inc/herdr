@@ -1139,6 +1139,13 @@
             "agent_status": {
               "$ref": "#/schemas/event/$defs/AgentStatus"
             },
+            "cwd": {
+              "description": "Current cwd of the workspace's root pane (first tab), else the cwd it was\ncreated in. Present only when the workspace has no `worktree` (a checkout\nopened through `worktree`/`workspace.create_linked`), so a row carries\nexactly one path: `worktree.checkout_path` or `cwd`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "focused": {
               "type": "boolean"
             },
@@ -2714,6 +2721,21 @@
                 "string",
                 "null"
               ]
+            }
+          },
+          "required": [
+            "pane_id"
+          ],
+          "type": "object"
+        },
+        "PaneCloseParams": {
+          "properties": {
+            "expected_terminal": {
+              "description": "Refuse the close unless the pane still owns this opaque terminal identity.\nOlder servers ignore this field on `pane.close`; use `pane.close_guarded`\nafter checking `pane_close_expected_terminal_guard`.",
+              "type": "string"
+            },
+            "pane_id": {
+              "type": "string"
             }
           },
           "required": [
@@ -7099,7 +7121,24 @@
               "type": "string"
             },
             "params": {
-              "$ref": "#/schemas/request/$defs/PaneTarget"
+              "$ref": "#/schemas/request/$defs/PaneCloseParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Requires `expected_terminal`; older servers reject instead of ignoring the guard.",
+          "properties": {
+            "method": {
+              "const": "pane.close_guarded",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneCloseParams"
             }
           },
           "required": [
@@ -11865,6 +11904,11 @@
             "live_handoff": {
               "type": "boolean"
             },
+            "pane_close_expected_terminal_guard": {
+              "default": false,
+              "description": "Supports the fail-closed `expected_terminal` guard on `pane.close` and `pane.close_guarded`.",
+              "type": "boolean"
+            },
             "refuse_if_exists_guard": {
               "default": false,
               "description": "Supports the write-time `refuse_if_exists` path guard on the local JSON\n`pane.send_text_path_checked` and `pane.send_keys_path_checked` methods.",
@@ -12009,6 +12053,13 @@
             },
             "agent_status": {
               "$ref": "#/schemas/success_response/$defs/AgentStatus"
+            },
+            "cwd": {
+              "description": "Current cwd of the workspace's root pane (first tab), else the cwd it was\ncreated in. Present only when the workspace has no `worktree` (a checkout\nopened through `worktree`/`workspace.create_linked`), so a row carries\nexactly one path: `worktree.checkout_path` or `cwd`.",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "focused": {
               "type": "boolean"

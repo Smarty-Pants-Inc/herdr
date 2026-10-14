@@ -691,7 +691,7 @@ fn pane_command() -> Command {
                 .arg(flag("focus"))
                 .arg(flag("no-focus")),
         )
-        .subcommand(id_command("close", "pane_id", "Close a pane"))
+        .subcommand(id_command("close", "pane_id", "Close a pane").arg(expected_terminal_option()))
         .subcommand(id_command(
             "clear-input-poison",
             "pane_id",

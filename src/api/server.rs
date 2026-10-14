@@ -152,6 +152,7 @@ fn default_capabilities() -> Option<ServerCapabilities> {
         ssh_agent_registration: false,
         guarded_live_handoff: crate::platform::capabilities().live_handoff,
         expected_terminal_guard: true,
+        pane_close_expected_terminal_guard: true,
         // Native live-generation and PTY foreground proof is required. Other
         // platforms deliberately refuse guarded session delivery.
         expected_agent_session_guard: crate::platform::expected_agent_session_guard_supported(),
@@ -1088,6 +1089,7 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::PaneClearAgentAuthority(_) => "pane.clear_agent_authority",
         Method::PaneReleaseAgent(_) => "pane.release_agent",
         Method::PaneClose(_) => "pane.close",
+        Method::PaneCloseGuarded(_) => "pane.close_guarded",
         Method::PopupClose(_) => "popup.close",
         Method::EventsSubscribe(_) => "events.subscribe",
         Method::EventsWait(_) => "events.wait",
@@ -2320,6 +2322,7 @@ mod tests {
                 ssh_agent_registration: false,
                 guarded_live_handoff: true,
                 expected_terminal_guard: true,
+                pane_close_expected_terminal_guard: true,
                 expected_agent_session_guard: true,
                 expected_agent_status_guard: true,
                 refuse_if_exists_guard: true,

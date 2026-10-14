@@ -54,6 +54,9 @@ pub struct ServerCapabilities {
     /// Supports the fail-closed `expected_terminal` guard on `agent.start` and `pane.send_input`.
     #[serde(default)]
     pub expected_terminal_guard: bool,
+    /// Supports the fail-closed `expected_terminal` guard on `pane.close` and `pane.close_guarded`.
+    #[serde(default)]
+    pub pane_close_expected_terminal_guard: bool,
     /// Supports the local JSON session-checked prompt, text and key methods.
     #[serde(default)]
     pub expected_agent_session_guard: bool,

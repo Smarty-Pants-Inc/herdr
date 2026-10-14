@@ -1562,7 +1562,16 @@ impl App {
             Method::PaneSendInput(params) | Method::PaneSendInputGuarded(params) => {
                 return self.handle_pane_send_input(request.id, params, context);
             }
-            Method::PaneClose(target) => return self.handle_pane_close(request.id, target),
+            Method::PaneCloseGuarded(params) if params.expected_terminal.is_none() => {
+                return responses::encode_error(
+                    request.id,
+                    "terminal_identity_mismatch",
+                    "pane.close_guarded requires expected_terminal",
+                );
+            }
+            Method::PaneClose(target) | Method::PaneCloseGuarded(target) => {
+                return self.handle_pane_close(request.id, target);
+            }
             Method::PopupClose(_) => {
                 return if self.close_popup_pane() {
                     responses::encode_success(request.id, ResponseResult::Ok {})
