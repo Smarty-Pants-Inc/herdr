@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 
 use super::test_support::shutdown_test_runtimes;
 use crate::api::schema::{
-    Method, PaneSplitParams, PaneTarget, Request, ResponseResult, SplitDirection, SuccessResponse,
-    TabCreateParams, WorkspaceCloseParams, WorkspaceCreateParams, WorkspaceTarget,
+    Method, PaneCloseParams, PaneSplitParams, PaneTarget, Request, ResponseResult, SplitDirection,
+    SuccessResponse, TabCreateParams, WorkspaceCloseParams, WorkspaceCreateParams, WorkspaceTarget,
 };
 use crate::app::App;
 use crate::config::{Config, ShellModeConfig};
@@ -226,8 +226,9 @@ async fn defaults_survive_closing_the_root_pane() {
     let mut h = Harness::new("root-close");
     let (a, a_root) = h.create_workspace(&[(KEY, "probe-split")]);
     let survivor = h.split(None, None, &[]);
-    h.call(Method::PaneClose(PaneTarget {
+    h.call(Method::PaneClose(PaneCloseParams {
         pane_id: a_root.clone(),
+        expected_terminal: None,
     }));
     h.focus_pane(&survivor);
 

@@ -1,9 +1,9 @@
 use bytes::Bytes;
 
 use crate::api::schema::{
-    EventData, EventEnvelope, EventKind, PaneClearAgentAuthorityParams, PaneCopyMotion,
-    PaneCopyMotionParams, PaneCopySearchDirection, PaneCopySearchParams, PaneCurrentParams,
-    PaneDirection, PaneEdgesParams, PaneEdgesResult, PaneFocusDirectionParams,
+    EventData, EventEnvelope, EventKind, PaneClearAgentAuthorityParams, PaneCloseParams,
+    PaneCopyMotion, PaneCopyMotionParams, PaneCopySearchDirection, PaneCopySearchParams,
+    PaneCurrentParams, PaneDirection, PaneEdgesParams, PaneEdgesResult, PaneFocusDirectionParams,
     PaneFocusDirectionReason, PaneFocusDirectionResult, PaneInfo, PaneInputSetParams,
     PaneLayoutPane, PaneLayoutParams, PaneLayoutRect, PaneLayoutSnapshot, PaneLayoutSplit,
     PaneListParams, PaneMoveDestination, PaneMoveParams, PaneMoveReason, PaneMoveResult,
@@ -2382,7 +2382,7 @@ impl App {
         encode_success(id, ResponseResult::Ok {})
     }
 
-    pub(super) fn handle_pane_close(&mut self, id: String, target: PaneTarget) -> String {
+    pub(super) fn handle_pane_close(&mut self, id: String, target: PaneCloseParams) -> String {
         match self.close_pane(id.clone(), &target) {
             Ok(()) => encode_success(id, ResponseResult::Ok {}),
             Err(response) => response,
@@ -2390,8 +2390,19 @@ impl App {
     }
 
     /// Close a pane; `Err` carries the encoded error response.
-    pub(super) fn close_pane(&mut self, id: String, target: &PaneTarget) -> Result<(), String> {
-        let Some((ws_idx, pane_id)) = self.parse_pane_id(&target.pane_id) else {
+    pub(super) fn close_pane(
+        &mut self,
+        id: String,
+        target: &PaneCloseParams,
+    ) -> Result<(), String> {
+        let pane = self.parse_pane_id(&target.pane_id);
+        // The guard and the close run in this one synchronous App step: no await
+        // or re-resolution can let another terminal take the pane in between.
+        let terminal_id =
+            pane.and_then(|(ws_idx, pane_id)| self.state.terminal_id_for_pane(ws_idx, pane_id));
+        self.check_expected_terminal(target.expected_terminal.as_deref(), terminal_id.as_ref())
+            .map_err(|error| super::responses::encode_error_body(id.clone(), error))?;
+        let Some((ws_idx, pane_id)) = pane else {
             return Err(pane_not_found(id, &target.pane_id));
         };
         let Some(public_pane_id) = self.public_pane_id(ws_idx, pane_id) else {
@@ -4079,8 +4090,9 @@ mod tests {
 
         let response = app.handle_pane_close(
             "req".into(),
-            PaneTarget {
+            PaneCloseParams {
                 pane_id: public_pane_id,
+                expected_terminal: None,
             },
         );
 

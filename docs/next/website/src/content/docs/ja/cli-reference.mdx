@@ -221,8 +221,10 @@ herdr pane move <pane_id> --tab <tab_id> --split right|down [--target-pane ID] [
 herdr pane move <pane_id> --new-tab [--workspace ID] [--label TEXT] [--focus|--no-focus]
 herdr pane move <pane_id> --new-workspace [--label TEXT] [--tab-label TEXT] [--focus|--no-focus]
 herdr pane clear-input-poison <pane>
-herdr pane close <pane_id>
+herdr pane close <pane_id> [--expected-terminal TERMINAL_ID]
 ```
+
+`pane close --expected-terminal <terminal_id>` は、ペインがまだそのターミナルを保持している場合にだけペインを閉じます。自分で起動したペインを閉じるときに使ってください。`terminal_id` は不透明な値なので、ペインを作成したレスポンスか `pane get` からコピーします。ペインが別のターミナルを保持している場合(たとえばサーバーが置き換わり、新しいターミナルが同じペイン ID を再利用した場合)、サーバーは `terminal_identity_mismatch` で拒否し、何も閉じません。サーバーは識別子の確認とクローズを 1 つのステップで行うため、その間に別のターミナルがペインを引き継ぐことはありません。サーバーが対応を通知していない場合、CLI は `expected_terminal_unsupported` を返し、何も閉じません。フラグなしの `pane close` の動作は変わりません。
 
 `--current` を受け付けるペインコマンドは、Herdr ペイン内から実行した場合、呼び出し元の `HERDR_PANE_ID` を使います。`pane split` では、明示したペイン ID または `--pane ID` がそのペインを分割します。対象を省略すると `HERDR_PANE_ID` があれば呼び出し元ペインを、なければフォーカス中のペインを使います。`--current` は呼び出し元ペインを必須とし、`HERDR_PANE_ID` がない場合はエラーになります。分割レスポンスでは、新しいペイン ID は `.result.pane.pane_id` にあります。
 

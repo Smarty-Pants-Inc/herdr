@@ -305,8 +305,40 @@ mod tests {
                     Some(serde_json::json!({"type": "boolean"}))
                 );
             }
+            let mut request_shape = normalized_wire_schema(branch);
+            if legacy_guarded_prompt && *method == "pane.close" {
+                // Same rule as if_draft_empty above: exclude ONLY the optional
+                // PaneCloseParams.expected_terminal property. It is separately
+                // advertised by pane_close_expected_terminal_guard, and the CLI sends
+                // it only through pane.close_guarded, which old servers reject.
+                // PaneCloseParams minus that field is the published PaneTarget shape;
+                // the full pane.close shape is independently frozen below.
+                let mut params = selected_definitions
+                    .remove("PaneCloseParams")
+                    .expect("pane close params definition");
+                assert!(!params["required"]
+                    .as_array()
+                    .expect("required pane close params")
+                    .iter()
+                    .any(|field| field == "expected_terminal"));
+                assert_eq!(
+                    params["properties"]
+                        .as_object_mut()
+                        .expect("pane close params properties")
+                        .remove("expected_terminal"),
+                    Some(serde_json::json!({"type": "string"}))
+                );
+                assert!(selected_definitions
+                    .insert("PaneTarget".into(), params)
+                    .is_none());
+                let params_ref = request_shape
+                    .pointer_mut("/properties/params/$ref")
+                    .expect("pane close params ref");
+                assert_eq!(params_ref, "#/$defs/PaneCloseParams");
+                *params_ref = "#/$defs/PaneTarget".into();
+            }
             let shape = serde_json::json!({
-                "request": normalized_wire_schema(branch),
+                "request": request_shape,
                 "definitions": selected_definitions,
             });
             let bytes = serde_json::to_vec(&shape).expect("method shape json");
@@ -413,6 +445,39 @@ mod tests {
         for invalid in [serde_json::Value::Null, "true".into(), 1.into()] {
             wire["params"]["if_draft_empty"] = invalid;
             assert!(serde_json::from_value::<crate::api::schema::Request>(wire.clone()).is_err());
+        }
+    }
+
+    #[test]
+    fn pane_close_expected_terminal_shape_is_separately_frozen_and_opt_in() {
+        assert_eq!(
+            endpoint_method_shape_digests(false)
+                .get("pane.close")
+                .map(String::as_str),
+            Some("e281168d0396a51340d85c78e94d193a977dfe1d6b01983fea04239762015cf4")
+        );
+        // The guarded alias is local JSON API only, never a client-shell method.
+        assert!(!supports_client_shell_method_name("pane.close_guarded"));
+        let wire = serde_json::json!({
+            "id": "close", "method": "pane.close", "params": {"pane_id": "w1:p1"}
+        });
+        let request: crate::api::schema::Request = serde_json::from_value(wire.clone()).unwrap();
+        assert!(supports_client_shell_method(&request.method));
+        let Method::PaneClose(params) = &request.method else {
+            panic!("expected pane.close");
+        };
+        assert_eq!(params.expected_terminal, None);
+        // Absent stays absent on the wire, so old endpoint servers see the v1 shape.
+        assert_eq!(serde_json::to_value(&request).unwrap(), wire);
+        let mut guarded = wire.clone();
+        guarded["params"]["expected_terminal"] = "term_opaque".into();
+        let request: crate::api::schema::Request = serde_json::from_value(guarded.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&request).unwrap(), guarded);
+        for invalid in [serde_json::Value::Null, 1.into(), true.into()] {
+            guarded["params"]["expected_terminal"] = invalid;
+            assert!(
+                serde_json::from_value::<crate::api::schema::Request>(guarded.clone()).is_err()
+            );
         }
     }
 

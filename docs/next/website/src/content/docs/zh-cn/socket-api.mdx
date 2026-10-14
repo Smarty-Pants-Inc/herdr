@@ -99,7 +99,7 @@ herdr pane read w1:p2 --source recent --lines 50
 | 工作区 | `workspace.create`、`workspace.list`、`workspace.get`、`workspace.focus`、`workspace.rename`、`workspace.move`、`workspace.move_block`、`workspace.report_metadata`、`workspace.close` |
 | Worktree | `worktree.list`、`worktree.create`、`worktree.create_project_checked`、`worktree.open`、`worktree.open_project_checked`、`worktree.remove` |
 | 标签页 | `tab.create`、`tab.list`、`tab.get`、`tab.focus`、`tab.rename`、`tab.move`、`tab.close` |
-| 窗格 | `pane.split`、`pane.swap`、`pane.move`、`pane.zoom`、`pane.layout`、`pane.process_info`、`pane.neighbor`、`pane.edges`、`pane.focus_direction`、`pane.resize`、`pane.list`、`pane.current`、`pane.get`、`pane.last_input`、`pane.rename`、`pane.send_text`、`pane.send_text_session_checked`、`pane.send_keys`、`pane.send_keys_session_checked`、`pane.send_input`、`pane.send_input_guarded`、`pane.read`、`pane.report_agent`、`pane.report_agent_session`、`pane.report_metadata`、`pane.clear_agent_authority`、`pane.release_agent`、`pane.close`、`pane.wait_for_output` |
+| 窗格 | `pane.split`、`pane.swap`、`pane.move`、`pane.zoom`、`pane.layout`、`pane.process_info`、`pane.neighbor`、`pane.edges`、`pane.focus_direction`、`pane.resize`、`pane.list`、`pane.current`、`pane.get`、`pane.last_input`、`pane.rename`、`pane.send_text`、`pane.send_text_session_checked`、`pane.send_keys`、`pane.send_keys_session_checked`、`pane.send_input`、`pane.send_input_guarded`、`pane.read`、`pane.report_agent`、`pane.report_agent_session`、`pane.report_metadata`、`pane.clear_agent_authority`、`pane.release_agent`、`pane.close`、`pane.close_guarded`、`pane.wait_for_output` |
 | 输入消费者（仅本地 JSON） | `pane.input_consumer.enroll`、`pane.input_consumer.cut`、`pane.input_consumer.release` |
 | 弹窗 | `popup.close` |
 | 布局 | `layout.export`、`layout.apply`、`layout.apply_restorable`、`layout.set_split_ratio` |
@@ -379,6 +379,12 @@ principal 由服务器解析，每个客户端连接只绑定一次。在 Linux 
 ```
 
 该守卫标识的是终端，而不是终端内的智能体名称、进程或原生智能体会话。它不会改变单独的跨窗格输入策略。
+
+`pane.close` 也接受同样可选的 `expected_terminal` 字符串。服务器在同一步骤中检查并关闭窗格，因此其间不会有别的终端接管该窗格。窗格不存在、标识未知、字符串格式错误或连接的是其他终端时，返回 `terminal_identity_mismatch`，并且不关闭任何窗格。省略该字段则保持无守卫的关闭。旧服务器会忽略 `pane.close` 上的这个字段，所以请先检查 `ping.result.capabilities.pane_close_expected_terminal_guard == true`，再发送 `pane.close_guarded`：该方法要求提供 `expected_terminal`，旧服务器会拒绝该方法。仅有 `expected_terminal_guard` 并不代表服务器支持关闭守卫。CLI 的 `pane close --expected-terminal` 使用 `pane.close_guarded`，并以 `expected_terminal_unsupported` 拒绝不支持的服务器。
+
+```json
+{"id":"guarded_close","method":"pane.close_guarded","params":{"pane_id":"w1:p1","expected_terminal":"term_opaque_from_pane_get"}}
+```
 
 ### 预期智能体会话守卫
 
