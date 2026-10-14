@@ -1,5 +1,5 @@
 //! Linux-only PTY consumer proof and semantic termios snapshots.
-use crate::platform::{InputConsumerSnapshot, ProcessIdentity};
+use crate::platform::{InputConsumerSnapshot, PeerPidfd, ProcessIdentity};
 use std::{io, os::fd::RawFd};
 
 fn refused(reason: &'static str) -> io::Error {
@@ -69,7 +69,10 @@ fn semantic_termios(fd: RawFd) -> io::Result<Vec<u64>> {
     ]);
     Ok(values)
 }
-fn identity_snapshot(fd: RawFd, peer: ProcessIdentity) -> io::Result<InputConsumerSnapshot> {
+fn identity_snapshot(fd: RawFd, pidfd: &PeerPidfd) -> io::Result<InputConsumerSnapshot> {
+    // The pid comes from PIDFD_GET_INFO on the enroll connection's own pidfd,
+    // read while that pidfd shows the process alive (design item 4).
+    let peer = super::peer_pidfd::identity(pidfd)?;
     let (pgid, sid, tty) = process_fields(peer)?;
     let fg = super::foreground_process_group_id_for_tty_fd(fd)
         .ok_or_else(|| refused("foreground_unavailable"))?;
@@ -80,12 +83,8 @@ fn identity_snapshot(fd: RawFd, peer: ProcessIdentity) -> io::Result<InputConsum
     }
     let leader =
         super::process_identity(pgid).ok_or_else(|| refused("group_leader_unavailable"))?;
-    // Open the pidfds first; the full proof below then pins them to the
-    // checked generations, since a live pidfd blocks numeric PID reuse.
-    let pidfds = match (pidfd_open(peer.pid), pidfd_open(leader.pid)) {
-        (Some(p), Some(l)) => Some(std::sync::Arc::new([p, l])),
-        _ => None,
-    };
+    // Open the leader pidfd first; the full proof below then pins it to the
+    // checked generation, since a live (unexited) process keeps its PID.
     let snapshot = InputConsumerSnapshot {
         peer,
         pgid,
@@ -93,13 +92,15 @@ fn identity_snapshot(fd: RawFd, peer: ProcessIdentity) -> io::Result<InputConsum
         sid,
         tty,
         termios: Vec::new(),
-        pidfds,
+        peer_pidfd: pidfd.clone(),
+        leader_pidfd: pidfd_open(leader.pid).map(std::sync::Arc::new),
     };
     if !full_alive(fd, &snapshot)
+        || !super::peer_pidfd::running(pidfd)
         || snapshot
-            .pidfds
-            .as_ref()
-            .is_some_and(|p| !p.iter().all(running))
+            .leader_pidfd
+            .as_deref()
+            .is_some_and(|l| !running(l))
     {
         return Err(refused("consumer_changed"));
     }
@@ -107,10 +108,14 @@ fn identity_snapshot(fd: RawFd, peer: ProcessIdentity) -> io::Result<InputConsum
 }
 /// Check the same foreground incarnation even when its termios has changed.
 /// An already-enrolled incarnation must never acquire a second capability.
-pub(crate) fn incarnation(fd: RawFd, peer: ProcessIdentity) -> io::Result<ProcessIdentity> {
-    Ok(identity_snapshot(fd, peer)?.leader)
+pub(crate) fn incarnation(
+    fd: RawFd,
+    peer: &PeerPidfd,
+) -> io::Result<(ProcessIdentity, ProcessIdentity)> {
+    let snapshot = identity_snapshot(fd, peer)?;
+    Ok((snapshot.peer, snapshot.leader))
 }
-pub(crate) fn snapshot(fd: RawFd, peer: ProcessIdentity) -> io::Result<InputConsumerSnapshot> {
+pub(crate) fn snapshot(fd: RawFd, peer: &PeerPidfd) -> io::Result<InputConsumerSnapshot> {
     let mut snapshot = identity_snapshot(fd, peer)?;
     snapshot.termios = semantic_termios(fd)?;
     if !full_alive(fd, &snapshot) {
@@ -140,19 +145,21 @@ fn running(pidfd: &std::os::fd::OwnedFd) -> bool {
 /// /proc controlling-tty proof still runs at enroll and at every cut
 /// (`unchanged`).
 pub(crate) fn alive(fd: RawFd, s: &InputConsumerSnapshot) -> bool {
-    let Some(pidfds) = s.pidfds.as_deref() else {
-        return full_alive(fd, s);
+    let peer = || super::peer_pidfd::running(&s.peer_pidfd);
+    let Some(leader) = s.leader_pidfd.as_deref() else {
+        return peer() && full_alive(fd, s) && peer();
     };
+    let pidfds = || peer() && running(leader);
     let pid = s.peer.pid as libc::pid_t;
-    // ponytail: a live pidfd pins its PID, so getpgid/getsid between two
-    // running() checks observe the enrolled peer, not a reused PID.
-    pidfds.iter().all(running)
+    // ponytail: an unexited process keeps its PID, so getpgid/getsid between
+    // two running() checks observe the enrolled peer, not a reused PID.
+    pidfds()
         // SAFETY: getpgid/getsid/tcgetpgrp/tcgetsid take no pointers.
         && unsafe { libc::getpgid(pid) } == s.pgid as libc::pid_t
         && unsafe { libc::getsid(pid) } == s.sid as libc::pid_t
         && unsafe { libc::tcgetpgrp(fd) } == s.pgid as libc::pid_t
         && unsafe { libc::tcgetsid(fd) } == s.sid as libc::pid_t
-        && pidfds.iter().all(running)
+        && pidfds()
 }
 fn full_alive(fd: RawFd, s: &InputConsumerSnapshot) -> bool {
     process_fields(s.peer).ok()==Some((s.pgid,s.sid,s.tty))

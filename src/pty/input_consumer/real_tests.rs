@@ -12,7 +12,7 @@ fn input_consumer_real_pty_nonleader_first_and_second_same_group_refused() {
     let leader = crate::platform::process_identity(peer.child.process_id().expect("leader"))
         .expect("leader identity");
     assert!(
-        matches!(response(&actor,ConsumerOperation::Enroll { peer:leader }),ConsumerResponse::Refused { reason } if reason=="already_enrolled")
+        matches!(response(&actor,ConsumerOperation::Enroll { peer:pidfd_of(leader) }),ConsumerResponse::Refused { reason } if reason=="already_enrolled")
     );
     // Ruling r3 B: after release the group stays owned by its first consumer.
     assert!(matches!(
@@ -20,20 +20,20 @@ fn input_consumer_real_pty_nonleader_first_and_second_same_group_refused() {
             &actor,
             ConsumerOperation::Release {
                 epoch: epoch.clone(),
-                epoch_key: key
+                peer_ino: Some(key)
             }
         ),
         ConsumerResponse::Released
     ));
     assert!(
-        matches!(response(&actor,ConsumerOperation::Enroll { peer:leader }),ConsumerResponse::Refused { reason } if reason=="already_enrolled")
+        matches!(response(&actor,ConsumerOperation::Enroll { peer:pidfd_of(leader) }),ConsumerResponse::Refused { reason } if reason=="already_enrolled")
     );
     let (fresh, _, nonce) = enroll(&actor, &peer);
     assert_ne!(fresh, epoch);
     let marker = format!("\x1b_herdr-epoch;{nonce}\x1b\\");
     assert_eq!(receive_bytes(&rx, marker.len()), marker.as_bytes());
     assert!(
-        matches!(response(&actor,ConsumerOperation::Enroll { peer:leader }),ConsumerResponse::Refused { reason } if reason=="already_enrolled")
+        matches!(response(&actor,ConsumerOperation::Enroll { peer:pidfd_of(leader) }),ConsumerResponse::Refused { reason } if reason=="already_enrolled")
     );
     actor.shutdown();
 }
@@ -81,7 +81,7 @@ fn input_consumer_real_pty_all_raw_flags_semantic_change_and_retry_poison() {
             0
         );
         assert!(
-            matches!(response(&actor,ConsumerOperation::Enroll { peer:peer.identity }),ConsumerResponse::Refused { reason } if reason=="already_enrolled")
+            matches!(response(&actor,ConsumerOperation::Enroll { peer:peer.pidfd() }),ConsumerResponse::Refused { reason } if reason=="already_enrolled")
         );
         expect_cut(
             &actor,
@@ -155,7 +155,7 @@ fn input_consumer_real_pty_release_death_and_idle_epoch_hint_end() {
                     &actor,
                     ConsumerOperation::Release {
                         epoch: epoch.clone(),
-                        epoch_key: key.clone()
+                        peer_ino: Some(key)
                     }
                 ),
                 ConsumerResponse::Released
@@ -164,11 +164,11 @@ fn input_consumer_real_pty_release_death_and_idle_epoch_hint_end() {
             assert_ne!(fresh, epoch);
             receive_bytes(&rx, format!("\x1b_herdr-epoch;{nonce}\x1b\\").len());
             assert!(
-                matches!(response(&actor,ConsumerOperation::Enroll { peer:peer.identity }),ConsumerResponse::Refused { reason } if reason=="already_enrolled")
+                matches!(response(&actor,ConsumerOperation::Enroll { peer:peer.pidfd() }),ConsumerResponse::Refused { reason } if reason=="already_enrolled")
             );
         }
         assert!(!actor.input_consumer_epoch_matches(&epoch));
-        match actor.queue_input_consumer_operation(ConsumerOperation::Cut(req), None) {
+        match actor.queue_input_consumer_operation(req, None) {
             Ok(rx) => assert!(matches!(
                 rx.recv_timeout(Duration::from_secs(3)),
                 Ok(ConsumerResponse::Refused { .. }) | Err(_)
@@ -190,12 +190,7 @@ fn input_consumer_real_pty_enroll_waits_for_active_delayed_submission() {
         )
         .expect("submission");
     let enrollment = actor
-        .queue_input_consumer_operation(
-            ConsumerOperation::Enroll {
-                peer: peer.identity,
-            },
-            None,
-        )
+        .queue_input_consumer_operation(ConsumerOperation::Enroll { peer: peer.pidfd() }, None)
         .expect("enroll");
     assert!(enrollment.recv_timeout(Duration::from_millis(20)).is_err());
     completed
@@ -206,12 +201,7 @@ fn input_consumer_real_pty_enroll_waits_for_active_delayed_submission() {
         .recv_timeout(Duration::from_secs(3))
         .expect("enrollment")
     {
-        ConsumerResponse::Enrolled {
-            epoch,
-            epoch_key,
-            nonce,
-            ..
-        } => (epoch, epoch_key, nonce),
+        ConsumerResponse::Enrolled { epoch, nonce, .. } => (epoch, peer.pidfd().ino, nonce),
         _ => panic!("not enrolled"),
     };
     let marker = format!("\x1b_herdr-epoch;{nonce}\x1b\\");
@@ -337,7 +327,7 @@ fn input_consumer_real_pty_audit_blocks_reply_failure_poison_and_retry_no_repeat
         Err(std::io::Error::other("append/fsync failed"))
     });
     let receipt = actor
-        .queue_input_consumer_operation(ConsumerOperation::Cut(req.clone()), Some(audit))
+        .queue_input_consumer_operation(req.clone(), Some(audit))
         .expect("cut");
     entered_rx
         .recv_timeout(Duration::from_secs(3))
@@ -459,7 +449,7 @@ fn input_consumer_real_pty_foreground_handover_revokes_cached_result() {
         );
     }
     assert!(matches!(
-        response(&actor, ConsumerOperation::Cut(req)),
+        response(&actor, req),
         ConsumerResponse::Refused { .. }
     ));
     assert!(!actor.input_consumer_epoch_matches(&epoch));
@@ -493,10 +483,7 @@ fn input_consumer_real_pty_foreground_return_original_reenrolls_fresh_epoch() {
     let (fresh, fresh_key, nonce) = enroll(&actor, &peer);
     assert_ne!(fresh, epoch);
     assert!(matches!(
-        response(
-            &actor,
-            ConsumerOperation::Cut(cut(&epoch, &key, 1, "old", 0, b""))
-        ),
+        response(&actor, cut(&epoch, &key, 1, "old", 0, b"")),
         ConsumerResponse::Refused { .. }
     ));
     receive_bytes(&rx, format!("\x1b_herdr-epoch;{nonce}\x1b\\").len());

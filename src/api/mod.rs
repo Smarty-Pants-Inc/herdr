@@ -157,6 +157,10 @@ impl ApiRequestContext {
 pub struct ApiRequestMessage {
     pub request: Request,
     pub(crate) context: ApiRequestContext,
+    /// The connection's `SO_PEERPIDFD`, taken at accept. Kept out of the `Copy`
+    /// context because the input consumer retains the enroll pidfd for its
+    /// epoch; only that route reads it (smarty-dev#2636 E′).
+    pub(crate) peer_pidfd: Option<crate::platform::PeerPidfd>,
 
     pub respond_to: std::sync::mpsc::Sender<String>,
     pub response_write_complete: Option<std::sync::mpsc::Receiver<()>>,

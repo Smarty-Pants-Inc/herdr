@@ -112,6 +112,11 @@ enum ManagedAgentPhase {
         observed_expected: bool,
     },
     Blocked,
+    /// The launch deadline passed after the expected agent was seen, but it
+    /// has not reached readiness (a resumed session still working). The
+    /// launch keeps its name and stays pending, with no deadline, until the
+    /// normal readiness condition makes it active.
+    Seen,
     Active,
 }
 
@@ -119,6 +124,10 @@ enum ManagedAgentPhase {
 struct ManagedAgent {
     kind: Agent,
     phase: ManagedAgentPhase,
+    /// The agent process first identified for this launch. The launch, and
+    /// its name, belong to that process only: another process of the same
+    /// kind in the pane ends the launch.
+    process: Option<crate::platform::ProcessIdentity>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2892,6 +2901,10 @@ impl TerminalState {
         timeout: Duration,
     ) {
         self.codex_prompt_ready = false;
+        // A previous agent's exit belongs to that agent. Left in place, the
+        // shell still in front while the new agent starts reads as
+        // exit-then-shell and frees the new launch's name.
+        self.recent_agent_process_exit = None;
         self.set_agent_name(name);
         self.agent_process_acquisition_pending = true;
         self.agent_name_owner = Some(AgentNameOwner {
@@ -2905,6 +2918,7 @@ impl TerminalState {
                 deadline: now.checked_add(timeout).unwrap_or(now),
                 observed_expected: false,
             },
+            process: None,
         });
     }
 
@@ -2912,7 +2926,9 @@ impl TerminalState {
         self.managed_agent.is_some_and(|managed| {
             matches!(
                 managed.phase,
-                ManagedAgentPhase::Pending { .. } | ManagedAgentPhase::Blocked
+                ManagedAgentPhase::Pending { .. }
+                    | ManagedAgentPhase::Blocked
+                    | ManagedAgentPhase::Seen
             )
         })
     }
@@ -2961,26 +2977,29 @@ impl TerminalState {
             ManagedAgentPhase::Pending {
                 observed_expected, ..
             } => observed_expected || known_agent == Some(managed.kind),
+            ManagedAgentPhase::Seen => true,
             ManagedAgentPhase::Blocked | ManagedAgentPhase::Active => false,
         };
         let clear = process_exited
             || known_agent.is_some_and(|agent| agent != managed.kind)
-            || matches!(managed.phase, ManagedAgentPhase::Pending { .. })
-                && observed_expected
-                && known_agent.is_none();
+            || observed_expected && known_agent.is_none();
         if clear {
             self.clear_agent_name();
             return true;
         }
-        if managed.phase == ManagedAgentPhase::Blocked {
-            if known_agent == Some(managed.kind)
-                && (self.state == AgentState::Idle
-                    || managed.kind == Agent::Codex
-                        && self.state == AgentState::Unknown
-                        && self.codex_prompt_ready)
-            {
+        let ready = known_agent == Some(managed.kind)
+            && (self.state == AgentState::Idle
+                || managed.kind == Agent::Codex
+                    && self.state == AgentState::Unknown
+                    && self.codex_prompt_ready);
+        if matches!(
+            managed.phase,
+            ManagedAgentPhase::Blocked | ManagedAgentPhase::Seen
+        ) {
+            if ready {
                 self.managed_agent = Some(ManagedAgent {
                     kind: managed.kind,
+                    process: managed.process,
                     phase: ManagedAgentPhase::Active,
                 });
                 self.managed_agent_launch_session = None;
@@ -2997,23 +3016,41 @@ impl TerminalState {
             if known_agent == Some(managed.kind) && self.state == AgentState::Blocked {
                 self.managed_agent = Some(ManagedAgent {
                     kind: managed.kind,
+                    process: managed.process,
                     phase: ManagedAgentPhase::Blocked,
                 });
                 return true;
             }
             if now >= deadline {
-                self.clear_agent_name();
+                // The deadline bounds how long the expected agent may take to
+                // appear, not how long it may stay busy. Once seen (a resumed
+                // session can work past the deadline), the launch keeps its
+                // name but is not ready: it waits in `Seen` for the normal
+                // readiness condition. Only a launch whose agent never
+                // appeared releases the name here.
+                // (A seen agent that is gone, or replaced, was cleared above.)
+                if observed_expected {
+                    let phase = if ready {
+                        self.managed_agent_launch_session = None;
+                        ManagedAgentPhase::Active
+                    } else {
+                        ManagedAgentPhase::Seen
+                    };
+                    self.managed_agent = Some(ManagedAgent {
+                        kind: managed.kind,
+                        process: managed.process,
+                        phase,
+                    });
+                } else {
+                    self.clear_agent_name();
+                }
                 return true;
             }
             if ready_after.is_none_or(|ready_after| now >= ready_after) {
-                if known_agent == Some(managed.kind)
-                    && (self.state == AgentState::Idle
-                        || managed.kind == Agent::Codex
-                            && self.state == AgentState::Unknown
-                            && self.codex_prompt_ready)
-                {
+                if ready {
                     self.managed_agent = Some(ManagedAgent {
                         kind: managed.kind,
+                        process: managed.process,
                         phase: ManagedAgentPhase::Active,
                     });
                     self.managed_agent_launch_session = None;
@@ -3022,6 +3059,7 @@ impl TerminalState {
                 if ready_after.is_some() {
                     self.managed_agent = Some(ManagedAgent {
                         kind: managed.kind,
+                        process: managed.process,
                         phase: ManagedAgentPhase::Pending {
                             ready_after: None,
                             deadline,
@@ -3034,6 +3072,7 @@ impl TerminalState {
             if observed_expected != previous_observed_expected {
                 self.managed_agent = Some(ManagedAgent {
                     kind: managed.kind,
+                    process: managed.process,
                     phase: ManagedAgentPhase::Pending {
                         ready_after,
                         deadline,
@@ -3055,7 +3094,35 @@ impl TerminalState {
         self.managed_agent = Some(ManagedAgent {
             kind,
             phase: ManagedAgentPhase::Active,
+            process: None,
         });
+    }
+
+    /// Binds a managed launch to the first agent process of its kind
+    /// identified in the pane. A later, different process of the same kind
+    /// (another instance replacing the launched one without an observed
+    /// exit) does not inherit the launch: the launch ends and its name is
+    /// freed. A different kind is handled by kind reconciliation.
+    pub(crate) fn observe_agent_process_identity(
+        &mut self,
+        agent: Agent,
+        process: crate::platform::ProcessIdentity,
+    ) -> Option<TerminalStateMutation> {
+        let managed = self.managed_agent.as_mut()?;
+        if managed.kind != agent {
+            return None;
+        }
+        match managed.process {
+            None => {
+                managed.process = Some(process);
+                None
+            }
+            Some(bound) if bound == process => None,
+            Some(_) => {
+                self.clear_agent_name();
+                Some(TerminalStateMutation::default())
+            }
+        }
     }
 
     pub fn clear_agent_name(&mut self) {
@@ -4179,6 +4246,129 @@ mod tests {
         assert!(!terminal.reconcile_managed_agent_at(now + Duration::from_secs(2), false));
         assert_eq!(terminal.agent_name.as_deref(), Some("reviewer"));
         assert!(terminal.reconcile_managed_agent_at(now + Duration::from_secs(2), true));
+        assert_eq!(terminal.agent_name, None);
+    }
+
+    // Decision C: the CLI E2E in tests/cli/agents.rs cannot deterministically
+    // deliver a detection update with no agent between `agent start` and the
+    // agent process appearing (the detector publishes on change, and that
+    // window is a race), so this pins the relaunch-after-exit state directly.
+    // A managed launch belongs to the agent process first seen for it. Another
+    // process of the same kind replacing it, in any phase, ends the launch.
+    #[test]
+    fn managed_launch_name_is_bound_to_the_first_agent_process_seen() {
+        let now = Instant::now();
+        let first = crate::platform::ProcessIdentity {
+            pid: 21,
+            start_time: 11,
+        };
+        let reused_pid = crate::platform::ProcessIdentity {
+            pid: 21,
+            start_time: 12,
+        };
+        let other = crate::platform::ProcessIdentity {
+            pid: 22,
+            start_time: 11,
+        };
+        for replacement in [reused_pid, other] {
+            for active in [false, true] {
+                let mut terminal = test_terminal();
+                terminal.begin_managed_agent(
+                    "lead-x".into(),
+                    Agent::Pi,
+                    now,
+                    Duration::from_millis(100),
+                    Duration::from_secs(60),
+                );
+                terminal.set_detected_state(Some(Agent::Pi), AgentState::Working);
+                assert_eq!(
+                    terminal.observe_agent_process_identity(Agent::Pi, first),
+                    None
+                );
+                // Seen (still working past the deadline), or Active.
+                if active {
+                    terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
+                }
+                assert!(terminal.reconcile_managed_agent_at(now + Duration::from_secs(60), false));
+                assert_eq!(terminal.managed_agent_interactive_ready(), active);
+                // The same process again, or another kind: not this check's call.
+                assert_eq!(
+                    terminal.observe_agent_process_identity(Agent::Pi, first),
+                    None
+                );
+                assert_eq!(
+                    terminal.observe_agent_process_identity(Agent::Claude, other),
+                    None
+                );
+                assert_eq!(terminal.agent_name.as_deref(), Some("lead-x"));
+
+                assert!(terminal
+                    .observe_agent_process_identity(Agent::Pi, replacement)
+                    .is_some());
+                assert_eq!(terminal.agent_name, None, "{replacement:?} active={active}");
+                assert_eq!(terminal.managed_agent_kind(), None);
+                assert!(!terminal.managed_agent_launch_pending());
+                // The replacement is still the pane's (unnamed) agent.
+                assert_eq!(terminal.effective_known_agent(), Some(Agent::Pi));
+            }
+        }
+    }
+
+    #[test]
+    fn managed_launch_after_an_agent_exit_keeps_its_name_before_the_agent_appears() {
+        let now = Instant::now();
+        let mut terminal = test_terminal();
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
+        terminal.set_detected_state_with_visible_blocker(
+            Some(Agent::Pi),
+            AgentState::Idle,
+            false,
+            false,
+            true,
+        );
+        terminal.set_detected_state(None, AgentState::Unknown);
+        assert!(terminal.recent_agent_process_exit.is_some());
+
+        terminal.begin_managed_agent(
+            "lead-x".into(),
+            Agent::Pi,
+            now,
+            Duration::from_millis(100),
+            Duration::from_secs(60),
+        );
+        // The shell is still in front while it starts the new agent.
+        terminal.set_detected_state(None, AgentState::Unknown);
+        assert_eq!(terminal.agent_name.as_deref(), Some("lead-x"));
+        assert!(terminal.managed_agent_launch_pending());
+
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Working);
+        assert!(terminal.reconcile_managed_agent_at(now + Duration::from_secs(60), false));
+        // Past the deadline, still working: the name stays, the launch is not
+        // ready, and there is no further deadline.
+        assert_eq!(terminal.agent_name.as_deref(), Some("lead-x"));
+        assert!(terminal.managed_agent_launch_pending());
+        assert!(!terminal.managed_agent_interactive_ready());
+        assert_eq!(terminal.next_managed_agent_deadline(), None);
+        assert!(!terminal.reconcile_managed_agent_at(now + Duration::from_secs(120), false));
+        assert_eq!(terminal.agent_name.as_deref(), Some("lead-x"));
+        assert!(!terminal.managed_agent_interactive_ready());
+
+        // The normal readiness condition makes it active.
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
+        assert!(terminal.reconcile_managed_agent_at(now + Duration::from_secs(120), false));
+        assert!(!terminal.managed_agent_launch_pending());
+        assert!(terminal.managed_agent_interactive_ready());
+        assert_eq!(terminal.agent_name.as_deref(), Some("lead-x"));
+
+        // Leaving the pane still frees the name.
+        terminal.set_detected_state_with_visible_blocker(
+            Some(Agent::Pi),
+            AgentState::Idle,
+            false,
+            false,
+            true,
+        );
+        terminal.set_detected_state(None, AgentState::Unknown);
         assert_eq!(terminal.agent_name, None);
     }
 
