@@ -134,15 +134,17 @@ pub(crate) fn agent_session_loss_partial_text_consumed(error: &std::io::Error) -
 }
 
 /// The submission's `refuse_if_exists` path existed (`lstat` succeeded), or
-/// could not be checked, right before a `write(2)`, so the actor dropped the
-/// submission's remaining bytes.
+/// could not be checked, before a write attempt while no submission byte had
+/// been written. The actor refused the whole submission with zero bytes written
+/// and no flush.
 #[derive(Debug)]
 struct GuardPathPresent {
     path: std::path::PathBuf,
     /// The lookup error when `lstat` failed with anything but "absent".
     unverifiable: Option<String>,
-    /// As for session loss: text bytes of this submission already reached the PTY.
+    /// Always `Some(false)`: path admission refusal precedes all submission bytes.
     partial_text_consumed: Option<bool>,
+    /// Always false: path admission refusal must not flush unrelated staged input.
     flush_failed: bool,
 }
 
@@ -211,7 +213,9 @@ pub(crate) fn guard_path_present_details(
         })
 }
 
-/// Fresh `lstat(path)` right before each guarded `write(2)`, never cached.
+/// Fresh `lstat(path)` before each submission write attempt until its first
+/// byte is written, including zero-byte retries; never at request time or after
+/// a successful Text/Enter write.
 /// `None`: the path is absent (ENOENT, or ENOTDIR: a component is not a
 /// directory, so it cannot exist), and the write proceeds. `Some(None)`: it
 /// exists. `Some(Some(error))`: it could not be checked (EACCES, ELOOP, EIO,

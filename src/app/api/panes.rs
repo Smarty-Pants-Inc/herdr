@@ -43,8 +43,8 @@ pub(super) fn pane_input_completion_response(id: String, result: std::io::Result
         Err(error) if crate::pty::actor::is_agent_session_lost(&error) => {
             session_loss_response(id, &error)
         }
-        // The path guard refused the write; like session loss, it reports
-        // whether text bytes had already reached the PTY.
+        // Path refusal precedes the first written request byte: its typed fields
+        // report zero bytes and no flush, unlike partial session loss.
         Err(error) if crate::pty::actor::guard_path_present_details(&error).is_some() => {
             let (code, partial, flush_failed) = crate::pty::actor::guard_path_present_details(
                 &error,
@@ -2215,9 +2215,10 @@ impl App {
         encode_success(id, ResponseResult::Ok {})
     }
 
-    /// Queues pane text or keys with a session guard, a write-time
+    /// Queues pane text or keys with a session guard, a before-first-byte
     /// `refuse_if_exists` path guard, or both. Neither is checked here: the
-    /// PTY writer checks both right before each `write(2)`.
+    /// PTY writer checks the session before every `write(2)` and the path
+    /// before each attempt until the first request byte is written.
     pub(super) fn queue_session_checked_pane_input(
         &mut self,
         id: String,

@@ -394,28 +394,30 @@ pub struct PaneSendKeysParams {
     pub allow_cross_pane: bool,
 }
 
-/// `pane.send_text_path_checked`: `pane.send_text` that the PTY writer refuses,
-/// with `guard_path_present` and no byte written, when `refuse_if_exists`
-/// exists right before a write. Older servers reject the method name.
+/// `pane.send_text_path_checked`: `pane.send_text` with a path check before
+/// each write attempt until the first byte is successfully written. A present
+/// `refuse_if_exists` path refuses with `guard_path_present`, zero bytes and no
+/// flush. Once writing starts, a later claim does not interrupt the request.
+/// Older servers reject the method name.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PaneSendTextPathCheckedParams {
     #[serde(flatten)]
     pub input: PaneSendTextParams,
-    /// Absolute path; the write is refused if, at write time, `lstat` of it
-    /// succeeds (`guard_path_present`) or fails other than not-found
-    /// (`guard_path_unverifiable`).
+    /// Absolute path; until the first byte is written, `lstat` before each
+    /// attempt refuses if it succeeds (`guard_path_present`) or fails other
+    /// than not-found (`guard_path_unverifiable`). No checks after that byte.
     pub refuse_if_exists: String,
 }
 
-/// `pane.send_keys_path_checked`: `pane.send_keys` with the same write-time
-/// `refuse_if_exists` guard as `pane.send_text_path_checked`.
+/// `pane.send_keys_path_checked`: `pane.send_keys` with the same
+/// before-first-byte `refuse_if_exists` guard as `pane.send_text_path_checked`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PaneSendKeysPathCheckedParams {
     #[serde(flatten)]
     pub input: PaneSendKeysParams,
-    /// Absolute path; the write is refused if, at write time, `lstat` of it
-    /// succeeds (`guard_path_present`) or fails other than not-found
-    /// (`guard_path_unverifiable`).
+    /// Absolute path; until the first byte is written, `lstat` before each
+    /// attempt refuses if it succeeds (`guard_path_present`) or fails other
+    /// than not-found (`guard_path_unverifiable`). No checks after that byte.
     pub refuse_if_exists: String,
 }
 

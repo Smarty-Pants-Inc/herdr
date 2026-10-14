@@ -779,7 +779,7 @@ fn expected_session_option() -> Arg {
 
 fn refuse_if_exists_option() -> Arg {
     option("refuse-if-exists", "PATH").help(
-        "Refuse the write (guard_path_present, no bytes) if PATH exists right before Herdr writes it; requires server support",
+        "Refuse before the first byte (guard_path_present, zero bytes, no flush) if PATH exists; recheck zero-byte retries, never interrupt after writing starts; requires server support",
     )
 }
 

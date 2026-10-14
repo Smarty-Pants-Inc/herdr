@@ -3587,7 +3587,7 @@
           "type": "object"
         },
         "PaneSendKeysPathCheckedParams": {
-          "description": "`pane.send_keys_path_checked`: `pane.send_keys` with the same write-time\n`refuse_if_exists` guard as `pane.send_text_path_checked`.",
+          "description": "`pane.send_keys_path_checked`: `pane.send_keys` with the same\nbefore-first-byte `refuse_if_exists` guard as `pane.send_text_path_checked`.",
           "properties": {
             "allow_cross_pane": {
               "description": "Deliberately allow an agent-originated request to target another pane.",
@@ -3606,7 +3606,7 @@
               "type": "string"
             },
             "refuse_if_exists": {
-              "description": "Absolute path; the write is refused if, at write time, `lstat` of it\nsucceeds (`guard_path_present`) or fails other than not-found\n(`guard_path_unverifiable`).",
+              "description": "Absolute path; until the first byte is written, `lstat` before each\nattempt refuses if it succeeds (`guard_path_present`) or fails other\nthan not-found (`guard_path_unverifiable`). No checks after that byte.",
               "type": "string"
             }
           },
@@ -3640,7 +3640,7 @@
           "type": "object"
         },
         "PaneSendTextPathCheckedParams": {
-          "description": "`pane.send_text_path_checked`: `pane.send_text` that the PTY writer refuses,\nwith `guard_path_present` and no byte written, when `refuse_if_exists`\nexists right before a write. Older servers reject the method name.",
+          "description": "`pane.send_text_path_checked`: `pane.send_text` with a path check before\neach write attempt until the first byte is successfully written. A present\n`refuse_if_exists` path refuses with `guard_path_present`, zero bytes and no\nflush. Once writing starts, a later claim does not interrupt the request.\nOlder servers reject the method name.",
           "properties": {
             "allow_cross_pane": {
               "description": "Deliberately allow an agent-originated request to target another pane.",
@@ -3653,7 +3653,7 @@
               "type": "string"
             },
             "refuse_if_exists": {
-              "description": "Absolute path; the write is refused if, at write time, `lstat` of it\nsucceeds (`guard_path_present`) or fails other than not-found\n(`guard_path_unverifiable`).",
+              "description": "Absolute path; until the first byte is written, `lstat` before each\nattempt refuses if it succeeds (`guard_path_present`) or fails other\nthan not-found (`guard_path_unverifiable`). No checks after that byte.",
               "type": "string"
             },
             "text": {
@@ -11911,7 +11911,7 @@
             },
             "refuse_if_exists_guard": {
               "default": false,
-              "description": "Supports the write-time `refuse_if_exists` path guard on the local JSON\n`pane.send_text_path_checked` and `pane.send_keys_path_checked` methods.",
+              "description": "Supports the before-first-byte `refuse_if_exists` path guard on the\nlocal JSON `pane.send_text_path_checked` and `pane.send_keys_path_checked`\nmethods. Zero-byte retries recheck; a claim after the first written byte\ndoes not interrupt the request.",
               "type": "boolean"
             },
             "ssh_agent_registration": {

@@ -280,8 +280,9 @@ impl PtyIoActorHandle {
         self.queue_submission(text, enter, delay, Some(guard), None, source)
     }
 
-    /// A submission with an optional session guard and an optional
-    /// `refuse_if_exists` path, both checked right before each `write(2)`.
+    /// A submission with an optional session guard checked before each
+    /// `write(2)` and a `refuse_if_exists` path checked before each write attempt
+    /// until the first submission byte is written, including zero-byte retries.
     pub(crate) fn queue_checked_user_input_submission_with_source(
         &self,
         text: Bytes,
@@ -757,8 +758,9 @@ struct PtyIoActorRunner {
 
 struct ActiveSubmission {
     guard: Option<SessionInputGuard>,
-    /// Refuse the remaining bytes when `lstat` of this path succeeds right
-    /// before a write (smarty-code#1707). Never checked at request time.
+    /// Admission guard (smarty-code#1707), checked before every write attempt
+    /// until the first submission byte is written, not at request time. Then
+    /// disarmed for all later chunks, retries and delayed Enter.
     refuse_if_exists: Option<std::path::PathBuf>,
     source: InputSource,
     enter: Bytes,
@@ -1653,15 +1655,17 @@ impl PtyIoActorRunner {
                             || !guard.binding_is_current()
                             || !guard.status_is_current()
                     });
-                // The path guard: one fresh lstat right before this write(2),
-                // with no request-time check and no cached answer. A lookup
-                // error other than "absent" refuses too (fail closed).
+                // Recheck the path until the first submission byte is written.
+                // Zero-byte EAGAIN/Interrupted retries retain it. A positive
+                // Text/Enter write disarms it below, so a later claim cannot
+                // truncate input; session proof above still applies to every write.
+                // Lookup errors other than "absent" fail closed before any byte.
                 let guard_path = if session_lost {
                     None
                 } else {
                     self.active_submission
                         .as_ref()
-                        .and_then(|submission| submission.refuse_if_exists.as_deref())
+                        .and_then(|submission| submission.refuse_if_exists.as_ref())
                         .and_then(|path| {
                             super::guard_path_refusal(path).map(|unverifiable| (path, unverifiable))
                         })
@@ -1681,7 +1685,7 @@ impl PtyIoActorRunner {
                         (None, Some((path, unverifiable))) => super::guard_path_present(
                             path,
                             unverifiable.as_deref(),
-                            Some(partial_text_consumed),
+                            Some(false),
                             false,
                         ),
                         (None, None) => input_submission_closed_error(),
@@ -1696,6 +1700,12 @@ impl PtyIoActorRunner {
                         )
                     });
                     self.current_write_offset = 0;
+                    if guard_path.is_some() {
+                        // Admission refusal wrote zero bytes. Do not flush the
+                        // slave's unrelated staged input or the writer below.
+                        self.fail_active_submission(error);
+                        return Ok(None);
+                    }
                     if partial_text_consumed {
                         if let Err(flush_error) = self.flush_slave_input() {
                             // Advisory (Paul, 2026-10-13): report the flush
@@ -1703,15 +1713,9 @@ impl PtyIoActorRunner {
                             // the pane's later input.
                             warn!(pane = self.pane_id, err = %flush_error,
                                     "guarded PTY flush failed; later pane input is not blocked");
-                            error = match (session_guard, &guard_path) {
-                                (Some(guard), _) => super::agent_session_flush_failed(guard),
-                                (None, Some((path, unverifiable))) => super::guard_path_present(
-                                    path,
-                                    unverifiable.as_deref(),
-                                    None,
-                                    true,
-                                ),
-                                (None, None) => error,
+                            error = match session_guard {
+                                Some(guard) => super::agent_session_flush_failed(guard),
+                                None => error,
                             };
                         }
                     }
@@ -1736,9 +1740,17 @@ impl PtyIoActorRunner {
                     if let (Some(source), Some((_, ledger))) = (&write.source, &mut self.consumer) {
                         ledger.record(&chunk[..written], source, Instant::now());
                     }
-                    if written > 0 && write.boundary == Some(SubmissionBoundary::Text) {
+                    if written > 0
+                        && matches!(
+                            write.boundary,
+                            Some(SubmissionBoundary::Text | SubmissionBoundary::Enter)
+                        )
+                    {
                         if let Some(submission) = self.active_submission.as_mut() {
-                            submission.text_bytes_written = true;
+                            let _ = submission.refuse_if_exists.take();
+                            if write.boundary == Some(SubmissionBoundary::Text) {
+                                submission.text_bytes_written = true;
+                            }
                         }
                     }
                     self.current_write_offset += written;

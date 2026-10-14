@@ -862,57 +862,287 @@ fn guarded_native_rechecks_between_partial_syscalls_in_one_flush() {
     assert!(runner.pending_writes.is_empty());
 }
 
-/// smarty-code#1707: the path guard is re-checked before every syscall, so a
-/// path that appears between partial chunks drops the rest and reports that
-/// text already reached the PTY; unrelated later input still arrives.
+/// #274 P2: admission ends at the first successful byte. A path appearing
+/// between real partial writes must not truncate text or suppress Enter.
 #[test]
-fn refuse_if_exists_rechecks_between_partial_syscalls_in_one_flush() {
+fn refuse_if_exists_admits_all_chunks_and_enter_after_path_appears() {
     let fixture = NativePty::new();
     let mut runner = fixture.runner();
     let claim = fixture.directory.join("floor-claim");
     let created = claim.clone();
+    let length = 4 * 1024 * 1024;
     let mut attempts = 0;
-    runner.file.before_write = Some(Box::new(move |_| {
+    runner.file.before_write = Some(Box::new(move |offset| {
         attempts += 1;
         if attempts == 2 {
+            assert!(offset > 0 && offset < length, "real native partial write");
             std::fs::write(&created, "claimed").expect("create claim");
         }
     }));
-    let length = 4 * 1024 * 1024;
     let (reply, receipt) = std_mpsc::channel();
     assert!(
         !runner.handle_data_command(PtyIoDataCommand::SubmitUserInput {
             source: InputSource::Api,
             text: Bytes::from(vec![b'x'; length]),
-            enter: Bytes::new(),
+            enter: Bytes::from_static(b"\r"),
             delay: Duration::ZERO,
             guard: None,
-            refuse_if_exists: Some(claim),
+            refuse_if_exists: Some(claim.clone()),
             reply,
         })
     );
+    if let Some(boundary) = runner.flush_pending_writes_once().expect("first flush") {
+        runner.complete_submission_boundary(boundary);
+    }
+    assert!(
+        claim.exists(),
+        "claim appeared after the first native chunk"
+    );
+    assert!(
+        runner
+            .active_submission
+            .as_ref()
+            .expect("active submission")
+            .refuse_if_exists
+            .is_none(),
+        "path guard is disarmed after admission"
+    );
+    pump(&mut runner);
+    receipt
+        .recv_timeout(Duration::from_secs(1))
+        .expect("completion")
+        .expect("late claim must not refuse any remaining text or Enter");
+    assert!(runner.pending_writes.is_empty() && runner.active_submission.is_none());
+    runner.enqueue_write(Bytes::from_static(b"after"));
+    pump(&mut runner);
+    let mut expected = vec![b'x'; length];
+    expected.extend_from_slice(b"\rafter");
+    fixture.captured(&expected);
+}
+
+/// Decision C: data safety at the path/PTY trust boundary. Real EAGAIN before
+/// any guarded byte must retain admission checks and preserve unrelated input.
+#[cfg(target_os = "linux")]
+#[test]
+fn refuse_if_exists_after_zero_byte_wouldblock_refuses_without_flush() {
+    let fixture = NativePty::new();
+    let mut runner = fixture.runner();
+    fixture.control("pause");
+    let filler = Bytes::from(vec![b'f'; 4 * 1024 * 1024]);
+    runner.enqueue_write(filler.clone());
+    assert_eq!(runner.flush_pending_writes_once().expect("fill PTY"), None);
+    let accepted = runner.current_write_offset;
+    assert!(
+        accepted > 0 && accepted < filler.len(),
+        "native partial filler"
+    );
+    let remainder = runner.pending_writes.pop_front().expect("filler remainder");
+    assert_eq!(remainder.boundary, None);
+    assert_eq!(remainder.bytes, filler);
+    assert!(runner.pending_writes.is_empty());
+    // Drop only the fixture's UNWRITTEN remainder, never the kernel's input.
+    runner.current_write_offset = 0;
+    drop(remainder);
+
+    // Linux can move master staging into the line discipline after EAGAIN.
+    // Top up via a duplicate of the real master immediately before the guarded
+    // attempt, then observe its actual zero-byte outcome rather than assume it.
+    let staged = Arc::new(AtomicUsize::new(accepted));
+    let observed = Arc::clone(&staged);
+    let mut refill = fixture.runner().file;
+    let mut attempts = 0;
+    runner.file.before_write = Some(Box::new(move |offset| {
+        attempts += 1;
+        if attempts != 1 {
+            return;
+        }
+        assert_eq!(offset, 0);
+        for _ in 0..64 {
+            match refill.write(&filler) {
+                Ok(0) => panic!("native refill wrote zero"),
+                Ok(written) => {
+                    observed.fetch_add(written, Ordering::Relaxed);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return,
+                Err(error) => panic!("native refill: {error}"),
+            }
+        }
+        panic!("bounded native refill did not reach EAGAIN");
+    }));
+    let claim = fixture.directory.join("floor-claim");
+    let (reply, receipt) = std_mpsc::channel();
+    assert!(
+        !runner.handle_data_command(PtyIoDataCommand::SubmitUserInput {
+            source: InputSource::Api,
+            text: Bytes::from_static(b"refused"),
+            enter: Bytes::from_static(b"\r"),
+            delay: Duration::ZERO,
+            guard: None,
+            refuse_if_exists: Some(claim.clone()),
+            reply,
+        })
+    );
+    runner.enqueue_write(Bytes::from_static(b"after"));
+    assert_eq!(runner.flush_pending_writes_once().expect("full PTY"), None);
+    assert_eq!(runner.current_write_offset, 0, "actual zero guarded bytes");
+    assert!(matches!(
+        receipt.try_recv(),
+        Err(std_mpsc::TryRecvError::Empty)
+    ));
+    let active = runner
+        .active_submission
+        .as_ref()
+        .expect("pending submission");
+    assert_eq!(active.refuse_if_exists.as_ref(), Some(&claim));
+    assert!(!active.text_bytes_written);
+    runner.file.before_write = None;
+
+    std::fs::write(&claim, "claimed").expect("claim before retry");
+    runner.file.force_flush_failure = true;
     assert_eq!(
-        runner.flush_pending_writes_once().expect("single flush"),
+        runner.flush_pending_writes_once().expect("path retry"),
         None
     );
     let error = receipt
         .recv_timeout(Duration::from_secs(1))
         .expect("completion")
-        .expect_err("path guard refuses");
+        .expect_err("claim refuses before first byte");
     assert_eq!(
         super::super::guard_path_present_details(&error),
-        Some(("guard_path_present", Some(true), false))
+        Some(("guard_path_present", Some(false), false))
     );
-    assert!(!super::super::is_agent_session_lost(&error));
-    assert!(runner.pending_writes.is_empty() && runner.active_submission.is_none());
-    runner.enqueue_write(Bytes::from_static(b"after"));
+    assert!(runner.active_submission.is_none());
+    assert_eq!(runner.current_write_offset, 0);
+    assert_eq!(
+        runner.pending_writes.len(),
+        1,
+        "unrelated queued input survives"
+    );
+    assert_eq!(runner.pending_writes[0].bytes, Bytes::from_static(b"after"));
+    fixture.captured(b"");
+
+    let accepted = staged.load(Ordering::Relaxed);
+    let mut expected = vec![b'f'; accepted];
+    // Drain every accepted byte before later input can mask a flushed prefix.
+    // Do not probe first: its shared O_NONBLOCK makes the later cat exit
+    // at EAGAIN after draining the prefix, before it can capture "after".
+    fixture.control(&format!("dead-drain:{accepted}"));
+    fixture.captured(&expected); // exact filler only: no refused text or Enter
     pump(&mut runner);
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while !fixture.bytes().ends_with(b"after") {
-        assert!(Instant::now() < deadline, "later input arrives");
-        std::thread::sleep(Duration::from_millis(5));
+    expected.extend_from_slice(b"after");
+    fixture.captured(&expected);
+}
+
+/// Enter-only admission must not depend on the text-written cleanup marker,
+/// and an interleaved ordinary write must not disarm the submission's path.
+#[test]
+fn refuse_if_exists_enter_only_disarms_on_its_first_byte_not_unrelated_input() {
+    let fixture = NativePty::new();
+    let mut runner = fixture.runner();
+    runner.enqueue_write(Bytes::from_static(b"before"));
+    let claim = fixture.directory.join("floor-claim");
+    let (reply, receipt) = std_mpsc::channel();
+    assert!(
+        !runner.handle_data_command(PtyIoDataCommand::SubmitUserInput {
+            source: InputSource::Api,
+            text: Bytes::new(),
+            enter: Bytes::from_static(b"\r"),
+            delay: Duration::ZERO,
+            guard: None,
+            refuse_if_exists: Some(claim.clone()),
+            reply,
+        })
+    );
+    assert_eq!(
+        runner.flush_pending_writes_once().expect("ordinary input"),
+        None
+    );
+    let active = runner
+        .active_submission
+        .as_ref()
+        .expect("waiting for Enter");
+    assert_eq!(active.refuse_if_exists.as_ref(), Some(&claim));
+    assert!(!active.text_bytes_written);
+    runner.schedule_submission_enter();
+    let boundary = runner
+        .flush_pending_writes_once()
+        .expect("Enter write")
+        .expect("Enter boundary");
+    assert_eq!(boundary, SubmissionBoundary::Enter);
+    let active = runner.active_submission.as_ref().expect("Enter completion");
+    assert!(active.refuse_if_exists.is_none());
+    assert!(
+        !active.text_bytes_written,
+        "preserve session cleanup metadata"
+    );
+    runner.complete_submission_boundary(boundary);
+    receipt
+        .recv_timeout(Duration::from_secs(1))
+        .expect("completion")
+        .expect("admitted Enter");
+    fixture.captured(b"before\r");
+}
+
+/// #274 P2: present and unverifiable paths refuse every submission byte
+/// without flushing slave input or discarding unrelated queued bytes.
+#[test]
+fn refuse_if_exists_before_first_attempt_refuses_zero_bytes_without_flush() {
+    for unverifiable in [false, true] {
+        let fixture = NativePty::new();
+        let mut runner = fixture.runner();
+        // Any slave-input flush attempt must report failure on the refusal.
+        runner.file.force_flush_failure = true;
+        runner.enqueue_write(Bytes::from_static(b"before"));
+        let claim = if unverifiable {
+            fixture.directory.join("loop/child")
+        } else {
+            fixture.directory.join("floor-claim")
+        };
+        let (reply, receipt) = std_mpsc::channel();
+        assert!(
+            !runner.handle_data_command(PtyIoDataCommand::SubmitUserInput {
+                source: InputSource::Api,
+                text: Bytes::from_static(b"refused"),
+                enter: Bytes::from_static(b"\r"),
+                delay: Duration::ZERO,
+                guard: None,
+                refuse_if_exists: Some(claim.clone()),
+                reply,
+            })
+        );
+        runner.enqueue_write(Bytes::from_static(b"after"));
+        // Change the path after enqueue, but before the first write attempt.
+        if unverifiable {
+            std::os::unix::fs::symlink("loop", fixture.directory.join("loop"))
+                .expect("unverifiable intermediate symlink loop");
+        } else {
+            std::fs::write(&claim, "claimed").expect("create claim");
+        }
+        assert_eq!(runner.flush_pending_writes_once().expect("admission"), None);
+        let error = receipt
+            .recv_timeout(Duration::from_secs(1))
+            .expect("completion")
+            .expect_err("path admission refuses");
+        let code = if unverifiable {
+            "guard_path_unverifiable"
+        } else {
+            "guard_path_present"
+        };
+        assert_eq!(
+            super::super::guard_path_present_details(&error),
+            Some((code, Some(false), false))
+        );
+        assert!(runner.active_submission.is_none());
+        assert_eq!(runner.current_write_offset, 0);
+        assert_eq!(
+            runner.pending_writes.len(),
+            1,
+            "unrelated FIFO work remains"
+        );
+        assert_eq!(runner.pending_writes[0].bytes, Bytes::from_static(b"after"));
+        pump(&mut runner);
+        fixture.captured(b"beforeafter");
     }
-    assert!(fixture.bytes().len() < length, "the rest was dropped");
 }
 
 /// Only "absent" lets the write proceed: ENOENT and ENOTDIR. Any other lookup
