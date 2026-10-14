@@ -7728,6 +7728,7 @@
               "type": "boolean"
             },
             "name": {
+              "description": "The pane's opt-in agent name; null when the pane's agent has no name.",
               "type": [
                 "string",
                 "null"
@@ -7796,6 +7797,7 @@
           },
           "required": [
             "terminal_id",
+            "name",
             "agent_status",
             "workspace_id",
             "tab_id",

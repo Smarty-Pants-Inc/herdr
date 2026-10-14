@@ -507,3 +507,74 @@ fn different_agent_in_front_of_a_suspended_reporter_clears_its_binding() {
         .unwrap_or_default()
         .contains("to-claude"));
 }
+
+/// Runs a real `herdr agent ...` CLI command and returns its JSON `result`.
+fn agent_cli_result(server: &Server, args: &[&str]) -> serde_json::Value {
+    let output = server.cli(args);
+    assert!(
+        output.status.success(),
+        "{args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|err| panic!("{args:?}: {err}: {:?}", output.stdout));
+    response
+        .get("result")
+        .cloned()
+        .unwrap_or_else(|| panic!("{args:?}: no result: {response}"))
+}
+
+/// The detected agent's record: the opt-in `name` key must be present, either
+/// explicitly `null` or a string, never omitted.
+fn assert_agent_name(agent: &serde_json::Value, pi: &FakePi, pane_id: &str, name: Option<&str>) {
+    // The real detected reporter, not a synthesized record.
+    assert_eq!(agent["pane_id"], pane_id, "{agent}");
+    assert_eq!(agent["agent"], "pi", "{agent}");
+    assert_eq!(agent["agent_session_id"], pi.session_id.as_str(), "{agent}");
+    let value = agent
+        .get("name")
+        .unwrap_or_else(|| panic!("the name key is omitted: {agent}"));
+    match name {
+        None => assert!(value.is_null(), "name is not null: {agent}"),
+        Some(name) => assert_eq!(value.as_str(), Some(name), "{agent}"),
+    }
+}
+
+fn listed_agent(server: &Server, pane_id: &str) -> serde_json::Value {
+    let result = agent_cli_result(server, &["agent", "list"]);
+    let agents = result["agents"]
+        .as_array()
+        .unwrap_or_else(|| panic!("agent list: {result}"));
+    let matching: Vec<&serde_json::Value> = agents
+        .iter()
+        .filter(|agent| agent["pane_id"] == pane_id)
+        .collect();
+    assert_eq!(matching.len(), 1, "agent list: {result}");
+    matching[0].clone()
+}
+
+fn assert_listed_and_got(server: &Server, pi: &FakePi, pane_id: &str, name: Option<&str>) {
+    assert_agent_name(&listed_agent(server, pane_id), pi, pane_id, name);
+    let got = agent_cli_result(server, &["agent", "get", pane_id]);
+    assert_agent_name(&got["agent"], pi, pane_id, name);
+}
+
+#[test]
+fn unnamed_detected_agent_reports_explicit_null_name_until_renamed() {
+    let server = Server::start();
+    let pane_id = server.new_pane();
+    let pi = start_fake_pi(&server, &pane_id, "unnamed");
+
+    // Detected but never named: `name` is an explicit null in list and get.
+    assert_listed_and_got(&server, &pi, &pane_id, None);
+
+    // Opt-in name: the rename response, list and get carry the string.
+    let renamed = agent_cli_result(&server, &["agent", "rename", &pane_id, "reviewer"]);
+    assert_agent_name(&renamed["agent"], &pi, &pane_id, Some("reviewer"));
+    assert_listed_and_got(&server, &pi, &pane_id, Some("reviewer"));
+
+    // Clearing it returns to an explicit null, not an omitted key.
+    let cleared = agent_cli_result(&server, &["agent", "rename", &pane_id, "--clear"]);
+    assert_agent_name(&cleared["agent"], &pi, &pane_id, None);
+    assert_listed_and_got(&server, &pi, &pane_id, None);
+}
