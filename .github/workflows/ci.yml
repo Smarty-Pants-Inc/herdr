@@ -235,9 +235,17 @@ jobs:
         if: runner.os == 'Linux'
         run: CARGO_INCREMENTAL=1 just lint
 
+      # Most slow tests wait on real servers, PTYs and timers, not the CPU, so one
+      # thread per vCPU leaves the runner idle. Measured under a 4-CPU quota:
+      # 4 threads 176-194 s, 8 threads 100-112 s, 12 threads 86-87 s, all clean;
+      # 16 threads failed a timing test in 1 of 5 runs and 24 in 1 of 2, and
+      # 16 under a 2-CPU quota failed. So scale with the runner: 3 per vCPU.
       - name: Run Linux tests
         if: runner.os == 'Linux'
-        run: CARGO_INCREMENTAL=1 just ci-tests '${{ matrix.nextest_filter }}'
+        run: |
+          export NEXTEST_TEST_THREADS=$(( $(nproc) * 3 ))
+          echo "nproc=$(nproc) NEXTEST_TEST_THREADS=$NEXTEST_TEST_THREADS"
+          CARGO_INCREMENTAL=1 just ci-tests '${{ matrix.nextest_filter }}'
 
       - name: Run macOS checks
         if: runner.os == 'macOS'
