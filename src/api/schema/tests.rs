@@ -487,6 +487,41 @@ fn first_agent_session_event_with_null_previous_session_matches_schema() {
 }
 
 #[test]
+fn agent_name_is_always_present_and_nullable_but_legacy_records_still_parse() {
+    // Older servers omitted the opt-in name for unnamed agents.
+    let legacy = serde_json::json!({
+        "terminal_id": "term_1",
+        "agent": "pi",
+        "agent_status": "idle",
+        "workspace_id": "w1",
+        "tab_id": "w1:t1",
+        "pane_id": "w1:p1",
+        "focused": false,
+        "revision": 0
+    });
+    let mut agent: AgentInfo = serde_json::from_value(legacy).unwrap();
+    assert_eq!(agent.name, None);
+    let unnamed = serde_json::to_value(&agent).unwrap();
+    assert_eq!(unnamed.get("name"), Some(&serde_json::Value::Null));
+    assert_eq!(serde_json::from_value::<AgentInfo>(unnamed).unwrap(), agent);
+
+    agent.name = Some("worker".into());
+    let named = serde_json::to_value(&agent).unwrap();
+    assert_eq!(named.get("name"), Some(&serde_json::json!("worker")));
+    assert_eq!(serde_json::from_value::<AgentInfo>(named).unwrap(), agent);
+
+    let schema = serde_json::to_value(schemars::schema_for!(AgentInfo)).unwrap();
+    assert!(schema["required"]
+        .as_array()
+        .unwrap()
+        .contains(&serde_json::json!("name")));
+    assert_eq!(
+        schema["properties"]["name"]["type"],
+        serde_json::json!(["string", "null"])
+    );
+}
+
+#[test]
 fn generated_protocol_schema_artifact_is_current() {
     let actual = format!(
         "{}\n",

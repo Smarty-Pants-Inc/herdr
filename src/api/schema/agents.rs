@@ -229,7 +229,10 @@ pub struct AgentPromptParams {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AgentInfo {
     pub terminal_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// The pane's opt-in agent name; null when the pane's agent has no name.
+    #[serde(default)]
+    // The response schema requires the key; legacy missing keys still deserialize.
+    #[schemars(!default, required, schema_with = "super::common::nullable_string_schema")]
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
