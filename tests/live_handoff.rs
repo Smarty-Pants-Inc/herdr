@@ -5026,3 +5026,128 @@ while not (root / 'exit').exists() and time.monotonic() < deadline:
         .expect("stop all three owned server generations");
     drop(spawned);
 }
+
+/// smarty-dev#2014: every workspace row reports a path. `worktree` reports only
+/// Herdr-opened checkouts, so `cwd` (the root pane's current cwd) must survive a
+/// live handoff and a stop/start restore, including after the pane `cd`s.
+#[cfg(target_os = "linux")]
+#[test]
+fn workspace_rows_report_root_pane_cwd_across_live_handoff_and_restore() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let plain = base.join("plain");
+    let repo = base.join("repo");
+    fs::create_dir_all(&plain).unwrap();
+    fs::create_dir_all(&repo).unwrap();
+    let git = std::process::Command::new("git")
+        .args(["init", "--quiet"])
+        .arg(&repo)
+        .status()
+        .expect("run git init");
+    assert!(git.success());
+    let repo_path = repo.to_str().unwrap().to_string();
+
+    let spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    register_runtime_dir(&runtime_dir);
+
+    let create = |cwd: &Path| {
+        let created = request(
+            &api_socket,
+            serde_json::json!({
+                "id": "test:workspace:create",
+                "method": "workspace.create",
+                "params": {"cwd": cwd, "focus": false}
+            }),
+        );
+        let workspace_id = created["result"]["workspace"]["workspace_id"]
+            .as_str()
+            .expect("workspace id")
+            .to_string();
+        let pane_id = created["result"]["root_pane"]["pane_id"]
+            .as_str()
+            .expect("root pane id")
+            .to_string();
+        (workspace_id, pane_id)
+    };
+    let (moved_id, moved_pane) = create(&plain);
+    let (at_repo_id, _) = create(&repo);
+    let row_cwds = || {
+        let listed = request(
+            &api_socket,
+            serde_json::json!({"id":"test:workspaces","method":"workspace.list","params":{}}),
+        );
+        let rows = listed["result"]["workspaces"].as_array().unwrap().clone();
+        let cwd_of = |id: &str| {
+            rows.iter()
+                .find(|row| row["workspace_id"] == id)
+                .and_then(|row| row["cwd"].as_str())
+                .map(str::to_string)
+        };
+        (cwd_of(&moved_id), cwd_of(&at_repo_id))
+    };
+    let wait_for_cwds = |phase: &str, moved: &str| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let cwds = row_cwds();
+            if cwds == (Some(moved.to_string()), Some(repo_path.clone())) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{phase}: workspace cwds {cwds:?}"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+    };
+
+    // Created in a plain directory, and created directly in a Git checkout.
+    wait_for_cwds("after create", plain.to_str().unwrap());
+
+    // The pane moves into the checkout after its workspace exists.
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:cd",
+            "method": "pane.send_text",
+            "params": {"pane_id": moved_pane, "text": format!("cd {repo_path}\n")}
+        }),
+    ));
+    wait_for_cwds("after cd", &repo_path);
+
+    let old_pid = spawned.child.process_id().expect("old server pid");
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({"id":"test:handoff","method":"server.live_handoff","params":{}}),
+    ));
+    let replacement_pid =
+        wait_for_replacement_server_pid(&runtime_dir, old_pid, Duration::from_secs(10));
+    drop(spawned);
+    wait_for_api(&api_socket, Duration::from_secs(10));
+    wait_for_cwds("after live handoff", &repo_path);
+
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
+    ));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Path::new(&format!("/proc/{replacement_pid}")).exists() {
+        assert!(Instant::now() < deadline, "replacement server did not stop");
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    let restored = spawn_server(&config_home, &runtime_dir, &api_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    wait_for_api(&api_socket, Duration::from_secs(10));
+    wait_for_cwds("after restore", &repo_path);
+
+    let _ = request(
+        &api_socket,
+        serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
+    );
+    drop(restored);
+    cleanup_test_base(&base);
+}

@@ -410,6 +410,16 @@ impl App {
                     checkout_path: space.checkout_path.display().to_string(),
                     is_linked_worktree: space.is_linked_worktree,
                 }),
+            // One path per row: a worktree row's path is `worktree.checkout_path`;
+            // a root pane that `cd`s elsewhere must not contradict it.
+            cwd: ws
+                .worktree_space()
+                .is_none()
+                .then(|| {
+                    ws.resolved_identity_cwd_from(&self.state.terminals, &self.terminal_runtimes)
+                })
+                .flatten()
+                .map(|cwd| cwd.display().to_string()),
         }
     }
 }
