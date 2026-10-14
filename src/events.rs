@@ -93,6 +93,13 @@ pub enum AppEvent {
         agent: Agent,
         observed_at: Instant,
     },
+    /// Process detection identified the exact agent process now in front.
+    /// Sent when that process differs from the one identified before.
+    AgentProcessIdentified {
+        pane_id: PaneId,
+        agent: Agent,
+        process: crate::platform::ProcessIdentity,
+    },
     /// The current Codex input screen is visible during managed startup.
     CodexPromptObserved { pane_id: PaneId, ready: bool },
     /// Fallback detector state changed in a pane.

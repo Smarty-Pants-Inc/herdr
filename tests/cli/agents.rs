@@ -801,12 +801,272 @@ fn agent_start_timeout_releases_the_name_for_reuse() {
     let error: serde_json::Value = serde_json::from_slice(&started.stderr).unwrap();
     assert_eq!(error["error"]["code"], "timeout");
 
+    // The agent never appeared, so the deadline released the name.
+    let gone = run_cli(&socket_path, &["agent", "get", "worker"]);
+    assert_eq!(gone.status.code(), Some(1));
+    let gone: serde_json::Value = serde_json::from_slice(&gone.stderr).unwrap();
+    assert_eq!(gone["error"]["code"], "agent_not_found");
+
     let reused = run_cli(&socket_path, &["agent", "rename", &reuse_pane_id, "worker"]);
     assert!(
         reused.status.success(),
         "name was not released: {}",
         String::from_utf8_lossy(&reused.stderr)
     );
+
+    cleanup_spawned_herdr(herdr, base);
+}
+
+/// A fake `pi` on PATH that reports the state given as its first argument
+/// (default `working`), reports `idle` or `working` again when it reads that
+/// line, and exits when it reads `quit`. On `replace` it hands the pane to a
+/// NEW `pi` process: it becomes a plain shell (same pid, no longer `pi` or
+/// hinted as one) that runs another fake `pi` in the foreground, so the pane
+/// shell never comes back and no exit is seen.
+fn write_stateful_fake_pi(base: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let bin = base.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let fake_pi = bin.join("pi");
+    fs::write(
+        &fake_pi,
+        format!(
+            "#!/bin/sh\nexport HERDR_AGENT=pi\nreport() {{ '{0}' pane report-agent \"$HERDR_PANE_ID\" --source custom:fake-pi --agent pi --state \"$1\" >/dev/null; }}\nreport \"${{1:-working}}\"\nwhile IFS= read -r line; do\n  case \"$line\" in\n    quit) exit 0 ;;\n    idle|working) report \"$line\" ;;\n    replace) exec /usr/bin/env -u HERDR_AGENT /bin/sh -c '\"$0\" working; exit $?' \"$0\" ;;\n  esac\ndone\n",
+            env!("CARGO_BIN_EXE_herdr"),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&fake_pi, fs::Permissions::from_mode(0o755)).unwrap();
+    bin
+}
+
+fn agent_get(socket_path: &Path, name: &str) -> Result<serde_json::Value, serde_json::Value> {
+    let output = run_cli(socket_path, &["agent", "get", name]);
+    if output.status.success() {
+        Ok(
+            serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["result"]["agent"]
+                .clone(),
+        )
+    } else {
+        Err(serde_json::from_slice(&output.stderr).unwrap())
+    }
+}
+
+// smarty-dev#11073: a managed launch whose agent was seen, but is still working
+// when the launch deadline passes (a Pi resuming a big session, or one that
+// starts work at once), keeps its name without becoming ready: prompts are still
+// rejected until the agent reaches idle. Leaving the pane still frees the name,
+// and the same pane can be relaunched under the same name.
+#[test]
+fn agent_start_keeps_the_name_of_a_seen_agent_still_working_at_the_deadline() {
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+    let bin = write_stateful_fake_pi(&base);
+    let herdr = spawn_herdr_with_path(&config_home, &runtime_dir, &socket_path, Some(&bin));
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+    let created = run_cli_json(
+        &socket_path,
+        &["workspace", "create", "--cwd", base.to_str().unwrap()],
+    );
+    let pane_id = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let terminal_id = created["result"]["root_pane"]["terminal_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Before the deadline, a prompt to the still-starting launch is rejected
+    // by the managed-startup guard. Capture that rejection to compare with the
+    // one after the deadline.
+    let early_socket = socket_path.clone();
+    let early_prompt = thread::spawn(move || {
+        assert!(
+            wait_until(Duration::from_secs(3), Duration::from_millis(50), || {
+                agent_get(&early_socket, "lead-x")
+                    .is_ok_and(|agent| agent["agent_status"] == "working")
+            }),
+            "the launch never showed its working agent"
+        );
+        let prompted = run_cli(&early_socket, &["agent", "prompt", "lead-x", "too early"]);
+        assert_eq!(prompted.status.code(), Some(1));
+        serde_json::from_slice::<serde_json::Value>(&prompted.stderr).unwrap()
+    });
+
+    // The agent is seen and working, never idle, so the CLI's readiness wait
+    // times out; the launch deadline passes with the agent still in the pane.
+    let started = run_cli(
+        &socket_path,
+        &[
+            "agent",
+            "start",
+            "lead-x",
+            "--kind",
+            "pi",
+            "--pane",
+            &pane_id,
+            "--timeout",
+            "3500",
+        ],
+    );
+    assert_eq!(started.status.code(), Some(1));
+    let error: serde_json::Value = serde_json::from_slice(&started.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "timeout");
+    let early_rejection = early_prompt.join().unwrap();
+    assert_eq!(
+        early_rejection["error"]["code"], "agent_not_ready",
+        "{early_rejection}"
+    );
+
+    // Past the deadline, and again after more reconcile ticks: the name stays,
+    // but the still-working launch is not ready and a prompt is rejected
+    // exactly as before the deadline.
+    for _ in 0..2 {
+        let agent = agent_get(&socket_path, "lead-x")
+            .unwrap_or_else(|err| panic!("the working agent lost its name: {err}"));
+        assert_eq!(agent["terminal_id"], terminal_id.as_str(), "{agent}");
+        assert_eq!(agent["pane_id"], pane_id.as_str(), "{agent}");
+        assert_eq!(agent["agent"], "pi", "{agent}");
+        assert_eq!(agent["agent_status"], "working", "{agent}");
+        // `interactive_ready` is omitted when false.
+        assert_ne!(agent["interactive_ready"], true, "{agent}");
+        assert_eq!(agent["launch_pending"], true, "{agent}");
+        let prompted = run_cli(&socket_path, &["agent", "prompt", "lead-x", "too early"]);
+        assert_eq!(prompted.status.code(), Some(1));
+        let rejection: serde_json::Value = serde_json::from_slice(&prompted.stderr).unwrap();
+        assert_eq!(rejection["error"], early_rejection["error"], "{rejection}");
+        thread::sleep(Duration::from_millis(600));
+    }
+
+    // The agent reports idle: the launch becomes ready and takes a prompt.
+    assert!(run_cli(&socket_path, &["pane", "run", &pane_id, "idle"])
+        .status
+        .success());
+    assert!(
+        wait_until(Duration::from_secs(10), Duration::from_millis(50), || {
+            agent_get(&socket_path, "lead-x").is_ok_and(|agent| {
+                agent["agent_status"] == "idle" && agent["interactive_ready"] == true
+            })
+        }),
+        "the idle agent never became ready: {:?}",
+        agent_get(&socket_path, "lead-x")
+    );
+    let prompted = run_cli(&socket_path, &["agent", "prompt", "lead-x", "hello"]);
+    assert!(
+        prompted.status.success(),
+        "a ready agent rejected the prompt: {}",
+        String::from_utf8_lossy(&prompted.stderr)
+    );
+
+    // The agent leaves the pane (exit, shell back): the name is freed.
+    assert!(run_cli(&socket_path, &["pane", "run", &pane_id, "quit"])
+        .status
+        .success());
+    assert!(
+        wait_until(Duration::from_secs(10), Duration::from_millis(50), || {
+            agent_get(&socket_path, "lead-x")
+                .is_err_and(|err| err["error"]["code"] == "agent_not_found")
+        }),
+        "an exited agent kept its name: {:?}",
+        agent_get(&socket_path, "lead-x")
+    );
+
+    // Same-session relaunch in the same pane under the same name.
+    let relaunched = run_cli(
+        &socket_path,
+        &[
+            "agent",
+            "start",
+            "lead-x",
+            "--kind",
+            "pi",
+            "--pane",
+            &pane_id,
+            "--timeout",
+            "8000",
+            "--",
+            "idle",
+        ],
+    );
+    assert!(
+        relaunched.status.success(),
+        "relaunch failed: {}",
+        String::from_utf8_lossy(&relaunched.stderr)
+    );
+    let agent = agent_get(&socket_path, "lead-x").unwrap();
+    assert_eq!(agent["terminal_id"], terminal_id.as_str(), "{agent}");
+    assert_eq!(agent["interactive_ready"], true, "{agent}");
+
+    cleanup_spawned_herdr(herdr, base);
+}
+
+// smarty-dev#11073 review: the launch's name belongs to the agent process first
+// seen for it, not to its kind. A different `pi` process replacing the launched
+// one in the pane, with no exit seen in between, does not keep the name.
+#[test]
+fn agent_start_name_does_not_pass_to_a_different_process_of_the_same_kind() {
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+    let bin = write_stateful_fake_pi(&base);
+    let herdr = spawn_herdr_with_path(&config_home, &runtime_dir, &socket_path, Some(&bin));
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+    let created = run_cli_json(
+        &socket_path,
+        &["workspace", "create", "--cwd", base.to_str().unwrap()],
+    );
+    let pane_id = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Seen and working past the deadline: the launch keeps its name (Seen).
+    let started = run_cli(
+        &socket_path,
+        &[
+            "agent",
+            "start",
+            "lead-x",
+            "--kind",
+            "pi",
+            "--pane",
+            &pane_id,
+            "--timeout",
+            "3500",
+        ],
+    );
+    assert_eq!(started.status.code(), Some(1));
+    let error: serde_json::Value = serde_json::from_slice(&started.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "timeout");
+    let agent = agent_get(&socket_path, "lead-x")
+        .unwrap_or_else(|err| panic!("the working agent lost its name: {err}"));
+    assert_eq!(agent["agent"], "pi", "{agent}");
+    assert_eq!(agent["launch_pending"], true, "{agent}");
+
+    // A new `pi` process takes the pane over; the first one is gone.
+    assert!(run_cli(&socket_path, &["pane", "run", &pane_id, "replace"])
+        .status
+        .success());
+    assert!(
+        wait_until(Duration::from_secs(15), Duration::from_millis(100), || {
+            agent_get(&socket_path, "lead-x")
+                .is_err_and(|err| err["error"]["code"] == "agent_not_found")
+        }),
+        "a different pi process kept the launch's name: {:?}",
+        agent_get(&socket_path, "lead-x")
+    );
+
+    // The pane still runs a pi, now unnamed.
+    let unnamed = agent_get(&socket_path, &pane_id)
+        .unwrap_or_else(|err| panic!("the replacement pi is not the pane's agent: {err}"));
+    assert_eq!(unnamed["agent"], "pi", "{unnamed}");
+    assert!(unnamed["name"].is_null(), "{unnamed}");
+    assert_ne!(unnamed["launch_pending"], true, "{unnamed}");
 
     cleanup_spawned_herdr(herdr, base);
 }
