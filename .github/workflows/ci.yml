@@ -237,13 +237,12 @@ jobs:
 
       # Most slow tests wait on real servers, PTYs and timers, not the CPU, so one
       # thread per vCPU leaves the runner idle. Measured under a 4-CPU quota:
-      # 4 threads 176-194 s, 8 threads 100-112 s, 12 threads 86-87 s, all clean;
-      # 16 threads failed a timing test in 1 of 5 runs and 24 in 1 of 2, and
-      # 16 under a 2-CPU quota failed. So scale with the runner: 3 per vCPU.
+      # 4 threads 176-194 s; 8 threads 100-112 s, all clean; 12 threads failed
+      # a handoff-timing test in 2 of 3 runs. Scale with the runner: 2 per vCPU.
       - name: Run Linux tests
         if: runner.os == 'Linux'
         run: |
-          export NEXTEST_TEST_THREADS=$(( $(nproc) * 3 ))
+          export NEXTEST_TEST_THREADS=$(( $(nproc) * 2 ))
           echo "nproc=$(nproc) NEXTEST_TEST_THREADS=$NEXTEST_TEST_THREADS"
           CARGO_INCREMENTAL=1 just ci-tests '${{ matrix.nextest_filter }}'
 
