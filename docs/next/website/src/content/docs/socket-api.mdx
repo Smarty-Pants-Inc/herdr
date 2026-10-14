@@ -1179,6 +1179,8 @@ Reports containing `resume_argv` are content writes: Herdr attributes a local ag
 
 If no native session reference is stored, the field is omitted.
 
+`agent.list` and `agent.get` responses always include `name`: a string when explicitly named, or `null` when the pane's agent has no name. Names are opt-in labels set with `agent.rename`; they are separate from agent kind, `display_agent`, and the pane label. Herdr does not generate names automatically.
+
 `pane.get`, `pane.list`, `agent.get`, and `agent.list` also expose `foreground_cwd` when Herdr can resolve the cwd of the process currently controlling the pane PTY. The existing `cwd` field remains the pane/workspace cwd used for labels, follow-cwd behavior, and restored session state.
 
 `PaneInfo` and `AgentInfo` expose optional `terminal_title` and `terminal_title_stripped` fields. `terminal_title` is the latest OSC 0/2 title after safety normalization. `terminal_title_stripped` removes one recognized leading activity or spinner glyph and following whitespace. These server-owned values are ephemeral across a cold restart and are independent of the metadata `title` and semantic agent state.
