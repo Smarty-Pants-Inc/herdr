@@ -243,8 +243,8 @@ herdr pane read <pane_id> --source recent-unwrapped --lines 120
 发送输入:
 
 ```bash
-herdr pane send-text <pane_id> [--expected-session ID] <text>
-herdr pane send-keys <pane_id> [--expected-session ID] <key> [key ...]
+herdr pane send-text <pane_id> [--expected-session ID] [--refuse-if-exists PATH] <text>
+herdr pane send-keys <pane_id> [--expected-session ID] [--refuse-if-exists PATH] <key> [key ...]
 herdr pane run <pane_id> <command>
 ```
 
@@ -269,6 +269,8 @@ herdr pane run <pane_id> <command>
 初始检查与接受请求时 Herdr 的已上报窗格状态是原子的。它无法检测智能体尚未上报的会话变化。仍有两类残余竞态：最后一次实时进程／前台原生检查与 `write(2)` 之间的检查／写入间隙，以及所有权丢失／刷新／读取方之间的竞态；读取方可能在刷新前消费已暂存的字节。完成结果和刷新都不保证总写入或总消费字节数为零。App 到 actor 的队列和延迟 Enter 的等待受守卫保护，但不能消除这些原生竞态。CLI 要求 `expected_agent_session_guard`，仅 Linux 支持并通告此能力。macOS 和 Windows 在无法确认安全时拒绝操作；macOS 的原生证明尚待实现。缺少支持时，CLI 返回 `expected_agent_session_unsupported`，不发送带守卫的操作，并使用 checked 方法名，因此即使能力检查后服务器被替换，也会在无法确认安全时拒绝操作。省略这些标志会保留现有行为和独立的跨窗格输入策略。
 
 已知限制：暂停后，恢复或重新加载同一个原生会话不会恢复带守卫发送的资格；请开启新会话（`/new`）或重启智能体。参见[后续问题](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/7577)。
+
+在 `pane send-text` 或 `pane send-keys` 上使用 `--refuse-if-exists PATH`，会在第一个请求字节成功写入前的每次写入尝试之前用 `lstat` 检查 PATH，而不是在接纳请求时检查。第一个字节写入前已存在的 claim 会阻止请求；一旦开始写入，请求就会完成。如果写入尝试返回 `EAGAIN`（会阻塞）或 `EINTR`（被中断），尚未写入任何字节，则重试前会再次检查 PATH。路径存在时返回 `guard_path_present`，退出码为 1，请求写入为 0 字节，`partial_text_consumed: false`、`flush_failed: false`。若无法检查路径（例如父目录不可搜索），则安全失败，返回 `guard_path_unverifiable` 和相同的 0 字节结果。只有路径不存在时才开始写入。开始后不再检查路径，部分分块、重试和延迟的 Enter 都会完成。路径守卫从不刷新未读输入，因此无关的排队输入会保留。独立的 `--expected-session` 守卫仍在每次写入前检查，并保留其会话丢失时的刷新行为。分开的 `lstat` 和第一次 `write(2)` 不是同步机制，可能漏掉在两者之间创建的 claim（已接受的技术风险 [smarty-dev#12584](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/12584)）。CLI 会以自身的工作目录为基准，把相对 PATH 转为绝对路径。它需要服务器能力 `refuse_if_exists_guard`（仅 Unix）；缺少该能力时，CLI 不发送并返回 `refuse_if_exists_unsupported`。CLI 使用带检查的方法 `pane.send_text_path_checked` 和 `pane.send_keys_path_checked`，因此旧服务器会拒绝请求，而不会忽略该标志。省略该标志时行为不变。
 
 从自定义钩子上报智能体状态:
 

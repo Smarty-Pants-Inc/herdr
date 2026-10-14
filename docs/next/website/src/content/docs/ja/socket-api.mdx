@@ -99,7 +99,7 @@ herdr pane read w1:p2 --source recent --lines 50
 | ワークスペース | `workspace.create`、`workspace.list`、`workspace.get`、`workspace.focus`、`workspace.rename`、`workspace.move`、`workspace.move_block`、`workspace.report_metadata`、`workspace.close` |
 | Worktree | `worktree.list`、`worktree.create`、`worktree.create_project_checked`、`worktree.open`、`worktree.open_project_checked`、`worktree.remove` |
 | タブ | `tab.create`、`tab.list`、`tab.get`、`tab.focus`、`tab.rename`、`tab.move`、`tab.close` |
-| ペイン | `pane.split`、`pane.swap`、`pane.move`、`pane.zoom`、`pane.layout`、`pane.process_info`、`pane.neighbor`、`pane.edges`、`pane.focus_direction`、`pane.resize`、`pane.list`、`pane.current`、`pane.get`、`pane.last_input`、`pane.rename`、`pane.send_text`、`pane.send_text_session_checked`、`pane.send_keys`、`pane.send_keys_session_checked`、`pane.send_input`、`pane.send_input_guarded`、`pane.read`、`pane.report_agent`、`pane.report_agent_session`、`pane.report_metadata`、`pane.clear_agent_authority`、`pane.release_agent`、`pane.close`、`pane.close_guarded`、`pane.wait_for_output` |
+| ペイン | `pane.split`、`pane.swap`、`pane.move`、`pane.zoom`、`pane.layout`、`pane.process_info`、`pane.neighbor`、`pane.edges`、`pane.focus_direction`、`pane.resize`、`pane.list`、`pane.current`、`pane.get`、`pane.last_input`、`pane.rename`、`pane.send_text`、`pane.send_text_session_checked`、`pane.send_keys`、`pane.send_keys_session_checked`、`pane.send_text_path_checked`、`pane.send_keys_path_checked`、`pane.send_input`、`pane.send_input_guarded`、`pane.read`、`pane.report_agent`、`pane.report_agent_session`、`pane.report_metadata`、`pane.clear_agent_authority`、`pane.release_agent`、`pane.close`、`pane.close_guarded`、`pane.wait_for_output` |
 | 入力コンシューマー（ローカル JSON 専用） | `pane.input_consumer.enroll`、`pane.input_consumer.cut`、`pane.input_consumer.release` |
 | ポップアップ | `popup.close` |
 | レイアウト | `layout.export`、`layout.apply`、`layout.apply_restorable`、`layout.set_split_ratio` |
@@ -398,6 +398,16 @@ principal の解決はサーバーが行い、クライアント接続ごとに�
 {"id":"checked_prompt","method":"agent.prompt_session_checked","params":{"target":"worker","text":"review this change","expected_agent_session_id":"reported_id_from_agent_get","expected_pane_id":"w1:p1","wait":{"until":["idle"],"timeout_ms":30000}}}
 {"id":"checked_text","method":"pane.send_text_session_checked","params":{"pane_id":"w1:p1","text":"hello","expected_agent_session_id":"reported_id_from_pane_get"}}
 {"id":"checked_keys","method":"pane.send_keys_session_checked","params":{"pane_id":"w1:p1","keys":["Enter"],"expected_agent_session_id":"reported_id_from_pane_get"}}
+```
+
+### 書き込み時のパスガード
+
+`pane.send_text_path_checked` と `pane.send_keys_path_checked` は、`pane.send_text` と `pane.send_keys` の params に加えて、必須の文字列 `refuse_if_exists`（絶対パス）を受け取ります。Herdr はリクエストの受理時にはパスを確認しません。PTY ライターは最初のリクエストバイトの書き込みが成功するまで、各書き込み試行の直前に `lstat` を実行します。最初のバイトを書き込む前に存在する claim はリクエストを防ぎ、書き込み開始後はリクエストを完了します。書き込みが 0 バイトのまま `EAGAIN`（ブロックする）または `EINTR`（中断された）を返した場合、パスガードは有効なままで、次の試行で再確認します。`lstat` が成功した場合（ファイルの種類を問わず、リンク先のないシンボリックリンクも含む）、Herdr は `guard_path_present` で拒否し、リクエストの書き込みは 0 バイト、`error.partial_text_consumed: false`、`error.flush_failed: false` となります。フラッシュは行いません。書き込みが続行するのはパスが存在しない場合（`ENOENT`、またはディレクトリでない構成要素による `ENOTDIR`）だけです。それ以外の `lstat` エラー（親ディレクトリの `EACCES`、`ELOOP`、`EIO` など）でもバイトを破棄し、メッセージに OS エラーを含む `guard_path_unverifiable` を返します。他のフィールドは `guard_path_present` と同じです。開始後はパスを再検査せず、部分チャンク、再試行、遅延 Enter を完了します。パスガードは未読入力をフラッシュしないため、無関係なキュー入力は保持されます。相対パスは `invalid_request` を返します。レスポンスはキュー投入ではなく、PTY ライターの完了を報告します。`expected_agent_session_id` も併用できますが、その場合は `expected_agent_session_guard` も必要です。その独立したガードの各書き込み前のネイティブチェックとセッション喪失時のフラッシュ動作は変わりません。
+
+`ping.result.capabilities.refuse_if_exists_guard == true` を確認してください（Unix サーバーのみ。Windows は `false` を通知し、`refuse_if_exists_unsupported` で拒否します）。古いサーバーはこれらのメソッド名を `invalid_request` で拒否するため、ping とリクエストの間にサーバーが置き換えられても安全側で失敗します。拒否された後に `pane.send_text` や `pane.send_keys` へフォールバックしないでください。別々の `lstat` と最初の `write(2)` は同期ではなく、その間に作成された claim を見逃す可能性があります（受容された技術的リスク [smarty-dev#12584](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/12584)）。
+
+```json
+{"id":"claim_checked_keys","method":"pane.send_keys_path_checked","params":{"pane_id":"w1:p1","keys":["esc"],"refuse_if_exists":"/run/user/1000/floor/claim"}}
 ```
 
 ### 検出されたエージェント状態の期待値ガード

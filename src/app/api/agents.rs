@@ -106,7 +106,9 @@ impl App {
             | Method::AgentPromptSessionChecked(_)
             | Method::AgentPromptStatusChecked(_)
             | Method::PaneSendTextSessionChecked(_)
-            | Method::PaneSendKeysSessionChecked(_) => true,
+            | Method::PaneSendKeysSessionChecked(_)
+            | Method::PaneSendTextPathChecked(_)
+            | Method::PaneSendKeysPathChecked(_) => true,
             Method::PaneSendText(params) => params.expected_agent_session_id.is_some(),
             Method::PaneSendKeys(params) => params.expected_agent_session_id.is_some(),
             _ => false,
@@ -146,6 +148,27 @@ impl App {
                 self.defer_session_checked_pane_input(
                     request.id,
                     super::panes::SessionCheckedPaneInput::Text(params),
+                    None,
+                    context,
+                    respond_to,
+                );
+                return true;
+            }
+            crate::api::schema::Method::PaneSendTextPathChecked(params) => {
+                self.defer_session_checked_pane_input(
+                    request.id,
+                    super::panes::SessionCheckedPaneInput::Text(params.input),
+                    Some(params.refuse_if_exists.into()),
+                    context,
+                    respond_to,
+                );
+                return true;
+            }
+            crate::api::schema::Method::PaneSendKeysPathChecked(params) => {
+                self.defer_session_checked_pane_input(
+                    request.id,
+                    super::panes::SessionCheckedPaneInput::Keys(params.input),
+                    Some(params.refuse_if_exists.into()),
                     context,
                     respond_to,
                 );
@@ -156,6 +179,7 @@ impl App {
                 self.defer_session_checked_pane_input(
                     request.id,
                     super::panes::SessionCheckedPaneInput::Keys(params),
+                    None,
                     context,
                     respond_to,
                 );
@@ -225,10 +249,11 @@ impl App {
         &mut self,
         id: String,
         input: super::panes::SessionCheckedPaneInput,
+        refuse_if_exists: Option<std::path::PathBuf>,
         context: crate::api::ApiRequestContext,
         respond_to: std::sync::mpsc::Sender<String>,
     ) {
-        match self.queue_session_checked_pane_input(id.clone(), input, context) {
+        match self.queue_session_checked_pane_input(id.clone(), input, refuse_if_exists, context) {
             Ok(completion) => {
                 std::thread::spawn(move || {
                     let result = completion.recv().unwrap_or_else(|_| {

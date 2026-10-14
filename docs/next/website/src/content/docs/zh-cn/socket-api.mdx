@@ -99,7 +99,7 @@ herdr pane read w1:p2 --source recent --lines 50
 | 工作区 | `workspace.create`、`workspace.list`、`workspace.get`、`workspace.focus`、`workspace.rename`、`workspace.move`、`workspace.move_block`、`workspace.report_metadata`、`workspace.close` |
 | Worktree | `worktree.list`、`worktree.create`、`worktree.create_project_checked`、`worktree.open`、`worktree.open_project_checked`、`worktree.remove` |
 | 标签页 | `tab.create`、`tab.list`、`tab.get`、`tab.focus`、`tab.rename`、`tab.move`、`tab.close` |
-| 窗格 | `pane.split`、`pane.swap`、`pane.move`、`pane.zoom`、`pane.layout`、`pane.process_info`、`pane.neighbor`、`pane.edges`、`pane.focus_direction`、`pane.resize`、`pane.list`、`pane.current`、`pane.get`、`pane.last_input`、`pane.rename`、`pane.send_text`、`pane.send_text_session_checked`、`pane.send_keys`、`pane.send_keys_session_checked`、`pane.send_input`、`pane.send_input_guarded`、`pane.read`、`pane.report_agent`、`pane.report_agent_session`、`pane.report_metadata`、`pane.clear_agent_authority`、`pane.release_agent`、`pane.close`、`pane.close_guarded`、`pane.wait_for_output` |
+| 窗格 | `pane.split`、`pane.swap`、`pane.move`、`pane.zoom`、`pane.layout`、`pane.process_info`、`pane.neighbor`、`pane.edges`、`pane.focus_direction`、`pane.resize`、`pane.list`、`pane.current`、`pane.get`、`pane.last_input`、`pane.rename`、`pane.send_text`、`pane.send_text_session_checked`、`pane.send_keys`、`pane.send_keys_session_checked`、`pane.send_text_path_checked`、`pane.send_keys_path_checked`、`pane.send_input`、`pane.send_input_guarded`、`pane.read`、`pane.report_agent`、`pane.report_agent_session`、`pane.report_metadata`、`pane.clear_agent_authority`、`pane.release_agent`、`pane.close`、`pane.close_guarded`、`pane.wait_for_output` |
 | 输入消费者（仅本地 JSON） | `pane.input_consumer.enroll`、`pane.input_consumer.cut`、`pane.input_consumer.release` |
 | 弹窗 | `popup.close` |
 | 布局 | `layout.export`、`layout.apply`、`layout.apply_restorable`、`layout.set_split_ratio` |
@@ -416,6 +416,16 @@ principal 由服务器解析，每个客户端连接只绑定一次。在 Linux 
 {"id":"checked_prompt","method":"agent.prompt_session_checked","params":{"target":"worker","text":"review this change","expected_agent_session_id":"reported_id_from_agent_get","expected_pane_id":"w1:p1","wait":{"until":["idle"],"timeout_ms":30000}}}
 {"id":"checked_text","method":"pane.send_text_session_checked","params":{"pane_id":"w1:p1","text":"hello","expected_agent_session_id":"reported_id_from_pane_get"}}
 {"id":"checked_keys","method":"pane.send_keys_session_checked","params":{"pane_id":"w1:p1","keys":["Enter"],"expected_agent_session_id":"reported_id_from_pane_get"}}
+```
+
+### 写入时路径守卫
+
+`pane.send_text_path_checked` 和 `pane.send_keys_path_checked` 接受 `pane.send_text` 和 `pane.send_keys` 的 params，并额外要求字符串 `refuse_if_exists`，其值必须是绝对路径。Herdr 在接纳请求时不检查该路径。PTY 写入器会在第一个请求字节成功写入前的每次写入尝试之前执行 `lstat`。第一个字节写入前已存在的 claim 会阻止请求；一旦开始写入，请求就会完成。如果写入尝试返回 `EAGAIN`（会阻塞）或 `EINTR`（被中断），尚未写入任何字节，路径守卫仍然有效，下一次尝试会重新检查。如果 `lstat` 成功（任何文件类型，包括悬空符号链接），Herdr 会以 `guard_path_present` 拒绝，请求写入为 0 字节，`error.partial_text_consumed: false`、`error.flush_failed: false`，不会刷新输入。只有路径不存在（`ENOENT`，或某个组成部分不是目录时的 `ENOTDIR`）才会继续写入。其他 `lstat` 错误（例如父目录的 `EACCES`、`ELOOP` 或 `EIO`）同样会丢弃字节，并返回消息中带有操作系统错误的 `guard_path_unverifiable`；其余字段与 `guard_path_present` 相同。开始后不再检查路径，部分分块、重试和延迟的 Enter 都会完成。路径守卫从不刷新未读输入，因此无关的排队输入会保留。相对路径返回 `invalid_request`。响应报告的是 PTY 写入器的完成，而不是入队。也可以同时提供 `expected_agent_session_id`；此时请求还需要 `expected_agent_session_guard`。该独立守卫仍在每次写入前执行原生检查，并保留其会话丢失时的刷新行为。
+
+请检查 `ping.result.capabilities.refuse_if_exists_guard == true`（仅 Unix 服务器支持；Windows 通告 `false`，并以 `refuse_if_exists_unsupported` 拒绝）。旧服务器会以 `invalid_request` 拒绝这些方法名，因此即使服务器在 ping 和请求之间被替换，也会安全失败。被拒绝后不要回退到 `pane.send_text` 或 `pane.send_keys`。分开的 `lstat` 和第一次 `write(2)` 不是同步机制，可能漏掉在两者之间创建的 claim（已接受的技术风险 [smarty-dev#12584](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/12584)）。
+
+```json
+{"id":"claim_checked_keys","method":"pane.send_keys_path_checked","params":{"pane_id":"w1:p1","keys":["esc"],"refuse_if_exists":"/run/user/1000/floor/claim"}}
 ```
 
 ### 检测到的智能体状态预期守卫
