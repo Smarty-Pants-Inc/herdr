@@ -482,8 +482,9 @@ fn close_confirmation_error_becomes_client_owned_overlay_and_stable_workspace_cl
     // Exercise the server error fallback directly: last-pane keybindings now
     // confirm locally before issuing a request.
     state.push_endpoint_method(
-        crate::api::schema::Method::PaneClose(crate::api::schema::PaneTarget {
+        crate::api::schema::Method::PaneClose(crate::api::schema::PaneCloseParams {
             pane_id: "pane_1".into(),
+            expected_terminal: None,
         }),
         &mut close,
     );

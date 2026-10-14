@@ -395,6 +395,30 @@ pub struct PaneSendKeysParams {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneCloseParams {
+    pub pane_id: String,
+    /// Refuse the close unless the pane still owns this opaque terminal identity.
+    /// Older servers ignore this field on `pane.close`; use `pane.close_guarded`
+    /// after checking `pane_close_expected_terminal_guard`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "super::deserialize_expected_terminal"
+    )]
+    #[schemars(with = "String")]
+    pub expected_terminal: Option<String>,
+}
+
+impl PaneCloseParams {
+    pub fn unguarded(pane_id: impl Into<String>) -> Self {
+        Self {
+            pane_id: pane_id.into(),
+            expected_terminal: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PaneSendInputParams {
     pub pane_id: String,
     /// Refuse input unless the pane still owns this opaque terminal identity.

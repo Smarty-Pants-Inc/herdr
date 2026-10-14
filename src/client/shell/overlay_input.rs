@@ -1059,7 +1059,9 @@ impl ClientShellState {
             }
         }
         self.push_endpoint_method(
-            crate::api::schema::Method::PaneClose(crate::api::schema::PaneTarget { pane_id }),
+            crate::api::schema::Method::PaneClose(crate::api::schema::PaneCloseParams::unguarded(
+                pane_id,
+            )),
             outcome,
         );
     }
@@ -1116,7 +1118,9 @@ impl ClientShellState {
                 return;
             }
             if let Some(pane_id) = target.pane_id {
-                crate::api::schema::Method::PaneClose(crate::api::schema::PaneTarget { pane_id })
+                crate::api::schema::Method::PaneClose(
+                    crate::api::schema::PaneCloseParams::unguarded(pane_id),
+                )
             } else {
                 crate::api::schema::Method::TabClose(crate::api::schema::TabTarget {
                     tab_id: target.tab_id,

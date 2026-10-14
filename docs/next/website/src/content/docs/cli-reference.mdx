@@ -228,8 +228,10 @@ herdr pane move <pane_id> --tab <tab_id> --split right|down [--target-pane ID] [
 herdr pane move <pane_id> --new-tab [--workspace ID] [--label TEXT] [--focus|--no-focus]
 herdr pane move <pane_id> --new-workspace [--label TEXT] [--tab-label TEXT] [--focus|--no-focus]
 herdr pane clear-input-poison <pane>
-herdr pane close <pane_id>
+herdr pane close <pane_id> [--expected-terminal TERMINAL_ID]
 ```
+
+`pane close --expected-terminal <terminal_id>` closes the pane only if it still owns that terminal. Use it to close a pane you started yourself: copy the opaque `terminal_id` from the response that created the pane or from `pane get`. If the pane now holds a different terminal, for example after the server was replaced and a new terminal reused the pane ID, the server refuses with `terminal_identity_mismatch` and closes nothing. The server checks the identity and closes the pane in one step, so another terminal cannot take the pane in between. The CLI returns `expected_terminal_unsupported` and closes nothing if the server does not advertise support. Without the flag, `pane close` behaves as before.
 
 For pane commands that accept `--current`, Herdr uses the calling pane's
 `HERDR_PANE_ID` when the command runs inside a Herdr pane. For `pane split`,

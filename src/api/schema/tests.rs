@@ -1274,6 +1274,7 @@ fn success_response_round_trips() {
                 ssh_agent_registration: false,
                 guarded_live_handoff: true,
                 expected_terminal_guard: true,
+                pane_close_expected_terminal_guard: true,
                 expected_agent_session_guard: true,
                 expected_agent_status_guard: true,
                 input_consumer: false,

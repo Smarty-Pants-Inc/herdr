@@ -2219,8 +2219,9 @@ async fn project_change_explicit_pane_and_tab_close_allow_once_only_for_changed_
                             .unwrap(),
                     })
                 } else {
-                    Method::PaneClose(api::schema::PaneTarget {
+                    Method::PaneClose(api::schema::PaneCloseParams {
                         pane_id: server.app.public_pane_id(0, removed).unwrap(),
+                        expected_terminal: None,
                     })
                 };
                 let logs = capture_project_logs(|| {
