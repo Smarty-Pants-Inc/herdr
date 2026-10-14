@@ -39,19 +39,56 @@ enum Fake {
 /// One owned fixture. Drop stops only servers pinned by pidfd whose environment names this
 /// fixture's unique socket, then the bridge's own process group while the bridge is still
 /// unreaped, then removes only this fixture directory.
+///
+/// Expected skip: cleanup of the detached (`setsid`) daemon is only safe through a pidfd,
+/// so every process fixture requires `pidfd_open` + `pidfd_send_signal` (Linux 5.3+; every
+/// fleet Linux host has them). Without them `Fixture::new` prints a `SKIP:` line and returns
+/// `None` before creating files or spawning anything, and the test returns early. Rust has
+/// no dynamic skip, so such a test reports `ok`; the `SKIP:` line is the honest record that
+/// it proved nothing there. There is deliberately no PID/session/group fallback.
 struct Fixture {
     dir: PathBuf,
     bridge: Option<Child>,
 }
 
+/// Opens a pidfd; injectable only so a test can force the capability preflight to fail.
+type PidfdOpener = fn(u32) -> std::io::Result<OwnedFd>;
+
+/// Capability preflight on this test process itself: a pidfd for our own PID plus a
+/// signal-0 probe through it (signal 0 delivers nothing). Failure here means the kernel or
+/// sandbox lacks pidfd support, unlike a later per-candidate `ESRCH`, which only means that
+/// candidate already exited.
+fn pidfd_preflight(opener: PidfdOpener) -> std::io::Result<()> {
+    let fd = opener(std::process::id())?;
+    pidfd_signal(&fd, 0)
+}
+
 impl Fixture {
-    fn new(systemd_unit: Option<&str>, fake: Fake) -> Self {
+    /// `None` (after a `SKIP:` line) when pidfds are unavailable; see the type docs.
+    fn new(systemd_unit: Option<&str>, fake: Fake) -> Option<Self> {
+        Self::new_in(&std::env::temp_dir(), systemd_unit, fake, pidfd_open)
+    }
+
+    fn new_in(
+        root: &Path,
+        systemd_unit: Option<&str>,
+        fake: Fake,
+        opener: PidfdOpener,
+    ) -> Option<Self> {
+        // Before any fixture file, server or bridge exists.
+        if let Err(err) = pidfd_preflight(opener) {
+            eprintln!(
+                "SKIP: pidfd_open/pidfd_send_signal unavailable ({err}); managed-unit process \
+                 fixtures need pidfd-only cleanup, nothing was created, spawned or signalled"
+            );
+            return None;
+        }
         static SEQ: AtomicU32 = AtomicU32::new(0);
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.subsec_nanos())
             .unwrap_or(0);
-        let dir = std::env::temp_dir().join(format!(
+        let dir = root.join(format!(
             "lmu-{}-{nanos}-{}",
             std::process::id(),
             SEQ.fetch_add(1, Ordering::Relaxed)
@@ -95,7 +132,7 @@ impl Fixture {
         fs::write(&fake_path, script).unwrap();
         fs::set_permissions(&fake_path, fs::Permissions::from_mode(0o700)).unwrap();
 
-        Self { dir, bridge: None }
+        Some(Self { dir, bridge: None })
     }
 
     fn api_socket(&self) -> PathBuf {
@@ -199,14 +236,15 @@ impl Fixture {
 
     /// Pins a scanned candidate with a pidfd, then re-reads its marker. The pinned process
     /// still being alive after the re-read proves the read was of the pinned process, not a
-    /// PID recycled in between; anything else is not ours.
+    /// PID recycled in between; anything else is not ours. Capability was proven by the
+    /// preflight, so an open failure here is per candidate (normally `ESRCH`: it already
+    /// exited) and the candidate is never signalled.
     fn pin_fixture_server(&self, pid: u32) -> Option<OwnedFd> {
         let fd = match pidfd_open(pid) {
             Ok(fd) => fd,
+            Err(err) if err.raw_os_error() == Some(libc::ESRCH) => return None,
             Err(err) => {
-                eprintln!(
-                    "fixture cleanup: skip pid {pid}, no pidfd ({err}); left to group teardown"
-                );
+                eprintln!("fixture cleanup: pid {pid} not pinned ({err}); not signalled");
                 return None;
             }
         };
@@ -360,7 +398,9 @@ fn stderr_of(output: &Output) -> String {
 
 #[test]
 fn configured_unit_is_started_through_systemctl_user_and_bridge_attaches() {
-    let mut fx = Fixture::new(Some(UNIT), Fake::Succeeds);
+    let Some(mut fx) = Fixture::new(Some(UNIT), Fake::Succeeds) else {
+        return;
+    };
     fx.spawn_bridge();
 
     let (reply, peer_pid) = ping(&fx.api_socket());
@@ -410,7 +450,9 @@ fn configured_unit_is_started_through_systemctl_user_and_bridge_attaches() {
 
 #[test]
 fn failed_unit_start_reports_unit_and_launches_nothing() {
-    let mut fx = Fixture::new(Some(UNIT), Fake::Fails);
+    let Some(mut fx) = Fixture::new(Some(UNIT), Fake::Fails) else {
+        return;
+    };
     fx.spawn_bridge();
     let output = fx.wait_bridge_exit();
     let stderr = stderr_of(&output);
@@ -447,7 +489,9 @@ fn failed_unit_start_reports_unit_and_launches_nothing() {
 fn invalid_config_with_unit_fails_closed_instead_of_detached_defaults() {
     // A managed unit plus an unrelated wrong-typed field: Config::load rejects the whole
     // file and falls back to defaults (no unit), which must not become a detached launch.
-    let mut fx = Fixture::new(Some(UNIT), Fake::Succeeds);
+    let Some(mut fx) = Fixture::new(Some(UNIT), Fake::Succeeds) else {
+        return;
+    };
     let config_path = fx.dir.join("config.toml");
     let mut config = fs::read_to_string(&config_path).unwrap();
     config.push_str("\n[update]\nversion_check = \"yes\"\n");
@@ -479,7 +523,9 @@ fn invalid_config_with_unit_fails_closed_instead_of_detached_defaults() {
 
 #[test]
 fn without_configured_unit_launch_stays_detached_and_skips_systemctl() {
-    let mut fx = Fixture::new(None, Fake::Succeeds);
+    let Some(mut fx) = Fixture::new(None, Fake::Succeeds) else {
+        return;
+    };
     fx.spawn_bridge();
 
     let (reply, peer_pid) = ping(&fx.api_socket());
@@ -503,7 +549,9 @@ fn without_configured_unit_launch_stays_detached_and_skips_systemctl() {
 #[test]
 fn invalid_unit_name_is_rejected_before_any_launch() {
     let bad = "../herdr.service";
-    let mut fx = Fixture::new(Some(bad), Fake::Succeeds);
+    let Some(mut fx) = Fixture::new(Some(bad), Fake::Succeeds) else {
+        return;
+    };
     fx.spawn_bridge();
     let output = fx.wait_bridge_exit();
     let stderr = stderr_of(&output);
@@ -528,7 +576,9 @@ fn invalid_unit_name_is_rejected_before_any_launch() {
 
 #[test]
 fn hung_unit_start_times_out_and_kills_and_reaps_systemctl() {
-    let mut fx = Fixture::new(Some(UNIT), Fake::Hangs);
+    let Some(mut fx) = Fixture::new(Some(UNIT), Fake::Hangs) else {
+        return;
+    };
     let spawned = Instant::now();
     fx.spawn_bridge();
 
@@ -610,7 +660,9 @@ fn hung_unit_start_times_out_and_kills_and_reaps_systemctl() {
 fn cleanup_stops_pinned_fixture_server_and_spares_foreign_candidate() {
     // Owned: the real detached daemon of the no-unit flow (its own session, not in the
     // bridge's group, so only a pidfd can stop it safely).
-    let mut fx = Fixture::new(None, Fake::Succeeds);
+    let Some(mut fx) = Fixture::new(None, Fake::Succeeds) else {
+        return;
+    };
     fx.spawn_bridge();
     let (reply, server) = ping(&fx.api_socket());
     assert_eq!(reply, "pong");
@@ -618,7 +670,9 @@ fn cleanup_stops_pinned_fixture_server_and_spares_foreign_candidate() {
 
     // Foreign: a live real `herdr server` with the same argv shape but another fixture's
     // marker, owned by this test as a direct child.
-    let other = Fixture::new(None, Fake::Succeeds);
+    let Some(other) = Fixture::new(None, Fake::Succeeds) else {
+        return;
+    };
     let mut foreign = other
         .command()
         .arg("server")
@@ -657,4 +711,38 @@ fn cleanup_stops_pinned_fixture_server_and_spares_foreign_candidate() {
     assert!(foreign_alive, "foreign process was signalled");
     assert_eq!(foreign_reply, "pong");
     assert!(fx.fixture_servers().is_empty());
+}
+
+#[test]
+fn unavailable_pidfd_preflight_skips_before_creating_or_spawning_anything() {
+    static OPENS: AtomicU32 = AtomicU32::new(0);
+    fn unavailable(_pid: u32) -> std::io::Result<OwnedFd> {
+        OPENS.fetch_add(1, Ordering::Relaxed);
+        Err(std::io::Error::from_raw_os_error(libc::ENOSYS))
+    }
+    // A private empty root: any fixture file the skipped path created would land here.
+    let root = std::env::temp_dir().join(format!(
+        "lmu-preflight-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    fs::create_dir(&root).expect("create unique preflight root");
+
+    let fixture = Fixture::new_in(&root, None, Fake::Succeeds, unavailable);
+    let created: Vec<_> = fs::read_dir(&root)
+        .map(|entries| entries.flatten().map(|e| e.file_name()).collect())
+        .unwrap_or_default();
+    let _ = fs::remove_dir(&root);
+
+    assert!(fixture.is_none(), "unsupported pidfd must yield no fixture");
+    // The opener was the only probe: one call, and an Err means no pidfd existed to signal.
+    // Nothing can have been spawned: spawning needs the fixture this returned None for.
+    assert_eq!(OPENS.load(Ordering::Relaxed), 1);
+    assert!(
+        created.is_empty(),
+        "skip created fixture files: {created:?}"
+    );
 }

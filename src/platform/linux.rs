@@ -1711,15 +1711,26 @@ struct SystemctlChild {
 }
 
 impl SystemctlChild {
-    /// SIGKILLs and reaps the client. Marks it handled even on failure so Drop
-    /// does not repeat a failing attempt.
+    /// SIGKILLs and reaps the client. Marks it reaped only once a wait has
+    /// actually reaped it, so after a failed attempt Drop tries again.
     fn kill_and_reap(&mut self) -> std::io::Result<()> {
-        self.reaped = true;
-        if let Err(kill_err) = self.child.kill() {
+        self.kill_and_reap_with(std::process::Child::kill)
+    }
+
+    /// `kill_and_reap` with the signal step supplied by the caller. Production
+    /// always passes `Child::kill`; tests inject a failing signal step.
+    fn kill_and_reap_with(
+        &mut self,
+        kill: impl FnOnce(&mut std::process::Child) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        if let Err(kill_err) = kill(&mut self.child) {
             // Kill only fails if the process cannot be signalled; reap it if it
             // has already exited, otherwise report it instead of blocking.
             return match self.child.try_wait() {
-                Ok(Some(_)) => Ok(()),
+                Ok(Some(_)) => {
+                    self.reaped = true;
+                    Ok(())
+                }
                 Ok(None) => Err(std::io::Error::new(
                     kill_err.kind(),
                     format!("kill of pid {} failed: {kill_err}", self.child.id()),
@@ -1733,12 +1744,14 @@ impl SystemctlChild {
                 )),
             };
         }
-        self.child.wait().map(|_| ()).map_err(|err| {
+        self.child.wait().map_err(|err| {
             std::io::Error::new(
                 err.kind(),
                 format!("reap of pid {} failed: {err}", self.child.id()),
             )
-        })
+        })?;
+        self.reaped = true;
+        Ok(())
     }
 
     /// Suffix describing a failed kill/reap for an error message.
@@ -3218,5 +3231,145 @@ mod tests {
         assert_eq!(argv[1], "-c");
         assert!(argv[2].contains("EDITOR:-vi"));
         assert!(argv[2].contains("/tmp/herdr scrollback.txt"));
+    }
+
+    #[test]
+    fn systemctl_child_guard_retries_reap_after_injected_cleanup_failure() {
+        // Decision C: a real CLI kill failure needs unsafe privilege changes;
+        // inject that step while retaining real owned-child cleanup and reap proof.
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+
+        // A pidfd on one real child. It cannot name a reused PID. On drop it
+        // SIGKILLs and reaps the child if a failed assertion unwound before the
+        // guard reaped it; after a reap it returns at once with ECHILD.
+        struct Pidfd(OwnedFd);
+        impl Pidfd {
+            fn open(pid: u32) -> Self {
+                // SAFETY: pidfd_open takes a pid and flags and returns a new fd.
+                let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
+                assert!(
+                    raw >= 0,
+                    "pidfd_open({pid}) failed: {}",
+                    std::io::Error::last_os_error()
+                );
+                // SAFETY: pidfd_open returned a new descriptor nothing else owns.
+                Self(unsafe { OwnedFd::from_raw_fd(raw as RawFd) })
+            }
+            /// 0, or the errno of `pidfd_send_signal`. ESRCH means the process
+            /// is gone: a zombie still accepts signals until it is reaped.
+            fn send_signal(&self, sig: libc::c_int) -> i32 {
+                // SAFETY: the pidfd is open; a null siginfo is allowed.
+                let rc = unsafe {
+                    libc::syscall(
+                        libc::SYS_pidfd_send_signal,
+                        self.0.as_raw_fd(),
+                        sig,
+                        std::ptr::null::<libc::siginfo_t>(),
+                        0,
+                    )
+                };
+                if rc == 0 {
+                    0
+                } else {
+                    std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)
+                }
+            }
+            /// `waitid(P_PIDFD)`: Ok(Some(pid)) for an unreaped exited child,
+            /// Ok(None) for a running child, Err(errno) otherwise; ECHILD
+            /// means this process already reaped it. WNOWAIT never reaps.
+            fn waitid(&self, flags: libc::c_int) -> Result<Option<i32>, i32> {
+                // SAFETY: zeroed siginfo_t is a valid out-parameter.
+                let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+                // SAFETY: the pidfd is open and `info` is writable.
+                let rc = unsafe {
+                    libc::waitid(
+                        libc::P_PIDFD,
+                        self.0.as_raw_fd() as libc::id_t,
+                        &mut info,
+                        libc::WEXITED | flags,
+                    )
+                };
+                if rc != 0 {
+                    return Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(-1));
+                }
+                // SAFETY: waitid succeeded, so si_pid is initialized (0 if none).
+                let pid = unsafe { info.si_pid() };
+                Ok((pid != 0).then_some(pid))
+            }
+            fn assert_gone_and_reaped(&self) {
+                assert_eq!(self.send_signal(0), libc::ESRCH, "child still exists");
+                assert_eq!(
+                    self.waitid(libc::WNOHANG | libc::WNOWAIT),
+                    Err(libc::ECHILD),
+                    "child not reaped by this (live) test process"
+                );
+            }
+        }
+        impl Drop for Pidfd {
+            fn drop(&mut self) {
+                let _ = self.send_signal(libc::SIGKILL);
+                let _ = self.waitid(0);
+            }
+        }
+        fn spawn(program: &str, args: &[&str]) -> (Pidfd, SystemctlChild) {
+            let child = Command::new(program)
+                .args(args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn test child");
+            let guard = SystemctlChild {
+                child,
+                reaped: false,
+            };
+            // Keep cleanup custody even if opening the observer pidfd panics.
+            let pidfd = Pidfd::open(guard.child.id());
+            (pidfd, guard)
+        }
+        let injected = |_: &mut std::process::Child| -> std::io::Result<()> {
+            Err(std::io::Error::from_raw_os_error(libc::EPERM))
+        };
+
+        // Reported path: one injected kill failure while the child is alive.
+        // Locals drop in reverse order, so the guard drops before the pidfd.
+        let (pidfd, mut guard) = spawn("sleep", &["30"]);
+        let pid = guard.child.id();
+        let err = guard
+            .kill_and_reap_with(injected)
+            .expect_err("a failed kill of a live child must be reported");
+        assert!(
+            err.to_string()
+                .contains(&format!("kill of pid {pid} failed")),
+            "{err}"
+        );
+        assert!(
+            !guard.reaped,
+            "cleanup failure must leave the child unreaped"
+        );
+        assert_eq!(pidfd.send_signal(0), 0, "child must still be alive");
+        assert_eq!(pidfd.waitid(libc::WNOHANG | libc::WNOWAIT), Ok(None));
+        // Drop retries the real Child::kill and wait.
+        drop(guard);
+        pidfd.assert_gone_and_reaped();
+        drop(pidfd);
+
+        // Counterexample: normal cleanup kills and reaps on the first try.
+        let (pidfd, mut guard) = spawn("sleep", &["30"]);
+        guard.kill_and_reap().expect("normal kill and reap");
+        assert!(guard.reaped);
+        pidfd.assert_gone_and_reaped();
+        drop(guard);
+        drop(pidfd);
+
+        // A kill failure after the child already exited is reaped by try_wait.
+        let (pidfd, mut guard) = spawn("true", &[]);
+        let pid = i32::try_from(guard.child.id()).expect("pid fits i32");
+        assert_eq!(pidfd.waitid(libc::WNOWAIT), Ok(Some(pid)), "wait for exit");
+        guard
+            .kill_and_reap_with(injected)
+            .expect("an exited child is reaped despite the kill failure");
+        assert!(guard.reaped);
+        pidfd.assert_gone_and_reaped();
     }
 }
