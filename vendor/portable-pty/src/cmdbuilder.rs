@@ -695,7 +695,7 @@ impl CommandBuilder {
             for path in std::env::split_paths(&path) {
                 // Check for exactly the user's string in this path dir
                 let candidate = path.join(&exe);
-                if candidate.exists() {
+                if candidate.is_file() {
                     return candidate.into_os_string();
                 }
 
@@ -707,7 +707,7 @@ impl CommandBuilder {
                     // doesn't want that
                     let ext = ext.to_str().expect("PATHEXT entries must be utf8");
                     let path = path.join(&exe).with_extension(&ext[1..]);
-                    if path.exists() {
+                    if path.is_file() {
                         return path.into_os_string();
                     }
                 }
@@ -890,6 +890,62 @@ fn is_cwd_relative_path<P: AsRef<Path>>(p: P) -> bool {
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_search_path_skips_directories() {
+        use std::os::windows::ffi::OsStringExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "herdr-portable-pty-search-path-{}",
+            std::process::id()
+        ));
+        let shadow_dir = root.join("shadow");
+        let real_dir = root.join("real");
+        std::fs::create_dir_all(shadow_dir.join("herdrprobe")).expect("create shadow directory");
+        std::fs::create_dir_all(shadow_dir.join("herdrprobe.EXE"))
+            .expect("create shadow extension directory");
+        std::fs::create_dir_all(&real_dir).expect("create real directory");
+        let source = std::path::PathBuf::from(std::env::var_os("SystemRoot").expect("SystemRoot"))
+            .join("System32")
+            .join("where.exe");
+        let executable = real_dir.join("herdrprobe.exe");
+        std::fs::copy(&source, &executable).expect("copy probe executable");
+
+        let mut cmd = CommandBuilder::new("herdrprobe");
+        cmd.env(
+            "PATH",
+            std::env::join_paths([&shadow_dir, &real_dir]).expect("join PATH"),
+        );
+        cmd.env("PATHEXT", ".EXE");
+
+        let (exe, _) = cmd.cmdline().expect("command line");
+        let nul = exe
+            .iter()
+            .position(|unit| *unit == 0)
+            .expect("nul terminated executable");
+        let resolved_path = std::path::PathBuf::from(OsString::from_wide(&exe[..nul]));
+        let resolved = resolved_path.canonicalize();
+        let expected = executable.canonicalize().expect("probe executable");
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert_eq!(
+            resolved.expect("resolved executable"),
+            expected,
+            "search_path resolved {:?}",
+            resolved_path
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_cwd_relative() {
+        assert!(is_cwd_relative_path("."));
+        assert!(is_cwd_relative_path("./foo"));
+        assert!(is_cwd_relative_path("../foo"));
+        assert!(!is_cwd_relative_path("foo"));
+        assert!(!is_cwd_relative_path("/foo"));
+    }
+
     #[test]
     fn iter_full_env_includes_base_and_extra_entries() {
         let mut cmd = CommandBuilder::new("dummy");
@@ -938,16 +994,6 @@ mod tests {
         assert!(entries.contains(&(non_unicode.as_os_str(), OsStr::new("value"))));
         assert!(entries.contains(&(OsStr::new("key"), non_unicode.as_os_str())));
         assert_eq!(cmd.iter_full_env_as_str().count(), 0);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn test_cwd_relative() {
-        assert!(is_cwd_relative_path("."));
-        assert!(is_cwd_relative_path("./foo"));
-        assert!(is_cwd_relative_path("../foo"));
-        assert!(!is_cwd_relative_path("foo"));
-        assert!(!is_cwd_relative_path("/foo"));
     }
 
     #[test]
