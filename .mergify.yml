@@ -25,6 +25,7 @@ queue_rules:
       body: empty
     queue_conditions:
       - -label ~= (?i)^(hold|do[ -]?not[ -]?merge|dnm|freeze|frozen)$
+      - -label ~= (?i)^(wip|work[ -]?in[ -]?progress|do[ -]?not[ -]?land|never[ -]?land)$
       - base ~= ^(master|smarty-preview-source)$
       - -draft
       - -label = hold
