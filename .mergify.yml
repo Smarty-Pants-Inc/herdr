@@ -1,10 +1,15 @@
+# Follow smarty-dev's .mergify.yml auto-queue pattern for ready PRs.
+# `hold` is the opt-out; every queue keeps the same required checks.
+merge_protections_settings:
+  auto_merge_conditions: true
+
 merge_queue:
   mode: serial
   max_parallel_checks: 2
   reset_on_external_merge: always
 
 # smarty-dev's plain rule (smarty-dev#865): the PR, its required checks and this queue are the
-# review. The Astra reviewer queues a ready PR after its success verdict; `hold` and DO NOT LAND
+# review. Mergify queues a ready PR once queue_conditions pass; `hold` and DO NOT LAND
 # titles keep a PR out.
 queue_rules:
   - name: default
@@ -19,6 +24,7 @@ queue_rules:
       title: pr-title
       body: empty
     queue_conditions:
+      - -label ~= (?i)^(hold|do[ -]?not[ -]?merge|dnm|freeze|frozen)$
       - base ~= ^(master|smarty-preview-source)$
       - -draft
       - -label = hold
