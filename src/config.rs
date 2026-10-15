@@ -120,6 +120,7 @@ impl Config {
             .chain(window_title_diagnostics(&self.ui.window_title))
             .chain(self.invalid_sidebar_bounds_diagnostic())
             .chain(self.invalid_headless_size_diagnostic())
+            .chain(self.server.validated_systemd_unit().err())
             .chain(self.invalid_pane_nice_diagnostic())
             .collect()
     }

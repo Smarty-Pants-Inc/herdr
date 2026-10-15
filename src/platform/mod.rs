@@ -1960,6 +1960,25 @@ pub fn launch_server_daemon_command(command: &mut std::process::Command) -> std:
     command.spawn().map(|child| child.id())
 }
 
+/// Whether `server.systemd_unit` auto-start applies on this platform. Elsewhere
+/// the key is ignored and the detached daemon is used.
+pub(crate) const SYSTEMD_USER_UNITS_SUPPORTED: bool = cfg!(target_os = "linux");
+
+/// Starts the herdr server through an already validated systemd user unit.
+///
+/// Only Linux supports this; callers check `SYSTEMD_USER_UNITS_SUPPORTED`
+/// first, so the non-Linux error is an unreachable guard.
+pub(crate) fn start_server_user_unit(unit: &str) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    return linux::start_systemd_user_unit(unit);
+
+    #[cfg(not(target_os = "linux"))]
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        format!("server.systemd_unit {unit:?} is only supported on Linux; remove it from the config to auto-start the server"),
+    ))
+}
+
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn prepare_server_process(_handoff_import: bool) -> std::io::Result<bool> {
     Ok(false)
