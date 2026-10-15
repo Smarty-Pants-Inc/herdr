@@ -43,6 +43,13 @@ queue_rules:
       - -check-failure = smarty-ci
     merge_conditions:
       # An opt-out added after queueing must stop the merge.
+      - base ~= ^(master|smarty-preview-source)$
+      - -draft
+      - -title ~= (?i)do not land
+      - check-success = review/astra
+      - or:
+          - -head ~= ^sync/upstream-
+          - check-success = review/security
       - -label ~= (?i)^(hold|do[ -]?not[ -]?merge|dnm|freeze|frozen)$
       - -label ~= (?i)^(wip|work[ -]?in[ -]?progress|do[ -]?not[ -]?land|never[ -]?land)$
       - -label = hold
