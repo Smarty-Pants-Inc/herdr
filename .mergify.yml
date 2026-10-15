@@ -31,6 +31,7 @@ queue_rules:
       - -label = hold
       - -title ~= (?i)do not land
       - check-success = review/astra
+      - -check-failure = review/security  # a failed security verdict refuses admission, label or not
       # A PR that needs a named security pass waits for review/security, which herdr-security-astra posts on
       # the exact head (smarty-dev#806, #855); so does an upstream sync (smarty-dev#755).
       - or:
