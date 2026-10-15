@@ -585,6 +585,22 @@ fn git_watch_repair_non_utf8_ancestor_relative_markers_common_ref_update() {
     assert_eq!(app.state.workspaces[0].git_ahead_behind(), Some((0, 0)));
 }
 
+#[track_caller]
+fn assert_no_git_watch_wakeup(app: &mut App) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("build retired git watch runtime");
+    runtime.block_on(async {
+        match tokio::time::timeout(std::time::Duration::from_millis(250), app.event_rx.recv()).await
+        {
+            Err(_) => {}
+            Ok(Some(event)) => panic!("retired config path still wakes App: {event:?}"),
+            Ok(None) => panic!("Git watch event channel closed while checking removal"),
+        }
+    });
+}
+
 #[test]
 fn git_watch_repair_removed_workspace_drops_its_cached_config_dependency() {
     isolated_git_watch_test!(git_watch_repair_removed_workspace_drops_its_cached_config_dependency);
@@ -600,14 +616,11 @@ fn git_watch_repair_removed_workspace_drops_its_cached_config_dependency() {
     drive_git_watch_refresh(&mut app);
     app.state.workspaces.pop();
     app.sync_git_watches();
-    // Wait for setup workers and late native hints, not just a fixed sleep.
-    drain_git_watch_hints(&mut app);
+    // The setup worker's completion above is the readiness marker. Removal
+    // must reconcile watches synchronously: no forced worker may repair stale
+    // config dependencies before this native no-wakeup check.
     second.git(&["config", "unused.removed", "changed"]);
-    std::thread::sleep(std::time::Duration::from_millis(150));
-    assert!(
-        app.event_rx.try_recv().is_err(),
-        "retired config path still wakes App"
-    );
+    assert_no_git_watch_wakeup(&mut app);
     first.git(&["commit", "--allow-empty", "-m", "retained root"]);
     drive_git_watch_refresh(&mut app);
     assert_eq!(app.state.workspaces[0].git_ahead_behind(), Some((1, 0)));
