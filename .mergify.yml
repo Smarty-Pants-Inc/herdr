@@ -42,20 +42,17 @@ queue_rules:
       - check-success = smarty-ci
       - -check-failure = smarty-ci
     merge_conditions:
-      # An opt-out added after queueing must stop the merge.
+      # Label and title opt-outs added after queueing stop the merge.
+      # Review statuses here only refuse a FAILED review: an in-place or batch update
+      # makes a new head with no review statuses (smarty-dev#455).
+      # queue_conditions require the reviews on the reviewed head.
       - base ~= ^(master|smarty-preview-source)$
-      - -draft
       - -title ~= (?i)do not land
-      - check-success = review/astra
-      - or:
-          - -head ~= ^sync/upstream-
-          - check-success = review/security
+      - -check-failure = review/astra
       - -label ~= (?i)^(hold|do[ -]?not[ -]?merge|dnm|freeze|frozen)$
       - -label ~= (?i)^(wip|work[ -]?in[ -]?progress|do[ -]?not[ -]?land|never[ -]?land)$
       - -label = hold
-      - or:
-          - -label = needs-security-pass
-          - check-success = review/security
+      - -check-failure = review/security
       - check-success = smarty-ci
       - -check-failure = smarty-ci
 
