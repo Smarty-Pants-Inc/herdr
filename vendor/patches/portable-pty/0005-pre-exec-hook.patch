@@ -1,0 +1,134 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: smarty-fleet-write[bot] <333979660+smarty-fleet-write[bot]@users.noreply.github.com>
+Subject: [PATCH] run a caller hook in the pty child before exec
+
+Herdr resets each pane child to SCHED_OTHER and the configured nice value
+before exec, so a server at idle CPU priority does not pass it to panes.
+The hook runs after setsid and TIOCSCTTY and before inherited descriptors
+are closed; it cannot fail the spawn.
+
+Issue: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/11237
+Upstream discussion: none
+Upstream PR: none
+Vendored base: portable-pty 0.9.0
+---
+diff --git a/vendor/portable-pty/src/cmdbuilder.rs b/vendor/portable-pty/src/cmdbuilder.rs
+index 34cc8088..4ce63824 100644
+--- a/vendor/portable-pty/src/cmdbuilder.rs
++++ b/vendor/portable-pty/src/cmdbuilder.rs
+@@ -231,6 +231,41 @@ fn get_base_env() -> BTreeMap<OsString, EnvEntry> {
+     env
+ }
+
++/// A callback run in the forked child immediately before `exec`.
++#[cfg(unix)]
++#[derive(Clone)]
++pub struct PreExecHook(std::sync::Arc<dyn Fn() + Send + Sync>);
++
++#[cfg(unix)]
++impl PreExecHook {
++    /// # Safety
++    ///
++    /// `hook` runs in the forked child of a possibly multi-threaded parent.
++    /// It must only call async-signal-safe functions: no allocation, locking
++    /// or logging.
++    pub unsafe fn new(hook: impl Fn() + Send + Sync + 'static) -> Self {
++        Self(std::sync::Arc::new(hook))
++    }
++
++    pub(crate) fn run(&self) {
++        (self.0)();
++    }
++}
++
++#[cfg(unix)]
++impl std::fmt::Debug for PreExecHook {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.write_str("PreExecHook")
++    }
++}
++
++#[cfg(unix)]
++impl PartialEq for PreExecHook {
++    fn eq(&self, other: &Self) -> bool {
++        std::sync::Arc::ptr_eq(&self.0, &other.0)
++    }
++}
++
+ /// `CommandBuilder` is used to prepare a command to be spawned into a pty.
+ /// The interface is intentionally similar to that of `std::process::Command`.
+ #[derive(Clone, Debug, PartialEq)]
+@@ -243,6 +278,9 @@ pub struct CommandBuilder {
+     cwd: Option<OsString>,
+     #[cfg(unix)]
+     pub(crate) umask: Option<libc::mode_t>,
++    #[cfg(unix)]
++    #[cfg_attr(feature = "serde_support", serde(skip))]
++    pub(crate) pre_exec_hook: Option<PreExecHook>,
+     controlling_tty: bool,
+ }
+
+@@ -258,6 +296,8 @@ impl CommandBuilder {
+             cwd: None,
+             #[cfg(unix)]
+             umask: None,
++            #[cfg(unix)]
++            pre_exec_hook: None,
+             controlling_tty: true,
+         }
+     }
+@@ -272,6 +312,8 @@ impl CommandBuilder {
+             cwd: None,
+             #[cfg(unix)]
+             umask: None,
++            #[cfg(unix)]
++            pre_exec_hook: None,
+             controlling_tty: true,
+         }
+     }
+@@ -301,6 +343,8 @@ impl CommandBuilder {
+             cwd: None,
+             #[cfg(unix)]
+             umask: None,
++            #[cfg(unix)]
++            pre_exec_hook: None,
+             controlling_tty: true,
+         }
+     }
+@@ -469,6 +513,13 @@ impl CommandBuilder {
+         self.umask = mask;
+     }
+
++    /// Run `hook` in the child after the session and controlling terminal
++    /// are established and before inherited descriptors are closed and the
++    /// program is executed. The hook cannot fail the spawn.
++    pub fn pre_exec_hook(&mut self, hook: Option<PreExecHook>) {
++        self.pre_exec_hook = hook;
++    }
++
+     fn resolve_path(&self) -> Option<&OsStr> {
+         self.get_env("PATH")
+     }
+diff --git a/vendor/portable-pty/src/unix.rs b/vendor/portable-pty/src/unix.rs
+index cc458ce9..1555d7f4 100644
+--- a/vendor/portable-pty/src/unix.rs
++++ b/vendor/portable-pty/src/unix.rs
+@@ -227,6 +227,7 @@ impl PtyFd {
+
+     fn spawn_command(&self, builder: CommandBuilder) -> anyhow::Result<std::process::Child> {
+         let configured_umask = builder.umask;
++        let pre_exec_hook = builder.pre_exec_hook.clone();
+
+         let mut cmd = builder.as_command()?;
+         let controlling_tty = builder.get_controlling_tty();
+@@ -273,6 +274,10 @@ impl PtyFd {
+                         }
+                     }
+
++                    if let Some(hook) = &pre_exec_hook {
++                        hook.run();
++                    }
++
+                     close_random_fds();
+
+                     if let Some(mask) = configured_umask {

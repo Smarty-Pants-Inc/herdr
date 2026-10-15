@@ -41,6 +41,9 @@ pub(super) mod server_key;
 mod shutdown;
 pub(crate) use shutdown::monitor_host_shutdown;
 
+mod scheduling;
+pub(crate) use scheduling::{check_server_scheduling, prepare_pane_scheduling, PaneScheduling};
+
 pub(super) fn local_socket_peer_pid_platform(fd: RawFd) -> Option<u32> {
     let mut credentials = std::mem::MaybeUninit::<libc::ucred>::zeroed();
     let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;

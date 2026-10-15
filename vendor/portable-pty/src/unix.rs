@@ -227,6 +227,7 @@ impl PtyFd {
 
     fn spawn_command(&self, builder: CommandBuilder) -> anyhow::Result<std::process::Child> {
         let configured_umask = builder.umask;
+        let pre_exec_hook = builder.pre_exec_hook.clone();
 
         let mut cmd = builder.as_command()?;
         let controlling_tty = builder.get_controlling_tty();
@@ -271,6 +272,10 @@ impl PtyFd {
                         if libc::ioctl(0, libc::TIOCSCTTY as _, 0) == -1 {
                             return Err(io::Error::last_os_error());
                         }
+                    }
+
+                    if let Some(hook) = &pre_exec_hook {
+                        hook.run();
                     }
 
                     close_random_fds();
