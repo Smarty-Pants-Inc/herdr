@@ -42,6 +42,13 @@ queue_rules:
       - check-success = smarty-ci
       - -check-failure = smarty-ci
     merge_conditions:
+      # An opt-out added after queueing must stop the merge.
+      - -label ~= (?i)^(hold|do[ -]?not[ -]?merge|dnm|freeze|frozen)$
+      - -label ~= (?i)^(wip|work[ -]?in[ -]?progress|do[ -]?not[ -]?land|never[ -]?land)$
+      - -label = hold
+      - or:
+          - -label = needs-security-pass
+          - check-success = review/security
       - check-success = smarty-ci
       - -check-failure = smarty-ci
 
