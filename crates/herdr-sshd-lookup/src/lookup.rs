@@ -1738,6 +1738,52 @@ mod tests {
     }
 
     /// Stops and reaps a spawned process on every exit path.
+    /// Whether process `pid` (this test's child) holds a socket whose peer is
+    /// bound to `path`. Reads each socket through a duplicate (`pidfd_getfd`).
+    #[cfg(debug_assertions)]
+    fn connected_to(pid: u32, path: &str) -> bool {
+        // SAFETY: integer-only syscall; a nonnegative result is a new descriptor.
+        let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as RawFd;
+        if pidfd < 0 {
+            return false;
+        }
+        let numbers: Vec<libc::c_int> = std::fs::read_dir(format!("/proc/{pid}/fd"))
+            .map(|entries| {
+                entries
+                    .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse().ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let found = numbers.into_iter().any(|number| {
+            // SAFETY: integer-only syscall; a nonnegative result is a new descriptor.
+            let fd = unsafe { libc::syscall(libc::SYS_pidfd_getfd, pidfd, number, 0) } as RawFd;
+            if fd < 0 {
+                return false;
+            }
+            let mut address = std::mem::MaybeUninit::<libc::sockaddr_un>::zeroed();
+            let mut len = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+            // SAFETY: getpeername writes at most `len` bytes into the zeroed address.
+            let named =
+                unsafe { libc::getpeername(fd, address.as_mut_ptr().cast(), &mut len) } == 0;
+            // SAFETY: closing the duplicate made above.
+            unsafe { libc::close(fd) };
+            // SAFETY: zero-initialized, and getpeername filled it on success.
+            let address = unsafe { address.assume_init() };
+            let peer: Vec<u8> = address
+                .sun_path
+                .iter()
+                .take_while(|c| **c != 0)
+                .map(|c| *c as u8)
+                .collect();
+            named
+                && address.sun_family == libc::AF_UNIX as libc::sa_family_t
+                && peer == path.as_bytes()
+        });
+        // SAFETY: closing the pidfd opened above.
+        unsafe { libc::close(pidfd) };
+        found
+    }
+
     /// A new private directory (`mkdtemp`), removed on every exit path.
     #[cfg(debug_assertions)]
     struct TempDir(std::path::PathBuf);
@@ -1868,23 +1914,20 @@ mod tests {
         // The server is non-dumpable: the reads the helper used to make refuse.
         assert_eq!(real.exe(server_pid), Some(Exe::Unreadable));
         assert_eq!(real.sockets(server_pid), None);
-        // The server's accepted socket from the bridge: once the bridge's
-        // startup probe has closed (the server closes it at its EOF), the one
-        // connection on the client path, the same for 300 ms, well inside the
-        // server's 4 s hello deadline. After the lookup it must still be there
-        // with the bridge alive: a probe's socket would be gone.
-        let (mut last, mut stable) = (None, 0);
+        // The server's accepted socket from the bridge's persistent
+        // connection. The bridge closes its startup probe before it makes that
+        // connection, so once the bridge holds a socket connected to the client
+        // path, any other row on the path is the probe's server side or a
+        // connection not yet accepted (inode 0). One row with an inode is then
+        // the persistent connection's accepted socket.
         let accepted = loop {
-            let now = client_rows(&mut real).1;
-            stable = if now.len() == 1 && last.as_ref() == Some(&now) {
-                stable + 1
-            } else {
-                0
-            };
-            if stable == 6 {
-                break now[0];
+            if connected_to(bridge_pid, &path) {
+                if let [inode] = client_rows(&mut real).1[..] {
+                    if inode != 0 {
+                        break inode;
+                    }
+                }
             }
-            last = Some(now);
             assert!(Instant::now() < deadline, "bridge did not connect");
             std::thread::sleep(Duration::from_millis(50));
         };
