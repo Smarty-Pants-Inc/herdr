@@ -46,9 +46,15 @@ pub(crate) fn literal_slots(args: &[String]) -> Vec<usize> {
         return Vec::new();
     };
     index += 1;
-    // Preserve the existing prompt parser's exact first-two-argv contract.
+    // Protect exactly the TARGET/TEXT the prompt parser will read, from the
+    // same classification it uses.
     if command == "prompt" {
-        return (index..(index + 2).min(args.len())).collect();
+        let argv = classify_prompt_argv(&args[index..]);
+        return [argv.target, argv.text]
+            .into_iter()
+            .flatten()
+            .map(|slot| index + slot)
+            .collect();
     }
     let positional_count = match command {
         "channel-info" | "draft-state" => 1,
@@ -85,6 +91,95 @@ pub(crate) fn literal_slots(args: &[String]) -> Vec<usize> {
         index += 1;
     }
     slots
+}
+
+const ALLOW_CROSS_PANE: &str = "--allow-cross-pane";
+
+/// Roles in `agent prompt` argv (the argv after `prompt`), as indices into it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct PromptArgv {
+    pub(super) target: Option<usize>,
+    pub(super) text: Option<usize>,
+    /// Set by an opt-in before TARGET or right after it. An opt-in after TEXT
+    /// is an ordinary trailing option, parsed with the others from `options`.
+    pub(super) cross_pane_opt_in: bool,
+    /// First index of the trailing options (after TEXT).
+    pub(super) options: usize,
+}
+
+/// The one classification of `agent prompt` argv (smarty-dev#9677). Both the
+/// prompt parser and the global session/remote extractors (through
+/// `literal_slots`) use it, so they cannot disagree on TARGET, TEXT or the
+/// opt-in.
+///
+/// Global launch options (`--session`, `--remote`, `--remote-keybindings` with
+/// their values in either form, and `--handoff`) before the first `--` are
+/// identified first; opt-in positions are counted on the remaining argv. An
+/// exact `--allow-cross-pane` is the cross-pane opt-in only:
+/// (a) leading, before TARGET, possibly repeated; or
+/// (b) right after TARGET, when a next argument exists and does not start
+///     with `-`; that argument is TEXT.
+/// Then globals before TEXT are extracted and are not TARGET or TEXT.
+///
+/// Otherwise master's contract holds unchanged: the first two RAW argv are
+/// the literal TARGET and TEXT, whatever their shape, including a global
+/// option such as `--session=work`; globals are only extracted after them.
+/// So `<pane> --allow-cross-pane` and `<pane> --allow-cross-pane --wait` send
+/// the literal text `--allow-cross-pane`, and `<pane> --session=work --wait`
+/// sends the literal text `--session=work`. A trailing `--allow-cross-pane`
+/// (c) is parsed as an option after TEXT, as before. Indexing that path by
+/// `positions` instead would extract such a TEXT and shift the next option
+/// into it, which master never did.
+///
+/// Removing any of the identified globals does not change the result, so
+/// classifying before, between and after the two extractors agrees. The
+/// remote extractor still extracts after a `--` that is the protected TARGET
+/// or TEXT, as on master; that only affects options after TEXT.
+pub(super) fn classify_prompt_argv(args: &[String]) -> PromptArgv {
+    let mut positions = Vec::with_capacity(args.len());
+    let mut index = 0;
+    while index < args.len() {
+        if args[index] == "--" {
+            // No global option is identified after the separator.
+            positions.extend(index..args.len());
+            break;
+        }
+        let next = skip_launch_options(args, index);
+        if next == index {
+            positions.push(index);
+            index += 1;
+        } else {
+            index = next;
+        }
+    }
+    let arg = |slot: usize| positions.get(slot).map(|&index| args[index].as_str());
+    let leading = positions
+        .iter()
+        .take_while(|&&index| args[index] == ALLOW_CROSS_PANE)
+        .count();
+    // Nothing after a `--` TARGET is an opt-in.
+    let after_target = arg(leading).is_some_and(|target| target != "--")
+        && arg(leading + 1) == Some(ALLOW_CROSS_PANE)
+        && arg(leading + 2).is_some_and(|next| !next.starts_with('-'));
+    if leading == 0 && !after_target {
+        // Master's literal slots: raw argv 0 and 1, not `positions`.
+        return PromptArgv {
+            target: (!args.is_empty()).then_some(0),
+            text: (args.len() > 1).then_some(1),
+            cross_pane_opt_in: false,
+            options: args.len().min(2),
+        };
+    }
+    let target = positions.get(leading).copied();
+    let text = positions
+        .get(leading + 1 + usize::from(after_target))
+        .copied();
+    PromptArgv {
+        target,
+        text,
+        cross_pane_opt_in: true,
+        options: text.map_or(args.len(), |text| text + 1),
+    }
 }
 
 fn parse_terminal_target(args: &[String], command: &str) -> Result<String, i32> {
@@ -804,6 +899,415 @@ mod tests {
             assert_eq!(literal_slots(&input), [3, 4]);
         }
         assert!(literal_slots(&args(&["herdr", "pane", "run", "w1:p1", "text"])).is_empty());
+    }
+
+    #[test]
+    fn prompt_argv_takes_cross_pane_opt_in_only_in_unambiguous_positions() {
+        const FLAG: &str = "--allow-cross-pane";
+        let classify = |input: &[&str]| {
+            let argv = classify_prompt_argv(&args(input));
+            (argv.target, argv.text, argv.cross_pane_opt_in, argv.options)
+        };
+        for (input, expected) in [
+            // (a) leading, possibly repeated.
+            (&[FLAG, "w1", "hi"][..], (Some(1), Some(2), true, 3)),
+            (&[FLAG, FLAG, "w1", "hi"][..], (Some(2), Some(3), true, 4)),
+            (
+                &[FLAG, "w1", "hi", "--wait"][..],
+                (Some(1), Some(2), true, 3),
+            ),
+            (&[FLAG, "--", "hi"][..], (Some(1), Some(2), true, 3)),
+            (&[FLAG, "w1"][..], (Some(1), None, true, 2)),
+            (&[FLAG][..], (None, None, true, 1)),
+            // (b) right after TARGET, before a next argument not starting with '-'.
+            (&["w1", FLAG, "hi"][..], (Some(0), Some(2), true, 3)),
+            (
+                &["w1", FLAG, "hi", "--wait"][..],
+                (Some(0), Some(2), true, 3),
+            ),
+            (&[FLAG, "w1", FLAG, "hi"][..], (Some(1), Some(3), true, 4)),
+            // (c) after TEXT it is a trailing option, as before.
+            (&["w1", "hi", FLAG][..], (Some(0), Some(1), false, 2)),
+            // Everything else keeps the literal first-two-argv contract.
+            (&["w1", FLAG][..], (Some(0), Some(1), false, 2)),
+            (&["w1", FLAG, "--wait"][..], (Some(0), Some(1), false, 2)),
+            (&["w1", FLAG, "-x"][..], (Some(0), Some(1), false, 2)),
+            (&["w1", FLAG, "--"][..], (Some(0), Some(1), false, 2)),
+            (&["w1", FLAG, FLAG][..], (Some(0), Some(1), false, 2)),
+            (&["--", FLAG, "hi"][..], (Some(0), Some(1), false, 2)),
+            (&[FLAG, "--", FLAG, "hi"][..], (Some(1), Some(2), true, 3)),
+            (&["w1", "hi"][..], (Some(0), Some(1), false, 2)),
+            (&["w1"][..], (Some(0), None, false, 1)),
+            (&[][..], (None, None, false, 0)),
+            (
+                &["--session=target", "--remote=text"][..],
+                (Some(0), Some(1), false, 2),
+            ),
+            // Positions are counted after global options and their values.
+            (
+                &["w1", "--session=x", FLAG, "hi"][..],
+                (Some(0), Some(3), true, 4),
+            ),
+            (
+                &[FLAG, "--session=work", "w1:p2", "--remote=host"][..],
+                (Some(2), None, true, 4),
+            ),
+            (
+                &[FLAG, "--session=work", "w1:p2", "--remote=host", "hi"][..],
+                (Some(2), Some(4), true, 5),
+            ),
+            (
+                &[
+                    FLAG,
+                    "--session",
+                    "work",
+                    "w1",
+                    "--remote",
+                    "host",
+                    "hi",
+                    "--wait",
+                ][..],
+                (Some(3), Some(6), true, 7),
+            ),
+            (
+                &["--session=work", FLAG, "--handoff", "w1", "hi"][..],
+                (Some(3), Some(4), true, 5),
+            ),
+            (
+                &["w1", FLAG, "--remote-keybindings", "server", "hi"][..],
+                (Some(0), Some(4), true, 5),
+            ),
+            (
+                &["w1", FLAG, "--session=x"][..],
+                (Some(0), Some(1), false, 2),
+            ),
+            (
+                &["w1", FLAG, "--session", "y"][..],
+                (Some(0), Some(1), false, 2),
+            ),
+        ] {
+            assert_eq!(classify(input), expected, "{input:?}");
+        }
+    }
+
+    #[test]
+    fn prompt_literal_slots_are_the_classified_target_and_text() {
+        let prompt = |rest: &[&str]| {
+            let mut input = args(&["herdr", "--session", "s", "agent", "prompt"]);
+            input.extend(args(rest));
+            literal_slots(&input)
+        };
+        let flag = "--allow-cross-pane";
+        assert!(prompt(&[flag, "--remote=t", "--session=x"]).is_empty());
+        assert_eq!(prompt(&[flag, "w1", "--remote=x", "hi"]), [6, 8]);
+        assert_eq!(prompt(&["w1", flag, "--session=x"]), [5, 6]);
+        assert_eq!(prompt(&["w1", flag, "hi", "--session", "y"]), [5, 7]);
+        assert_eq!(prompt(&["w1", flag, "--session", "y", "hi"]), [5, 9]);
+        assert_eq!(prompt(&["w1", "hi", flag]), [5, 6]);
+        assert_eq!(prompt(&["w1", flag, "--wait"]), [5, 6]);
+        assert_eq!(
+            prompt(&[flag, "--session=work", "w1:p2", "--remote=host"]),
+            [7]
+        );
+    }
+
+    /// Session extraction, then remote extraction, then the prompt parser, as
+    /// `main` runs them; each classifies the argv it sees.
+    fn extract_prompt(rest: &[&str]) -> (Option<String>, Option<String>, Vec<String>, PromptArgv) {
+        crate::session::clear_explicit_session_for_test();
+        let mut input = args(&["herdr", "agent", "prompt"]);
+        input.extend(args(rest));
+        let cleaned = crate::session::configure_from_args(&input).unwrap();
+        let (cleaned, remote) = crate::remote::extract_remote_args(&cleaned).unwrap();
+        let prompt_argv = cleaned[3..].to_vec();
+        let argv = classify_prompt_argv(&prompt_argv);
+        (
+            crate::session::explicit_session_requested()
+                .then(|| crate::session::active_name().unwrap_or_default()),
+            remote.map(|remote| remote.target),
+            prompt_argv,
+            argv,
+        )
+    }
+
+    #[test]
+    fn prompt_classification_agrees_across_global_extraction() {
+        let env = crate::environment::test_env();
+        const FLAG: &str = "--allow-cross-pane";
+
+        // Review trace 1: master behavior, literal flag TEXT and --wait option.
+        env.remove(crate::session::SESSION_ENV_VAR);
+        let (session, remote, cleaned, argv) = extract_prompt(&["w1", FLAG, "--wait"]);
+        assert_eq!((session, remote), (None, None));
+        assert_eq!(cleaned, args(&["w1", FLAG, "--wait"]));
+        assert_eq!(argv.target.map(|i| cleaned[i].as_str()), Some("w1"));
+        assert_eq!(argv.text.map(|i| cleaned[i].as_str()), Some(FLAG));
+        assert!(!argv.cross_pane_opt_in);
+        assert_eq!(&cleaned[argv.options..], ["--wait"]);
+
+        // Review trace 2: both globals applied, TARGET kept, no TEXT consumed.
+        for (rest, text) in [
+            (
+                &[FLAG, "--session=work", "w1:p2", "--remote=host"][..],
+                None,
+            ),
+            (
+                &[FLAG, "--session=work", "w1:p2", "--remote=host", "hi"][..],
+                Some("hi"),
+            ),
+            (
+                &[FLAG, "--session", "work", "w1:p2", "--remote", "host", "hi"][..],
+                Some("hi"),
+            ),
+            (
+                &["w1:p2", FLAG, "--session=work", "--remote=host", "hi"][..],
+                Some("hi"),
+            ),
+        ] {
+            env.remove(crate::session::SESSION_ENV_VAR);
+            let (session, remote, cleaned, argv) = extract_prompt(rest);
+            assert_eq!(session.as_deref(), Some("work"), "{rest:?}");
+            assert_eq!(remote.as_deref(), Some("host"), "{rest:?}");
+            let mut expected = args(&[FLAG, "w1:p2"]);
+            if rest[0] != FLAG {
+                expected.swap(0, 1);
+            }
+            expected.extend(text.map(str::to_owned));
+            assert_eq!(cleaned, expected, "{rest:?}");
+            assert_eq!(argv.target.map(|i| cleaned[i].as_str()), Some("w1:p2"));
+            assert_eq!(argv.text.map(|i| cleaned[i].as_str()), text, "{rest:?}");
+            assert!(argv.cross_pane_opt_in, "{rest:?}");
+            assert_eq!(argv.options, cleaned.len(), "{rest:?}");
+        }
+
+        // Without an opt-in before TEXT, the first two raw argv stay the
+        // literal TARGET and TEXT as on master, even when they are globals.
+        env.remove(crate::session::SESSION_ENV_VAR);
+        let (session, remote, cleaned, argv) =
+            extract_prompt(&["--session=t", "--remote=x", "--session=work"]);
+        assert_eq!((session.as_deref(), remote), (Some("work"), None));
+        assert_eq!(cleaned, args(&["--session=t", "--remote=x"]));
+        assert_eq!(
+            argv.target.map(|i| cleaned[i].as_str()),
+            Some("--session=t")
+        );
+        assert_eq!(argv.text.map(|i| cleaned[i].as_str()), Some("--remote=x"));
+        assert!(!argv.cross_pane_opt_in);
+        assert_eq!(argv.options, cleaned.len());
+        env.remove(crate::session::SESSION_ENV_VAR);
+        crate::session::clear_explicit_session_for_test();
+    }
+
+    // smarty-dev#9677 review trace 3. Master protects the first two raw argv,
+    // so `--session=work` is the literal TEXT and is not extracted, and
+    // `--wait --timeout 1000` stay options. Indexing TARGET/TEXT by positions
+    // would instead make `--wait` the TEXT and fail on `--timeout`.
+    #[test]
+    fn prompt_global_in_the_text_slot_stays_literal_text_as_on_master() {
+        let env = crate::environment::test_env();
+        env.remove(crate::session::SESSION_ENV_VAR);
+        let rest = ["w1:p1", "--session=work", "--wait", "--timeout", "1000"];
+        let mut input = args(&["herdr", "agent", "prompt"]);
+        input.extend(args(&rest));
+        assert_eq!(literal_slots(&input), [3, 4]);
+        let (session, remote, cleaned, argv) = extract_prompt(&rest);
+        assert_eq!((session, remote), (None, None));
+        assert_eq!(cleaned, args(&rest));
+        assert_eq!(argv.target.map(|i| cleaned[i].as_str()), Some("w1:p1"));
+        assert_eq!(
+            argv.text.map(|i| cleaned[i].as_str()),
+            Some("--session=work")
+        );
+        assert!(!argv.cross_pane_opt_in);
+        assert_eq!(&cleaned[argv.options..], ["--wait", "--timeout", "1000"]);
+        assert_eq!(
+            master_prompt(&rest),
+            (
+                None,
+                None,
+                Some("w1:p1".into()),
+                Some("--session=work".into()),
+                args(&["--wait", "--timeout", "1000"]),
+            )
+        );
+        crate::session::clear_explicit_session_for_test();
+    }
+
+    /// (session, remote, TARGET, TEXT, options) of an `agent prompt` argv.
+    type PromptOutcome = (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Vec<String>,
+    );
+
+    /// An independent model of master (4e5a64d2) for `agent prompt`, written
+    /// from its code: `literal_slots` protects exactly the first two raw argv
+    /// after `prompt`; the session extractor stops at any `--`; the remote
+    /// extractor keeps a protected `--` and continues, stops at an unprotected
+    /// one, and moves an unused `--handoff` to the end; the parser reads TARGET
+    /// and TEXT as argv 0 and 1, then options.
+    fn master_prompt(rest: &[&str]) -> PromptOutcome {
+        let mut session = None;
+        let mut after_session: Vec<&str> = Vec::new();
+        let mut index = 0;
+        while index < rest.len() {
+            let arg = rest[index];
+            if arg == "--" {
+                after_session.extend(&rest[index..]);
+                break;
+            }
+            if index < 2 {
+                after_session.push(arg);
+            } else if arg == "--session" {
+                session = Some(rest[index + 1].to_owned());
+                index += 1;
+            } else if let Some(value) = arg.strip_prefix("--session=") {
+                session = Some(value.to_owned());
+            } else {
+                after_session.push(arg);
+            }
+            index += 1;
+        }
+        let (mut remote, mut handoff) = (None, false);
+        let mut cleaned: Vec<String> = Vec::new();
+        let mut index = 0;
+        while index < after_session.len() {
+            let arg = after_session[index];
+            if index < 2 {
+                cleaned.push(arg.to_owned());
+            } else if arg == "--" {
+                cleaned.extend(after_session[index..].iter().map(|arg| (*arg).to_owned()));
+                break;
+            } else if arg == "--handoff" {
+                handoff = true;
+            } else if arg == "--remote" || arg == "--remote-keybindings" {
+                if arg == "--remote" {
+                    remote = Some(after_session[index + 1].to_owned());
+                }
+                index += 1;
+            } else if let Some(value) = arg.strip_prefix("--remote=") {
+                remote = Some(value.to_owned());
+            } else if !arg.starts_with("--remote-keybindings=") {
+                cleaned.push(arg.to_owned());
+            }
+            index += 1;
+        }
+        if remote.is_none() && handoff {
+            cleaned.push("--handoff".into());
+        }
+        (
+            session,
+            remote,
+            cleaned.first().cloned(),
+            cleaned.get(1).cloned(),
+            cleaned.iter().skip(2).cloned().collect(),
+        )
+    }
+
+    // Every argv without a cross-pane opt-in before TEXT behaves exactly as on
+    // master, with globals before, between and after TARGET and TEXT.
+    #[test]
+    fn no_opt_in_prompt_argv_matches_master() {
+        let env = crate::environment::test_env();
+        const FLAG: &str = "--allow-cross-pane";
+        let table: &[&[&str]] = &[
+            &[],
+            &["w1:p1"],
+            &["w1:p1", "hi"],
+            &["w1:p1", "hi", "--wait", "--timeout", "1000"],
+            // Globals before TARGET.
+            &["--session=work"],
+            &["--session=work", "w1:p1", "hi"],
+            &["--session", "work", "w1:p1", "hi"],
+            &["--remote=host", "w1:p1", "hi"],
+            &["--handoff", "w1:p1", "hi"],
+            &["--session=t", "--remote=x", "--session=work"],
+            // Globals between TARGET and TEXT.
+            &["w1:p1", "--session=work"],
+            &["w1:p1", "--session=work", "--wait", "--timeout", "1000"],
+            &["w1:p1", "--session=work", "hi"],
+            &["w1:p1", "--session", "work", "hi"],
+            &["w1:p1", "--remote=host", "hi", "--session=work"],
+            &["w1:p1", "--remote", "host", "hi"],
+            &["w1:p1", "--handoff", "hi"],
+            &["w1:p1", FLAG, "--session=work", "--wait"],
+            &["w1:p1", FLAG, "--session", "work"],
+            // Globals after TEXT.
+            &["w1:p1", "hi", "--session=work"],
+            &["w1:p1", "hi", "--session", "work", "--wait"],
+            &["w1:p1", "hi", "--remote=host"],
+            &["w1:p1", "hi", "--remote", "host", "--session=work"],
+            &["w1:p1", "hi", "--handoff"],
+            &["w1:p1", "hi", "--remote=host", "--handoff"],
+            &[
+                "w1:p1",
+                "hi",
+                "--remote-keybindings=server",
+                "--remote=host",
+            ],
+            &["w1:p1", "hi", FLAG, "--session=work"],
+            // Separators.
+            &["w1:p1", "--", "--session=work"],
+            &["w1:p1", "--", "--remote=host"],
+            &["--", "w1:p1", "--remote=host", "--session=work"],
+            &["w1:p1", "hi", "--", "--session=work", "--remote=host"],
+            &["w1:p1", FLAG, "--", "--remote=host"],
+        ];
+        assert!(table.len() >= 15);
+        for &rest in table {
+            env.remove(crate::session::SESSION_ENV_VAR);
+            let mut input = args(&["herdr", "agent", "prompt"]);
+            input.extend(args(rest));
+            // Master's literal slots exactly.
+            assert_eq!(
+                literal_slots(&input),
+                (3..input.len().min(5)).collect::<Vec<_>>(),
+                "{rest:?}"
+            );
+            assert!(
+                !classify_prompt_argv(&input[3..]).cross_pane_opt_in,
+                "{rest:?}"
+            );
+            let (session, remote, cleaned, argv) = extract_prompt(rest);
+            assert!(!argv.cross_pane_opt_in, "{rest:?}");
+            let actual = (
+                session,
+                remote,
+                argv.target.map(|i| cleaned[i].clone()),
+                argv.text.map(|i| cleaned[i].clone()),
+                cleaned[argv.options..].to_vec(),
+            );
+            assert_eq!(actual, master_prompt(rest), "{rest:?}");
+        }
+        env.remove(crate::session::SESSION_ENV_VAR);
+        crate::session::clear_explicit_session_for_test();
+    }
+
+    // As on master, the remote extractor keeps a separator that is the
+    // protected TARGET or TEXT and extracts after it; the session extractor
+    // stops at any separator.
+    #[test]
+    fn remote_extraction_passes_a_literal_prompt_separator_as_on_master() {
+        let input = args(&["herdr", "agent", "prompt", "--", "hi", "--remote=host"]);
+        assert_eq!(literal_slots(&input), [3, 4]);
+        let (cleaned, remote) = crate::remote::extract_remote_args(&input).unwrap();
+        assert_eq!(cleaned, input[..5]);
+        assert_eq!(remote.unwrap().target, "host");
+        let input = args(&[
+            "herdr",
+            "agent",
+            "prompt",
+            "hi",
+            "there",
+            "--",
+            "--remote=host",
+        ]);
+        assert_eq!(
+            crate::remote::extract_remote_args(&input).unwrap(),
+            (input, None)
+        );
     }
 
     fn command_with_mock_server(
