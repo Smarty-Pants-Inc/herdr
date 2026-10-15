@@ -871,6 +871,7 @@ fn old_server_capabilities_do_not_advertise_expected_terminal_guard() {
     assert!(!caps.expected_terminal_guard);
     assert!(!caps.expected_agent_session_guard);
     assert!(!caps.expected_agent_status_guard);
+    assert!(!caps.refuse_if_exists_guard);
     assert!(!caps.input_consumer);
 }
 
@@ -1277,6 +1278,7 @@ fn success_response_round_trips() {
                 pane_close_expected_terminal_guard: true,
                 expected_agent_session_guard: true,
                 expected_agent_status_guard: true,
+                refuse_if_exists_guard: true,
                 input_consumer: false,
             }),
         },
@@ -1359,6 +1361,7 @@ fn worktree_request_and_response_round_trip() {
                     checkout_path: "/worktrees/herdr/worktree-api".into(),
                     is_linked_worktree: true,
                 }),
+                cwd: None,
             },
             tab: TabInfo {
                 tab_id: "w_1:1".into(),
@@ -1447,6 +1450,7 @@ fn worktree_lifecycle_events_round_trip() {
             checkout_path: "/worktrees/herdr/worktree-api".into(),
             is_linked_worktree: true,
         }),
+        cwd: None,
     };
     let worktree = WorktreeInfo {
         path: "/worktrees/herdr/worktree-api".into(),

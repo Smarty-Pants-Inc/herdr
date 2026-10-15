@@ -88,6 +88,15 @@ fn spawn_server(
     api_socket_path: &Path,
     _client_socket_path: &Path,
 ) -> SpawnedHerdr {
+    spawn_server_with_nofile(config_home, runtime_dir, api_socket_path, None)
+}
+
+fn spawn_server_with_nofile(
+    config_home: &Path,
+    runtime_dir: &Path,
+    api_socket_path: &Path,
+    nofile: Option<(libc::rlim_t, libc::rlim_t)>,
+) -> SpawnedHerdr {
     fs::create_dir_all(config_home.join("herdr")).unwrap();
     fs::create_dir_all(runtime_dir).unwrap();
     register_runtime_dir(runtime_dir);
@@ -106,8 +115,24 @@ fn spawn_server(
         })
         .unwrap();
 
-    let mut cmd = crate::test_command::herdr_pty_command();
-    cmd.arg("server");
+    let mut cmd = if let Some((soft, hard)) = nofile {
+        let mut cmd = portable_pty::CommandBuilder::new("/bin/bash");
+        crate::test_command::sanitize_pty_command_env(&mut cmd);
+        cmd.args([
+            "-c",
+            "ulimit -Sn \"$1\" && ulimit -Hn \"$2\" && printf '%s %s\\n' \"$(ulimit -Sn)\" \"$(ulimit -Hn)\" > \"$4\" && exec \"$3\" server",
+            "herdr-nofile-test",
+        ]);
+        cmd.arg(soft.to_string());
+        cmd.arg(hard.to_string());
+        cmd.arg(env!("CARGO_BIN_EXE_herdr"));
+        cmd.arg(runtime_dir.join("inherited-nofile"));
+        cmd
+    } else {
+        let mut cmd = crate::test_command::herdr_pty_command();
+        cmd.arg("server");
+        cmd
+    };
     cmd.env("XDG_CONFIG_HOME", config_home);
     cmd.env("XDG_RUNTIME_DIR", runtime_dir);
     cmd.env("HERDR_SOCKET_PATH", api_socket_path);
@@ -122,6 +147,54 @@ fn spawn_server(
     SpawnedHerdr {
         _master: pair.master,
         child,
+    }
+}
+
+/// The SSH bridge's daemon and an explicit `herdr server` both enter the
+/// headless bootstrap. Read the real process's limits after API readiness.
+#[cfg(target_os = "linux")]
+#[test]
+fn server_raises_inherited_nofile_limit_without_lowering_limits() {
+    let _lock = test_lock();
+    let mut inherited = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    assert_eq!(
+        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut inherited) },
+        0
+    );
+    assert!(inherited.rlim_max >= 4096, "test needs hard NOFILE >= 4096");
+    let hard = inherited.rlim_max.min(1_048_576);
+    for (soft, hard, expected_soft) in [
+        (1024, hard, hard.min(524_288)),
+        (1024, 4096, 4096),
+        (4096, 4096, 4096),
+    ] {
+        let base = unique_test_dir();
+        let config_home = base.join("config");
+        let runtime_dir = base.join("runtime");
+        let api_socket = runtime_dir.join("herdr.sock");
+        let server =
+            spawn_server_with_nofile(&config_home, &runtime_dir, &api_socket, Some((soft, hard)));
+        wait_for_socket(&api_socket, Duration::from_secs(10));
+        assert!(ping_socket(&api_socket).contains("pong"));
+        let before = fs::read_to_string(runtime_dir.join("inherited-nofile")).unwrap();
+        assert_eq!(before.trim(), format!("{soft} {hard}"));
+        let pid = server.child.process_id().expect("server PID");
+        let limits = fs::read_to_string(format!("/proc/{pid}/limits")).unwrap();
+        let after = limits
+            .lines()
+            .find(|line| line.starts_with("Max open files"))
+            .expect("NOFILE in /proc limits");
+        let values: Vec<_> = after.split_whitespace().collect();
+        println!(
+            "server PID {pid}: before soft/hard = {}; after: {after}",
+            before.trim()
+        );
+        assert_eq!(values[3], expected_soft.to_string(), "{after}");
+        assert_eq!(values[4], hard.to_string(), "hard must not change: {after}");
+        cleanup_spawned_herdr(server, base);
     }
 }
 

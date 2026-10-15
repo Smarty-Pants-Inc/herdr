@@ -62,6 +62,12 @@
           "type": "string",
           "default": "unset",
           "description": "Linux only; ignored on other platforms. Optional systemd user unit to auto-start when the local TUI or SSH bridge needs a server. Omit on Linux to keep existing startup behavior. Herdr invokes the absolute executable `/usr/bin/systemctl`, falling back to `/bin/systemctl` only if the first path is absent; it does not search `PATH`. It passes the arguments `--user --no-block start -- UNIT`, which only queues the start job. The helper child is bounded to 5 seconds and killed and reaped on timeout. Herdr then waits up to 15 seconds for the configured session's client socket. Socket readiness determines success; a failed request or timeout is an error, with no unmanaged-server fallback. If Herdr cannot read or parse the config, Linux auto-start is refused rather than using defaults that could start a server outside systemd. The name must match ASCII pattern [A-Za-z0-9@._-]+\\.service and must not begin with `-`; a leading hyphen is rejected when config loads. Configure the unit to expose the correct session socket; client environment variables are not promised to be inherited by the unit."
+        },
+        {
+          "key": "server.pane_nice",
+          "type": "integer",
+          "default": "0",
+          "description": "Linux only: nice value for newly created pane processes, from -20 to 19. Panes also start at the normal SCHED_OTHER scheduling policy, so a server running at idle priority does not pass it on. Lowering a nice value needs RLIMIT_NICE or CAP_SYS_NICE; when the kernel refuses, the pane keeps the server's value and the server log names the pane and the error. Out-of-range values use 0."
         }
       ]
     },

@@ -43,6 +43,24 @@ pub(super) fn pane_input_completion_response(id: String, result: std::io::Result
         Err(error) if crate::pty::actor::is_agent_session_lost(&error) => {
             session_loss_response(id, &error)
         }
+        // Path refusal precedes the first written request byte: its typed fields
+        // report zero bytes and no flush, unlike partial session loss.
+        Err(error) if crate::pty::actor::guard_path_present_details(&error).is_some() => {
+            let (code, partial, flush_failed) = crate::pty::actor::guard_path_present_details(
+                &error,
+            )
+            .unwrap_or(("guard_path_present", None, false));
+            serde_json::json!({
+                "id": id,
+                "error": {
+                    "code": code,
+                    "message": error.to_string(),
+                    "partial_text_consumed": partial,
+                    "flush_failed": flush_failed
+                }
+            })
+            .to_string()
+        }
         Err(error) => {
             let code = if crate::pty::actor::is_pane_input_poisoned(&error) {
                 "pane_input_poisoned"
@@ -2197,10 +2215,15 @@ impl App {
         encode_success(id, ResponseResult::Ok {})
     }
 
+    /// Queues pane text or keys with a session guard, a before-first-byte
+    /// `refuse_if_exists` path guard, or both. Neither is checked here: the
+    /// PTY writer checks the session before every `write(2)` and the path
+    /// before each attempt until the first request byte is written.
     pub(super) fn queue_session_checked_pane_input(
         &mut self,
         id: String,
         input: SessionCheckedPaneInput,
+        refuse_if_exists: Option<std::path::PathBuf>,
         context: crate::api::ApiRequestContext,
     ) -> Result<std::sync::mpsc::Receiver<std::io::Result<()>>, String> {
         let (pane, expected, method) = match &input {
@@ -2225,13 +2248,13 @@ impl App {
         let guard = self
             .capture_expected_agent_session(expected, ws_idx, pane_id)
             .map_err(|error| super::responses::encode_error_body(id.clone(), error))?;
-        let Some(guard) = guard else {
+        if guard.is_none() && refuse_if_exists.is_none() {
             return Err(encode_error(
                 id,
                 "agent_session_unknown",
                 "session-checked input requires expected_agent_session_id",
             ));
-        };
+        }
         // Retain this checked runtime through logging and enqueue; never resolve
         // the target again after logging or send keys as independent packets.
         let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
@@ -2250,11 +2273,12 @@ impl App {
         self.log_api_input(&id, method, ws_idx, pane_id, context, bytes.len())?;
         let has_input = !bytes.is_empty();
         let completion = runtime
-            .queue_guarded_user_input_submission_with_source(
+            .queue_checked_user_input_submission_with_source(
                 Bytes::from(bytes),
                 Bytes::new(),
                 std::time::Duration::ZERO,
                 guard,
+                refuse_if_exists,
                 crate::pty::input_consumer::InputSource::Api,
             )
             .map_err(|error| pane_input_completion_response(id, Err(error)))?;
@@ -2276,6 +2300,7 @@ impl App {
             return match self.queue_session_checked_pane_input(
                 id.clone(),
                 SessionCheckedPaneInput::Text(params),
+                None,
                 context,
             ) {
                 Ok(completion) => complete_direct_pane_input(id, completion),
@@ -2316,6 +2341,26 @@ impl App {
         }
 
         encode_success(id, ResponseResult::Ok {})
+    }
+
+    /// Private/direct route for the path-checked methods; production servers
+    /// defer them to a completion worker instead.
+    pub(super) fn handle_pane_path_checked_input(
+        &mut self,
+        id: String,
+        input: SessionCheckedPaneInput,
+        refuse_if_exists: String,
+        context: crate::api::ApiRequestContext,
+    ) -> String {
+        match self.queue_session_checked_pane_input(
+            id.clone(),
+            input,
+            Some(refuse_if_exists.into()),
+            context,
+        ) {
+            Ok(completion) => complete_direct_pane_input(id, completion),
+            Err(response) => response,
+        }
     }
 
     pub(super) fn handle_pane_send_input(
@@ -2495,6 +2540,7 @@ impl App {
             return match self.queue_session_checked_pane_input(
                 id.clone(),
                 SessionCheckedPaneInput::Keys(params),
+                None,
                 context,
             ) {
                 Ok(completion) => complete_direct_pane_input(id, completion),

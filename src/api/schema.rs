@@ -291,6 +291,12 @@ pub enum Method {
     PaneSendKeys(PaneSendKeysParams),
     #[serde(rename = "pane.send_keys_session_checked")]
     PaneSendKeysSessionChecked(PaneSendKeysParams),
+    /// Local JSON only; older servers reject instead of ignoring the path guard.
+    #[serde(rename = "pane.send_text_path_checked")]
+    PaneSendTextPathChecked(PaneSendTextPathCheckedParams),
+    /// Local JSON only; older servers reject instead of ignoring the path guard.
+    #[serde(rename = "pane.send_keys_path_checked")]
+    PaneSendKeysPathChecked(PaneSendKeysPathCheckedParams),
     #[serde(rename = "pane.send_input")]
     PaneSendInput(PaneSendInputParams),
     /// Requires `expected_terminal`; older servers reject instead of ignoring the guard.

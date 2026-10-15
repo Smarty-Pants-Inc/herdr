@@ -133,6 +133,109 @@ pub(crate) fn agent_session_loss_partial_text_consumed(error: &std::io::Error) -
     agent_session_loss_details(error).and_then(|(partial, _)| partial)
 }
 
+/// The submission's `refuse_if_exists` path existed (`lstat` succeeded), or
+/// could not be checked, before a write attempt while no submission byte had
+/// been written. The actor refused the whole submission with zero bytes written
+/// and no flush.
+#[derive(Debug)]
+struct GuardPathPresent {
+    path: std::path::PathBuf,
+    /// The lookup error when `lstat` failed with anything but "absent".
+    unverifiable: Option<String>,
+    /// Always `Some(false)`: path admission refusal precedes all submission bytes.
+    partial_text_consumed: Option<bool>,
+    /// Always false: path admission refusal must not flush unrelated staged input.
+    flush_failed: bool,
+}
+
+impl std::fmt::Display for GuardPathPresent {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.unverifiable {
+            Some(error) => write!(
+                formatter,
+                "guard_path_unverifiable: {} could not be checked at write time ({error}); ",
+                self.path.display()
+            )?,
+            None => write!(
+                formatter,
+                "guard_path_present: {} exists at write time; ",
+                self.path.display()
+            )?,
+        }
+        write!(
+            formatter,
+            "the input was refused; partial_text_consumed={}; flush_failed={}",
+            self.partial_text_consumed
+                .map_or("unknown", |partial| if partial { "true" } else { "false" }),
+            self.flush_failed
+        )
+    }
+}
+
+impl std::error::Error for GuardPathPresent {}
+
+#[cfg(unix)]
+pub(crate) fn guard_path_present(
+    path: &std::path::Path,
+    unverifiable: Option<&str>,
+    partial_text_consumed: Option<bool>,
+    flush_failed: bool,
+) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        GuardPathPresent {
+            path: path.to_path_buf(),
+            unverifiable: unverifiable.map(str::to_owned),
+            partial_text_consumed,
+            flush_failed,
+        },
+    )
+}
+
+/// `(code, partial_text_consumed, flush_failed)` for a path-guard refusal:
+/// `guard_path_present` or `guard_path_unverifiable`.
+pub(crate) fn guard_path_present_details(
+    error: &std::io::Error,
+) -> Option<(&'static str, Option<bool>, bool)> {
+    error
+        .get_ref()?
+        .downcast_ref::<GuardPathPresent>()
+        .map(|refusal| {
+            (
+                if refusal.unverifiable.is_some() {
+                    "guard_path_unverifiable"
+                } else {
+                    "guard_path_present"
+                },
+                refusal.partial_text_consumed,
+                refusal.flush_failed,
+            )
+        })
+}
+
+/// Fresh `lstat(path)` before each submission write attempt until its first
+/// byte is written, including zero-byte retries; never at request time or after
+/// a successful Text/Enter write.
+/// `None`: the path is absent (ENOENT, or ENOTDIR: a component is not a
+/// directory, so it cannot exist), and the write proceeds. `Some(None)`: it
+/// exists. `Some(Some(error))`: it could not be checked (EACCES, ELOOP, EIO,
+/// ...), so the guard fails closed instead of treating it as absent.
+#[cfg(unix)]
+fn guard_path_refusal(path: &std::path::Path) -> Option<Option<String>> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Some(None),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            None
+        }
+        Err(error) => Some(Some(error.to_string())),
+    }
+}
+
 #[derive(Debug)]
 struct PaneInputPoisoned;
 impl std::fmt::Display for PaneInputPoisoned {
@@ -310,6 +413,29 @@ mod windows {
             // against ConPTY. Do not substitute process existence for ownership.
             let _ = (guard.reporter, &guard.binding_validity);
             Err(super::agent_session_lost(&guard, false))
+        }
+
+        /// No write-time path guard on ConPTY yet; the server does not
+        /// advertise `refuse_if_exists_guard` here, so never enqueue.
+        pub(crate) fn queue_checked_user_input_submission_with_source(
+            &self,
+            text: Bytes,
+            enter: Bytes,
+            delay: Duration,
+            guard: Option<super::SessionInputGuard>,
+            refuse_if_exists: Option<std::path::PathBuf>,
+            source: crate::pty::input_consumer::InputSource,
+        ) -> std::io::Result<std_mpsc::Receiver<std::io::Result<()>>> {
+            if let Some(guard) = guard {
+                return self.queue_guarded_user_input_submission_with_source(
+                    text, enter, delay, guard, source,
+                );
+            }
+            let _ = refuse_if_exists;
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "refuse_if_exists is supported only on Unix",
+            ))
         }
 
         pub(crate) fn input_consumer_epoch_matches(&self, _epoch: &str) -> bool {

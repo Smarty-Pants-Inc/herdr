@@ -327,7 +327,20 @@ fn append_line(path: &std::path::Path, line: &str) -> std::io::Result<()> {
 /// record is refused with an `InputLogFull` error and the log does not grow, so the caller's
 /// input is refused like any other unloggable write. A symlink or foreign file at the log path
 /// is neither rotated nor written (the private open refuses it), as before.
+///
+/// Within one process, every append is also serialized on `APPEND_LOCK` for the whole call,
+/// from directory creation to the explicit unlock. The file locks are per-handle and the
+/// Windows private open reads and replaces the file's security descriptor in separate steps
+/// (size query, then fetch), so two threads opening the same log or `<log>.lock` at once could
+/// see the descriptor change between them and fail with `ERROR_INSUFFICIENT_BUFFER`
+/// (smarty-dev#9461). ponytail: one global mutex, as there are only two production logs and
+/// appends are infrequent; a poisoned mutex fails the append closed.
 fn append_line_with_cap(path: &std::path::Path, line: &str, cap: u64) -> std::io::Result<()> {
+    static APPEND_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // Held until the function returns, after the file lock is released.
+    let _append_guard = APPEND_LOCK
+        .lock()
+        .map_err(|_| std::io::Error::other("input log writer lock poisoned"))?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -1366,7 +1379,7 @@ mod tests {
     }
 
     fn read(path: &std::path::Path) -> String {
-        std::fs::read_to_string(path).unwrap()
+        std::fs::read_to_string(path).unwrap_or_else(|err| panic!("read {}: {err}", path.display()))
     }
 
     /// Every name in the log's directory, sorted.
@@ -1486,7 +1499,10 @@ mod tests {
                 scope.spawn(move || {
                     barrier.wait();
                     for seq in 0..PER_THREAD {
-                        super::append_line_with_cap(log, &line(t, seq), THREAD_CAP).unwrap();
+                        let context =
+                            format!("append to {} by writer {t} at seq {seq}", log.display());
+                        super::append_line_with_cap(log, &line(t, seq), THREAD_CAP)
+                            .expect(&context);
                     }
                 });
             }
@@ -1535,6 +1551,110 @@ mod tests {
                 "api-input.jsonl.lock"
             ]
         );
+        std::fs::remove_dir_all(log.parent().unwrap()).unwrap();
+    }
+
+    /// smarty-dev#9461: eight writers through several full rotations. Each wave writes exactly
+    /// one cap-sized generation concurrently, so the first wave fills the log and every later
+    /// wave rotates exactly once, leaving the previous wave in `.1` and its own in the log.
+    #[test]
+    fn concurrent_writers_lose_no_record_across_repeated_rotations() {
+        const THREADS: u32 = 8;
+        const PER_WAVE: u32 = 20;
+        const WAVES: u32 = 5;
+        const LINE: u64 = 25;
+        // One wave is exactly one generation: the cap is reached by the wave's last record.
+        const WAVE_CAP: u64 = THREADS as u64 * PER_WAVE as u64 * LINE;
+        let line = |t: u32, seq: u32, wave: u32| {
+            format!("{{\"t\":{t},\"seq\":{},\"w\":{wave}}}", seq + 1000)
+        };
+        assert_eq!(line(0, 0, 0).len() as u64 + 1, LINE);
+        assert_eq!(line(7, 99, 4).len() as u64 + 1, LINE);
+        let parse = |path: &std::path::Path| -> Vec<(u32, u32, u32)> {
+            let mut records: Vec<(u32, u32, u32)> = read(path)
+                .lines()
+                .map(|raw| {
+                    let value: serde_json::Value = serde_json::from_str(raw)
+                        .unwrap_or_else(|err| panic!("{}: {raw:?}: {err}", path.display()));
+                    let field = |name: &str| {
+                        value[name]
+                            .as_u64()
+                            .unwrap_or_else(|| panic!("{}: {raw:?}: {name}", path.display()))
+                            as u32
+                    };
+                    (field("w"), field("t"), field("seq") - 1000)
+                })
+                .collect();
+            records.sort();
+            records
+        };
+        let expected = |wave: u32| -> Vec<(u32, u32, u32)> {
+            let mut records: Vec<(u32, u32, u32)> = (0..THREADS)
+                .flat_map(|t| {
+                    (wave * PER_WAVE..(wave + 1) * PER_WAVE).map(move |seq| (wave, t, seq))
+                })
+                .collect();
+            records.sort();
+            records
+        };
+        let log = rotation_log("waves");
+        for wave in 0..WAVES {
+            let barrier = std::sync::Barrier::new(THREADS as usize);
+            let rotations: u32 = std::thread::scope(|scope| {
+                let writers: Vec<_> = (0..THREADS)
+                    .map(|t| {
+                        let (log, barrier) = (&log, &barrier);
+                        scope.spawn(move || {
+                            super::ROTATIONS.set(0);
+                            barrier.wait();
+                            for seq in wave * PER_WAVE..(wave + 1) * PER_WAVE {
+                                super::append_line_with_cap(log, &line(t, seq, wave), WAVE_CAP)
+                                    .unwrap_or_else(|err| {
+                                        panic!(
+                                            "append to {} by writer {t} at seq {seq} in wave {wave}: {err}",
+                                            log.display()
+                                        )
+                                    });
+                            }
+                            super::ROTATIONS.get()
+                        })
+                    })
+                    .collect();
+                writers
+                    .into_iter()
+                    .map(|writer| writer.join().expect("writer thread"))
+                    .sum()
+            });
+            assert_eq!(rotations, u32::from(wave > 0), "rotations in wave {wave}");
+            assert_eq!(
+                std::fs::metadata(&log).unwrap().len(),
+                WAVE_CAP,
+                "log size after wave {wave}"
+            );
+            assert_eq!(
+                parse(&log),
+                expected(wave),
+                "current generation after wave {wave}"
+            );
+            if wave == 0 {
+                assert_eq!(names(&log), ["api-input.jsonl", "api-input.jsonl.lock"]);
+            } else {
+                assert_eq!(
+                    parse(&rotated(&log)),
+                    expected(wave - 1),
+                    "previous generation after wave {wave}"
+                );
+                assert_eq!(
+                    names(&log),
+                    [
+                        "api-input.jsonl",
+                        "api-input.jsonl.1",
+                        "api-input.jsonl.lock"
+                    ],
+                    "names after wave {wave}"
+                );
+            }
+        }
         std::fs::remove_dir_all(log.parent().unwrap()).unwrap();
     }
 

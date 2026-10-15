@@ -243,8 +243,8 @@ herdr pane read <pane_id> --source recent-unwrapped --lines 120
 发送输入:
 
 ```bash
-herdr pane send-text <pane_id> [--expected-session ID] <text>
-herdr pane send-keys <pane_id> [--expected-session ID] <key> [key ...]
+herdr pane send-text <pane_id> [--expected-session ID] [--refuse-if-exists PATH] <text>
+herdr pane send-keys <pane_id> [--expected-session ID] [--refuse-if-exists PATH] <key> [key ...]
 herdr pane run <pane_id> <command>
 ```
 
@@ -269,6 +269,8 @@ herdr pane run <pane_id> <command>
 初始检查与接受请求时 Herdr 的已上报窗格状态是原子的。它无法检测智能体尚未上报的会话变化。仍有两类残余竞态：最后一次实时进程／前台原生检查与 `write(2)` 之间的检查／写入间隙，以及所有权丢失／刷新／读取方之间的竞态；读取方可能在刷新前消费已暂存的字节。完成结果和刷新都不保证总写入或总消费字节数为零。App 到 actor 的队列和延迟 Enter 的等待受守卫保护，但不能消除这些原生竞态。CLI 要求 `expected_agent_session_guard`，仅 Linux 支持并通告此能力。macOS 和 Windows 在无法确认安全时拒绝操作；macOS 的原生证明尚待实现。缺少支持时，CLI 返回 `expected_agent_session_unsupported`，不发送带守卫的操作，并使用 checked 方法名，因此即使能力检查后服务器被替换，也会在无法确认安全时拒绝操作。省略这些标志会保留现有行为和独立的跨窗格输入策略。
 
 已知限制：暂停后，恢复或重新加载同一个原生会话不会恢复带守卫发送的资格；请开启新会话（`/new`）或重启智能体。参见[后续问题](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/7577)。
+
+在 `pane send-text` 或 `pane send-keys` 上使用 `--refuse-if-exists PATH`，会在第一个请求字节成功写入前的每次写入尝试之前用 `lstat` 检查 PATH，而不是在接纳请求时检查。第一个字节写入前已存在的 claim 会阻止请求；一旦开始写入，请求就会完成。如果写入尝试返回 `EAGAIN`（会阻塞）或 `EINTR`（被中断），尚未写入任何字节，则重试前会再次检查 PATH。路径存在时返回 `guard_path_present`，退出码为 1，请求写入为 0 字节，`partial_text_consumed: false`、`flush_failed: false`。若无法检查路径（例如父目录不可搜索），则安全失败，返回 `guard_path_unverifiable` 和相同的 0 字节结果。只有路径不存在时才开始写入。开始后不再检查路径，部分分块、重试和延迟的 Enter 都会完成。路径守卫从不刷新未读输入，因此无关的排队输入会保留。独立的 `--expected-session` 守卫仍在每次写入前检查，并保留其会话丢失时的刷新行为。分开的 `lstat` 和第一次 `write(2)` 不是同步机制，可能漏掉在两者之间创建的 claim（已接受的技术风险 [smarty-dev#12584](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/12584)）。CLI 会以自身的工作目录为基准，把相对 PATH 转为绝对路径。它需要服务器能力 `refuse_if_exists_guard`（仅 Unix）；缺少该能力时，CLI 不发送并返回 `refuse_if_exists_unsupported`。CLI 使用带检查的方法 `pane.send_text_path_checked` 和 `pane.send_keys_path_checked`，因此旧服务器会拒绝请求，而不会忽略该标志。省略该标志时行为不变。
 
 从自定义钩子上报智能体状态:
 
@@ -495,13 +497,14 @@ herdr integration status [--outdated-only]
 
 ```bash
 herdr plugin install <owner>/<repo>[/subdir...] [--ref REF] [--yes]
+herdr plugin update [<plugin_id|owner/repo[/subdir...]>...] [--yes]
 herdr plugin list [--plugin ID] [--json]
 herdr plugin uninstall <plugin_id|owner/repo[/subdir...]>
 herdr plugin enable <plugin_id>
 herdr plugin disable <plugin_id>
 ```
 
-`plugin install` 只接受 GitHub 简写,比如 `ogulcancelik/herdr-plugin-examples/worktree-bootstrap`。它使用 `git`,在交互式终端显示信任预览,运行受支持的清单构建命令,并把 GitHub 安装保存在 Herdr 管理的目录中。非交互式安装用 `--yes`。重新安装 GitHub 管理的插件会替换该托管检出。不允许覆盖安装到本地链接的插件之上。插件清单必须声明 `min_herdr_version`;当插件要求更新的 Herdr 二进制时,install 和 link 会失败。`plugin list` 默认是人类可读的;要原始 API 响应就传 `--json`。
+`plugin install` 只接受 GitHub 简写,比如 `ogulcancelik/herdr-plugin-examples/worktree-bootstrap`。它使用 `git`,在交互式终端显示信任预览,运行受支持的清单构建命令,并把 GitHub 安装保存在 Herdr 管理的目录中。非交互式安装用 `--yes`。`plugin update` 不指定目标时更新全部 GitHub 托管插件,指定目标时只更新对应的插件 id 或 GitHub 来源。它保留安装时记录的 ref,跳过未变化的提交,批量更新时忽略本地链接的插件。重新安装会创建新目录;运行中的插件保留原文件,新调用使用新安装。不允许覆盖安装到本地链接的插件之上。插件清单必须声明 `min_herdr_version`;当插件要求更新的 Herdr 二进制时,install 和 link 会失败。`plugin list` 默认是人类可读的;要原始 API 响应就传 `--json`。
 
 本地开发:
 
@@ -510,7 +513,7 @@ herdr plugin link <path> [--disabled]
 herdr plugin unlink <plugin_id>
 ```
 
-`plugin link` 接受包含 `herdr-plugin.toml` 的插件目录,或直接指向清单的路径。从本地检出编写或测试插件时,它仍然是正确的命令。`plugin unlink` 注销插件、不动文件。`plugin uninstall` 注销插件,并同时删除 Herdr 管理的 GitHub 检出文件。对 GitHub 安装,uninstall 既接受插件 id,也接受与 install 相同的 `owner/repo[/subdir...]` 简写。动作、事件钩子、窗格和链接处理器在清单中声明;运行时动作注册不在 v1 范围内。
+`plugin link` 接受包含 `herdr-plugin.toml` 的插件目录,或直接指向清单的路径。从本地检出编写或测试插件时,它仍然是正确的命令。`plugin unlink` 和 `plugin uninstall` 注销插件并保留文件,让运行中的插件完成工作。更新和重新安装也会保留旧版本;新调用无需重新加载配置便会使用新安装。使用旧安装的服务器退出后,下一次成功安装、更新或服务器启动会清理过时的托管安装。重新加载配置不会释放旧安装。插件必须在父命令或窗格退出前停止分离的后台进程;服务器退出后仍存活的进程不受清理保护。没有清理跟踪的旧安装和本地链接文件会保留。对 GitHub 安装,uninstall 既接受插件 id,也接受与 install 相同的 `owner/repo[/subdir...]` 简写。动作、事件钩子、窗格和链接处理器在清单中声明;运行时动作注册不在 v1 范围内。
 
 配置目录:
 
@@ -545,7 +548,7 @@ herdr plugin pane close <pane_id>
 
 `plugin pane open` 要求插件已链接、已启用并与当前平台兼容。它把清单声明的 `[[panes]]` 命令作为 Herdr 管理的终端窗格启动。清单的默认值是 `overlay`,在活动窗格上方打开一个临时的缩放覆盖层。它也可以作为分割、新标签页、缩放窗格,或不改变标签页布局的会话级模态 `popup` 打开。`--width` 和 `--height` 以终端单元格数或 `80%` 这样的百分比设置弹窗外层尺寸;省略时默认为终端大小的一半,过小的值会限制为弹窗最小尺寸。弹窗不是 Herdr 窗格,不会收到 `HERDR_PANE_ID`,也不参与 pane 或智能体 API。非终端的原生插件窗格是之后的能力面。
 
-新窗格使用 `TERM_PROGRAM=herdr` 标识自身，并将 `TERM_PROGRAM_VERSION` 设为 Herdr 的版本。它们保留 `TERM=xterm-256color` 和 `COLORTERM=truecolor`。应用显式的启动环境值之前，Herdr 会移除继承的外层终端会话标记（iTerm2、WezTerm、Kitty、Windows Terminal、tmux、screen 和 Zellij）、iTerm2 的 `LC_TERMINAL` 身份，以及已知的 Claude Code、Codex 和 OMP 会话标记。这可防止新窗格冒充最初启动服务器的终端或智能体会话。API 密钥和显示设置等普通环境变量仍会继承，而不会被连接客户端的环境替换。SSH 智能体转发有自己的重连处理。现有窗格进程不受此清理影响。
+新窗格使用 `TERM_PROGRAM=herdr` 标识自身，并将 `TERM_PROGRAM_VERSION` 设为 Herdr 的版本。它们保留 `TERM=xterm-256color` 和 `COLORTERM=truecolor`。由于 Herdr 会在调整大小时重排文本,新窗格还会获得 `fish_handle_reflow=0`;继承或显式指定的 `fish_handle_reflow` 值会保留。应用显式的启动环境值之前，Herdr 会移除继承的外层终端会话标记（iTerm2、WezTerm、Kitty、Windows Terminal、tmux、screen 和 Zellij）、iTerm2 的 `LC_TERMINAL` 身份，以及已知的 Claude Code、Codex 和 OMP 会话标记。这可防止新窗格冒充最初启动服务器的终端或智能体会话。API 密钥和显示设置等普通环境变量仍会继承，而不会被连接客户端的环境替换。SSH 智能体转发有自己的重连处理。现有窗格进程不受此清理影响。
 
 `--env KEY=VALUE` 可以在启动进程的命令上重复使用,只作用于新启动的进程。当与调用方提供的环境变量冲突时,`HERDR_SOCKET_PATH`、`HERDR_BIN_PATH`、`HERDR_ENV`、`HERDR_WORKSPACE_ID`、`HERDR_TAB_ID`、`HERDR_PANE_ID`、`HERDR_PLUGIN_ID`、`HERDR_PLUGIN_ROOT`、`HERDR_PLUGIN_CONFIG_DIR`、`HERDR_PLUGIN_STATE_DIR`、`HERDR_PLUGIN_ENTRYPOINT_ID` 和 `HERDR_PLUGIN_CONTEXT_JSON` 等 Herdr 管理的变量保持权威。
 

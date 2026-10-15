@@ -701,6 +701,7 @@ fn pane_command() -> Command {
             Command::new("send-text")
                 .about("Send literal text to a pane")
                 .arg(expected_session_option())
+                .arg(refuse_if_exists_option())
                 .arg(required("pane_id", "PANE_ID"))
                 .arg(required("text", "TEXT").num_args(1..).action(ArgAction::Append))
                 .arg(
@@ -715,6 +716,7 @@ fn pane_command() -> Command {
             Command::new("send-keys")
                 .about("Send key presses to a pane")
                 .arg(expected_session_option())
+                .arg(refuse_if_exists_option())
                 .arg(required("pane_id", "PANE_ID"))
                 .arg(required("key", "KEY").num_args(1..).action(ArgAction::Append))
                 .arg(
@@ -773,6 +775,12 @@ fn pane_command() -> Command {
 fn expected_session_option() -> Arg {
     option("expected-session", "ID")
         .help("Refuse unless the pane still reports this agent session ID at enqueue; requires server support")
+}
+
+fn refuse_if_exists_option() -> Arg {
+    option("refuse-if-exists", "PATH").help(
+        "Refuse before the first byte (guard_path_present, zero bytes, no flush) if PATH exists; recheck zero-byte retries, never interrupt after writing starts; requires server support",
+    )
 }
 
 fn expected_terminal_option() -> Arg {

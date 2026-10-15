@@ -790,6 +790,41 @@ fn guarded_request(
     request: &Request,
     capabilities: Option<&crate::api::schema::ServerCapabilities>,
 ) -> Result<Option<Request>, serde_json::Value> {
+    // Path-checked sends already use their own method name, which older
+    // servers reject. Without the capability, never send and never fall back.
+    let path_checked_needs_session = match &request.method {
+        Method::PaneSendTextPathChecked(params) => {
+            Some(params.input.expected_agent_session_id.is_some())
+        }
+        Method::PaneSendKeysPathChecked(params) => {
+            Some(params.input.expected_agent_session_id.is_some())
+        }
+        _ => None,
+    };
+    if let Some(needs_session_guard) = path_checked_needs_session {
+        if !capabilities.is_some_and(|caps| caps.refuse_if_exists_guard) {
+            return Err(serde_json::json!({
+                "id": request.id,
+                "error": {
+                    "code": "refuse_if_exists_unsupported",
+                    "message": "server does not advertise refuse_if_exists_guard; guarded input was not sent",
+                },
+            }));
+        }
+        if needs_session_guard
+            && !capabilities.is_some_and(|caps| caps.expected_agent_session_guard)
+        {
+            return Err(serde_json::json!({
+                "id": request.id,
+                "error": {
+                    "code": "expected_agent_session_unsupported",
+                    "message": "server does not advertise expected_agent_session_guard; guarded input was not sent",
+                },
+            }));
+        }
+        return Ok(None);
+    }
+
     // An older server ignores expected_terminal on pane.close and would close a
     // re-occupied pane, so a guarded close always uses pane.close_guarded.
     let close_guarded = match &request.method {

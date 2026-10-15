@@ -121,7 +121,26 @@ impl Config {
             .chain(self.invalid_sidebar_bounds_diagnostic())
             .chain(self.invalid_headless_size_diagnostic())
             .chain(self.server.validated_systemd_unit().err())
+            .chain(self.invalid_pane_nice_diagnostic())
             .collect()
+    }
+
+    /// The configured pane nice value, or 0 when it is out of range.
+    pub(crate) fn pane_nice(&self) -> i32 {
+        if self.invalid_pane_nice_diagnostic().is_some() {
+            0
+        } else {
+            self.server.pane_nice
+        }
+    }
+
+    pub(crate) fn invalid_pane_nice_diagnostic(&self) -> Option<String> {
+        (!(-20..=19).contains(&self.server.pane_nice)).then(|| {
+            format!(
+                "server.pane_nice must be between -20 and 19 (got {}); using 0",
+                self.server.pane_nice
+            )
+        })
     }
 
     pub(crate) fn headless_size(&self) -> (u16, u16) {

@@ -99,7 +99,7 @@ herdr pane read w1:p2 --source recent --lines 50
 | ワークスペース | `workspace.create`、`workspace.list`、`workspace.get`、`workspace.focus`、`workspace.rename`、`workspace.move`、`workspace.move_block`、`workspace.report_metadata`、`workspace.close` |
 | Worktree | `worktree.list`、`worktree.create`、`worktree.create_project_checked`、`worktree.open`、`worktree.open_project_checked`、`worktree.remove` |
 | タブ | `tab.create`、`tab.list`、`tab.get`、`tab.focus`、`tab.rename`、`tab.move`、`tab.close` |
-| ペイン | `pane.split`、`pane.swap`、`pane.move`、`pane.zoom`、`pane.layout`、`pane.process_info`、`pane.neighbor`、`pane.edges`、`pane.focus_direction`、`pane.resize`、`pane.list`、`pane.current`、`pane.get`、`pane.last_input`、`pane.rename`、`pane.send_text`、`pane.send_text_session_checked`、`pane.send_keys`、`pane.send_keys_session_checked`、`pane.send_input`、`pane.send_input_guarded`、`pane.read`、`pane.report_agent`、`pane.report_agent_session`、`pane.report_metadata`、`pane.clear_agent_authority`、`pane.release_agent`、`pane.close`、`pane.close_guarded`、`pane.wait_for_output` |
+| ペイン | `pane.split`、`pane.swap`、`pane.move`、`pane.zoom`、`pane.layout`、`pane.process_info`、`pane.neighbor`、`pane.edges`、`pane.focus_direction`、`pane.resize`、`pane.list`、`pane.current`、`pane.get`、`pane.last_input`、`pane.rename`、`pane.send_text`、`pane.send_text_session_checked`、`pane.send_keys`、`pane.send_keys_session_checked`、`pane.send_text_path_checked`、`pane.send_keys_path_checked`、`pane.send_input`、`pane.send_input_guarded`、`pane.read`、`pane.report_agent`、`pane.report_agent_session`、`pane.report_metadata`、`pane.clear_agent_authority`、`pane.release_agent`、`pane.close`、`pane.close_guarded`、`pane.wait_for_output` |
 | 入力コンシューマー（ローカル JSON 専用） | `pane.input_consumer.enroll`、`pane.input_consumer.cut`、`pane.input_consumer.release` |
 | ポップアップ | `popup.close` |
 | レイアウト | `layout.export`、`layout.apply`、`layout.apply_restorable`、`layout.set_split_ratio` |
@@ -193,6 +193,8 @@ Pi は `pi.submitUserMessage` の呼び出し直前にエディタと hold を�
 `agent.wait` はサーバー所有でイベント駆動です。解決したペイン占有者に固定されるため、置換されたエージェントが待機を満たすことはありません。`agent.prompt` は `until` と `timeout_ms` を持つ省略可能な `wait` オブジェクトを受け付けます。これにより、プロンプト送信と待機開始を 1 つのリクエストで行い、別々の呼び出し間の競合を避けられます。解決したエージェントがすでに `blocked` の場合、`agent.prompt` は入力を送信せず、待機も開始せずに `agent_blocked` を返します。
 
 `workspace.move_block` は、順序付きの `workspace_ids` を `before_workspace_id` の前へアトミックに移動します。アンカーを省略するとブロックを末尾へ移動します。id は一意である必要があり、アンカーをブロックに含めることはできません。レスポンスにはサーバーが確定した順序付きワークスペース一覧が含まれます。
+
+すべてのワークスペースレコードはパスをちょうど 1 つ持ちます。任意の `worktree` オブジェクトは、Herdr がワークツリーとして開いたチェックアウト（`worktree.create`、`worktree.open`、`workspace.create_linked`）にのみ付き、その `checkout_path` がワークスペースのパスです。`cwd` はワークスペースに `worktree` がない場合にのみ存在し、ワークスペースのルートペイン（最初のタブの最初のペイン）の現在の作業ディレクトリ、または作成時のディレクトリです。Git チェックアウト内で `workspace.create` により作成したワークスペースには `cwd` はありますが `worktree` はありません。
 
 `session.snapshot` は、独自のローカルランタイムキャッシュを持つクライアント向けに、一度限りのブートストラップスナップショットを返します。レスポンスには、バージョン/プロトコルメタデータ、フォーカス中のワークスペース/タブ/ペイン id、ワークスペース、タブ、ペイン、タブレイアウト、エージェントの各レコードが含まれます。これは購読ではありません。キャッシュの初期化と復旧では、先に購読を開始し、後述のイベント購読セクションの手順でサーバーから現在の状態を読み取り、キャッシュを照合・更新します。イベントはキャッシュの無効化を知らせるものであり、スナップショットに無条件で再適用できるものではありません。再接続後やキャッシュが古い可能性がある場合は、`session.snapshot` を再度呼び出します。ワークスペースレコードには、関連付けられた worktree の出自情報も含まれます。リポジトリ全体の worktree 検出には引き続き `worktree.list` を使います。
 
@@ -396,6 +398,16 @@ principal の解決はサーバーが行い、クライアント接続ごとに�
 {"id":"checked_prompt","method":"agent.prompt_session_checked","params":{"target":"worker","text":"review this change","expected_agent_session_id":"reported_id_from_agent_get","expected_pane_id":"w1:p1","wait":{"until":["idle"],"timeout_ms":30000}}}
 {"id":"checked_text","method":"pane.send_text_session_checked","params":{"pane_id":"w1:p1","text":"hello","expected_agent_session_id":"reported_id_from_pane_get"}}
 {"id":"checked_keys","method":"pane.send_keys_session_checked","params":{"pane_id":"w1:p1","keys":["Enter"],"expected_agent_session_id":"reported_id_from_pane_get"}}
+```
+
+### 書き込み時のパスガード
+
+`pane.send_text_path_checked` と `pane.send_keys_path_checked` は、`pane.send_text` と `pane.send_keys` の params に加えて、必須の文字列 `refuse_if_exists`（絶対パス）を受け取ります。Herdr はリクエストの受理時にはパスを確認しません。PTY ライターは最初のリクエストバイトの書き込みが成功するまで、各書き込み試行の直前に `lstat` を実行します。最初のバイトを書き込む前に存在する claim はリクエストを防ぎ、書き込み開始後はリクエストを完了します。書き込みが 0 バイトのまま `EAGAIN`（ブロックする）または `EINTR`（中断された）を返した場合、パスガードは有効なままで、次の試行で再確認します。`lstat` が成功した場合（ファイルの種類を問わず、リンク先のないシンボリックリンクも含む）、Herdr は `guard_path_present` で拒否し、リクエストの書き込みは 0 バイト、`error.partial_text_consumed: false`、`error.flush_failed: false` となります。フラッシュは行いません。書き込みが続行するのはパスが存在しない場合（`ENOENT`、またはディレクトリでない構成要素による `ENOTDIR`）だけです。それ以外の `lstat` エラー（親ディレクトリの `EACCES`、`ELOOP`、`EIO` など）でもバイトを破棄し、メッセージに OS エラーを含む `guard_path_unverifiable` を返します。他のフィールドは `guard_path_present` と同じです。開始後はパスを再検査せず、部分チャンク、再試行、遅延 Enter を完了します。パスガードは未読入力をフラッシュしないため、無関係なキュー入力は保持されます。相対パスは `invalid_request` を返します。レスポンスはキュー投入ではなく、PTY ライターの完了を報告します。`expected_agent_session_id` も併用できますが、その場合は `expected_agent_session_guard` も必要です。その独立したガードの各書き込み前のネイティブチェックとセッション喪失時のフラッシュ動作は変わりません。
+
+`ping.result.capabilities.refuse_if_exists_guard == true` を確認してください（Unix サーバーのみ。Windows は `false` を通知し、`refuse_if_exists_unsupported` で拒否します）。古いサーバーはこれらのメソッド名を `invalid_request` で拒否するため、ping とリクエストの間にサーバーが置き換えられても安全側で失敗します。拒否された後に `pane.send_text` や `pane.send_keys` へフォールバックしないでください。別々の `lstat` と最初の `write(2)` は同期ではなく、その間に作成された claim を見逃す可能性があります（受容された技術的リスク [smarty-dev#12584](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/12584)）。
+
+```json
+{"id":"claim_checked_keys","method":"pane.send_keys_path_checked","params":{"pane_id":"w1:p1","keys":["esc"],"refuse_if_exists":"/run/user/1000/floor/claim"}}
 ```
 
 ### 検出されたエージェント状態の期待値ガード
