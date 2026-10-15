@@ -362,6 +362,7 @@ mod tests {
         let text = Request {
             id: "t".into(),
             method: Method::PaneSendText(PaneSendTextParams {
+                expected_agent_session_id: None,
                 pane_id: "w1:p2".into(),
                 text: "x".into(),
                 allow_cross_pane: true,

@@ -34,6 +34,10 @@ pub use tabs::*;
 pub use workspaces::*;
 pub use worktrees::*;
 
+pub const PANE_INPUT_POISON_NOTICE: &str = "Input is blocked because a failed flush may have left staged text on the line. Inspect or discard that text before explicitly clearing input poison.";
+pub const PANE_INPUT_POISON_CLEAR_WARNING: &str =
+    "Clearing input poison first discards unread pane input (TCIFLUSH) and refuses if that fails; text a program already read may remain in its own buffer.";
+
 fn is_false(value: &bool) -> bool {
     !*value
 }
@@ -44,6 +48,15 @@ where
     D: serde::Deserializer<'de>,
 {
     String::deserialize(deserializer).map(Some)
+}
+
+fn deserialize_expected_agent_status<'de, D>(
+    deserializer: D,
+) -> Result<Option<AgentStatus>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    AgentStatus::deserialize(deserializer).map(Some)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -185,6 +198,13 @@ pub enum Method {
     AgentDraftState(AgentDraftStateParams),
     #[serde(rename = "agent.prompt_guarded")]
     AgentPromptGuarded(AgentPromptGuardedParams),
+    /// Local JSON only; older servers reject instead of ignoring identity guards.
+    #[serde(rename = "agent.prompt_session_checked")]
+    AgentPromptSessionChecked(AgentPromptParams),
+    /// Local JSON only; requires status and session expectations. Older servers
+    /// reject instead of silently ignoring the detected-status guard.
+    #[serde(rename = "agent.prompt_status_checked")]
+    AgentPromptStatusChecked(AgentPromptParams),
     #[serde(rename = "agent.wait")]
     AgentWait(AgentWaitParams),
     #[serde(rename = "pane.split")]
@@ -228,6 +248,8 @@ pub enum Method {
     PaneScroll(PaneScrollParams),
     #[serde(rename = "pane.clear")]
     PaneClear(PaneTarget),
+    #[serde(rename = "pane.clear_input_poison")]
+    PaneClearInputPoison(PaneTarget),
     #[serde(rename = "pane.edit_scrollback")]
     PaneEditScrollback(PaneTarget),
     #[serde(rename = "pane.selection.read")]
@@ -263,8 +285,18 @@ pub enum Method {
     PaneRename(PaneRenameParams),
     #[serde(rename = "pane.send_text")]
     PaneSendText(PaneSendTextParams),
+    #[serde(rename = "pane.send_text_session_checked")]
+    PaneSendTextSessionChecked(PaneSendTextParams),
     #[serde(rename = "pane.send_keys")]
     PaneSendKeys(PaneSendKeysParams),
+    #[serde(rename = "pane.send_keys_session_checked")]
+    PaneSendKeysSessionChecked(PaneSendKeysParams),
+    /// Local JSON only; older servers reject instead of ignoring the path guard.
+    #[serde(rename = "pane.send_text_path_checked")]
+    PaneSendTextPathChecked(PaneSendTextPathCheckedParams),
+    /// Local JSON only; older servers reject instead of ignoring the path guard.
+    #[serde(rename = "pane.send_keys_path_checked")]
+    PaneSendKeysPathChecked(PaneSendKeysPathCheckedParams),
     #[serde(rename = "pane.send_input")]
     PaneSendInput(PaneSendInputParams),
     /// Requires `expected_terminal`; older servers reject instead of ignoring the guard.
@@ -283,7 +315,10 @@ pub enum Method {
     #[serde(rename = "pane.release_agent")]
     PaneReleaseAgent(PaneReleaseAgentParams),
     #[serde(rename = "pane.close")]
-    PaneClose(PaneTarget),
+    PaneClose(PaneCloseParams),
+    /// Requires `expected_terminal`; older servers reject instead of ignoring the guard.
+    #[serde(rename = "pane.close_guarded")]
+    PaneCloseGuarded(PaneCloseParams),
     #[serde(rename = "popup.close")]
     PopupClose(EmptyParams),
     #[serde(rename = "events.subscribe")]

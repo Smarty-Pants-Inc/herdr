@@ -1082,6 +1082,9 @@ pub struct ServerConfig {
     pub headless_cols: u16,
     /// Virtual terminal height used when no client is attached. Default: 40.
     pub headless_rows: u16,
+    /// Linux: nice value for new pane processes, which also start at SCHED_OTHER
+    /// whatever the server's own CPU priority. Range -20..=19. Default: 0.
+    pub pane_nice: i32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1354,6 +1357,7 @@ impl Default for ServerConfig {
             allow_unelevated_clients: false,
             headless_cols: crate::config::DEFAULT_HEADLESS_COLS,
             headless_rows: crate::config::DEFAULT_HEADLESS_ROWS,
+            pane_nice: 0,
         }
     }
 }

@@ -194,6 +194,7 @@ fn pane_scroll_result(
             state_labels: HashMap::new(),
             tokens: HashMap::new(),
             agent_session: None,
+            agent_session_id: None,
             scroll: Some(crate::api::schema::PaneScrollInfo {
                 offset_from_bottom,
                 max_offset_from_bottom,
@@ -247,6 +248,7 @@ fn surface_with_popup() -> PaneSurfaceFrame {
 
 mod agents_worktrees_notifications;
 mod chrome_context;
+mod close_pane;
 mod close_tab;
 mod copy;
 mod endpoint_requests;

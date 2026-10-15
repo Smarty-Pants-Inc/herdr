@@ -11,6 +11,9 @@ use crate::app::App;
 const PLUGIN_COMMAND_OUTPUT_MAX_BYTES: usize = 64 * 1024;
 pub(super) const MAX_PLUGIN_COMMANDS_IN_FLIGHT: usize = 32;
 const PLUGIN_COMMAND_LOG_LIMIT: usize = 200;
+const PLUGIN_ACTION_GRANT_UNAVAILABLE: &str = "plugin_action_grant_unavailable";
+const PLUGIN_ACTION_GRANT_UNAVAILABLE_MESSAGE: &str =
+    "plugin action could not get its security grant; try again";
 
 impl App {
     pub(super) fn start_plugin_command(
@@ -79,11 +82,15 @@ impl App {
                 link_handler_id.clone(),
             ));
         }
-        if self.state.plugin_commands_in_flight >= MAX_PLUGIN_COMMANDS_IN_FLIGHT {
-            let message = format!(
-                "maximum concurrent plugin commands reached ({MAX_PLUGIN_COMMANDS_IN_FLIGHT})"
-            );
-            let log = PluginCommandLogInfo {
+        let refuse = |app: &mut Self,
+                      log_id: String,
+                      action_id: Option<String>,
+                      event: Option<String>,
+                      command: Vec<String>,
+                      code: &'static str,
+                      message: String|
+         -> Result<PluginCommandLogInfo, (&'static str, String)> {
+            app.push_plugin_command_log(PluginCommandLogInfo {
                 log_id,
                 plugin_id: plugin.plugin_id.clone(),
                 action_id,
@@ -96,31 +103,61 @@ impl App {
                 stdout: Some(String::new()),
                 stderr: Some(String::new()),
                 error: Some(message.clone()),
-            };
-            self.push_plugin_command_log(log);
-            return Err(("plugin_command_limit_reached", message));
+            });
+            Err((code, message))
+        };
+        if self.state.plugin_commands_in_flight >= MAX_PLUGIN_COMMANDS_IN_FLIGHT {
+            let message = format!(
+                "maximum concurrent plugin commands reached ({MAX_PLUGIN_COMMANDS_IN_FLIGHT})"
+            );
+            return refuse(
+                self,
+                log_id,
+                action_id,
+                event,
+                command,
+                "plugin_command_limit_reached",
+                message,
+            );
         }
         // Only user-invoked actions get an input grant; startup and event
         // hooks never do (herdr-8592). Minted before spawn so the child can
         // never present it before it is registered.
+        //
+        // herdr#9212: a user-invoked action never runs without its grant.
+        // Running tokenless is not a safe fallback, even for a pane-invoked
+        // action: the action child is spawned by the server, not inside the
+        // invoking pane's process tree, so pane ancestry cannot attribute it,
+        // and a grandchild that strips HERDR_ENV/HERDR_PANE_ID is classified
+        // as an ordinary server descendant that may write to any existing
+        // pane. Mint or bind failure therefore refuses the action before any
+        // worker, spawn or in-flight accounting.
         let action_grant = match (action_id.as_ref(), event.is_none()) {
-            (Some(action_id), true) => match self.plugin_action_grants.mint(
+            (Some(granted_action_id), true) => match self.plugin_action_grants.mint(
                 crate::plugin_action_origin::PluginActionGrant {
                     plugin_id: plugin.plugin_id.clone(),
-                    action_id: action_id.clone(),
+                    action_id: granted_action_id.clone(),
                     invoking_pane: context.focused_pane_id.clone(),
                     grant_id: log_id.clone(),
                 },
             ) {
                 Ok((_, key)) if !self.bind_plugin_action_invoking_terminal(key, context) => {
                     // The server-resolved invoking pane has no terminal or
-                    // the grant refused it: fail closed, run without a token.
+                    // the grant refused it: revoke and refuse the action.
                     self.plugin_action_grants.revoke(key);
                     tracing::warn!(
                         plugin_id = %plugin.plugin_id,
-                        "plugin action invoking terminal unavailable; running without an input grant"
+                        "plugin action invoking terminal unavailable; action refused"
                     );
-                    None
+                    return refuse(
+                        self,
+                        log_id,
+                        action_id,
+                        event,
+                        command,
+                        PLUGIN_ACTION_GRANT_UNAVAILABLE,
+                        PLUGIN_ACTION_GRANT_UNAVAILABLE_MESSAGE.to_string(),
+                    );
                 }
                 Ok((token, key)) => {
                     env.push((
@@ -136,9 +173,17 @@ impl App {
                     tracing::warn!(
                         err = %err,
                         plugin_id = %plugin.plugin_id,
-                        "plugin action input grant unavailable; running without one"
+                        "plugin action input grant unavailable; action refused"
                     );
-                    None
+                    return refuse(
+                        self,
+                        log_id,
+                        action_id,
+                        event,
+                        command,
+                        PLUGIN_ACTION_GRANT_UNAVAILABLE,
+                        PLUGIN_ACTION_GRANT_UNAVAILABLE_MESSAGE.to_string(),
+                    );
                 }
             },
             _ => None,
@@ -517,6 +562,144 @@ pub(super) fn read_capped_plugin_output(mut reader: impl Read, cap: usize) -> St
         ));
     }
     output
+}
+
+/// herdr#9212: user-invoked actions refuse to run without their grant. These
+/// never spawn, so they run on every platform.
+#[cfg(test)]
+mod grant_refusal_tests {
+    use super::*;
+    use crate::plugin_action_origin::{PluginActionGrant, MAX_ENTRIES};
+
+    fn test_app() -> App {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        App::new(
+            &crate::config::Config::default(),
+            crate::app::AppPolicy::TEST,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        )
+    }
+
+    fn plugin() -> InstalledPluginInfo {
+        InstalledPluginInfo {
+            plugin_id: "example.grant-refusal".into(),
+            name: "Grant refusal".into(),
+            version: "0.1.0".into(),
+            min_herdr_version: crate::build_info::BASE_VERSION.into(),
+            description: None,
+            manifest_path: "never-read/herdr-plugin.toml".into(),
+            plugin_root: "never-read".into(),
+            enabled: true,
+            platforms: None,
+            build: vec![],
+            startup: vec![],
+            actions: vec![],
+            events: vec![],
+            panes: vec![],
+            link_handlers: vec![],
+            source: Default::default(),
+            warnings: vec![],
+        }
+    }
+
+    /// Fills the registry with pending grants through the real mint path.
+    fn fill_registry(app: &App) -> usize {
+        let mut minted = 0;
+        while app
+            .plugin_action_grants
+            .mint(PluginActionGrant {
+                plugin_id: "filler".into(),
+                action_id: "filler".into(),
+                invoking_pane: None,
+                grant_id: format!("filler-{minted}"),
+            })
+            .is_ok()
+        {
+            minted += 1;
+            assert!(minted <= MAX_ENTRIES, "registry never filled");
+        }
+        minted
+    }
+
+    fn assert_refused(
+        app: &mut App,
+        context: &PluginInvocationContext,
+    ) -> Result<PluginCommandLogInfo, (&'static str, String)> {
+        let logs_before = app.state.plugin_command_logs.len();
+        let result = app.start_plugin_command(
+            &plugin(),
+            Some("open".into()),
+            None,
+            vec!["never-launched-9212".into()],
+            context,
+            None,
+        );
+        let Err((code, message)) = &result else {
+            panic!("action ran without a grant: {result:?}");
+        };
+        assert_eq!(*code, "plugin_action_grant_unavailable");
+        assert_eq!(message, PLUGIN_ACTION_GRANT_UNAVAILABLE_MESSAGE);
+        assert!(!message.contains("registry") && !message.contains("token"));
+        assert_eq!(app.state.plugin_commands_in_flight, 0, "no worker started");
+        assert_eq!(app.state.plugin_command_logs.len(), logs_before + 1);
+        let log = app.state.plugin_command_logs.last().unwrap();
+        assert_eq!(log.status, PluginCommandStatus::Failed);
+        assert_eq!(log.error.as_deref(), Some(message.as_str()));
+        assert_eq!(log.exit_code, None);
+        result
+    }
+
+    #[test]
+    fn global_action_is_refused_when_grant_mint_fails() {
+        let mut app = test_app();
+        assert_eq!(fill_registry(&app), MAX_ENTRIES);
+        let context = app.invoking_plugin_context(None, "refuse-global");
+        assert!(context.focused_pane_id.is_none());
+        let _ = assert_refused(&mut app, &context);
+    }
+
+    #[test]
+    fn pane_action_is_refused_when_grant_mint_fails() {
+        let mut app = test_app();
+        let workspace = crate::workspace::Workspace::test_new("grant-refusal");
+        let pane_id = workspace.tabs[0].root_pane;
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        let context = app.plugin_context_for_pane(0, pane_id, "refuse-pane");
+        assert!(context.focused_pane_id.is_some());
+        assert_eq!(fill_registry(&app), MAX_ENTRIES);
+        let _ = assert_refused(&mut app, &context);
+    }
+
+    #[test]
+    fn action_is_refused_and_grant_revoked_when_invoking_terminal_cannot_bind() {
+        let mut app = test_app();
+        let mut context = app.invoking_plugin_context(None, "refuse-bind");
+        context.focused_pane_id = Some("p_missing_9212".into());
+        let _ = assert_refused(&mut app, &context);
+        // The refused grant is a revoked tombstone, so the registry still
+        // admits a full set of pending grants.
+        assert_eq!(fill_registry(&app), MAX_ENTRIES);
+    }
+
+    #[test]
+    fn event_hooks_never_mint_so_a_full_registry_does_not_refuse_them() {
+        let mut app = test_app();
+        assert_eq!(fill_registry(&app), MAX_ENTRIES);
+        let context = app.invoking_plugin_context(None, "hook");
+        let result = app.start_plugin_command(
+            &plugin(),
+            None,
+            Some("worktree.created".into()),
+            vec!["never-launched-9212".into()],
+            &context,
+            None,
+        );
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(app.state.plugin_commands_in_flight, 1);
+    }
 }
 
 #[cfg(all(test, unix))]

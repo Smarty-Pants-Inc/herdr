@@ -34,12 +34,15 @@ mod agent_channel_tests;
 mod config_file_tests;
 
 pub(super) mod client_identity;
-mod group_privilege;
-pub(crate) use group_privilege::drop_inherited_group_privilege;
 pub(super) mod input_consumer;
+pub(super) mod peer_pidfd;
+pub(super) mod server_key;
 
 mod shutdown;
 pub(crate) use shutdown::monitor_host_shutdown;
+
+mod scheduling;
+pub(crate) use scheduling::{check_server_scheduling, prepare_pane_scheduling, PaneScheduling};
 
 pub(super) fn local_socket_peer_pid_platform(fd: RawFd) -> Option<u32> {
     let mut credentials = std::mem::MaybeUninit::<libc::ucred>::zeroed();
@@ -455,7 +458,58 @@ fn copy_config_xattrs(source: RawFd, destination: RawFd) -> std::io::Result<()> 
     Ok(())
 }
 
-pub fn raise_server_nofile_limit() {}
+/// systemd's default hard `NOFILE` (`DefaultLimitNOFILE=1024:524288`): the soft
+/// limit a service manager would grant on request, so a server autostarted from
+/// an SSH login (soft 1024) does not run out of descriptors with many panes.
+const SERVER_NOFILE_LIMIT_TARGET: libc::rlim_t = 524_288;
+
+pub fn raise_server_nofile_limit() {
+    match raise_nofile_limit(SERVER_NOFILE_LIMIT_TARGET) {
+        Ok(None) => {}
+        Ok(Some((previous, target))) => {
+            tracing::info!(previous, target, "raised server file descriptor soft limit")
+        }
+        Err(err) => tracing::warn!(err = %err, "failed to raise server file descriptor limit"),
+    }
+}
+
+fn raise_nofile_limit(
+    target: libc::rlim_t,
+) -> std::io::Result<Option<(libc::rlim_t, libc::rlim_t)>> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    // The hard limit is never changed.
+    let Some(target) = target_nofile_soft_limit(limit.rlim_cur, limit.rlim_max, target) else {
+        return Ok(None);
+    };
+
+    let previous = limit.rlim_cur;
+    limit.rlim_cur = target;
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    Ok(Some((previous, target)))
+}
+
+/// Soft limit to request, or `None` when the current soft limit already meets
+/// the capped target. Never exceeds `hard` and never lowers `current`.
+fn target_nofile_soft_limit(
+    current: libc::rlim_t,
+    hard: libc::rlim_t,
+    target: libc::rlim_t,
+) -> Option<libc::rlim_t> {
+    // RLIM_INFINITY exceeds the target on every Linux ABI, so min() also
+    // covers an unlimited hard limit.
+    let target = target.min(hard);
+    (current < target).then_some(target)
+}
 
 pub(crate) fn should_draw_host_cursor_by_default() -> bool {
     running_inside_wsl()
@@ -1588,6 +1642,20 @@ pub(crate) fn process_identity(pid: u32) -> Option<crate::platform::ProcessIdent
     })
 }
 
+/// Read the current POSIX group only while the original reporter is live.
+/// Numeric PID queries are bracketed so zombies and PID reuse cannot prove ownership.
+pub(super) fn session_reporter_process_group_id(reporter: super::ProcessIdentity) -> Option<u32> {
+    let pid = libc::pid_t::try_from(reporter.pid)
+        .ok()
+        .filter(|pid| *pid > 0)?;
+    if process_identity(reporter.pid) != Some(reporter) {
+        return None;
+    }
+    // SAFETY: getpgid queries one positive PID and has no pointer arguments.
+    let group = unsafe { libc::getpgid(pid) };
+    (group > 0 && process_identity(reporter.pid) == Some(reporter)).then_some(group as u32)
+}
+
 pub(crate) fn process_caller_metadata_platform(
     peer: super::ProcessIdentity,
 ) -> Option<super::CallerMetadata> {
@@ -1612,12 +1680,21 @@ pub(crate) fn process_caller_metadata_platform(
                     .map(str::to_owned)
             })
         });
+    // Reuse the stat snapshot above, rather than adding a getsid syscall (or
+    // another /proc read) just for the log. Field 6 is the OS session ID.
+    let sid = stat
+        .get(stat.rfind(')')? + 2..)?
+        .split_whitespace()
+        .nth(3)
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|sid| *sid != 0);
     // The exe and cgroup lookups reopen a numeric PID; discard the entire
     // snapshot if the original instance exited or was replaced during either.
     (process_identity(peer.pid) == Some(peer)).then_some(super::CallerMetadata {
         exe,
         ppid: Some(ppid),
         unit,
+        sid,
     })
 }
 
@@ -1644,16 +1721,23 @@ fn process_identity_and_parent_from_stat(
 /// outside this server only when its ancestry reaches a strictly older process
 /// before reaching the current server. Missing, reused, exited, or newer
 /// evidence remains unknown; pane markers are enforced by the caller.
-pub(crate) fn process_identity_outside_server_ancestry(
-    peer: crate::platform::ProcessIdentity,
-) -> Option<bool> {
-    let server = process_identity(std::process::id())?;
-    crate::platform::observe_outside_server_ancestry(
-        peer,
-        server,
-        process_identity,
-        parent_process_identity,
-    )
+pub(crate) fn process_identity_server_ancestry_observation(
+    peer: super::ProcessIdentity,
+) -> super::ServerAncestryObservation {
+    let mut root_pid = None;
+    let outside = process_identity(std::process::id()).and_then(|server| {
+        super::observe_outside_server_ancestry_with_root(
+            peer,
+            server,
+            process_identity,
+            parent_process_identity,
+            &mut root_pid,
+        )
+    });
+    super::ServerAncestryObservation {
+        verdict: super::server_ancestry_observation(outside),
+        root_pid,
+    }
 }
 
 fn process_session_id(pid: u32) -> Option<i32> {
@@ -1667,6 +1751,114 @@ fn process_session_id(pid: u32) -> Option<i32> {
 mod tests {
     use super::*;
     use std::{cell::RefCell, collections::HashMap};
+
+    // Decision C: keep these pure tests. The real-server E2E covers
+    // 1024 -> 524288, 1024 -> 4096 and already-at-hard. An unprivileged lane
+    // (hard = soft = 524288) cannot reach the states below.
+
+    // Keep: a hard limit above the target needs privilege to set up.
+    #[test]
+    fn nofile_target_caps_at_target_when_hard_is_higher() {
+        assert_eq!(
+            target_nofile_soft_limit(1024, 1_048_576, SERVER_NOFILE_LIMIT_TARGET),
+            Some(SERVER_NOFILE_LIMIT_TARGET)
+        );
+    }
+
+    // Keep: the kernel rejects hard NOFILE above fs.nr_open, so an unlimited
+    // hard limit is unreachable in a real process.
+    #[test]
+    fn nofile_target_caps_at_target_when_hard_is_unlimited() {
+        assert_eq!(
+            target_nofile_soft_limit(1024, libc::RLIM_INFINITY, SERVER_NOFILE_LIMIT_TARGET),
+            Some(SERVER_NOFILE_LIMIT_TARGET)
+        );
+    }
+
+    // Keep: a soft limit above the target needs a hard limit above the target,
+    // which needs privilege to set up.
+    #[test]
+    fn nofile_target_does_not_lower_soft_limit_above_target() {
+        assert_eq!(
+            target_nofile_soft_limit(1_048_576, 1_048_576, SERVER_NOFILE_LIMIT_TARGET),
+            None
+        );
+    }
+
+    #[test]
+    fn caller_metadata_sid_matches_getsid_without_an_extra_production_syscall() {
+        let peer = process_identity(std::process::id()).expect("live peer");
+        let metadata = process_caller_metadata_platform(peer).expect("live metadata");
+        // SAFETY: getsid only reads the current process's session ID. The
+        // production metadata path instead extracts it from its existing stat.
+        let sid = unsafe { libc::getsid(0) };
+        assert!(sid > 0);
+        assert_eq!(metadata.sid, Some(sid as u32));
+        assert!(
+            process_caller_metadata_platform(super::super::ProcessIdentity {
+                start_time: peer.start_time.wrapping_add(1),
+                ..peer
+            })
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn session_reporter_foreground_rejects_zombie_and_reaped_process() {
+        struct Child(std::process::Child);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut child = Child(
+            std::process::Command::new("sh")
+                .args(["-c", "read line"])
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn reporter"),
+        );
+        let reporter = process_identity(child.0.id()).expect("live reporter pin");
+        let group = session_reporter_process_group_id(reporter).expect("live reporter group");
+        assert!(super::super::session_reporter_is_foreground(
+            reporter,
+            || { Some(group) }
+        ));
+        drop(child.0.stdin.take());
+        let mut status = std::mem::MaybeUninit::<libc::siginfo_t>::uninit();
+        loop {
+            // SAFETY: waitid receives this owned child's PID and a writable
+            // siginfo buffer. WNOWAIT preserves the zombie for the proof check.
+            let result = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    reporter.pid,
+                    status.as_mut_ptr(),
+                    libc::WEXITED | libc::WNOWAIT,
+                )
+            };
+            if result == 0 {
+                break;
+            }
+            assert_eq!(
+                std::io::Error::last_os_error().kind(),
+                std::io::ErrorKind::Interrupted,
+                "wait for zombie without reaping",
+            );
+        }
+        assert!(process_identity(reporter.pid).is_none());
+        assert!(session_reporter_process_group_id(reporter).is_none());
+        assert!(!super::super::session_reporter_is_foreground(
+            reporter,
+            || { Some(group) }
+        ));
+        child.0.wait().expect("reap reporter");
+        assert!(!super::super::session_reporter_is_foreground(
+            reporter,
+            || { Some(group) }
+        ));
+    }
 
     #[test]
     fn initial_environment_parser_distinguishes_absence_and_malformed_data() {

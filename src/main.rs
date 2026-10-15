@@ -238,6 +238,9 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # allow_unelevated_clients = false
 # headless_cols = 120
 # headless_rows = 40
+# Linux: nice value for new panes, which always start at SCHED_OTHER even
+# when the server itself runs at idle priority. Range -20..19.
+# pane_nice = 0
 
 # [worktrees]
 # directory = "~/.herdr/worktrees"
@@ -517,8 +520,10 @@ fn finish_cli(outcome: io::Result<cli::CommandOutcome>) -> io::Result<()> {
 }
 
 fn main() -> io::Result<()> {
-    // Before any file, socket or child (herdr#188).
-    platform::drop_inherited_group_privilege();
+    // Before anything reads config or the environment, or opens a file, socket or child:
+    // the server takes its attestation key, every mode drops a setgid group and refuses to
+    // run with the herdr group (smarty-dev#2636 r4 conditions 1-2, herdr#188).
+    platform::acquire_server_key(&std::env::args_os().collect::<Vec<_>>());
     let raw_args: Vec<String> = match args_as_utf8(std::env::args_os()) {
         Ok(args) => args,
         Err(err) => {

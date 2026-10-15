@@ -364,6 +364,13 @@ pub struct PaneRenameParams {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PaneSendTextParams {
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "super::deserialize_expected_terminal"
+    )]
+    #[schemars(with = "String")]
+    pub expected_agent_session_id: Option<String>,
     pub pane_id: String,
     pub text: String,
     /// Deliberately allow an agent-originated request to target another pane.
@@ -373,11 +380,69 @@ pub struct PaneSendTextParams {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PaneSendKeysParams {
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "super::deserialize_expected_terminal"
+    )]
+    #[schemars(with = "String")]
+    pub expected_agent_session_id: Option<String>,
     pub pane_id: String,
     pub keys: Vec<String>,
     /// Deliberately allow an agent-originated request to target another pane.
     #[serde(default, skip_serializing_if = "super::is_false")]
     pub allow_cross_pane: bool,
+}
+
+/// `pane.send_text_path_checked`: `pane.send_text` with a path check before
+/// each write attempt until the first byte is successfully written. A present
+/// `refuse_if_exists` path refuses with `guard_path_present`, zero bytes and no
+/// flush. Once writing starts, a later claim does not interrupt the request.
+/// Older servers reject the method name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneSendTextPathCheckedParams {
+    #[serde(flatten)]
+    pub input: PaneSendTextParams,
+    /// Absolute path; until the first byte is written, `lstat` before each
+    /// attempt refuses if it succeeds (`guard_path_present`) or fails other
+    /// than not-found (`guard_path_unverifiable`). No checks after that byte.
+    pub refuse_if_exists: String,
+}
+
+/// `pane.send_keys_path_checked`: `pane.send_keys` with the same
+/// before-first-byte `refuse_if_exists` guard as `pane.send_text_path_checked`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneSendKeysPathCheckedParams {
+    #[serde(flatten)]
+    pub input: PaneSendKeysParams,
+    /// Absolute path; until the first byte is written, `lstat` before each
+    /// attempt refuses if it succeeds (`guard_path_present`) or fails other
+    /// than not-found (`guard_path_unverifiable`). No checks after that byte.
+    pub refuse_if_exists: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneCloseParams {
+    pub pane_id: String,
+    /// Refuse the close unless the pane still owns this opaque terminal identity.
+    /// Older servers ignore this field on `pane.close`; use `pane.close_guarded`
+    /// after checking `pane_close_expected_terminal_guard`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "super::deserialize_expected_terminal"
+    )]
+    #[schemars(with = "String")]
+    pub expected_terminal: Option<String>,
+}
+
+impl PaneCloseParams {
+    pub fn unguarded(pane_id: impl Into<String>) -> Self {
+        Self {
+            pane_id: pane_id.into(),
+            expected_terminal: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -541,6 +606,9 @@ pub struct PaneInfo {
     pub tokens: HashMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_session: Option<AgentSessionInfo>,
+    /// Actual ID from the accepted current report, independent of its resume path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scroll: Option<PaneScrollInfo>,
     pub revision: u64,

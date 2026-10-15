@@ -1277,7 +1277,7 @@ fn agent_methods_round_trip_over_socket() {
     let agents = listed["result"]["agents"].as_array().unwrap();
     assert_eq!(agents.len(), 1);
     assert_eq!(agents[0]["terminal_id"], terminal_id);
-    assert!(agents[0].get("name").is_none());
+    assert_eq!(agents[0].get("name"), Some(&serde_json::Value::Null));
     assert_eq!(agents[0]["agent"], "pi");
     assert_eq!(agents[0]["agent_status"], "working");
     assert_eq!(agents[0]["pane_id"], pane_id);

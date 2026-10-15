@@ -103,11 +103,11 @@ Raw socket method names use dot notation:
 | Workspace | `workspace.create`, `workspace.create_linked`, `workspace.list`, `workspace.get`, `workspace.focus`, `workspace.rename`, `workspace.move`, `workspace.move_block`, `workspace.report_metadata`, `workspace.close` |
 | Worktree | `worktree.list`, `worktree.create`, `worktree.create_project_checked`, `worktree.open`, `worktree.open_project_checked`, `worktree.remove` |
 | Tab | `tab.create`, `tab.list`, `tab.get`, `tab.focus`, `tab.rename`, `tab.move`, `tab.close` |
-| Pane | `pane.split`, `pane.swap`, `pane.move`, `pane.zoom`, `pane.layout`, `pane.process_info`, `pane.neighbor`, `pane.edges`, `pane.focus_direction`, `pane.resize`, `pane.list`, `pane.current`, `pane.get`, `pane.last_input`, `pane.rename`, `pane.send_text`, `pane.send_keys`, `pane.send_input`, `pane.send_input_guarded`, `pane.read`, `pane.report_agent`, `pane.report_agent_session`, `pane.report_metadata`, `pane.clear_agent_authority`, `pane.release_agent`, `pane.close`, `pane.wait_for_output` |
+| Pane | `pane.split`, `pane.swap`, `pane.move`, `pane.zoom`, `pane.layout`, `pane.process_info`, `pane.neighbor`, `pane.edges`, `pane.focus_direction`, `pane.resize`, `pane.list`, `pane.current`, `pane.get`, `pane.last_input`, `pane.rename`, `pane.send_text`, `pane.send_text_session_checked`, `pane.send_keys`, `pane.send_keys_session_checked`, `pane.send_text_path_checked`, `pane.send_keys_path_checked`, `pane.send_input`, `pane.send_input_guarded`, `pane.read`, `pane.report_agent`, `pane.report_agent_session`, `pane.report_metadata`, `pane.clear_agent_authority`, `pane.release_agent`, `pane.close`, `pane.close_guarded`, `pane.wait_for_output` |
 | Input consumer (local JSON only) | `pane.input_consumer.enroll`, `pane.input_consumer.cut`, `pane.input_consumer.release` |
 | Popup | `popup.close` |
 | Layout | `layout.export`, `layout.apply`, `layout.apply_restorable`, `layout.set_split_ratio` |
-| Agent | `agent.list`, `agent.get`, `agent.read`, `agent.explain`, `agent.send_keys`, `agent.prompt`, `agent.register_self`, `agent.channel_info`, `agent.draft_state`, `agent.prompt_guarded`, `agent.wait`, `agent.rename`, `agent.focus`, `agent.start`, `agent.start_guarded`, `agent.view.set`, `agent.view.clear` |
+| Agent | `agent.list`, `agent.get`, `agent.read`, `agent.explain`, `agent.send_keys`, `agent.prompt`, `agent.prompt_session_checked`, `agent.register_self`, `agent.channel_info`, `agent.draft_state`, `agent.prompt_guarded`, `agent.wait`, `agent.rename`, `agent.focus`, `agent.start`, `agent.start_guarded`, `agent.view.set`, `agent.view.clear` |
 | Events | `events.subscribe`, `events.wait` |
 | Integrations | `integration.install`, `integration.uninstall` |
 | Plugins | `plugin.link`, `plugin.list`, `plugin.unlink`, `plugin.enable`, `plugin.disable`, `plugin.action.list`, `plugin.action.invoke`, `plugin.log.list`, `plugin.pane.open`, `plugin.pane.focus`, `plugin.pane.close` |
@@ -154,9 +154,19 @@ ACKs must match the live connection, epoch, request ID, and session generation. 
 
 Only complete frames are submitted. Frame size, in-flight requests, receipt waiters, and the per-epoch dedup ledger are bounded; capacity exhaustion refuses rather than evicting reusable dedup keys. The server reserves `(registration_epoch, request_id, exact text, if_draft_empty)` before dispatch. Both server and Pi include the guard value in payload identity, including retained retired-epoch entries. A duplicate with the same payload shares the first receipt and is marked `duplicate`; a changed payload is rejected with `payload_mismatch`. A new request ID is never an automatic retry.
 
+#### Epoch rotation
+
+When an epoch's dedup ledger reaches its rotation threshold, the server stops reserving new request IDs on that epoch; they fail with `agent_channel_rotating` and are neither reserved nor delivered. Duplicates of already reserved IDs still return their receipts. Once no request on the epoch is pending, the server sends one control frame and closes the connection:
+
+```json
+{"type":"rotate","registration_epoch":"epoch_opaque","session_generation":"pi-session-token"}
+```
+
+Pi acts only on a rotate frame that matches its live connection, epoch, and session generation. It closes the socket and opens a new one, sends `agent.register_self` again as the first request with its current `session_generation` (and `draft_guard` when supported), and waits for `ready: true`. It does not resend deliveries or ACKs from the old connection. Until the new registration is ready, `agent.channel_info` reports `ready: false` and delivery is refused. A delivery pinned to the old epoch fails with `registration_epoch_mismatch`, except that a duplicate of a request reserved on the old epoch still returns its original receipt while that epoch is the one retained prior epoch and the current channel is still attached, foreground, and bound to the same pane; otherwise it also fails with `registration_epoch_mismatch`. Callers then call `agent.channel_info` again and pin the new `registration_epoch`; they must not replay the old request under the new epoch.
+
 #### Redacted draft-state queries
 
-`agent.draft_state` requires `target` and accepts an optional boolean `allow_cross_pane` (default `false`) as an explicit cross-pane opt-in; same-pane queries need no opt-in. It observes the registered receiver's editor and UI hold without changing them. The default query timeout is two seconds. It never returns draft text:
+`agent.draft_state` requires `target` and accepts an optional boolean `allow_cross_pane` (default `false`), kept for compatibility; the input-origin check is advisory, so cross-pane queries are allowed and logged without it. It observes the registered receiver's editor and UI hold without changing them. The default query timeout is two seconds. It never returns draft text:
 
 ```json
 {"id":"draft","method":"agent.draft_state","params":{"target":"w1:p1"}}
@@ -164,7 +174,7 @@ Only complete frames are submitted. Frame size, in-flight requests, receipt wait
 {"id":"draft","result":{"status":"unknown","reason":"unsupported"}}
 ```
 
-For `status: "known"`, `empty` is boolean and `hold` is `null` (no active hold), `"dialog"`, `"custom"`, or `"editor"`. The result contains no draft text or character count. `status: "unknown"` has a typed `reason`: `unregistered` (no registered channel), `unsupported` (missing draft-guard capability), `timeout` (no timely reply), or `unknown` (unobservable state). Unknown must not be treated as empty. An agent querying its own pane is allowed by default; an agent querying another pane requires `allow_cross_pane: true`. Ordinary external operators follow the same policy as `agent.prompt`. Authorization is checked before reservation or frame dispatch. Attribution or connection uncertainty fails closed. This observation is not a reservation or authorization for a later prompt; never supply a cached state as proof that a later delivery is safe.
+For `status: "known"`, `empty` is boolean and `hold` is `null` (no active hold), `"dialog"`, `"custom"`, or `"editor"`. The result contains no draft text or character count. `status: "unknown"` has a typed `reason`: `unregistered` (no registered channel), `unsupported` (missing draft-guard capability), `timeout` (no timely reply), or `unknown` (unobservable state). Unknown must not be treated as empty. An agent may query its own pane and, without `allow_cross_pane`, another pane: the input-origin check is advisory, so cross-pane and unattributable queries are allowed and logged. Ordinary external operators follow the same policy as `agent.prompt`. The check runs before reservation or frame dispatch; a presented invalid plugin-action token is still refused. Connection uncertainty fails closed. This observation is not a reservation or authorization for a later prompt; never supply a cached state as proof that a later delivery is safe.
 
 Over the existing registration socket, the query and reply use the same epoch, request ID, and session generation:
 
@@ -186,7 +196,7 @@ Only one of the known or unknown replies is used. The server validates correlati
 
 When requesting `if_draft_empty: true`, first require `agent.channel_info.result.draft_guard == true`; older servers may otherwise ignore a new field. The CLI preflights this capability for both `agent prompt --if-draft-empty` and `agent prompt-guarded --if-draft-empty`, with no typing or legacy fallback. The convenience `agent prompt` flag is incompatible with `--wait`, `--until`, and `--timeout`. Without the flag, legacy `agent prompt` behavior is unchanged; raw `agent.prompt` is not the draft-guard method.
 
-A requested guard adds `if_draft_empty: true` and `deadline_ms` to the `deliver` frame; unguarded frames omit the guard flag. `deadline_ms` is an absolute Unix epoch millisecond deadline fixed at the first server reservation, not a new public API parameter. Duplicates retain that first deadline; differing caller timeouts do not change payload identity. Pi validates expiry synchronously before the editor/hold checks and submit invocation: `Date.now() >= deadline_ms` rejects with `expired`, without submission or editor mutation; missing or invalid guarded expiry rejects with `unknown`.
+A requested guard adds `if_draft_empty: true`, `deadline_ms`, and `remaining_ms` to the `deliver` frame; unguarded frames omit the guard flag. The deadline is fixed on the server's monotonic clock at the first server reservation, not a new public API parameter. Duplicates retain that first deadline; differing caller timeouts do not change payload identity. `remaining_ms` is the whole milliseconds left on that deadline when the server starts writing the frame. `deadline_ms` is the same deadline as absolute Unix epoch milliseconds, kept for logs and for receivers that predate `remaining_ms`. On receipt, Pi converts `remaining_ms` to a deadline on its own monotonic clock, and admission requires both that budget and `deadline_ms` to be unexpired: the budget means a backward wall-clock step cannot admit a prompt late, and `deadline_ms` means time spent before Pi reads the frame cannot either. Without `remaining_ms`, Pi uses `deadline_ms` alone. Pi validates expiry synchronously before the editor/hold checks and again before submit invocation: an elapsed budget or deadline rejects with `expired`, without submission or editor mutation; a missing or invalid guarded expiry, including a missing `deadline_ms` (even with `remaining_ms` present) or a present but malformed `remaining_ms` or `deadline_ms`, rejects with `unknown`.
 
 Pi checks the editor and hold synchronously immediately before invoking `pi.submitUserMessage`, with no await or scheduling gap between check and invocation, then awaits the receipt. It never mutates the editor or uses typing/legacy ingress. A nonempty draft refuses with `draft_present`, any non-`undefined` `holdState()` value with `ui_hold` (including `dialog`, `custom`, and `editor`), and an unavailable getter, exception, non-string draft, or unobservable state with `unknown`. These become `agent_prompt_rejected` errors with typed `error.reason`. Missing registration or capability refuses with `unregistered` or `unsupported`. These pre-admission refusals submit nothing and preserve the draft; a prior draft-state query cannot bypass the check.
 
@@ -207,6 +217,8 @@ The identity boundary is cooperative and same-user: kernel peer identity proves 
 `agent.wait` is server-owned and event-driven. It pins the resolved pane occupant so a replacement cannot satisfy the wait. `agent.prompt` accepts an optional `wait` object with `until` and `timeout_ms`; this submits the prompt and starts the wait in one request, avoiding a race between separate calls. If the resolved agent is already `blocked`, `agent.prompt` returns `agent_blocked` without sending input or starting the wait.
 
 `workspace.move_block` atomically moves the ordered `workspace_ids` before `before_workspace_id`; omit the anchor to move the block to the end. The ids must be unique and the anchor cannot be part of the block. The response contains the authoritative ordered workspace list.
+
+Every workspace record carries exactly one path. The `worktree` object appears only for a checkout that Herdr opened as a worktree (`worktree.create`, `worktree.open` or `workspace.create_linked`); its `checkout_path` is the workspace's path. `cwd` is present only when the workspace has no `worktree`: it is the current working directory of the workspace's root pane (the first pane of its first tab), or the directory it was created in. A workspace created with `workspace.create` in a Git checkout has `cwd` but no `worktree`.
 
 `session.snapshot` returns a one-time bootstrap snapshot for clients that keep
 their own local runtime cache. The response includes version/protocol metadata,
@@ -296,42 +308,43 @@ and client hello names are not substitutes.
 
 | Method | Required params | Purpose |
 | --- | --- | --- |
-| `pane.input_consumer.enroll` | `pane_id`, `challenge` | Admit the local socket peer and issue `epoch`, secret `epoch_key`, `nonce`, and the pane `tty`. |
-| `pane.input_consumer.cut` | `epoch`, `epoch_key`, `seq`, `token`, `cut`, `digest`, `kind` | Close an interval; `kind` is `submit` or `discard`. |
-| `pane.input_consumer.release` | `epoch`, `epoch_key` | End the epoch before exit, suspension, or TTY handover. |
+| `pane.input_consumer.enroll` | `pane_id`, `challenge` | Admit the local socket peer and issue `epoch`, `nonce`, the pane `tty`, the pinned `peer`, and the server signature `sig`. |
+| `pane.input_consumer.cut` | `epoch`, `seq`, `token`, `cut`, `digest`, `kind` | Close an interval; `kind` is `submit` or `discard`. |
+| `pane.input_consumer.release` | `epoch` | End the epoch before exit, suspension, or TTY handover. |
 
 Requests and responses below are separate JSON lines. Success echoes `id` with
-a flat `result`, **without a `type` tag**. `<epoch>`, `<epoch_key>`, and `<nonce>`
-are illustrative placeholders, not usable credentials; use the values returned
-by enrollment privately.
+a flat `result`, **without a `type` tag**. `<epoch>` and `<nonce>` are
+illustrative placeholders. Nothing the consumer holds or sends is a secret:
+requests carry no credential, and only the enrolled process may cut or release.
+The value labels the input's provenance; it is not a gate on input.
 
 ```json
 {"id":"enroll","method":"pane.input_consumer.enroll","params":{"pane_id":"w1:p1","challenge":"<64 lowercase hex>"}}
-{"id":"enroll","result":{"epoch":"<epoch>","epoch_key":"<epoch_key>","nonce":"<nonce>","tty":{"dev":"<st_dev>","ino":"<st_ino>"}}}
+{"id":"enroll","result":{"epoch":"<epoch>","nonce":"<nonce>","tty":{"dev":"<st_dev>","ino":"<st_ino>"},"peer":{"pid":"<pid>","pidns":"<pid namespace inode>"},"sig":"<base64 Ed25519>"}}
 ```
 
 For the first interval containing exactly `a\r` (hex bytes `61 0d`), `cut = 2`
 and `digest` is SHA-256 of those two bytes, not of the literal backslash notation:
 
 ```json
-{"id":"cut","method":"pane.input_consumer.cut","params":{"epoch":"<epoch>","epoch_key":"<epoch_key>","seq":1,"token":"example-submit-1","cut":2,"digest":"961a57df036f6c4f44ca8a054271c45e823f469bcc439f0255c40974c3e3d131","kind":"submit"}}
+{"id":"cut","method":"pane.input_consumer.cut","params":{"epoch":"<epoch>","seq":1,"token":"example-submit-1","cut":2,"digest":"961a57df036f6c4f44ca8a054271c45e823f469bcc439f0255c40974c3e3d131","kind":"submit"}}
 ```
 
 Alternative responses to that cut (one response per request):
 
 ```json
-{"id":"cut","result":{"result":"client","principal":null,"mac":"<64 hex>"}}
-{"id":"cut","result":{"result":"client","principal":{"smarty_id":"kate","display_name":"Kate"},"mac":"<64 hex>"}}
-{"id":"cut","result":{"result":"api","mac":"<64 hex>"}}
-{"id":"cut","result":{"result":"mixed","mac":"<64 hex>"}}
-{"id":"cut","result":{"result":"unknown","reason":"input_log_unavailable","mac":"<64 hex>"}}
+{"id":"cut","result":{"result":"client","principal":null,"sig":"<base64 Ed25519>"}}
+{"id":"cut","result":{"result":"client","principal":{"smarty_id":"kate","display_name":"Kate"},"sig":"<base64 Ed25519>"}}
+{"id":"cut","result":{"result":"api","sig":"<base64 Ed25519>"}}
+{"id":"cut","result":{"result":"mixed","sig":"<base64 Ed25519>"}}
+{"id":"cut","result":{"result":"unknown","reason":"input_log_unavailable","sig":"<base64 Ed25519>"}}
 ```
 
 Release succeeds with an empty object. Refusals use the standard `error`
 envelope with `code` and `message`, not an attribution result:
 
 ```json
-{"id":"release","method":"pane.input_consumer.release","params":{"epoch":"<epoch>","epoch_key":"<epoch_key>"}}
+{"id":"release","method":"pane.input_consumer.release","params":{"epoch":"<epoch>"}}
 {"id":"release","result":{}}
 {"id":"cut","error":{"code":"token_conflict","message":"token_conflict"}}
 ```
@@ -351,14 +364,53 @@ all be off. Each cut rechecks raw mode and unchanged termios; failure returns
 `ping.result.capabilities.input_consumer == true` first: non-Linux servers
 advertise `false` and refuse all three methods with `unsupported_platform`.
 
-**Server authentication.** This build has none: the enroll answer carries no
-`sig`, so a consumer cannot prove which server answered and must treat its
-answers as unauthenticated terminal input. Check `tty` against `fstat` of your
-own stdin. Each cut answer's `mac` is HMAC-SHA256 under the decoded `epoch_key`
-over `herdr-cut-v1`, `epoch`, `seq`, `token`, `cut`, `digest`, `kind`, `result`,
-`reason`, and the principal's `smarty_id` and `display_name` (empty strings when
-absent), each encoded as a u32 big-endian byte length plus UTF-8 bytes. The
-`challenge` is validated but not yet bound to a signature.
+**Peer pin.** Enrollment requires the kernel's `SO_PEERPIDFD` (Linux 6.5),
+pidfs (6.9, 64-bit) and `PIDFD_GET_INFO` (6.13). Herdr keeps the enroll
+connection's pidfd for the epoch. A `cut` or `release` is accepted only when its
+connection's `SO_PEERPIDFD` names the same pidfs inode and that process has not
+exited; otherwise it is refused with `invalid_epoch`, with no sequence change
+and no audit record. Without those kernel features, or when the server's
+`/proc` belongs to another pid namespace, enrollment is refused with
+`peer_identity_unsupported`. There is no pid or start-time fallback.
+
+**Server authentication.** A consumer must not trust any socket that answers.
+The installed server is `root:herdr` mode `2755` and reads the Ed25519 key
+`/etc/herdr/server.key` (`0640 root:herdr`) once at startup, then drops the
+group, so no pane child runs with it and same-user processes cannot read the
+key from the file or from server memory. The `herdr` group must have no
+members and be nobody's primary group, or the server does not load the key:
+`nsswitch.conf` must map `passwd` and `group` (and `initgroups`, if listed) to
+`files` or `files systemd`, `/etc/group` must hold exactly one entry with the
+group's gid (no second name) and no other entry with its name, `/etc/group` and
+`/etc/passwd` must give the group no member or primary holder, and no systemd
+userdb drop-in (`*.membership`, `*.user` `memberOf`, `*.group` `members` in
+`/etc/userdb`, `/run/userdb`, `/run/host/userdb`, or `/usr/lib/userdb`) may
+name it or define its gid under another name. When NSS lists `systemd`, every
+Varlink userdb service in `/run/systemd/userdb` (homed, machined,
+`DynamicUser=`, third-party services; the multiplexer and the NSS re-export are
+skipped) must answer `GetMemberships` for the group and `GetGroupRecord` for its
+gid with `NoRecordFound`, and its user enumeration (`GetUserRecord` without a
+name) must hold no user whose primary gid is the group or whose `memberOf`
+names it. Only `io.systemd.Machine` may refuse enumeration. All queries share a
+2-second deadline; a membership, an error, a timeout, or a bad reply refuses. The server also refuses when it runs with `herdr` as a
+supplementary group, which a setgid drop cannot shed and which proves a member
+exists. An unreadable or unparseable record also refuses. The key is provisioned only by a reviewed root
+setup step that runs the same checks before it writes the key; the server's
+check is defense in depth. Every field below is encoded as a u32 big-endian
+byte length plus UTF-8 bytes; numbers are unsigned decimal strings. The enroll
+`sig` is Ed25519 over `herdr-enroll-v2`, `challenge`, `epoch`, `nonce`,
+`pane_id`, the pane slave's `tty.dev` and `tty.ino`, and the pinned
+`peer.pid` and `peer.pidns` (the peer's pid from `PIDFD_GET_INFO` and the
+nsfs inode of the server's pid namespace). Verify it with
+`/etc/herdr/server.pub` over a message built from your own `challenge` and
+`pane_id`, check `tty` against `fstat` of your own stdin, `peer.pid` against
+your own pid, and `peer.pidns` against the inode of `/proc/self/ns/pid`. Each
+cut answer's `sig` is Ed25519 under the same key over `herdr-cut-answer-v2`,
+`epoch`, `seq`, `token`, `cut`, `digest`, `kind`, `result`, `reason`, and the
+principal's `smarty_id` and `display_name` (empty strings when absent). Fresh
+answers, exact replays and early `unknown` answers are all signed; the release
+answer is not. Without a usable key the server advertises `false` and refuses
+enrollment with `server_key_unavailable`; there is no unsigned mode.
 
 Enrollment and the marker write are one ordered pane-actor operation. The marker
 is `ESC _ herdr-epoch;<nonce> ESC \\`; discard earlier input and strip the expected
@@ -381,7 +433,7 @@ unknown, never neutral. API text and API-sent Enter are not neutral.
 
 New cuts increment `seq` by one, starting at 1. `token` is an idempotency and
 correlation identifier, not authority. An exact retry (same epoch, sequence,
-token, cut, digest, and kind with valid key) returns the recorded result. Changed
+token, cut, digest, and kind from the enrolled process) returns the recorded result. Changed
 fields for a known token are refused as `token_conflict`; an old token cannot
 answer a new sequence. A cut must arrive within **30 seconds** of the server
 writing its endpoint byte. Retained receipts have a 10-minute limit; raw interval
@@ -411,9 +463,8 @@ The map is read at server start and checked by mtime on new connections. An
 invalid map supplies no labels; existing connections keep their bindings.
 **There is no SIGHUP reload**; do not send SIGHUP to refresh the map.
 
-Keep `epoch_key` private and **never log it**. A separate owner-only
-input-consumer audit log records token, epoch, sequence, cut, digest, kind, and
-result, never the key, nonce, or raw input. Attribution requires durable
+A separate owner-only input-consumer audit log records token, epoch, sequence,
+cut, digest, kind, and result, never the nonce, the signature, or raw input. Attribution requires durable
 append/fsync before returning: failure yields `unknown` with
 `input_log_unavailable` and poisons the epoch. Exact retries reuse the durable
 record. This audit is separate from the existing API prewrite input log.
@@ -456,11 +507,73 @@ Check `ping.result.capabilities.expected_terminal_guard == true` before using th
 
 The guard identifies a terminal, not an agent name, process, or native agent session inside that terminal. It does not change the separate cross-pane input policy.
 
+`pane.close` accepts the same optional `expected_terminal` string. The server checks it and closes the pane in the same step, so another terminal cannot take the pane in between. A missing pane, unknown identity, malformed string, or different attachment returns `terminal_identity_mismatch` and closes nothing. Omit the field to keep the unguarded close. An older server ignores this field on `pane.close`, so check `ping.result.capabilities.pane_close_expected_terminal_guard == true` and send `pane.close_guarded`, which requires `expected_terminal` and which an older server rejects. `expected_terminal_guard` alone does not mean a server supports the close guard. The CLI uses `pane.close_guarded` for `pane close --expected-terminal` and refuses unsupported servers with `expected_terminal_unsupported`.
+
+```json
+{"id":"guarded_close","method":"pane.close_guarded","params":{"pane_id":"w1:p1","expected_terminal":"term_opaque_from_pane_get"}}
+```
+
+### Expected agent session guard
+
+`agent.prompt`, `pane.send_text`, and `pane.send_keys` accept an optional `expected_agent_session_id` string. Copy `agent_session_id` from the current `pane.get` or `agent.get` record, not `agent_session.value`. For Pi, the latter can be a resume path; the server retains the reported native ID separately. An unreported ID returns `agent_session_unknown`; a different ID returns `agent_session_mismatch`. These initial refusals write zero input bytes and never include the actual ID.
+
+The server binds an accepted session report to the local socket peer's process ID and start time. At admission it checks that this same process is alive and belongs to the pane's current PTY foreground process group, using a fresh native observation rather than cached agent detection. An exited, suspended, background, unbound, or replaced reporter initially returns `agent_session_unknown` with zero input bytes, even before exit detection updates the pane. This proof is available only on Linux; macOS, Windows, and unsupported platforms fail closed with `expected_agent_session_unsupported`. macOS is pending native proof. Short-lived hook reporters cannot authorize later guarded sends after they exit. Omitting the session expectation does not apply this process check.
+
+The pinned reporter and expected ID travel with the request to the PTY actor. Before every `write(2)`, the actor repeats the fresh native proof against its own PTY master, including partial chunks, retries, any focus prefix, text, and the 300 ms delayed Enter. Ownership loss after admission returns `agent_session_lost` and drops remaining input and Enter. Partial text or a prefix may already have been written. If text-stage bytes have been written, Linux opens the exact PTY slave from the actor's master and calls `tcflush(slave, TCIFLUSH)` before completion, discarding staged unread input. The flush is tty-wide and can also discard other already-staged unread input. It cannot recover bytes already consumed by a reader; the same Pi draft may remain. This error does not promise zero total bytes written or consumed.
+
+For `agent_session_lost`, `error.partial_text_consumed` is a boolean or `null`, and `error.flush_failed` reports whether the exact-slave open or `TCIFLUSH` failed. If flushing succeeds (or no text-stage bytes were written, so no flush is needed), `flush_failed` is `false`: `partial_text_consumed` is `true` if and only if text-stage bytes reached the PTY and may have been consumed, and `false` if and only if no text-stage bytes were written. This is not confirmed reader acknowledgment. If the exact-slave open or `TCIFLUSH` fails, the error has `partial_text_consumed: null` (unknown) and `flush_failed: true`. Session-guarded text and key sends await the actor's typed completion rather than reporting success on enqueue. Completion confirms PTY writes, not acknowledgment by the receiving agent. Loss errors disclose only the expected ID, never the actual ID; do not automatically retry or downgrade to an unchecked operation after an error.
+
+On an exact-slave open or `TCIFLUSH` failure, Herdr does **not** close the PTY master or terminate the user's process. It drops the remaining request without sending Enter, fails that request with `flush_failed: true`, and logs a warning. Later pane input is not blocked.
+
+`pane.clear_input_poison` with `pane_id` (CLI `herdr pane clear-input-poison <pane>`) remains available and accepts any caller; the caller's origin is logged. Before clearing, Herdr discards unread pane input once more (`TCIFLUSH`); if that fails the request returns `pane_clear_input_poison_failed` and the pane stays poisoned. **Warning:** text the foreground program already read stays in its own buffer, and a future Enter can submit it. Inspect the pane before clearing. Do not clear automatically or as a retry strategy.
+
+```json
+{"id":"clear_input_poison","method":"pane.clear_input_poison","params":{"pane_id":"w1:p1"}}
+```
+
+The bundled Pi integration version 12 and OMP integration version 12 report both the native ID and the unchanged resume path. Older path-only integrations produce `agent_session_unknown`; reinstall the updated integration with `herdr integration install pi` or `herdr integration install omp`, then restart or reload that agent at a safe boundary to load the updated hooks and report the ID. This hook-loading step is not recovery from suspension: resuming or reloading the same native session does not restore guarded-send eligibility. Start a new session (`/new`) or restart the agent; see [the follow-up issue](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/7577).
+
+`agent.prompt` also accepts `expected_pane_id`, which requires its target (including an alias) to resolve to that exact pane. A different resolution initially returns `expected_pane_mismatch` with zero input bytes. These expectations can be used separately or together, including with the optional `wait` object. Pane sends already address an exact `pane_id`; they do not have an `expected_pane_id` field. Initial checks are atomic with Herdr's reported pane state at admission, not with an agent's unreported internal session changes. Residual races remain: the final native-check/write gap between the fresh process/foreground check and `write(2)`, and the loss/flush/reader race in which a reader can consume staged bytes before the flush. Neither completion nor flushing guarantees zero total bytes written or consumed. The App-to-actor queue and delayed Enter wait are guarded, but do not eliminate these native races. Omitting the expectations retains existing behavior and does not change cross-pane input policy.
+
+Check `ping.result.capabilities.expected_agent_session_guard == true` (supported and advertised as `true` only on Linux; macOS and Windows advertise `false` and fail closed, with macOS pending native proof). For guarded operations, use `agent.prompt_session_checked`, `pane.send_text_session_checked`, and `pane.send_keys_session_checked`. The checked prompt method requires at least one expectation; checked pane sends require `expected_agent_session_id`. Older servers reject these names with `invalid_request` instead of silently ignoring the guard, including when replaced between ping and the operation. Do not fall back to the unchecked method after rejection. The CLI uses these aliases for `--expected-session` and for `agent prompt --expected-pane`, and returns `expected_agent_session_unsupported` without sending the operation when the capability is absent.
+
+```json
+{"id":"checked_prompt","method":"agent.prompt_session_checked","params":{"target":"worker","text":"review this change","expected_agent_session_id":"reported_id_from_agent_get","expected_pane_id":"w1:p1","wait":{"until":["idle"],"timeout_ms":30000}}}
+{"id":"checked_text","method":"pane.send_text_session_checked","params":{"pane_id":"w1:p1","text":"hello","expected_agent_session_id":"reported_id_from_pane_get"}}
+{"id":"checked_keys","method":"pane.send_keys_session_checked","params":{"pane_id":"w1:p1","keys":["Enter"],"expected_agent_session_id":"reported_id_from_pane_get"}}
+```
+
+### Write-time path guard
+
+`pane.send_text_path_checked` and `pane.send_keys_path_checked` take the params of `pane.send_text` and `pane.send_keys` plus a required `refuse_if_exists` string, which must be an absolute path. Herdr does not check the path at request-time admission. The PTY writer calls `lstat` before each write attempt until the first request byte is successfully written. A claim present before the first byte is written prevents the request; once writing has begun, the request completes. An `EAGAIN` (would block) or `EINTR` (interrupted) result with zero bytes written leaves the path guard armed: the next attempt checks the path again. If `lstat` succeeds (any file type, also a dangling symlink), Herdr refuses with `guard_path_present`, zero request bytes written, `error.partial_text_consumed: false`, and `error.flush_failed: false`. No flush is performed. Only a missing path (`ENOENT`, or `ENOTDIR` for a component that is not a directory) lets the write proceed. Any other `lstat` error, for example `EACCES` on a parent directory, `ELOOP` or `EIO`, also drops the bytes and returns `guard_path_unverifiable`, with the OS error in the message; its other fields are the same as for `guard_path_present`. Once writing starts, partial chunks, retries, and any delayed Enter complete without another path check. The path guard never flushes unread input, so unrelated queued input survives. A relative path returns `invalid_request`. The response reports the PTY writer's completion, not the enqueue. You can also give `expected_agent_session_id`; the request then also needs `expected_agent_session_guard`. That independent guard retains its per-write native checks and session-loss flush behavior.
+
+Check `ping.result.capabilities.refuse_if_exists_guard == true` (Unix servers only; Windows advertises `false` and refuses with `refuse_if_exists_unsupported`). Older servers reject these method names with `invalid_request`, so a server replaced between the ping and the request fails closed. Do not fall back to `pane.send_text` or `pane.send_keys` after a rejection. The separate `lstat` and first `write(2)` are not synchronization: a claim created between them can be missed (accepted technical risk [smarty-dev#12584](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/12584)).
+
+```json
+{"id":"claim_checked_keys","method":"pane.send_keys_path_checked","params":{"pane_id":"w1:p1","keys":["esc"],"refuse_if_exists":"/run/user/1000/floor/claim"}}
+```
+
+### Expected detected agent status guard
+
+Agent prompt params accept the optional `expected_agent_status` field, which **requires `expected_agent_session_id`**. Status-only guards are not supported: a status expectation without a session expectation returns `invalid_request`. Set the status to `"idle"` to require Herdr's **detected** agent state to be idle at admission. An initial mismatch returns `expected_status_mismatch` before any input bytes are written. Omit the field to retain existing prompting behavior; a present `null`, non-string, or unrecognized status is an `invalid_request`, not an unguarded prompt.
+
+Check `ping.result.capabilities.expected_agent_status_guard == true` and use `agent.prompt_status_checked` for status-guarded prompts. This method requires both `expected_agent_status` and `expected_agent_session_id`. Older servers, including those supporting only the session guard, reject the unknown method rather than silently ignoring the status field. The CLI uses this method whenever `--expected-status` is given and refuses unsupported servers with `expected_agent_status_unsupported`. There is no legacy retry; do not silently drop the expectation or fall back to another prompt method after rejection. Supporting servers also enforce the field when supplied on `agent.prompt` or `agent.prompt_session_checked`, but those names alone do not guarantee enforcement by older servers.
+
+```json
+{"id":"status_checked_prompt","method":"agent.prompt_status_checked","params":{"target":"worker","text":"review this change","expected_agent_session_id":"reported_id_from_agent_get","expected_agent_status":"idle"}}
+```
+
+The comparison uses the effective detected state from hooks and screen detection, not the pane's seen state or its `done` presentation. An idle agent displayed as `done` satisfies `"idle"`. In addition to the required session expectation, `expected_pane_id` and the optional `wait` object can be supplied. The detected-status predicate rides the existing session/reporter guard at admission and before PTY writes. A later detected-status mismatch also returns `expected_status_mismatch`, stops further request bytes, and sends no further Enter. Partial input may already have been written; this later error does not promise zero total bytes. Session ownership loss remains a separate `agent_session_lost` error.
+
+Detected idle is the **last observed state**, not transactional proof that the actual agent is not busy. Hook and screen observations can lag, and the agent can become busy after a check. Destructive commands still need an agent-side busy check. This is not a wait-until-idle operation, and `wait` still observes activity and settled status after submission.
+
 `pane.send_keys` and `pane.send_input.keys` accept Herdr key-combo strings:
 plain printable keys, special keys like `enter` and `esc`, modifier chords
 like `ctrl+h`, `control+j`, `alt+x`, and `shift+tab`, function keys like
 `f1`, and named punctuation like `minus` and `plus`. They do not accept
 `prefix+` binding strings.
+
+On macOS, `pane.send_input` (used by `pane run`) and `agent.start` check the terminal's current canonical input limit before accepting a command into the input queue. An oversized encoded line, including Enter, is rejected in full; wait for the shell prompt and retry. Multiple short lines and raw-mode input remain supported. Successful responses still acknowledge queue admission, not command execution. This check covers the current submission only: it cannot inspect an earlier incomplete line or guarantee the terminal mode will remain unchanged while input is queued.
 
 ```json
 {"id":"req_current","method":"pane.current","params":{"caller_pane_id":"w1:p1"}}
@@ -923,10 +1036,10 @@ it created. A valid token aimed at any other existing terminal returns
 tokens return `input_origin_unknown`. Explicit `allow_cross_pane` remains a
 separate override. A token is valid only on the issuing server, while the action
 process is alive, and for at most ten minutes. The server keeps at most 256
-grants, including revoked ones; when live or pending grants fill it, the action runs
-without a token under the ordinary input rules. No new grant is issued. On cap
-exhaustion, a global action runs as an ordinary client, as before action tokens
-were introduced; those rules allow writes to existing panes. Startup and event
+grants, including revoked ones. If live or pending grants fill it, secure random
+generation is unavailable, or the invoking terminal cannot be bound, no grant is
+issued and the user-invoked action, global or pane, does not launch. Herdr shows
+an error saying the action could not get a security grant; try again. Startup and event
 hooks receive no action token. Never log the token. Same-user processes may read each other's
 environment, so it does not isolate processes running as the same OS user.
 
@@ -1053,7 +1166,7 @@ Session-only official integrations report native session references with `pane.r
 
 Both methods accept an optional `resume_argv` array with the command that resumes the reporter's current session after a Herdr server restart. Its first element must be a plain command name, not a path. It allows at most 64 elements and 8 KiB in total, and no element may contain an apostrophe or control character; invalid values fail with `invalid_resume_argv` and the report is not applied. A custom agent must hold the pane through `pane.report_agent` before it can attach a command; otherwise the request fails with `resume_not_accepted`. Herdr keeps the command only while the same `source` and `agent` hold the pane, and it takes precedence over Herdr's built-in resume command for that agent. Older Herdr versions ignore the field.
 
-Reports containing `resume_argv` are content writes: Herdr attributes a local agent caller, including its child processes, to its terminal and rejects another-pane targets with `cross_pane_input_denied`. An unattributable caller receives `input_origin_unknown`. Both report methods accept `allow_cross_pane` (default `false`) to explicitly opt in; the CLI exposes it as `herdr pane report-agent ... --allow-cross-pane -- <resume-command...>` or `herdr pane report-agent-session ... --allow-cross-pane -- <resume-command...>`. Reports without `resume_argv` remain metadata-only and do not require this opt-in. Opt-in bypasses only the cross-pane policy, not resume validation or report authority rules.
+Reports containing `resume_argv` are content writes: Herdr attributes a local agent caller, including its child processes, to its terminal and logs another-pane or unattributable reports; the input-origin check is advisory and does not refuse them. Both report methods still accept `allow_cross_pane` (default `false`) for compatibility; the CLI exposes it as `herdr pane report-agent ... --allow-cross-pane -- <resume-command...>` or `herdr pane report-agent-session ... --allow-cross-pane -- <resume-command...>`. Reports without `resume_argv` remain metadata-only and do not require this opt-in. Opt-in bypasses only the cross-pane policy, not resume validation or report authority rules.
 
 ```json
 {
@@ -1083,6 +1196,8 @@ Reports containing `resume_argv` are content writes: Herdr attributes a local ag
 ```
 
 If no native session reference is stored, the field is omitted.
+
+`agent.list` and `agent.get` responses always include `name`: a string when explicitly named, or `null` when the pane's agent has no name. Names are opt-in labels set with `agent.rename`; they are separate from agent kind, `display_agent`, and the pane label. Herdr does not generate names automatically.
 
 `pane.get`, `pane.list`, `agent.get`, and `agent.list` also expose `foreground_cwd` when Herdr can resolve the cwd of the process currently controlling the pane PTY. The existing `cwd` field remains the pane/workspace cwd used for labels, follow-cwd behavior, and restored session state.
 
@@ -1157,6 +1272,19 @@ and retry rather than assuming the other entries were subscribed.
 Lifecycle subscriptions start when the request is accepted and do not replay
 events retained before that point.
 
+A refused subscription returns one error response with the request `id` and a
+stable `error.code`, then closes the connection without starting a stream:
+
+- `invalid_request`: the request or a subscription entry is malformed, or names
+  a subscription `type` this server does not support (for example an older
+  Herdr asked for `pane.agent_session_changed`).
+- `pane_not_found`: a pane-scoped entry names a pane that does not exist.
+- `server_unavailable`: the server could not handle the request, for example
+  while it is shutting down.
+
+If the socket does not accept the connection, no response is sent; treat that
+as the server not running.
+
 Lifecycle and agent-status events are drained in bounded batches, in order within
 each subscription. Event history is not durable. If a subscriber falls behind
 the retained history, including while its subscriptions are being initialized,
@@ -1187,7 +1315,8 @@ Tab event subscriptions include `tab.created`, `tab.closed`, `tab.focused`,
 that workspace.
 Pane event subscriptions include `pane.created`, `pane.updated`, `pane.closed`, `pane.focused`,
 `pane.moved`, `pane.exited`, `pane.agent_detected`,
-`pane.output_matched`, `pane.agent_status_changed`, and `pane.scroll_changed`.
+`pane.output_matched`, `pane.agent_status_changed`, `pane.agent_session_changed`,
+and `pane.scroll_changed`.
 `pane.focused` also reports manual pane selection changes from any client attached
 to this server. It does not move other clients' views, and its payload does not
 identify the client. Selecting an already-selected pane does not emit it again.
@@ -1195,6 +1324,25 @@ Terminal-title changes can emit `pane.updated`, but spinner-only raw-title chang
 `pane.scroll_changed` is scoped to one `pane_id` and emits `pane_id`,
 `workspace_id`, and the current `scroll` metrics whenever Herdr observes a
 changed scroll snapshot.
+`pane.agent_session_changed` is scoped to one `pane_id`, like
+`pane.agent_status_changed`. It is emitted when the agent in that pane reports
+a session (through `pane.report_agent_session`, or a `pane.report_agent` that
+carries a session) whose id differs from the pane's current one, or when the
+same session is reported with a different actual agent session id (an id now
+set, cleared, or replaced). Reporting the current session again with the same
+actual id emits nothing. The event carries `pane_id`, `workspace_id`, `agent`,
+`session_id`, `previous_session_id`, `agent_session_id`, and
+`previous_agent_session_id`. `previous_session_id` is `null` when the pane had
+no session before. `session_id` matches the pane's `agent_session.value`: the
+reported `agent_session_id`, or for Pi and omp the reported
+`agent_session_path` when present. `agent_session_id` is the actual id that
+`pane get` reports as `agent_session_id` after this report, and
+`previous_agent_session_id` the one before it; each is `null` when no actual id
+is bound: e.g. an initial path-only report, or a report for a different session
+without an id; a path-only report of the already-bound session keeps its id. A
+subscriber can therefore detect a session registered without an actual id by
+`agent_session_id` being `null`. Only sessions reported by Herdr's official
+agent integrations are tracked.
 Layout event subscriptions include `layout.updated`. The event carries the
 updated `PaneLayoutSnapshot` for one tab. Clients maintaining a cache with
 `session.snapshot` should use this event to refresh the affected layout through
@@ -1207,12 +1355,21 @@ Use `events.subscribe` for lifecycle events. Dedicated wait helpers are document
 ## API input log
 
 Before `pane.send_text`, `pane.send_input`, `pane.send_keys`, `agent.send_keys`, or
-`agent.prompt` writes to a pane, herdr appends one JSON line to `api-input.jsonl` in its
+`agent.prompt` writes to a pane, or `agent.prompt_guarded` delivers to an agent channel, herdr appends one JSON line to `api-input.jsonl` in its
 state directory (for example `~/.local/state/herdr/api-input.jsonl`; the file is readable
 by its owner only). The line records the time (`ts_ms`), the method, the target pane and
 terminal, the byte count, and the caller as herdr knows it from the socket peer process:
-its pid, pane, agent name, and agent session. It never records the text. If herdr cannot
-write the line, it refuses the input with `input_log_unavailable`.
+its pid, pane, agent name, and agent session. It never records the text. When the log
+reaches 32 MiB, herdr renames it to `api-input.jsonl.1` (replacing the previous
+generation) before appending the next line. If the log is full and that rotation fails,
+herdr refuses the input with `input_log_full`; the error names the log path and the
+rotation error. If herdr cannot write the line for any other reason, it refuses the input
+with `input_log_unavailable`. The session-checked forms
+(`pane.send_text_session_checked`, `pane.send_keys_session_checked`, and
+`agent.prompt_session_checked`) are logged exactly like their base methods, under the
+base method name, after their expected-session check accepts the input. The path-checked
+forms (`pane.send_text_path_checked` and `pane.send_keys_path_checked`) are also logged
+under the base method name, when Herdr accepts the input and before the write-time check.
 
 On Linux and macOS, `caller.exe` and `caller.ppid` record the executable basename
 (not a mutable process label) and parent PID at write time, even when the caller is
@@ -1221,6 +1378,21 @@ records `caller.unit` when the caller's cgroup names a systemd `.service` or `.s
 These fields are omitted when unavailable; they are not recorded on Windows or other
 platforms. Metadata lookup failure does not refuse input. Typed input does not add an
 API log record.
+
+Every record with a socket peer identity includes `caller.ancestry`: `outside`
+(the peer's ancestry is proven outside this server), `unknown` (the proof could
+not be completed or is unsupported), or `reached` (the walk reached this server).
+This is independent of pane attribution; a null `caller.pane` is not itself an
+ancestry verdict. The log reuses the guard's request-local proof when available.
+Linux additionally records `caller.sid`, the peer's OS session ID (the same ID as
+`getsid`, read from the existing process snapshot), and `caller.ancestry_root_pid`,
+the last pinned PID examined by that walk: the server PID for `reached`, otherwise
+the topmost ancestor examined before the proof stopped. These two fields are
+omitted when unavailable and are absent on other platforms. `caller.ancestor_exe`
+and `caller.ancestor_pid` identify the nearest non-Herdr ancestor when observable;
+`caller.pane_env_present` records only whether `HERDR_PANE_ID` is present, never
+its value. None of these diagnostic fields grants authorization or changes the
+input guard.
 
 A reader of an agent's session can then tell turns that the API sent into a pane from
 turns typed there, without anything in the terminal byte stream.

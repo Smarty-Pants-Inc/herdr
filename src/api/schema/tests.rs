@@ -46,6 +46,23 @@ fn protocol_schema_document() -> serde_json::Value {
 }
 
 #[test]
+fn clear_input_poison_method_is_registered_and_advertised() {
+    let value = serde_json::json!({"id":"clear", "method":"pane.clear_input_poison", "params":{"pane_id":"p1"}});
+    let request: Request = serde_json::from_value(value.clone()).unwrap();
+    assert!(matches!(request.method, Method::PaneClearInputPoison(_)));
+    assert_eq!(
+        crate::api::api_method_name(&request.method),
+        "pane.clear_input_poison"
+    );
+    assert!(
+        crate::server::client_commands::supports_client_shell_method_name(
+            "pane.clear_input_poison"
+        )
+    );
+    assert_eq!(serde_json::to_value(request).unwrap(), value);
+}
+
+#[test]
 fn input_consumer_local_methods_are_registered_and_not_endpoint_methods() {
     for (name, params) in [
         (
@@ -54,11 +71,11 @@ fn input_consumer_local_methods_are_registered_and_not_endpoint_methods() {
         ),
         (
             "pane.input_consumer.cut",
-            serde_json::json!({"epoch":"e", "epoch_key":"k", "seq":1, "token":"t", "cut":2, "digest":"d", "kind":"submit"}),
+            serde_json::json!({"epoch":"e", "seq":1, "token":"t", "cut":2, "digest":"d", "kind":"submit"}),
         ),
         (
             "pane.input_consumer.release",
-            serde_json::json!({"epoch":"e", "epoch_key":"k"}),
+            serde_json::json!({"epoch":"e"}),
         ),
     ] {
         let value = serde_json::json!({"id":"consumer", "method":name, "params":params});
@@ -74,22 +91,14 @@ fn input_consumer_local_methods_are_registered_and_not_endpoint_methods() {
 #[test]
 fn input_consumer_params_require_capabilities_and_exclusive_end_counts() {
     let params = serde_json::json!({
-        "epoch": "epoch", "epoch_key": "key", "seq": 1, "token": "token",
+        "epoch": "epoch", "seq": 1, "token": "token",
         "cut": 2, "digest": "digest", "kind": "submit"
     });
     let cut: PaneInputConsumerCutParams = serde_json::from_value(params.clone()).unwrap();
     assert_eq!(cut.cut, 2); // a\r is two post-marker bytes, not byte index 1.
     assert_eq!(cut.kind, InputConsumerCutKind::Submit);
     assert_eq!(serde_json::to_value(&cut).unwrap(), params);
-    for field in [
-        "epoch",
-        "epoch_key",
-        "seq",
-        "token",
-        "cut",
-        "digest",
-        "kind",
-    ] {
+    for field in ["epoch", "seq", "token", "cut", "digest", "kind"] {
         let mut missing = params.clone();
         missing.as_object_mut().unwrap().remove(field);
         assert!(serde_json::from_value::<PaneInputConsumerCutParams>(missing).is_err());
@@ -97,6 +106,18 @@ fn input_consumer_params_require_capabilities_and_exclusive_end_counts() {
     let mut attributed = params.clone();
     attributed["pane_id"] = "p1".into();
     assert!(serde_json::from_value::<PaneInputConsumerCutParams>(attributed).is_err());
+    // H2: v2 has no bearer key; a v1 `epoch_key` is an unknown field.
+    let mut keyed = params.clone();
+    keyed["epoch_key"] = "k".into();
+    assert!(serde_json::from_value::<PaneInputConsumerCutParams>(keyed).is_err());
+    assert!(serde_json::from_value::<PaneInputConsumerReleaseParams>(
+        serde_json::json!({"epoch": "e", "epoch_key": "k"})
+    )
+    .is_err());
+    assert!(serde_json::from_value::<PaneInputConsumerEnrollParams>(
+        serde_json::json!({"pane_id": "p1"})
+    )
+    .is_err());
     let mut discard = params;
     discard["kind"] = "discard".into();
     assert_eq!(
@@ -107,12 +128,11 @@ fn input_consumer_params_require_capabilities_and_exclusive_end_counts() {
     );
     discard["kind"] = "keyboard".into();
     assert!(serde_json::from_value::<PaneInputConsumerCutParams>(discard).is_err());
+    assert!(
+        serde_json::from_value::<PaneInputConsumerReleaseParams>(serde_json::json!({})).is_err()
+    );
     assert!(serde_json::from_value::<PaneInputConsumerReleaseParams>(
-        serde_json::json!({"epoch": "e"})
-    )
-    .is_err());
-    assert!(serde_json::from_value::<PaneInputConsumerReleaseParams>(
-        serde_json::json!({"epoch": "e", "epoch_key": "k", "pane_id": "p1"})
+        serde_json::json!({"epoch": "e", "pane_id": "p1"})
     )
     .is_err());
 }
@@ -275,6 +295,9 @@ fn agent_start_and_prompt_requests_round_trip() {
     let prompt = Request {
         id: "prompt".into(),
         method: Method::AgentPrompt(AgentPromptParams {
+            expected_agent_session_id: None,
+            expected_pane_id: None,
+            expected_agent_status: None,
             target: "reviewer".into(),
             text: "review this".into(),
             wait: None,
@@ -291,6 +314,9 @@ fn agent_start_and_prompt_requests_round_trip() {
     let prompt_and_wait = Request {
         id: "prompt-and-wait".into(),
         method: Method::AgentPrompt(AgentPromptParams {
+            expected_agent_session_id: None,
+            expected_pane_id: None,
+            expected_agent_status: None,
             target: "reviewer".into(),
             text: "review this".into(),
             wait: Some(AgentPromptWaitOptions {
@@ -341,6 +367,158 @@ fn bundled_protocol_schema_refs_resolve_inside_bundle() {
     }
 
     assert_no_standalone_refs(&protocol_schema_document());
+}
+
+#[test]
+fn first_agent_session_event_with_null_previous_session_matches_schema() {
+    // The first reported session has no predecessor, so the event carries an
+    // explicit `"previous_session_id": null`. Every schema that declares the
+    // field must keep it required and accept null.
+    fn collect_session_changed_schemas<'a>(
+        value: &'a serde_json::Value,
+        found: &mut Vec<&'a serde_json::Value>,
+    ) {
+        match value {
+            serde_json::Value::Object(object) => {
+                if object
+                    .get("properties")
+                    .and_then(|properties| properties.get("previous_session_id"))
+                    .is_some()
+                {
+                    found.push(value);
+                }
+                for child in object.values() {
+                    collect_session_changed_schemas(child, found);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    collect_session_changed_schemas(item, found);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let document = protocol_schema_document();
+    let mut schemas = Vec::new();
+    collect_session_changed_schemas(&document, &mut schemas);
+    assert!(
+        schemas.len() >= 3,
+        "expected event, subscription event and struct schemas, found {}",
+        schemas.len()
+    );
+    for schema in schemas {
+        let required = schema["required"].as_array().unwrap();
+        for field in [
+            "previous_session_id",
+            "agent_session_id",
+            "previous_agent_session_id",
+        ] {
+            assert!(required.contains(&serde_json::json!(field)), "{field}");
+            assert_eq!(
+                schema["properties"][field]["type"],
+                serde_json::json!(["string", "null"]),
+                "{field} must be nullable in {schema}"
+            );
+        }
+    }
+
+    let first_session = EventEnvelope {
+        event: EventKind::PaneAgentSessionChanged,
+        data: EventData::PaneAgentSessionChanged {
+            pane_id: "p_1".into(),
+            workspace_id: "w_1".into(),
+            agent: "pi".into(),
+            session_id: "session-a".into(),
+            previous_session_id: None,
+            agent_session_id: None,
+            previous_agent_session_id: None,
+        },
+    };
+    let json = serde_json::to_value(&first_session).unwrap();
+    for field in [
+        "previous_session_id",
+        "agent_session_id",
+        "previous_agent_session_id",
+    ] {
+        assert_eq!(
+            json["data"].get(field),
+            Some(&serde_json::Value::Null),
+            "{field} is always present"
+        );
+    }
+    // A pre-change event without the actual-id fields still deserializes.
+    let mut legacy = json.clone();
+    let data = legacy["data"].as_object_mut().unwrap();
+    data.remove("agent_session_id");
+    data.remove("previous_agent_session_id");
+    assert_eq!(
+        serde_json::from_value::<EventEnvelope>(legacy).unwrap(),
+        first_session
+    );
+    assert_eq!(
+        serde_json::from_value::<EventEnvelope>(json).unwrap(),
+        first_session
+    );
+
+    let standalone = serde_json::to_value(PaneAgentSessionChangedEvent {
+        pane_id: "p_1".into(),
+        workspace_id: "w_1".into(),
+        agent: "pi".into(),
+        session_id: "/sessions/a.jsonl".into(),
+        previous_session_id: None,
+        agent_session_id: Some("session-a".into()),
+        previous_agent_session_id: None,
+    })
+    .unwrap();
+    assert_eq!(
+        standalone.get("previous_session_id"),
+        Some(&serde_json::Value::Null)
+    );
+    assert_eq!(
+        standalone.get("agent_session_id"),
+        Some(&serde_json::json!("session-a"))
+    );
+    assert_eq!(
+        standalone.get("previous_agent_session_id"),
+        Some(&serde_json::Value::Null)
+    );
+}
+
+#[test]
+fn agent_name_is_always_present_and_nullable_but_legacy_records_still_parse() {
+    // Older servers omitted the opt-in name for unnamed agents.
+    let legacy = serde_json::json!({
+        "terminal_id": "term_1",
+        "agent": "pi",
+        "agent_status": "idle",
+        "workspace_id": "w1",
+        "tab_id": "w1:t1",
+        "pane_id": "w1:p1",
+        "focused": false,
+        "revision": 0
+    });
+    let mut agent: AgentInfo = serde_json::from_value(legacy).unwrap();
+    assert_eq!(agent.name, None);
+    let unnamed = serde_json::to_value(&agent).unwrap();
+    assert_eq!(unnamed.get("name"), Some(&serde_json::Value::Null));
+    assert_eq!(serde_json::from_value::<AgentInfo>(unnamed).unwrap(), agent);
+
+    agent.name = Some("worker".into());
+    let named = serde_json::to_value(&agent).unwrap();
+    assert_eq!(named.get("name"), Some(&serde_json::json!("worker")));
+    assert_eq!(serde_json::from_value::<AgentInfo>(named).unwrap(), agent);
+
+    let schema = serde_json::to_value(schemars::schema_for!(AgentInfo)).unwrap();
+    assert!(schema["required"]
+        .as_array()
+        .unwrap()
+        .contains(&serde_json::json!("name")));
+    assert_eq!(
+        schema["properties"]["name"]["type"],
+        serde_json::json!(["string", "null"])
+    );
 }
 
 #[test]
@@ -631,11 +809,131 @@ fn expected_terminal_guard_is_optional_but_present_values_must_be_strings() {
 }
 
 #[test]
+fn expected_agent_status_guard_is_optional_but_present_values_are_strict() {
+    for method in [
+        "agent.prompt",
+        "agent.prompt_session_checked",
+        "agent.prompt_status_checked",
+    ] {
+        let mut value = serde_json::json!({
+            "id": "status-guard", "method": method,
+            "params": {"target": "reviewer", "text": "hello", "expected_agent_session_id": "session=a"},
+        });
+        let request: Request = serde_json::from_value(value.clone()).unwrap();
+        assert!(serde_json::to_value(request).unwrap()["params"]
+            .get("expected_agent_status")
+            .is_none());
+        if method == "agent.prompt_status_checked" {
+            assert!(!crate::server::client_commands::supports_client_shell_method_name(method));
+        }
+        for status in ["idle", "working", "blocked", "done", "unknown"] {
+            value["params"]["expected_agent_status"] = status.into();
+            let request: Request = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(serde_json::to_value(&request).unwrap(), value);
+            assert_eq!(crate::api::api_method_name(&request.method), method);
+        }
+        for invalid in [
+            serde_json::Value::Null,
+            serde_json::json!("future_status"),
+            serde_json::json!("Idle"),
+            serde_json::json!(""),
+            serde_json::json!(1),
+            serde_json::json!(false),
+            serde_json::json!({}),
+            serde_json::json!(["idle"]),
+        ] {
+            value["params"]["expected_agent_status"] = invalid;
+            assert!(
+                serde_json::from_value::<Request>(value.clone()).is_err(),
+                "{value}"
+            );
+        }
+    }
+}
+
+#[test]
+fn expected_agent_status_guard_schema_is_optional_but_not_nullable() {
+    let schema = serde_json::to_value(schemars::schema_for!(AgentPromptParams)).unwrap();
+    assert_eq!(
+        schema["properties"]["expected_agent_status"]["$ref"],
+        "#/$defs/AgentStatus"
+    );
+    assert!(!schema["required"]
+        .as_array()
+        .unwrap()
+        .contains(&serde_json::json!("expected_agent_status")));
+}
+
+#[test]
 fn old_server_capabilities_do_not_advertise_expected_terminal_guard() {
     let caps: ServerCapabilities =
         serde_json::from_value(serde_json::json!({"live_handoff": false})).unwrap();
     assert!(!caps.expected_terminal_guard);
+    assert!(!caps.expected_agent_session_guard);
+    assert!(!caps.expected_agent_status_guard);
+    assert!(!caps.refuse_if_exists_guard);
     assert!(!caps.input_consumer);
+}
+
+#[test]
+fn agent_session_expectations_are_optional_but_present_null_cannot_disable_them() {
+    for (method, params) in [
+        (
+            "agent.prompt",
+            serde_json::json!({"target": "sink", "text": "hello"}),
+        ),
+        (
+            "agent.prompt_session_checked",
+            serde_json::json!({"target": "sink", "text": "hello"}),
+        ),
+        (
+            "pane.send_text",
+            serde_json::json!({"pane_id": "w1:p1", "text": "hello"}),
+        ),
+        (
+            "pane.send_text_session_checked",
+            serde_json::json!({"pane_id": "w1:p1", "text": "hello"}),
+        ),
+        (
+            "pane.send_keys",
+            serde_json::json!({"pane_id": "w1:p1", "keys": ["enter"]}),
+        ),
+        (
+            "pane.send_keys_session_checked",
+            serde_json::json!({"pane_id": "w1:p1", "keys": ["enter"]}),
+        ),
+    ] {
+        let mut value = serde_json::json!({"id": "guard", "method": method, "params": params});
+        let request: Request =
+            serde_json::from_value(value.clone()).expect("optional expectations");
+        assert_eq!(crate::api::api_method_name(&request.method), method);
+        if method.ends_with("_session_checked") {
+            assert!(!crate::server::client_commands::supports_client_shell_method_name(method));
+        }
+        assert!(serde_json::to_value(request).unwrap()["params"]
+            .get("expected_agent_session_id")
+            .is_none());
+        for field in if method.starts_with("agent.") {
+            vec!["expected_agent_session_id", "expected_pane_id"]
+        } else {
+            vec!["expected_agent_session_id"]
+        } {
+            for malformed in [
+                serde_json::Value::Null,
+                serde_json::json!(1),
+                serde_json::json!(false),
+            ] {
+                value["params"][field] = malformed;
+                assert!(serde_json::from_value::<Request>(value.clone()).is_err());
+            }
+            value["params"][field] = "expected".into();
+            let request: Request = serde_json::from_value(value.clone()).expect("valid guard");
+            assert_eq!(
+                serde_json::to_value(request).unwrap()["params"][field],
+                "expected"
+            );
+        }
+    }
 }
 
 #[test]
@@ -977,6 +1275,10 @@ fn success_response_round_trips() {
                 ssh_agent_registration: false,
                 guarded_live_handoff: true,
                 expected_terminal_guard: true,
+                pane_close_expected_terminal_guard: true,
+                expected_agent_session_guard: true,
+                expected_agent_status_guard: true,
+                refuse_if_exists_guard: true,
                 input_consumer: false,
             }),
         },
@@ -1059,6 +1361,7 @@ fn worktree_request_and_response_round_trip() {
                     checkout_path: "/worktrees/herdr/worktree-api".into(),
                     is_linked_worktree: true,
                 }),
+                cwd: None,
             },
             tab: TabInfo {
                 tab_id: "w_1:1".into(),
@@ -1088,6 +1391,7 @@ fn worktree_request_and_response_round_trip() {
                 state_labels: HashMap::new(),
                 tokens: HashMap::new(),
                 agent_session: None,
+                agent_session_id: None,
                 scroll: None,
                 revision: 0,
             },
@@ -1146,6 +1450,7 @@ fn worktree_lifecycle_events_round_trip() {
             checkout_path: "/worktrees/herdr/worktree-api".into(),
             is_linked_worktree: true,
         }),
+        cwd: None,
     };
     let worktree = WorktreeInfo {
         path: "/worktrees/herdr/worktree-api".into(),
@@ -1517,6 +1822,7 @@ fn create_response_round_trips_with_root_pane() {
                 state_labels: HashMap::new(),
                 tokens: HashMap::new(),
                 agent_session: None,
+                agent_session_id: None,
                 scroll: None,
                 revision: 0,
             },

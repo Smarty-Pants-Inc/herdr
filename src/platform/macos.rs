@@ -52,11 +52,20 @@ pub(crate) use super::unix_common::{
 mod bootstrap;
 pub(crate) use bootstrap::{configure_server_daemon_context, prepare_server_process};
 
+mod shutdown;
+pub(crate) use shutdown::monitor_host_shutdown;
+
 #[cfg(test)]
 pub(crate) use super::unix_common::remote_bridge_endpoint_path_in;
 
 #[cfg(test)]
 mod config_file_tests;
+
+#[cfg(test)]
+mod input_tests;
+
+mod input;
+pub(crate) use input::PtyInputGuard;
 
 pub(crate) fn config_file_link_count(path: &Path) -> std::io::Result<u64> {
     use std::os::unix::fs::MetadataExt;
@@ -1083,6 +1092,21 @@ fn process_identity_from_bsdinfo(
         .checked_mul(1_000_000)?
         .checked_add(info.pbi_start_tvusec)?;
     Some(crate::platform::ProcessIdentity { pid, start_time })
+}
+
+/// Darwin's live generation checks and getpgid supply native job-control proof.
+/// A stopped/background reporter is not ownership evidence unless its group is
+/// still the foreground group read from this pane's master.
+pub(super) fn session_reporter_process_group_id(reporter: super::ProcessIdentity) -> Option<u32> {
+    let pid = libc::pid_t::try_from(reporter.pid)
+        .ok()
+        .filter(|pid| *pid > 0)?;
+    if process_identity(reporter.pid) != Some(reporter) {
+        return None;
+    }
+    // SAFETY: getpgid queries one positive PID and has no pointer arguments.
+    let group = unsafe { libc::getpgid(pid) };
+    (group > 0 && process_identity(reporter.pid) == Some(reporter)).then_some(group as u32)
 }
 
 pub(crate) fn process_caller_metadata_platform(

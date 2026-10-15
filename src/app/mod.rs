@@ -37,7 +37,7 @@ use std::io;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-const MIN_RENDER_INTERVAL: Duration = Duration::from_millis(16);
+pub(crate) const MIN_RENDER_INTERVAL: Duration = Duration::from_millis(16);
 // Native git metadata events drive freshness; this timer is only a safety net.
 const GIT_REMOTE_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 const GIT_REPO_DISCOVERY_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
@@ -443,6 +443,7 @@ impl App {
     ) -> std::io::Result<Self> {
         let prefix_keys = config.prefix_keys();
         crate::kitty_graphics::set_enabled(config.kitty_graphics_enabled());
+        crate::platform::set_pane_nice(config.pane_nice());
         let (event_tx, event_rx) = mpsc::channel::<AppEvent>(APP_EVENT_CHANNEL_CAPACITY);
         let render_notify = Arc::new(Notify::new());
         let render_dirty = Arc::new(crate::render_signal::RenderSignal::new());
@@ -1029,6 +1030,8 @@ impl App {
             } else {
                 self.state.headless_size = config.headless_size();
             }
+            diagnostics.extend(config.invalid_pane_nice_diagnostic());
+            crate::platform::set_pane_nice(config.pane_nice());
         }
 
         if !invalid_section("advanced") {
@@ -3209,8 +3212,9 @@ mod tests {
 
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "req_pane_close".into(),
-            method: crate::api::schema::Method::PaneClose(crate::api::schema::PaneTarget {
+            method: crate::api::schema::Method::PaneClose(crate::api::schema::PaneCloseParams {
                 pane_id: target_pane_id,
+                expected_terminal: None,
             }),
         });
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
@@ -3235,8 +3239,9 @@ mod tests {
 
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "req_pane_close_last".into(),
-            method: crate::api::schema::Method::PaneClose(crate::api::schema::PaneTarget {
+            method: crate::api::schema::Method::PaneClose(crate::api::schema::PaneCloseParams {
                 pane_id: target_pane_id,
+                expected_terminal: None,
             }),
         });
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
@@ -3274,8 +3279,9 @@ mod tests {
 
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "req_pane_close_parent_group".into(),
-            method: crate::api::schema::Method::PaneClose(crate::api::schema::PaneTarget {
+            method: crate::api::schema::Method::PaneClose(crate::api::schema::PaneCloseParams {
                 pane_id: target_pane_id,
+                expected_terminal: None,
             }),
         });
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();

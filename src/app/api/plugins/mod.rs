@@ -647,9 +647,7 @@ impl App {
         let pane_id = params.pane_id;
         if let Err(response) = self.close_pane(
             id.clone(),
-            &crate::api::schema::PaneTarget {
-                pane_id: pane_id.clone(),
-            },
+            &crate::api::schema::PaneCloseParams::unguarded(pane_id.clone()),
         ) {
             return response;
         }
@@ -3558,6 +3556,7 @@ action = "missing"
                 agent_session_path: None,
                 resume_argv: None,
             },
+            Default::default(),
         );
 
         let root = unique_temp_path("plugin-action-context");
@@ -3613,6 +3612,7 @@ command = ["show-ctx"]
         let caller = crate::api::ApiRequestContext {
             local_peer_identity: Some(peer),
             local_peer_pane_origin: crate::platform::PeerPaneOrigin::Absent,
+            server_ancestry: None,
             plugin_action: crate::plugin_action_origin::PluginActionClaim::Absent,
         };
         let invoke = as_pane_a(peer, || {
@@ -3719,6 +3719,7 @@ command = ["show-ctx"]
                     agent_session_path: None,
                     resume_argv: None,
                 },
+                Default::default(),
             );
         }
         let root = unique_temp_path(name);
@@ -3826,6 +3827,7 @@ command = ["sh", "-c", 'printf "%s|%s|%s|%s" "${HERDR_PANE_ID-unset}" "${HERDR_W
         crate::api::ApiRequestContext {
             local_peer_identity: Some(fixture.a_peer),
             local_peer_pane_origin: crate::platform::PeerPaneOrigin::Absent,
+            server_ancestry: None,
             plugin_action: crate::plugin_action_origin::PluginActionClaim::Absent,
         }
     }
@@ -3979,11 +3981,13 @@ command = ["sh", "-c", 'printf "%s|%s|%s|%s" "${HERDR_PANE_ID-unset}" "${HERDR_W
         let stale_peer = crate::api::ApiRequestContext {
             local_peer_identity: Some(stale),
             local_peer_pane_origin: crate::platform::PeerPaneOrigin::Absent,
+            server_ancestry: None,
             plugin_action: crate::plugin_action_origin::PluginActionClaim::Absent,
         };
         let marked_unknown = crate::api::ApiRequestContext {
             local_peer_identity: Some(live),
             local_peer_pane_origin: crate::platform::PeerPaneOrigin::Unknown,
+            server_ancestry: None,
             plugin_action: crate::plugin_action_origin::PluginActionClaim::Absent,
         };
         let mut cases = vec![

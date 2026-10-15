@@ -66,8 +66,9 @@ use crate::server::notifications::{
     should_forward_toast_to_clients, toast_message_from_state_change, toast_notify_kind,
 };
 use crate::server::pane_input::{
-    apply_client_pane_input_events, apply_client_popup_input_events, apply_terminal_attach_input,
-    apply_terminal_attach_scroll, terminal_attach_mouse_position,
+    apply_client_pane_input_events, apply_client_popup_input_events,
+    apply_client_terminal_input_events, apply_terminal_attach_input, apply_terminal_attach_scroll,
+    terminal_attach_mouse_position,
 };
 use crate::server::shutdown::{ServerStop, ShutdownReason};
 use crate::server::socket_paths::{
@@ -164,6 +165,10 @@ const SHUTDOWN_API_TIMEOUT: Duration = Duration::from_secs(5);
 /// A quiet listener has no timer and waits solely for native readiness.
 const CLIENT_ACCEPT_ERROR_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 
+// Split shell redraws need several early updates; sustained output still coalesces.
+const INTERACTIVE_RENDER_BUDGET: u8 = 16;
+const INTERACTIVE_RENDER_WINDOW: Duration = Duration::from_millis(32);
+
 // ---------------------------------------------------------------------------
 // Headless server
 // ---------------------------------------------------------------------------
@@ -196,6 +201,8 @@ pub struct HeadlessServer {
     client_socket_identity: SocketFileIdentity,
     clients: HashMap<u64, ClientConnection>,
     native_graphics: native_graphics::NativeGraphics,
+    interactive_input_deadlines: HashMap<crate::layout::PaneId, Instant>,
+    interactive_render_budget: Option<(Instant, u8)>,
     #[cfg(unix)]
     next_client_id: u64,
     /// The client currently driving session-wide host presentation and side effects.
@@ -246,6 +253,8 @@ pub struct HeadlessServer {
     should_quit: Arc<AtomicBool>,
     server_stop: ServerStop,
     host_shutdown_requested: Arc<AtomicBool>,
+    /// An announced, still cancellable host shutdown; carried across live handoff.
+    host_shutdown_intent: crate::platform::HostShutdownIntentCell,
     #[cfg(test)]
     host_shutdown_probe: fn() -> bool,
     /// Channel for receiving server events from client connection threads.
@@ -354,6 +363,8 @@ impl HeadlessServer {
             client_socket_identity,
             clients: HashMap::new(),
             native_graphics: Default::default(),
+            interactive_input_deadlines: HashMap::new(),
+            interactive_render_budget: None,
             #[cfg(unix)]
             next_client_id: 1,
             foreground_client_id: None,
@@ -381,6 +392,7 @@ impl HeadlessServer {
             effective_size: headless_size,
             shutting_down: false,
             host_shutdown_requested: Arc::new(AtomicBool::new(false)),
+            host_shutdown_intent: Default::default(),
             #[cfg(test)]
             host_shutdown_probe: crate::platform::host_shutdown_in_progress,
             handoff_in_progress: false,
@@ -414,6 +426,7 @@ impl HeadlessServer {
         let quit_notify = self.server_event_tx.clone();
         let _host_shutdown = crate::platform::HostShutdownMonitor::start(
             self.host_shutdown_requested.clone(),
+            self.host_shutdown_intent.clone(),
             move || {
                 let _ = quit_notify.try_send(ServerEvent::QuitSignal);
             },
@@ -559,14 +572,13 @@ impl HeadlessServer {
             // bounded classification cadence without delaying presentation work
             // that joins the same coalesced request.
             let render_cadence_due = self.app.can_render_now(now);
-            if needs_render
-                && (render_cadence_due
-                    || (self.app.can_present_now(now)
-                        && self.has_pending_presentation_work(
-                            needs_full_render,
-                            needs_graphics_render,
-                        )))
-            {
+            let presentation_due = self.app.can_present_now(now)
+                && self.has_pending_presentation_work(needs_full_render, needs_graphics_render);
+            let interactive_due = needs_render
+                && !render_cadence_due
+                && !presentation_due
+                && self.can_render_interactive(now);
+            if needs_render && (render_cadence_due || presentation_due || interactive_due) {
                 crate::render_prof::event("render.attempt");
                 #[cfg(unix)]
                 if client_accept_retry_after.is_none_or(|deadline| now >= deadline) {
@@ -631,6 +643,9 @@ impl HeadlessServer {
                     self.render_and_stream();
                 }
                 self.app.record_render_attempt(now, !hidden_only);
+                if interactive_due {
+                    self.record_interactive_render(now);
+                }
                 needs_render = false;
                 needs_full_render = false;
                 needs_graphics_render = false;
@@ -1277,7 +1292,8 @@ impl HeadlessServer {
                         Ok(true) => self.invalidate_terminal_input_attribution(&terminal_id),
                         Ok(false) => {}
                         Err(err) => {
-                            warn!(client_id, terminal_id = %terminal_id, err = %err, "terminal attach clipboard image paste failed")
+                            warn!(client_id, terminal_id = %terminal_id, err = %err, "terminal attach clipboard image paste failed");
+                            self.notify_client_input_error(client_id, &terminal_id, &err);
                         }
                     }
                 }
@@ -1326,6 +1342,7 @@ impl HeadlessServer {
                     Ok(false) => {}
                     Err(err) => {
                         warn!(client_id, pane_id, err = %err, "client shell clipboard image paste failed");
+                        self.notify_client_input_error(client_id, &pane_id, &err);
                     }
                 }
                 true
@@ -1364,6 +1381,7 @@ impl HeadlessServer {
                     self.client_input_source(client_id),
                 ) {
                     warn!(client_id, terminal_id, err = %err, "client shell popup clipboard image paste failed");
+                    self.notify_client_input_error(client_id, &terminal_id, &err);
                 }
                 true
             }
@@ -1477,6 +1495,7 @@ impl HeadlessServer {
             Ok(false) => {}
             Err(err) => {
                 warn!(client_id, terminal_id = %terminal_id, err = %err, "terminal attach scroll failed");
+                self.notify_client_input_error(client_id, &terminal_id, &err);
             }
         }
         true
@@ -1533,6 +1552,7 @@ impl HeadlessServer {
             Ok(_) => {}
             Err(err) => {
                 warn!(client_id, terminal_id = %terminal_id, err = %err, "terminal attach mouse input failed");
+                self.notify_client_input_error(client_id, &terminal_id, &err);
             }
         }
         true
@@ -1969,11 +1989,111 @@ impl HeadlessServer {
             .is_some_and(|client| matches!(client.mode, ClientConnectionMode::TerminalPending))
     }
 
+    fn notify_client_input_error(
+        &mut self,
+        client_id: u64,
+        target: &str,
+        error: &super::pane_input::ClientInputError,
+    ) {
+        if *error != super::pane_input::ClientInputError::PaneInputPoisoned {
+            return;
+        }
+        let pane_id = self
+            .app
+            .resolve_terminal_target(target)
+            .ok()
+            .and_then(|resolved| self.app.public_pane_id(resolved.ws_idx, resolved.pane_id))
+            .unwrap_or_else(|| target.to_owned());
+        self.send_to_client(client_id, super::pane_input::input_poison_notice(&pane_id));
+    }
+
+    /// Client input poison is a runtime fact, not a client protocol extension.
+    /// Refuse before tracking held keys, promoting clients, or staging paste files.
+    fn reject_poisoned_client_input(&mut self, event: &ServerEvent) -> bool {
+        let (client_id, target, is_pane) = match event {
+            ServerEvent::ClientShellPaneInput {
+                client_id, pane_id, ..
+            } => (*client_id, pane_id.as_str(), true),
+            ServerEvent::ClientShellPopupInput {
+                client_id,
+                terminal_id,
+                ..
+            } => (*client_id, terminal_id.as_str(), false),
+            ServerEvent::ClientClipboardImage {
+                client_id, target, ..
+            } => match target {
+                protocol::ClientClipboardImageTarget::Pane(pane_id) => {
+                    (*client_id, pane_id.as_str(), true)
+                }
+                protocol::ClientClipboardImageTarget::Popup(terminal_id) => {
+                    (*client_id, terminal_id.as_str(), false)
+                }
+                protocol::ClientClipboardImageTarget::DirectTerminal => {
+                    let Some(ClientConnection {
+                        mode: ClientConnectionMode::TerminalAttach { terminal_id },
+                        ..
+                    }) = self.clients.get(client_id)
+                    else {
+                        return false;
+                    };
+                    (*client_id, terminal_id.as_str(), false)
+                }
+            },
+            ServerEvent::ClientInput { client_id, .. }
+            | ServerEvent::ClientAttachScroll { client_id, .. }
+            | ServerEvent::ClientAttachMouse { client_id, .. } => {
+                let Some(ClientConnection {
+                    mode: ClientConnectionMode::TerminalAttach { terminal_id },
+                    ..
+                }) = self.clients.get(client_id)
+                else {
+                    return false;
+                };
+                (*client_id, terminal_id.as_str(), false)
+            }
+            _ => return false,
+        };
+        let runtime = if is_pane {
+            self.app
+                .parse_pane_id(target)
+                .and_then(|(workspace_index, pane_id)| {
+                    self.app.state.runtime_for_pane_in_workspace(
+                        &self.app.terminal_runtimes,
+                        workspace_index,
+                        pane_id,
+                    )
+                })
+        } else {
+            self.runtime_for_terminal_id_string(target)
+        };
+        let Some(runtime) = runtime else {
+            return false;
+        };
+        if super::pane_input::precheck_client_input(runtime).is_ok() {
+            return false;
+        }
+        let pane_id = if is_pane {
+            target.to_owned()
+        } else {
+            self.app
+                .resolve_terminal_target(target)
+                .ok()
+                .and_then(|resolved| self.app.public_pane_id(resolved.ws_idx, resolved.pane_id))
+                .unwrap_or_else(|| target.to_owned())
+        };
+        self.send_to_client(client_id, super::pane_input::input_poison_notice(&pane_id));
+        true
+    }
+
     /// Handles a server event. Returns true if the event requires a re-render.
     fn handle_server_event(&mut self, ev: ServerEvent) -> bool {
         // Consume any bootstrap/deferred receipts before a newer client input can win.
         self.consume_api_input_receipts();
         if self.handoff_in_progress && Self::ignore_client_event_during_handoff(&ev) {
+            return false;
+        }
+
+        if self.reject_poisoned_client_input(&ev) {
             return false;
         }
 
@@ -2044,6 +2164,7 @@ impl HeadlessServer {
                 surface_scroll,
                 media_capable,
                 principal,
+                peer_context,
                 writer,
             } => {
                 if self.handoff_in_progress {
@@ -2085,6 +2206,7 @@ impl HeadlessServer {
                     Some(writer),
                 );
                 connection.principal = principal;
+                connection.shell_peer_context = peer_context;
                 connection.pixel_mouse = pixel_mouse && observed.is_known();
                 connection.direct_graphics = direct_graphics;
                 connection.shell_uses_endpoint_keybindings = endpoint_keybindings;
@@ -2245,7 +2367,10 @@ impl HeadlessServer {
                             self.invalidate_terminal_input_attribution(&terminal_id)
                         }
                         Ok(_) => {}
-                        Err(err) => warn!(client_id, terminal_id = %terminal_id, err = %err),
+                        Err(err) => {
+                            warn!(client_id, terminal_id = %terminal_id, err = %err);
+                            self.notify_client_input_error(client_id, &terminal_id, &err);
+                        }
                     }
                 }
                 true
@@ -2563,14 +2688,17 @@ impl HeadlessServer {
                         );
                     }
                     let scroll_before = runtime.scroll_metrics();
-                    if let Err(err) = apply_client_pane_input_events(
+                    let result = apply_client_pane_input_events(
                         runtime,
                         &releases,
                         self.client_input_source(client_id),
-                    ) {
+                    );
+                    let scroll_changed = runtime.scroll_metrics() != scroll_before;
+                    if let Err(err) = result {
                         warn!(client_id, pane_id, err = %err, "targeted client shell release failed");
+                        self.notify_client_input_error(client_id, &pane_id, &err);
                     }
-                    return runtime.scroll_metrics() != scroll_before;
+                    return scroll_changed;
                 }
                 let interaction = client_pane_input_has_interaction(&events);
                 if let Some(client) = self.clients.get_mut(&client_id) {
@@ -2590,11 +2718,15 @@ impl HeadlessServer {
                 };
                 let scroll_before = runtime.scroll_metrics();
                 let mut accepted_interaction = false;
+                let mut keyboard_forwarded = false;
+                let mut rejected = None;
                 for event in &events {
-                    match apply_client_pane_input_events(
+                    match apply_client_terminal_input_events(
                         runtime,
                         std::slice::from_ref(event),
+                        true,
                         self.client_input_source(client_id),
+                        &mut keyboard_forwarded,
                     ) {
                         Ok(true) => {
                             accepted_interaction |=
@@ -2603,11 +2735,20 @@ impl HeadlessServer {
                         Ok(false) => {}
                         Err(err) => {
                             warn!(client_id, pane_id, err = %err, "targeted client shell input failed");
+                            rejected = Some(err);
                             break;
                         }
                     }
                 }
                 let scroll_changed = runtime.scroll_metrics() != scroll_before;
+                // Like media interactivity, an accepted keystroke prefix keeps its
+                // render priority even when a later event in the batch fails.
+                if keyboard_forwarded {
+                    self.note_interactive_input(runtime_pane_id, Instant::now());
+                }
+                if let Some(err) = rejected {
+                    self.notify_client_input_error(client_id, &pane_id, &err);
+                }
                 // A later enqueue failure does not undo an already accepted prefix.
                 if accepted_interaction {
                     self.media.note_pane_input(
@@ -2636,12 +2777,12 @@ impl HeadlessServer {
                     client.pixel_mouse && client.host_sgr_pixels_active == Some(true)
                 });
                 let mut events = events;
-                let Some(popup_terminal_id) = self
+                let Some((popup_terminal_id, popup_pane_id)) = self
                     .app
                     .state
                     .popup_pane
                     .as_ref()
-                    .map(|popup| popup.terminal_id.clone())
+                    .map(|popup| (popup.terminal_id.clone(), popup.pane_id))
                 else {
                     return false;
                 };
@@ -2672,14 +2813,17 @@ impl HeadlessServer {
                         );
                     }
                     let scroll_before = runtime.scroll_metrics();
-                    if let Err(err) = apply_client_popup_input_events(
+                    let result = apply_client_popup_input_events(
                         runtime,
                         &releases,
                         self.client_input_source(client_id),
-                    ) {
+                    );
+                    let scroll_changed = runtime.scroll_metrics() != scroll_before;
+                    if let Err(err) = result {
                         warn!(client_id, terminal_id, err = %err, "targeted client popup release failed");
+                        self.notify_client_input_error(client_id, &terminal_id, &err);
                     }
-                    return runtime.scroll_metrics() != scroll_before;
+                    return scroll_changed;
                 }
                 let interaction = client_pane_input_has_interaction(&events);
                 if let Some(client) = self.clients.get_mut(&client_id) {
@@ -2696,14 +2840,23 @@ impl HeadlessServer {
                     return foreground_changed | geometry_changed;
                 };
                 let scroll_before = runtime.scroll_metrics();
-                if let Err(err) = apply_client_popup_input_events(
+                let mut keyboard_forwarded = false;
+                let result = apply_client_terminal_input_events(
                     runtime,
                     &events,
+                    false,
                     self.client_input_source(client_id),
-                ) {
-                    warn!(client_id, terminal_id, err = %err, "targeted client popup input failed");
+                    &mut keyboard_forwarded,
+                );
+                let scroll_changed = runtime.scroll_metrics() != scroll_before;
+                if keyboard_forwarded {
+                    self.note_interactive_input(popup_pane_id, Instant::now());
                 }
-                foreground_changed | geometry_changed || runtime.scroll_metrics() != scroll_before
+                if let Err(err) = result {
+                    warn!(client_id, terminal_id, err = %err, "targeted client popup input failed");
+                    self.notify_client_input_error(client_id, &terminal_id, &err);
+                }
+                foreground_changed | geometry_changed || scroll_changed
             }
             ServerEvent::ClientShellEndpointRequestError {
                 client_id,
@@ -3198,6 +3351,7 @@ impl HeadlessServer {
                 self.app.handle_deferred_input_consumer_request(
                     msg.request,
                     msg.context,
+                    msg.peer_pidfd,
                     msg.respond_to,
                 );
             }
@@ -3312,10 +3466,15 @@ impl HeadlessServer {
                 .handle_deferred_agent_api_request(msg.request, msg.context, msg.respond_to);
             return changed; // Observation is not input or a presentation-state mutation.
         }
-        if matches!(
-            &msg.request.method,
-            api::schema::Method::AgentPrompt(_) | api::schema::Method::AgentPromptGuarded(_)
-        ) {
+        // Session expectations on base pane methods are just as guarded as
+        // named aliases. Do not acknowledge their enqueue through the sync path.
+        // Public sockets and frame/client-control API invocations converge here.
+        if crate::app::App::api_request_requires_deferred_input(&msg.request)
+            || matches!(
+                &msg.request.method,
+                api::schema::Method::AgentPromptGuarded(_)
+            )
+        {
             let deferred_changed = self.app.handle_deferred_agent_api_request(
                 msg.request,
                 msg.context,

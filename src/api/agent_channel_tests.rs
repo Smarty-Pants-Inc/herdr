@@ -81,6 +81,53 @@ fn channel_dedup_reserves_before_dispatch_and_shares_one_outcome() {
     assert_eq!(result["result"]["duplicate"], true);
 }
 #[test]
+fn channel_audit_precedes_enqueue_and_failed_audit_leaves_key_unreserved() {
+    let (channel, receiver) = channel();
+    let refused = channel.reserve_with_audit(
+        "r".into(),
+        "private prompt".into(),
+        false,
+        Duration::from_secs(1),
+        || {
+            assert!(receiver.try_recv().is_err());
+            Err(Outcome::failure("input_log_unavailable", "audit failed"))
+        },
+    );
+    assert_eq!(code(refused.err().unwrap()), "input_log_unavailable");
+    assert!(receiver.try_recv().is_err());
+    assert!(channel.ledger.lock().unwrap().requests.is_empty());
+    assert_eq!(channel.ledger.lock().unwrap().bytes, 0);
+    assert_eq!(channel.waiters.load(Ordering::Acquire), 0);
+    let audited = Cell::new(0);
+    let (first, duplicate, _waiter) = channel
+        .reserve_with_audit(
+            "r".into(),
+            "private prompt".into(),
+            false,
+            Duration::from_secs(1),
+            || {
+                assert!(receiver.try_recv().is_err());
+                audited.set(audited.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap();
+    assert!(!duplicate);
+    assert!(Arc::ptr_eq(&first, &receiver.try_recv().unwrap()));
+    let (_, duplicate, _retry_waiter) = channel
+        .reserve_with_audit(
+            "r".into(),
+            "private prompt".into(),
+            false,
+            Duration::from_secs(1),
+            || panic!("receipt-only retry must not audit or enqueue"),
+        )
+        .unwrap();
+    assert!(duplicate);
+    assert_eq!(audited.get(), 1);
+    assert!(receiver.try_recv().is_err());
+}
+#[test]
 fn channel_ack_requires_complete_dispatch_and_all_correlations() {
     let (channel, _receiver) = channel();
     let (delivery, _, _waiter) = reserve(&channel, "r");
@@ -1094,6 +1141,53 @@ fn channel_draft_guard_identity_deadline_and_retired_duplicate_are_immutable() {
     assert_eq!(receiver.try_iter().count(), 1);
 }
 
+/// Unit, not E2E: an end-to-end run cannot pin how long a frame waits in the outbound queue,
+/// and the property is the byte-level frame `write_delivery` emits, so this drives that
+/// function with an in-memory writer and a real (monotonic) delay before dispatch.
+#[test]
+fn channel_guarded_frame_sends_monotonic_budget_spent_at_dispatch() {
+    let (channel, _receiver) = channel();
+    channel.set_draft_guard(true);
+    let timeout = Duration::from_secs(10);
+    let (delivery, _, _waiter) = channel
+        .reserve_prompt("r".into(), "literal".into(), true, timeout)
+        .unwrap();
+    let reserved: serde_json::Value = serde_json::from_slice(&delivery.frame).unwrap();
+    // The reserved frame holds the full budget, the widest value capacity must admit.
+    assert_eq!(reserved["remaining_ms"], 10_000);
+    let deadline_ms = reserved["deadline_ms"].as_u64().unwrap();
+    let delay = Duration::from_millis(60);
+    std::thread::sleep(delay); // Queue delay before dispatch spends Herdr's own budget.
+    let mut wire = Vec::new();
+    write_delivery(&mut wire, &channel, &delivery, || true, || true).unwrap();
+    assert!(wire.ends_with(b"\n") && wire.len() <= delivery.frame.len());
+    let sent: serde_json::Value = serde_json::from_slice(&wire).unwrap();
+    let budget = sent["remaining_ms"].as_u64().unwrap();
+    assert!(budget <= 10_000 - 60, "{budget}");
+    // Never more than what is left on Herdr's monotonic deadline after the write.
+    let left = delivery.deadline.saturating_duration_since(Instant::now());
+    assert!(Duration::from_millis(budget) >= left.saturating_sub(Duration::from_millis(1)));
+    assert!(Duration::from_millis(budget) <= timeout - delay);
+    // Everything else is the reserved frame: deadline_ms is unchanged for older receivers.
+    let mut rest = sent.clone();
+    rest["remaining_ms"] = reserved["remaining_ms"].clone();
+    assert_eq!(rest, reserved);
+    assert_eq!(sent["deadline_ms"].as_u64(), Some(deadline_ms));
+    // At or past the deadline the budget is zero, never negative or wrapped.
+    let late = delivery.dispatch_frame(delivery.deadline + Duration::from_secs(5));
+    let late: serde_json::Value = serde_json::from_slice(&late).unwrap();
+    assert_eq!(late["remaining_ms"], 0);
+    // Unguarded prompts carry neither budget nor deadline and go out byte-identical.
+    let (plain, _, _waiter2) = channel
+        .reserve_prompt("p".into(), "literal".into(), false, timeout)
+        .unwrap();
+    let mut wire = Vec::new();
+    write_delivery(&mut wire, &channel, &plain, || true, || true).unwrap();
+    assert_eq!(wire, plain.frame);
+    let plain: serde_json::Value = serde_json::from_slice(&wire).unwrap();
+    assert!(plain.get("remaining_ms").is_none() && plain.get("deadline_ms").is_none());
+}
+
 /// End-to-end tests cannot force preemption between the two clock reads, so this
 /// models it deterministically: one simulated real timeline serves both injected
 /// clocks, and every read is followed by a scheduling delay before the next.
@@ -1259,6 +1353,57 @@ fn channel_deadline_overflow_refuses_before_reservation_or_dispatch() {
     assert!(receiver.try_recv().is_err());
     // A refused ID is not retained, so a representable retry is a fresh request.
     assert!(!reserve(&channel, "r").1);
+    assert_eq!(receiver.try_iter().count(), 1);
+}
+
+#[test]
+fn channel_deadline_refusal_precedes_audit_and_audit_precedes_reservation() {
+    let (channel, receiver) = channel();
+    channel.set_draft_guard(true);
+    // Order: overflow-safe deadline (herdr#206), then audit (herdr#225), then reserve.
+    for guarded in [false, true] {
+        let refused = channel.reserve_with_audit(
+            "r".into(),
+            "literal".into(),
+            guarded,
+            Duration::MAX,
+            || panic!("a refused deadline must not reach the input log"),
+        );
+        assert_eq!(
+            refused.err().unwrap(),
+            Outcome::failure("agent_prompt_rejected", "unknown")
+        );
+    }
+    let audited = Cell::new(false);
+    let refused = channel.reserve_with_audit(
+        "r".into(),
+        "literal".into(),
+        true,
+        Duration::from_secs(1),
+        || {
+            audited.set(true);
+            Err(Outcome::failure("input_log_unavailable", "audit failed"))
+        },
+    );
+    assert!(audited.get());
+    assert_eq!(code(refused.err().unwrap()), "input_log_unavailable");
+    let ledger = channel.ledger.lock().unwrap();
+    assert!(ledger.requests.is_empty());
+    assert_eq!(ledger.bytes, 0);
+    drop(ledger);
+    assert_eq!(channel.waiters.load(Ordering::Acquire), 0);
+    assert!(!channel.rotating.load(Ordering::Acquire));
+    assert!(receiver.try_recv().is_err());
+    let (_, duplicate, _waiter) = channel
+        .reserve_with_audit(
+            "r".into(),
+            "literal".into(),
+            true,
+            Duration::from_secs(1),
+            || Ok(()),
+        )
+        .unwrap();
+    assert!(!duplicate);
     assert_eq!(receiver.try_iter().count(), 1);
 }
 

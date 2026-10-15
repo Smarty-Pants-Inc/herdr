@@ -2,9 +2,10 @@
 // managed by herdr; reinstalling or updating the integration overwrites this file.
 // add custom hooks/plugins beside this file instead of editing it.
 // HERDR_INTEGRATION_ID=pi
-// HERDR_INTEGRATION_VERSION=10
+// HERDR_INTEGRATION_VERSION=12
 // @ts-nocheck
 
+import { AsyncResource } from "node:async_hooks";
 import net from "node:net";
 import path from "node:path";
 
@@ -23,6 +24,10 @@ const RECENT_CHANNEL_EPOCHS = 2;
 const MAX_CHANNEL_ID = 1024;
 const RECONNECT_DELAY_MS = 250;
 const REGISTRATION_TIMEOUT_MS = 2000;
+// A held guarded delivery (see handleDeliver) is acknowledged with its refusal this long before the
+// frame's admission deadline. Herdr's own wait ends at that deadline as delivery_unknown, so an ACK
+// sent exactly at the deadline could lose the race and turn a definite refusal into an unknown.
+const HELD_DELIVERY_ACK_MARGIN_MS = 250;
 const CHANNEL_REASONS = new Set([
   "no_session",
   "session_changed",
@@ -36,8 +41,54 @@ const CHANNEL_REASONS = new Set([
   "expired",
 ]);
 
+function monotonicNow(): number {
+  return performance.now();
+}
+
+// A guarded admission deadline on two clocks (smarty-dev#8792). Admission requires BOTH at every
+// check: `monotonic`, the budget on this process's performance.now() timeline, catches a backward
+// wall-clock step; `wall`, the frame's absolute deadline_ms, catches time spent before this handler
+// read the frame (socket buffering, Pi paused or busy), which the budget cannot see. Accepted
+// residual: a pause before receipt combined with a backward wall-clock step can still admit late.
+// Herdr's own monotonic deadline still governs everything on the server side.
+type AdmissionDeadline = { monotonic: number; wall: number };
+
+// Builds the admission deadline for a guarded deliver frame at receipt. Herdr sends
+// `remaining_ms`, the budget left on its own monotonic deadline when it began writing the frame;
+// the monotonic deadline is receipt time plus that budget. An older Herdr sends only
+// `deadline_ms`: its remaining budget is read once against the wall clock here. `deadline_ms` is
+// required on every guarded frame (Herdr always sends it) and is always enforced as the wall
+// deadline; `remaining_ms` without it would skip the wall check, so it is refused. A present but
+// malformed field fails closed and never falls back. undefined means the frame carries no usable deadline (refused as
+// unknown).
+function admissionDeadline(frame: Record<string, any>, receivedAt: number): AdmissionDeadline | undefined {
+  if (!Number.isSafeInteger(frame.deadline_ms)) return undefined;
+  const wall: number = frame.deadline_ms;
+  if (frame.remaining_ms !== undefined) {
+    return Number.isSafeInteger(frame.remaining_ms) && frame.remaining_ms >= 0
+      ? { monotonic: receivedAt + frame.remaining_ms, wall }
+      : undefined;
+  }
+  return { monotonic: receivedAt + (wall - Date.now()), wall };
+}
+
+// True while both clocks are more than `marginMs` before their deadlines.
+function beforeDeadline(deadline: AdmissionDeadline, marginMs = 0): boolean {
+  return monotonicNow() < deadline.monotonic - marginMs &&
+    Date.now() < deadline.wall - marginMs;
+}
+
+// Milliseconds until the earlier of the two clocks reaches its deadline less `marginMs`.
+function msUntilDeadline(deadline: AdmissionDeadline, marginMs = 0): number {
+  const monotonic = deadline.monotonic - marginMs - monotonicNow();
+  const wall = deadline.wall - marginMs - Date.now();
+  return Math.max(0, Math.min(monotonic, wall));
+}
+
+// HERDR_PANE_ID is not required: when it is missing or empty, reports carry pane_id "" and
+// Herdr rebinds them to the pane whose session holds this process (smarty-dev#10398).
 function enabled() {
-  return HERDR_ENV === "1" && !!socketPath && !!paneId;
+  return HERDR_ENV === "1" && !!socketPath;
 }
 
 function sendRequestAttempt(request: unknown, timeoutMs: number): Promise<boolean> {
@@ -116,23 +167,18 @@ function updateSessionRef(ctx: any): void {
 }
 
 function withSessionRef(params: Record<string, unknown>): Record<string, unknown> {
-  if (currentAgentSessionPath) {
-    return { ...params, agent_session_path: currentAgentSessionPath };
-  }
-  if (currentAgentSessionId) {
-    return { ...params, agent_session_id: currentAgentSessionId };
-  }
-  return params;
+  const sessionRef = currentSessionRef();
+  return sessionRef ? { ...params, ...sessionRef } : params;
 }
 
 function currentSessionRef(): Record<string, unknown> | undefined {
-  if (currentAgentSessionPath) {
-    return { agent_session_path: currentAgentSessionPath };
+  if (!currentAgentSessionId && !currentAgentSessionPath) {
+    return undefined;
   }
-  if (currentAgentSessionId) {
-    return { agent_session_id: currentAgentSessionId };
-  }
-  return undefined;
+  return {
+    ...(currentAgentSessionId ? { agent_session_id: currentAgentSessionId } : {}),
+    ...(currentAgentSessionPath ? { agent_session_path: currentAgentSessionPath } : {}),
+  };
 }
 
 function reportSession(sessionStartSource?: string): Promise<void> {
@@ -145,7 +191,7 @@ function reportSession(sessionStartSource?: string): Promise<void> {
     id: `${source}:session:${Date.now()}:${Math.random().toString(36).slice(2)}`,
     method: "pane.report_agent_session",
     params: {
-      pane_id: paneId,
+      pane_id: paneId || "",
       source,
       agent: "pi",
       seq: nextReportSeq(),
@@ -160,7 +206,7 @@ function sendState(state: AgentState, message?: string, seq = nextReportSeq()): 
     id: `${source}:${Date.now()}:${Math.random().toString(36).slice(2)}`,
     method: "pane.report_agent",
     params: withSessionRef({
-      pane_id: paneId,
+      pane_id: paneId || "",
       source,
       agent: "pi",
       state,
@@ -228,10 +274,29 @@ export default function (pi) {
   let lastMessage: string | undefined;
   let rootSession = false;
 
-  // The receiver is deliberately owned by one session_start lifecycle. A new connection gets a
-  // new registration and never replays a frame from the previous connection or epoch.
+  // The guarded-input channel transport is owned by this extension instance, not by a
+  // session_start callback. Pi runs session_start for a native /new, /resume or /fork inside a
+  // temporary input fence, and anything whose async context descends from such a callback is
+  // refused input permanently once that fence ends (pi#163 security r3). The channel socket, its
+  // reader and every reconnect therefore run in the async context captured here, at extension
+  // load. session_start only sends a registration over an already connected socket; it never
+  // opens one. Herdr serves exactly one registration per connection, so a new connection still
+  // gets a new registration and never replays a frame from the previous connection or epoch.
+  const channelSupported = process.platform !== "win32" && typeof pi.submitUserMessage === "function";
+  // A native /new, /resume or /fork keeps the receiving session's input fenced until every
+  // session_start handler has returned. This extension registers from its own session_start, so a
+  // guarded delivery can reach Pi while a slower handler (for example an extension bootstrap)
+  // still holds that fence; Pi refuses it as session_changed without rotating the generation.
+  // A Pi that announces the lifted fence with session_ready lets such a refusal be held and
+  // re-attempted once on that event. Pi's `on` accepts any event name, so support is read from
+  // the host capability, never inferred. Without it the refusal passes through unchanged.
+  const sessionReadySupported = channelSupported && pi.hostCapabilities?.sessionReadyEvent === true;
+  const loadScope = channelSupported ? new AsyncResource("herdr-agent-channel") : undefined;
   let channelSocket: net.Socket | undefined;
+  let channelConnected = false;
   let channelGeneration = 0;
+  let channelRegistration: { id: string; sessionGeneration: string } | undefined;
+  let channelTargetGeneration: string | undefined;
   let channelSessionGeneration: string | undefined;
   let channelEpoch: string | undefined;
   let channelReady = false;
@@ -257,6 +322,46 @@ export default function (pi) {
   // Keep unresolved calls counted across reconnect/session replacement: an old callback must not
   // free a newer request's slot, and repeated replacement cannot create unlimited pending calls.
   const inflight = new Set<LedgerEntry>();
+  // Guarded deliveries Pi refused at a replacement's lifecycle fence, waiting for session_ready.
+  // At most one per request ID; each keeps its inflight slot, so this never exceeds
+  // MAX_CHANNEL_INFLIGHT.
+  type HeldDelivery = {
+    token: number;
+    socket: any;
+    registrationEpoch: string;
+    sessionGeneration: string;
+    deadline: AdmissionDeadline; // Expires HELD_DELIVERY_ACK_MARGIN_MS before either clock's deadline.
+    timer?: ReturnType<typeof setTimeout>;
+    // Re-attempts admission synchronously in the caller's callback; settles the delivery.
+    retry: () => void;
+    // Settles the delivery with its original refusal receipt.
+    refuse: () => void;
+  };
+  const held = new Map<string, HeldDelivery>();
+
+  function takeHeld(requestId: string): HeldDelivery | undefined {
+    const delivery = held.get(requestId);
+    if (!delivery) return undefined;
+    held.delete(requestId);
+    if (delivery.timer) clearTimeout(delivery.timer);
+    return delivery;
+  }
+
+  // A retired connection can never ACK, so its held deliveries settle now and free their slots.
+  function releaseHeldDeliveries() {
+    for (const requestId of [...held.keys()]) takeHeld(requestId)?.refuse();
+  }
+
+  function heldDeliveryLive(delivery: HeldDelivery): boolean {
+    return delivery.token === channelGeneration &&
+      delivery.socket === channelSocket &&
+      channelReady &&
+      !channelClosing &&
+      !delivery.socket.destroyed &&
+      channelEpoch === delivery.registrationEpoch &&
+      currentContext?.userMessageSessionGeneration === delivery.sessionGeneration &&
+      typeof pi.submitUserMessage === "function";
+  }
 
   function pruneEpochs() {
     const retained = new Set(recentEpochs);
@@ -280,13 +385,27 @@ export default function (pi) {
     }
   }
 
-  function closeChannel() {
-    clearReconnectTimer();
+  // Run fn in the extension-load async context. Timers and sockets created here never inherit
+  // a session callback's (possibly fenced) context, even when the trigger, such as a socket
+  // destroyed inside session_start, delivered its callback in that context.
+  function inLoadScope<T>(fn: () => T): T | undefined {
+    return loadScope ? loadScope.runInAsyncScope(fn) : undefined;
+  }
+
+  function wantsChannel(): boolean {
+    return channelSupported && !channelClosing && currentContext !== undefined &&
+      validChannelId(channelTargetGeneration) &&
+      currentContext?.userMessageSessionGeneration === channelTargetGeneration;
+  }
+
+  function dropConnection() {
     clearRegistrationTimer();
     channelGeneration += 1;
-    channelClosing = true;
+    releaseHeldDeliveries();
     const socket = channelSocket;
     channelSocket = undefined;
+    channelConnected = false;
+    channelRegistration = undefined;
     channelReady = false;
     channelEpoch = undefined;
     channelSessionGeneration = undefined;
@@ -446,6 +565,8 @@ export default function (pi) {
     const registrationEpoch = channelEpoch;
     const expectedSessionGeneration = channelSessionGeneration;
     const ifDraftEmpty = frame.if_draft_empty === true;
+    // Sampled synchronously at receipt, before any ledger or UI work, so neither can extend it.
+    const admitBy = ifDraftEmpty ? admissionDeadline(frame, monotonicNow()) : undefined;
     const prior = ledger.get(requestId);
     if (prior) {
       if (prior.text !== frame.text || prior.ifDraftEmpty !== ifDraftEmpty) {
@@ -489,7 +610,7 @@ export default function (pi) {
     }
     inflight.add(entry);
     const text = frame.text;
-    const admit = async () => {
+    const admit = async (redelivery: boolean) => {
       if (
         token !== channelGeneration ||
         socket !== channelSocket ||
@@ -501,8 +622,8 @@ export default function (pi) {
         return receiptForError("session_changed", expectedSessionGeneration);
       }
       if (ifDraftEmpty) {
-        if (!Number.isSafeInteger(frame.deadline_ms)) return receiptForError("unknown", expectedSessionGeneration);
-        if (Date.now() >= frame.deadline_ms) return receiptForError("expired", expectedSessionGeneration);
+        if (admitBy === undefined) return receiptForError("unknown", expectedSessionGeneration);
+        if (!beforeDeadline(admitBy)) return receiptForError("expired", expectedSessionGeneration);
         const state = readDraftSnapshot();
         if (!state) return receiptForError("unknown", expectedSessionGeneration);
         if (!state.empty) return receiptForError("draft_present", expectedSessionGeneration);
@@ -510,13 +631,15 @@ export default function (pi) {
         // non-undefined hold must refuse admission; only draft queries require the known union.
         if (state.hold !== undefined) return receiptForError("ui_hold", expectedSessionGeneration);
         // Slow synchronous UI implementations cannot extend the first-reservation deadline.
-        if (Date.now() >= frame.deadline_ms) return receiptForError("expired", expectedSessionGeneration);
+        if (!beforeDeadline(admitBy)) return receiptForError("expired", expectedSessionGeneration);
       }
       try {
         // This is the receipt-returning Pi ingress. The old void API is intentionally not a
         // fallback: acknowledging socket receipt would turn an unknown delivery into success.
         const result = await pi.submitUserMessage({
-          registrationEpoch,
+          // Pi reserves each (epoch, request) key even when it refuses, so the redelivery needs a
+          // fresh key. The NUL separator cannot occur in a Herdr ID; Pi uses the epoch only as a key.
+          registrationEpoch: redelivery ? `${registrationEpoch}\u0000session-ready` : registrationEpoch,
           requestId,
           sessionGeneration: expectedSessionGeneration,
           text,
@@ -528,10 +651,60 @@ export default function (pi) {
         return undefined; // Possible admission without a usable receipt is unknown, not rejection.
       }
     };
+    // A guarded refusal is held for session_ready only while it can be a receiving-session
+    // lifecycle fence: Pi definitively refused (a typed session_changed receipt, never an
+    // exception, void or duplicate), the session generation it was bound to is still live, and
+    // this connection and epoch are still current. Pi admitted nothing, so the one redelivery
+    // never replays an admitted message. A real session change rotates the generation: never held.
+    const holdForSessionReady = (
+      receipt: Record<string, any> | undefined,
+    ): Promise<Record<string, any> | undefined> | undefined => {
+      if (
+        admitBy === undefined ||
+        !sessionReadySupported ||
+        receipt?.status !== "rejected" ||
+        receipt.reason !== "session_changed" ||
+        receipt.duplicate === true ||
+        held.has(requestId) ||
+        held.size >= MAX_CHANNEL_INFLIGHT ||
+        !beforeDeadline(admitBy, HELD_DELIVERY_ACK_MARGIN_MS)
+      ) return undefined;
+      return new Promise((resolve) => {
+        const delivery: HeldDelivery = {
+          token,
+          socket,
+          registrationEpoch,
+          sessionGeneration: expectedSessionGeneration,
+          deadline: admitBy,
+          // Called from the session_ready callback: admit observes the editor/hold and invokes
+          // submitUserMessage there, synchronously, exactly as the first attempt does.
+          retry: () => resolve(admit(true)),
+          refuse: () => resolve(receipt),
+        };
+        if (!heldDeliveryLive(delivery)) {
+          resolve(receipt);
+          return;
+        }
+        // The deadline needs no polling: one one-shot load-scope timer per held delivery only
+        // settles it with Pi's refusal. It never re-attempts admission.
+        const timer = inLoadScope(() => setTimeout(() => {
+          if (held.get(requestId) === delivery) takeHeld(requestId)?.refuse();
+        }, msUntilDeadline(admitBy, HELD_DELIVERY_ACK_MARGIN_MS)));
+        if (!timer) {
+          resolve(receipt);
+          return;
+        }
+        timer.unref?.();
+        delivery.timer = timer;
+        held.set(requestId, delivery);
+      });
+    };
     // Guarded ingress must run in this very socket callback: no await, Promise scheduling or
     // event-loop gap between observing the editor/hold and invoking submitUserMessage. Only
     // its receipt is awaited. Preserve the existing deferred/fenced path for unguarded input.
-    const call = ifDraftEmpty ? admit() : Promise.resolve().then(admit);
+    const call = ifDraftEmpty
+      ? admit(false).then((receipt) => holdForSessionReady(receipt) ?? receipt)
+      : Promise.resolve().then(() => admit(false));
     void call.then((receipt) => {
       inflight.delete(entry);
       pruneEpochs();
@@ -565,62 +738,86 @@ export default function (pi) {
     socket.destroy();
   }
 
-  function scheduleReconnect(ctx: any) {
-    if (channelClosing || reconnectTimer || reconnectAttempts >= MAX_RECONNECT_ATTEMPTS || currentContext !== ctx) {
-      return;
-    }
-    const expectedSessionGeneration = ctx.userMessageSessionGeneration;
-    reconnectTimer = setTimeout(() => {
+  function scheduleReconnect(initial: boolean) {
+    if (!wantsChannel() || reconnectTimer || channelSocket) return;
+    if (!initial && reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) return;
+    const expectedSessionGeneration = channelTargetGeneration;
+    // The connection is always opened from this load-scope timer, never synchronously from the
+    // caller: a session callback, or a disconnect that Pi delivered in a session callback's context.
+    const timer = inLoadScope(() => setTimeout(() => {
+      if (reconnectTimer !== timer) return;
       reconnectTimer = undefined;
-      if (channelClosing || currentContext !== ctx || ctx?.userMessageSessionGeneration !== expectedSessionGeneration) return;
-      reconnectAttempts += 1;
-      openChannel(ctx);
-    }, RECONNECT_DELAY_MS);
-    reconnectTimer.unref?.();
+      if (!wantsChannel() || channelTargetGeneration !== expectedSessionGeneration || channelSocket) return;
+      if (!initial) reconnectAttempts += 1;
+      connectChannel();
+    }, initial ? 0 : RECONNECT_DELAY_MS));
+    reconnectTimer = timer;
+    reconnectTimer?.unref?.();
   }
 
   function rejectRegistration(socket: any, token: number) {
     if (token !== channelGeneration || socket !== channelSocket) return;
-    clearRegistrationTimer();
-    channelReady = false;
-    socket.destroy();
-    channelSocket = undefined;
-    channelEpoch = undefined;
-    channelSessionGeneration = undefined;
     // A server refusal/malformed registration response is final for this session. Transport loss
     // (including a missing response) may retry a bounded fresh registration, never a delivery.
     channelClosing = true;
+    dropConnection();
   }
 
-  function openChannel(ctx: any) {
+  function sendRegistration() {
+    const socket = channelSocket;
     if (
-      channelClosing ||
-      process.platform === "win32" ||
-      typeof pi.submitUserMessage !== "function" ||
-      !validChannelId(ctx?.userMessageSessionGeneration)
+      !socket || !channelConnected || socket.destroyed || channelReady || channelRegistration ||
+      !wantsChannel()
     ) {
       return;
     }
+    const token = channelGeneration;
+    const registration = { id: randomId("register"), sessionGeneration: channelTargetGeneration! };
+    channelRegistration = registration;
+    channelSessionGeneration = registration.sessionGeneration;
+    clearRegistrationTimer();
+    registrationTimer = inLoadScope(() => setTimeout(() => {
+      if (token === channelGeneration && socket === channelSocket && !channelReady) socket.destroy();
+    }, REGISTRATION_TIMEOUT_MS));
+    registrationTimer?.unref?.();
+    try {
+      socket.write(
+        `${JSON.stringify({
+          id: registration.id,
+          method: "agent.register_self",
+          params: {
+            session_generation: registration.sessionGeneration,
+            ...(draftGuardAvailable(currentContext) ? { draft_guard: true } : {}),
+          },
+        })}\n`,
+      );
+    } catch {
+      socket.destroy();
+    }
+  }
 
-    channelClosing = false;
+  // Only called at extension load or from a load-scope timer: never from a session callback.
+  function connectChannel() {
+    if (!channelSupported || channelSocket) return;
     const token = ++channelGeneration;
-    const expectedSessionGeneration = ctx.userMessageSessionGeneration;
-    channelSessionGeneration = expectedSessionGeneration;
+    channelConnected = false;
+    channelRegistration = undefined;
     channelReady = false;
     channelEpoch = undefined;
+    channelSessionGeneration = undefined;
     let buffer = Buffer.alloc(0);
-    const registrationId = randomId("register");
     const socket = net.createConnection(socketEndpoint!);
     channelSocket = socket;
-    registrationTimer = setTimeout(() => {
-      if (token === channelGeneration && socket === channelSocket) socket.destroy();
-    }, REGISTRATION_TIMEOUT_MS);
-    registrationTimer.unref?.();
+    // A passive receiver: the TUI keeps Pi alive, this socket must not.
+    socket.unref?.();
 
     const onDisconnect = () => {
       if (token !== channelGeneration || socket !== channelSocket) return;
       clearRegistrationTimer();
+      releaseHeldDeliveries();
       channelSocket = undefined;
+      channelConnected = false;
+      channelRegistration = undefined;
       channelReady = false;
       channelEpoch = undefined;
       channelSessionGeneration = undefined;
@@ -628,27 +825,17 @@ export default function (pi) {
       buffer = Buffer.alloc(0);
       // Socket loss is not receipt loss proof. Discard all unsent ACKs/deliveries and request a
       // fresh registration only, with a bounded total attempt budget for this session_start.
-      if (!channelClosing && ctx?.userMessageSessionGeneration === expectedSessionGeneration) scheduleReconnect(ctx);
+      // Before any session_start nothing reconnects; session_start requests the connection.
+      scheduleReconnect(false);
     };
 
     socket.on("connect", () => {
-      if (
-        token !== channelGeneration || socket !== channelSocket || channelClosing ||
-        socket.destroyed || ctx?.userMessageSessionGeneration !== expectedSessionGeneration
-      ) {
+      if (token !== channelGeneration || socket !== channelSocket || socket.destroyed) {
         socket.destroy();
         return;
       }
-      socket.write(
-        `${JSON.stringify({
-          id: registrationId,
-          method: "agent.register_self",
-          params: {
-            session_generation: expectedSessionGeneration,
-            ...(draftGuardAvailable(ctx) ? { draft_guard: true } : {}),
-          },
-        })}\n`,
-      );
+      channelConnected = true;
+      sendRegistration();
     });
     socket.on("data", (chunk: Buffer) => {
       if (token !== channelGeneration || socket !== channelSocket || channelClosing) return;
@@ -657,6 +844,11 @@ export default function (pi) {
       let offset = 0;
       while (offset < chunk.length) {
         if (token !== channelGeneration || socket !== channelSocket || socket.destroyed) return;
+        if (!channelReady && !channelRegistration) {
+          // Herdr never speaks first on an unregistered connection.
+          socket.destroy();
+          return;
+        }
         const newline = chunk.indexOf(10, offset);
         const end = newline < 0 ? chunk.length : newline;
         const part = chunk.subarray(offset, end);
@@ -677,20 +869,21 @@ export default function (pi) {
           return;
         }
         if (!channelReady) {
+          const registration = channelRegistration!;
           const result = isRecord(parsed) && isRecord(parsed.result) ? parsed.result : undefined;
           const epoch = isRecord(result) ? result.registration_epoch : undefined;
           const sessionGeneration = isRecord(result) ? result.session_generation : undefined;
           if (
             !isRecord(parsed) ||
-            parsed.id !== registrationId ||
+            parsed.id !== registration.id ||
             parsed.error !== undefined ||
             !isRecord(result) ||
             !validChannelId(result.terminal_id) ||
             result.ready !== true ||
             !validChannelId(epoch) ||
             typeof sessionGeneration !== "string" ||
-            sessionGeneration !== expectedSessionGeneration ||
-            ctx?.userMessageSessionGeneration !== expectedSessionGeneration ||
+            sessionGeneration !== registration.sessionGeneration ||
+            currentContext?.userMessageSessionGeneration !== registration.sessionGeneration ||
             usedEpochs.has(epoch)
           ) {
             rejectRegistration(socket, token);
@@ -701,6 +894,7 @@ export default function (pi) {
           recentEpochs.push(epoch);
           if (recentEpochs.length > RECENT_CHANNEL_EPOCHS) recentEpochs.shift();
           pruneEpochs();
+          channelRegistration = undefined;
           channelEpoch = epoch;
           channelSessionGeneration = sessionGeneration;
           channelReady = true;
@@ -721,25 +915,37 @@ export default function (pi) {
   }
 
   function installChannel(ctx: any) {
-    closeChannel();
+    clearReconnectTimer();
+    // A registration is bound to one session generation and one connection. A registered or
+    // registering connection is retired; its replacement is opened from the load scope.
+    if (channelReady || channelRegistration) dropConnection();
+    ledger.clear();
     channelClosing = false;
     reconnectAttempts = 0;
     currentContext = ctx;
+    channelTargetGeneration = undefined;
     // Feature detection is intentionally conjunctive. Headless sessions and old Pi builds do not
     // advertise a receiver, and there is no fallback through the void message API.
-    if (
-      typeof pi.submitUserMessage !== "function" ||
-      !validChannelId(ctx?.userMessageSessionGeneration)
-    ) {
+    if (!channelSupported || !validChannelId(ctx?.userMessageSessionGeneration)) {
       channelClosing = true;
+      dropConnection();
       return;
     }
-    openChannel(ctx);
+    channelTargetGeneration = ctx.userMessageSessionGeneration;
+    if (channelSocket) {
+      // Connected: register now over the load-time connection. Still connecting: its connect
+      // callback registers.
+      sendRegistration();
+      return;
+    }
+    scheduleReconnect(true);
   }
 
   function shutdownChannel() {
-    closeChannel();
+    clearReconnectTimer();
     channelClosing = true;
+    dropConnection();
+    channelTargetGeneration = undefined;
     currentContext = undefined;
     rootSession = false;
   }
@@ -818,5 +1024,29 @@ export default function (pi) {
     publishState();
   });
 
+  // The lifted fence: re-attempt each delivery held for this generation once, in this callback.
+  // Expired, retired or mismatched holds settle with Pi's original refusal; the post-receipt path
+  // then ACKs only on the still-current connection and generation.
+  if (sessionReadySupported) {
+    pi.on("session_ready", (event) => {
+      for (const requestId of [...held.keys()]) {
+        const delivery = takeHeld(requestId);
+        if (!delivery) continue;
+        if (
+          event?.sessionGeneration === delivery.sessionGeneration &&
+          beforeDeadline(delivery.deadline, HELD_DELIVERY_ACK_MARGIN_MS) &&
+          heldDeliveryLive(delivery)
+        ) {
+          delivery.retry();
+        } else {
+          delivery.refuse();
+        }
+      }
+    });
+  }
+
   pi.on("session_shutdown", shutdownChannel);
+
+  // Open the channel connection now, at extension load, outside every session callback.
+  connectChannel();
 }

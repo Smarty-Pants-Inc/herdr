@@ -7,6 +7,7 @@ pub(super) fn connect(
 ) -> std::sync::mpsc::Receiver<Vec<u8>> {
     let (writer, control, _render) = test_client_writer();
     server.handle_server_event(ServerEvent::ClientShellConnected {
+        peer_context: crate::api::ApiRequestContext::default(),
         client_id,
         surface_cols: 80,
         surface_rows: 23,
@@ -34,6 +35,7 @@ pub(super) fn connect(
 fn request(server: &mut HeadlessServer, method: api::schema::Method) -> serde_json::Value {
     let (respond_to, response) = std::sync::mpsc::channel();
     server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+        peer_pidfd: None,
         context: crate::api::ApiRequestContext::default(),
         request: api::schema::Request {
             id: "attribution".into(),

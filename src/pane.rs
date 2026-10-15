@@ -316,6 +316,37 @@ async fn publish_agent_process_detected_event(
     }
 }
 
+/// Tells the server which exact agent process is in front, once per change,
+/// so a managed launch stays bound to the process it started.
+async fn publish_agent_process_identity_change(
+    state_events: &mpsc::Sender<AppEvent>,
+    pane_id: PaneId,
+    agent: Option<Agent>,
+    previous: Option<crate::platform::ProcessIdentity>,
+    current: Option<crate::platform::ProcessIdentity>,
+) {
+    let (Some(agent), Some(process)) = (agent, current) else {
+        return;
+    };
+    if previous == Some(process) {
+        return;
+    }
+    if let Err(e) = state_events
+        .send(AppEvent::AgentProcessIdentified {
+            pane_id,
+            agent,
+            process,
+        })
+        .await
+    {
+        warn!(
+            pane = pane_id.raw(),
+            err = %e,
+            "failed to deliver AgentProcessIdentified event"
+        );
+    }
+}
+
 async fn publish_codex_prompt_observation(
     state_events: &mpsc::Sender<AppEvent>,
     pane_id: PaneId,
@@ -1193,6 +1224,7 @@ fn spawn_basic_detection_task(
                     }
                 }
                 let previous_agent = agent_presence.current_agent();
+                let previous_process = agent_job.foreground_process();
                 let (foreground_action, changed) = observe_foreground_agent(
                     &mut agent_presence,
                     &mut agent_job,
@@ -1208,6 +1240,14 @@ fn spawn_basic_detection_task(
                     &PlatformAgentProcesses,
                     pane_id,
                 );
+                publish_agent_process_identity_change(
+                    &state_events,
+                    pane_id,
+                    agent_presence.current_agent(),
+                    previous_process,
+                    agent_job.foreground_process(),
+                )
+                .await;
                 last_foreground_pgid = tracked_process_group_id;
                 if new_agent.is_some() {
                     acquisition_started_at = None;
@@ -1667,6 +1707,7 @@ enum PaneRuntimeIo {
     Actor(PtyIoActorHandle),
     #[cfg(test)]
     TestChannel {
+        input_poisoned: AtomicBool,
         sender: mpsc::Sender<Bytes>,
         resize_tx: watch::Sender<(u16, u16, u32, u32)>,
         foreground_cwd: Mutex<Option<std::path::PathBuf>>,
@@ -1676,6 +1717,46 @@ enum PaneRuntimeIo {
 }
 
 impl PaneRuntimeIo {
+    fn input_is_poisoned(&self) -> bool {
+        match self {
+            Self::Actor(actor) => actor.input_is_poisoned(),
+            #[cfg(test)]
+            Self::TestChannel { input_poisoned, .. } => input_poisoned.load(Ordering::Acquire),
+        }
+    }
+    fn clear_input_poison(&self) -> std::io::Result<()> {
+        match self {
+            Self::Actor(actor) => actor.clear_input_poison(),
+            #[cfg(test)]
+            Self::TestChannel { input_poisoned, .. } => {
+                input_poisoned.store(false, Ordering::Release);
+                Ok(())
+            }
+        }
+    }
+    #[cfg(test)]
+    fn test_set_input_poisoned(&self, poisoned: bool) {
+        match self {
+            Self::Actor(actor) => actor.test_set_input_poisoned(poisoned),
+            Self::TestChannel { input_poisoned, .. } => {
+                input_poisoned.store(poisoned, Ordering::Release)
+            }
+        }
+    }
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn test_set_before_write(
+        &self,
+        hook: Box<dyn FnMut(usize) + Send>,
+    ) -> std::io::Result<()> {
+        match self {
+            Self::Actor(actor) => actor.test_set_before_write(hook),
+            Self::TestChannel { .. } => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "before-write hooks require a native PTY actor",
+            )),
+        }
+    }
+
     fn shutdown(&self) {
         match self {
             PaneRuntimeIo::Actor(actor) => actor.shutdown(),
@@ -1823,6 +1904,9 @@ impl PaneRuntimeIo {
         bytes: Bytes,
         source: crate::pty::input_consumer::InputSource,
     ) -> Result<(), mpsc::error::TrySendError<Bytes>> {
+        if self.input_is_poisoned() {
+            return Err(mpsc::error::TrySendError::Closed(bytes));
+        }
         match self {
             PaneRuntimeIo::Actor(actor) => actor.try_write_user_input_with_source(bytes, source),
             #[cfg(test)]
@@ -1839,6 +1923,53 @@ impl PaneRuntimeIo {
                     let _ = sender.try_send(bytes);
                 }
             }
+        }
+    }
+
+    fn queue_guarded_user_input_submission_with_source(
+        &self,
+        text: Bytes,
+        enter: Bytes,
+        delay: std::time::Duration,
+        guard: crate::pty::actor::SessionInputGuard,
+        source: crate::pty::input_consumer::InputSource,
+    ) -> std::io::Result<std::sync::mpsc::Receiver<std::io::Result<()>>> {
+        match self {
+            Self::Actor(actor) => actor
+                .queue_guarded_user_input_submission_with_source(text, enter, delay, guard, source),
+            // A synthetic channel cannot prove ownership of a PTY master.
+            #[cfg(test)]
+            Self::TestChannel { .. } => Err(crate::pty::actor::agent_session_lost(&guard, false)),
+        }
+    }
+
+    fn queue_checked_user_input_submission_with_source(
+        &self,
+        text: Bytes,
+        enter: Bytes,
+        delay: std::time::Duration,
+        guard: Option<crate::pty::actor::SessionInputGuard>,
+        refuse_if_exists: Option<std::path::PathBuf>,
+        source: crate::pty::input_consumer::InputSource,
+    ) -> std::io::Result<std::sync::mpsc::Receiver<std::io::Result<()>>> {
+        match self {
+            Self::Actor(actor) => actor.queue_checked_user_input_submission_with_source(
+                text,
+                enter,
+                delay,
+                guard,
+                refuse_if_exists,
+                source,
+            ),
+            // A synthetic channel has no PTY writer to check before.
+            #[cfg(test)]
+            Self::TestChannel { .. } => Err(match guard {
+                Some(guard) => crate::pty::actor::agent_session_lost(&guard, false),
+                None => std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "a synthetic channel has no PTY writer",
+                ),
+            }),
         }
     }
 
@@ -2550,6 +2681,7 @@ impl PaneRuntime {
             terminal_title: self.terminal_title(),
             initial_history_ansi: None,
             agent_state: None,
+            agent_session_binding: None,
         }
     }
 
@@ -2784,6 +2916,7 @@ impl PaneRuntime {
             terminal_title,
             initial_history_ansi,
             agent_state: _,
+            agent_session_binding: _,
         } = state;
         let pane_id = PaneId::from_raw(pane_id);
         use std::os::fd::FromRawFd;
@@ -2975,7 +3108,7 @@ impl PaneRuntime {
         events: mpsc::Sender<AppEvent>,
         render_notify: Arc<Notify>,
         render_dirty: Arc<RenderSignal>,
-        cmd: CommandBuilder,
+        mut cmd: CommandBuilder,
         spawn_error_message: &'static str,
         initial_state: SpawnInitialState<'_>,
         agent_detection: AgentDetection,
@@ -3004,6 +3137,8 @@ impl PaneRuntime {
         let kitty_keyboard_flags = Arc::new(AtomicU16::new(0));
         let content_write_lock = Arc::new(Mutex::new(()));
 
+        // A pane never inherits the server's idle CPU class (smarty-dev#11237).
+        let scheduling = crate::platform::prepare_pane_spawn_scheduling(&mut cmd);
         // Backend diagnostics can contain executable paths or other launch recipe values.
         // Keep those details in the returned error for the caller, not in server logs.
         let spawned = crate::pty::backend::spawn_with_portable_pty(rows, cols, cmd).inspect_err(
@@ -3012,6 +3147,7 @@ impl PaneRuntime {
 
         // Pin the spawned instance before giving the child to a watcher that can reap it.
         let spawned_pid = spawned.child.process_id();
+        scheduling.report(pane_id.raw(), spawned_pid);
         let child_process_identity = spawned_pid.and_then(crate::platform::process_identity);
 
         // --- Child watcher task ---
@@ -3350,6 +3486,7 @@ impl PaneRuntime {
                             }
 
                             let previous_agent = agent_presence.current_agent();
+                            let previous_process = agent_job.foreground_process();
                             let (foreground_action, changed) = observe_foreground_agent(
                                 &mut agent_presence,
                                 &mut agent_job,
@@ -3365,6 +3502,14 @@ impl PaneRuntime {
                                 &PlatformAgentProcesses,
                                 pane_id,
                             );
+                            publish_agent_process_identity_change(
+                                &state_events,
+                                pane_id,
+                                agent_presence.current_agent(),
+                                previous_process,
+                                agent_job.foreground_process(),
+                            )
+                            .await;
                             last_foreground_pgid = tracked_process_group_id;
                             if new_agent.is_some() {
                                 acquisition_started_at = None;
@@ -4021,6 +4166,17 @@ impl PaneRuntime {
     pub(crate) fn input_consumer_epoch_matches(&self, epoch: &str) -> bool {
         self.io.input_consumer_epoch_matches(epoch)
     }
+    pub(crate) fn input_is_poisoned(&self) -> bool {
+        self.io.input_is_poisoned()
+    }
+    pub(crate) fn clear_input_poison(&self) -> std::io::Result<()> {
+        self.io.clear_input_poison()
+    }
+    #[cfg(test)]
+    pub(crate) fn test_set_input_poisoned(&self, poisoned: bool) {
+        self.io.test_set_input_poisoned(poisoned);
+    }
+
     pub(crate) fn try_send_bytes_with_source(
         &self,
         bytes: Bytes,
@@ -4028,6 +4184,55 @@ impl PaneRuntime {
     ) -> Result<(), mpsc::error::TrySendError<Bytes>> {
         self.io.try_send_bytes_with_source(bytes, source.user())
     }
+    pub(crate) fn queue_guarded_user_input_submission_with_source(
+        &self,
+        text: Bytes,
+        enter: Bytes,
+        delay: std::time::Duration,
+        guard: crate::pty::actor::SessionInputGuard,
+        source: crate::pty::input_consumer::InputSource,
+    ) -> std::io::Result<std::sync::mpsc::Receiver<std::io::Result<()>>> {
+        self.io.queue_guarded_user_input_submission_with_source(
+            text,
+            enter,
+            delay,
+            guard,
+            source.user(),
+        )
+    }
+    pub(crate) fn queue_checked_user_input_submission_with_source(
+        &self,
+        text: Bytes,
+        enter: Bytes,
+        delay: std::time::Duration,
+        guard: Option<crate::pty::actor::SessionInputGuard>,
+        refuse_if_exists: Option<std::path::PathBuf>,
+        source: crate::pty::input_consumer::InputSource,
+    ) -> std::io::Result<std::sync::mpsc::Receiver<std::io::Result<()>>> {
+        self.io.queue_checked_user_input_submission_with_source(
+            text,
+            enter,
+            delay,
+            guard,
+            refuse_if_exists,
+            source.user(),
+        )
+    }
+    /// Preflight a complete API command without changing input queue semantics.
+    pub(crate) fn validate_input_submission(&self, bytes: &[u8]) -> std::io::Result<()> {
+        match &self.io {
+            #[cfg(unix)]
+            PaneRuntimeIo::Actor(actor) => actor.validate_input_submission(bytes),
+            #[cfg(windows)]
+            PaneRuntimeIo::Actor(_) => {
+                let _ = bytes;
+                Ok(())
+            }
+            #[cfg(test)]
+            PaneRuntimeIo::TestChannel { .. } => Ok(()),
+        }
+    }
+
     pub(crate) fn queue_user_input_submission_with_source(
         &self,
         text: Bytes,
@@ -4216,6 +4421,25 @@ impl PaneRuntime {
         .then_some(identity)
     }
 
+    /// Fresh, scalar ownership proof for guarded API enqueue. Never use cached
+    /// detection or wait on the actor command channel for this security check.
+    pub(crate) fn session_reporter_is_foreground(
+        &self,
+        reporter: crate::platform::ProcessIdentity,
+    ) -> bool {
+        #[cfg(unix)]
+        {
+            let foreground = self.io.detection_foreground();
+            crate::platform::session_reporter_is_foreground(reporter, || {
+                foreground.observe().flatten()
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            crate::platform::session_reporter_is_foreground(reporter, || None)
+        }
+    }
+
     pub fn follow_cwd(&self) -> Option<std::path::PathBuf> {
         #[cfg(unix)]
         {
@@ -4272,6 +4496,14 @@ impl PaneRuntime {
 
 #[cfg(test)]
 impl PaneRuntime {
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn test_set_before_write(
+        &self,
+        hook: Box<dyn FnMut(usize) + Send>,
+    ) -> std::io::Result<()> {
+        self.io.test_set_before_write(hook)
+    }
+
     pub(crate) fn test_set_child_pid(&self, pid: u32) {
         self.child_process_identity
             .set(crate::platform::process_identity(pid));
@@ -4293,6 +4525,13 @@ impl PaneRuntime {
 
     pub(crate) fn test_with_channel(cols: u16, rows: u16) -> (Self, mpsc::Receiver<Bytes>) {
         Self::test_with_channel_and_scrollback_bytes(cols, rows, 0, &[], 4)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn test_with_actor(actor: PtyIoActorHandle) -> Self {
+        let (mut runtime, _) = Self::test_with_channel(80, 24);
+        runtime.io = PaneRuntimeIo::Actor(actor);
+        runtime
     }
 
     pub(crate) fn test_with_channel_capacity(
@@ -4455,6 +4694,7 @@ impl PaneRuntime {
                 pane_id,
                 terminal,
                 io: PaneRuntimeIo::TestChannel {
+                    input_poisoned: AtomicBool::new(false),
                     sender: tx,
                     resize_tx,
                     foreground_cwd: Mutex::new(None),
@@ -5864,6 +6104,18 @@ mod tests {
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
+    async fn session_reporter_foreground_requires_this_runtime_master() {
+        let (runtime, _rx) = PaneRuntime::test_with_channel(80, 24);
+        let reporter =
+            crate::platform::process_identity(std::process::id()).expect("live reporter");
+        runtime.test_set_child_pid(reporter.pid);
+        assert_eq!(runtime.child_process_identity(), Some(reporter));
+        // A valid root pin does not substitute for this runtime's master ioctl.
+        assert!(!runtime.session_reporter_is_foreground(reporter));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
     async fn reaped_root_identity_is_not_recaptured() {
         let (runtime, _rx) = PaneRuntime::test_with_channel(80, 24);
         let mut child = std::process::Command::new("sh")
@@ -6063,6 +6315,7 @@ mod tests {
             pane_id,
             terminal,
             io: PaneRuntimeIo::TestChannel {
+                input_poisoned: AtomicBool::new(false),
                 sender: tx,
                 resize_tx,
                 foreground_cwd: Mutex::new(None),
@@ -6109,6 +6362,7 @@ mod tests {
             pane_id,
             terminal,
             io: PaneRuntimeIo::TestChannel {
+                input_poisoned: AtomicBool::new(false),
                 sender: tx,
                 resize_tx,
                 foreground_cwd: Mutex::new(None),

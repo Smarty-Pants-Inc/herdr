@@ -1,6 +1,8 @@
 use std::time::{Duration, Instant};
 
 pub(super) mod agent_channel;
+#[cfg(all(test, target_os = "linux"))]
+mod agent_session_guard_tests;
 mod agent_view;
 mod agents;
 mod env;
@@ -26,6 +28,14 @@ use crate::events::AppEvent;
 const API_NOTIFICATION_RATE_LIMIT: Duration = Duration::from_secs(1);
 #[cfg(windows)]
 const WINDOWS_POWERSHELL_AGENT_EXIT_RESPAWN_GRACE: Duration = Duration::from_secs(2);
+
+/// A pane's session before a report, compared after the report to decide
+/// whether `pane.agent_session_changed` fires.
+#[derive(Debug, Default)]
+pub(super) struct PaneAgentSessionSnapshot {
+    info: Option<crate::api::schema::AgentSessionInfo>,
+    actual_id: Option<String>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RuntimeExitAction {
@@ -847,6 +857,68 @@ impl App {
         }
     }
 
+    /// The pane's session info plus the actual agent session id that `pane get`
+    /// reports as `agent_session_id` (only from the accepted current report).
+    pub(super) fn pane_agent_session_snapshot(
+        &self,
+        pane_id: crate::layout::PaneId,
+    ) -> PaneAgentSessionSnapshot {
+        let Some((_, pane)) = self.find_pane(pane_id) else {
+            return PaneAgentSessionSnapshot::default();
+        };
+        let Some(terminal) = self.state.terminals.get(&pane.attached_terminal_id) else {
+            return PaneAgentSessionSnapshot::default();
+        };
+        PaneAgentSessionSnapshot {
+            info: super::creation::terminal_agent_session_info(terminal),
+            actual_id: terminal.reported_agent_session_id().map(str::to_owned),
+        }
+    }
+
+    /// Emits `pane.agent_session_changed` when a session report left the pane
+    /// with a different session value or a different actual agent session id
+    /// (set, cleared, or replaced). Call it only after the report's id was
+    /// retained: until then the accepted report hides the actual id.
+    /// Repeated reports of one session with the same actual id emit nothing.
+    pub(super) fn emit_pane_agent_session_changed(
+        &mut self,
+        pane_id: crate::layout::PaneId,
+        previous: PaneAgentSessionSnapshot,
+    ) {
+        let PaneAgentSessionSnapshot {
+            info: Some(current),
+            actual_id: agent_session_id,
+        } = self.pane_agent_session_snapshot(pane_id)
+        else {
+            return;
+        };
+        let previous_session_id = previous.info.map(|session| session.value);
+        let previous_agent_session_id = previous.actual_id;
+        if previous_session_id.as_deref() == Some(current.value.as_str())
+            && previous_agent_session_id == agent_session_id
+        {
+            return;
+        }
+        let Some((ws_idx, _)) = self.find_pane(pane_id) else {
+            return;
+        };
+        let Some(public_pane_id) = self.public_pane_id(ws_idx, pane_id) else {
+            return;
+        };
+        self.emit_event(crate::api::schema::EventEnvelope {
+            event: crate::api::schema::EventKind::PaneAgentSessionChanged,
+            data: crate::api::schema::EventData::PaneAgentSessionChanged {
+                pane_id: public_pane_id,
+                workspace_id: self.public_workspace_id(ws_idx),
+                agent: current.agent,
+                session_id: current.value,
+                previous_session_id,
+                agent_session_id,
+                previous_agent_session_id,
+            },
+        });
+    }
+
     pub(super) fn emit_event(&mut self, event: crate::api::schema::EventEnvelope) {
         self.run_plugin_event_hooks(&event);
         self.event_hub.push(event);
@@ -1082,14 +1154,21 @@ impl App {
         (target.terminal_id == pane.terminal_id).then_some(target.terminal_id)
     }
 
+    // Headless production dispatch intercepts all session-checked input with
+    // App::api_request_requires_deferred_input before this synchronous fallback.
+    // Private/direct pane handlers still await bounded actor completion; enqueue
+    // alone is never a successful guarded API response.
     fn handle_api_request_with_ingress(
         &mut self,
         request: crate::api::schema::Request,
-        context: crate::api::ApiRequestContext,
+        mut context: crate::api::ApiRequestContext,
         ingress: ApiIngress,
     ) -> String {
         self.sync_pending_terminal_titles();
-        if let Some(response) = self.cross_pane_input_denial(&request, context) {
+        if let Some(response) = self.session_checked_guard_denial(&request) {
+            return response;
+        }
+        if let Some(response) = self.cross_pane_input_denial_with_ancestry(&request, &mut context) {
             return response;
         }
         let mut request = request;
@@ -1293,7 +1372,7 @@ impl App {
             Method::TabRename(params) => return self.handle_tab_rename(request.id, params),
             Method::TabMove(params) => return self.handle_tab_move(request.id, params),
             Method::TabMoveProjectChecked(params) => {
-                return self.handle_tab_move_project_checked(request.id, params)
+                return self.handle_tab_move_project_checked(request.id, params);
             }
             Method::TabClose(target) => return self.handle_tab_close(request.id, target),
             Method::AgentRegisterSelf(params) => {
@@ -1336,7 +1415,9 @@ impl App {
                     "input consumer operations require the asynchronous local API route",
                 );
             }
-            Method::AgentPrompt(_) => {
+            Method::AgentPrompt(_)
+            | Method::AgentPromptSessionChecked(_)
+            | Method::AgentPromptStatusChecked(_) => {
                 return responses::encode_error(
                     request.id,
                     "invalid_request",
@@ -1362,17 +1443,20 @@ impl App {
             }
             Method::PaneSwap(params) => return self.handle_pane_swap(request.id, params),
             Method::PaneSwapProjectChecked(params) => {
-                return self.handle_pane_swap_project_checked(request.id, params)
+                return self.handle_pane_swap_project_checked(request.id, params);
             }
             Method::PaneMove(params) => {
                 if params.allow_project_change {
-                    return responses::encode_error(request.id, "project_change_capability_required",
-                        "allow_project_change requires pane.move_project_checked; do not fall back to pane.move");
+                    return responses::encode_error(
+                        request.id,
+                        "project_change_capability_required",
+                        "allow_project_change requires pane.move_project_checked; do not fall back to pane.move",
+                    );
                 }
                 return self.handle_pane_move(request.id, params);
             }
             Method::PaneMoveProjectChecked(params) => {
-                return self.handle_pane_move(request.id, params)
+                return self.handle_pane_move(request.id, params);
             }
             Method::PaneZoom(params) => return self.handle_pane_zoom(request.id, params),
             Method::PaneLayout(params) => return self.handle_pane_layout(request.id, params),
@@ -1385,7 +1469,7 @@ impl App {
                 return self.handle_layout_apply_restorable(request.id, params);
             }
             Method::LayoutApplyProjectChecked(params) => {
-                return self.handle_layout_apply_project_checked(request.id, params)
+                return self.handle_layout_apply_project_checked(request.id, params);
             }
             Method::LayoutSetSplitRatio(params) => {
                 return self.handle_layout_set_split_ratio(request.id, params);
@@ -1398,6 +1482,10 @@ impl App {
             Method::PaneResize(params) => return self.handle_pane_resize(request.id, params),
             Method::PaneScroll(params) => return self.handle_pane_scroll(request.id, params),
             Method::PaneClear(target) => return self.handle_pane_clear(request.id, target),
+            Method::PaneClearInputPoison(target) => {
+                // Both lanes are classified by the caller's peer, never by ingress.
+                return self.handle_pane_clear_input_poison(request.id, target, &mut context);
+            }
             Method::PaneEditScrollback(target) => {
                 return self.handle_pane_edit_scrollback(request.id, target);
             }
@@ -1431,10 +1519,10 @@ impl App {
             Method::PaneRename(params) => return self.handle_pane_rename(request.id, params),
             Method::PaneRead(params) => return self.handle_pane_read(request.id, params),
             Method::PaneReportAgent(params) => {
-                return self.handle_pane_report_agent(request.id, params);
+                return self.handle_pane_report_agent(request.id, params, context);
             }
             Method::PaneReportAgentSession(params) => {
-                return self.handle_pane_report_agent_session(request.id, params);
+                return self.handle_pane_report_agent_session(request.id, params, context);
             }
             Method::PaneReportMetadata(params) => {
                 return self.handle_pane_report_metadata(request.id, params);
@@ -1445,8 +1533,24 @@ impl App {
             Method::PaneReleaseAgent(params) => {
                 return self.handle_pane_release_agent(request.id, params);
             }
-            Method::PaneSendText(params) => {
+            Method::PaneSendText(params) | Method::PaneSendTextSessionChecked(params) => {
                 return self.handle_pane_send_text(request.id, params, context);
+            }
+            Method::PaneSendTextPathChecked(params) => {
+                return self.handle_pane_path_checked_input(
+                    request.id,
+                    panes::SessionCheckedPaneInput::Text(params.input),
+                    params.refuse_if_exists,
+                    context,
+                );
+            }
+            Method::PaneSendKeysPathChecked(params) => {
+                return self.handle_pane_path_checked_input(
+                    request.id,
+                    panes::SessionCheckedPaneInput::Keys(params.input),
+                    params.refuse_if_exists,
+                    context,
+                );
             }
             Method::PaneSendInputGuarded(params) if params.expected_terminal.is_none() => {
                 return responses::encode_error(
@@ -1458,7 +1562,16 @@ impl App {
             Method::PaneSendInput(params) | Method::PaneSendInputGuarded(params) => {
                 return self.handle_pane_send_input(request.id, params, context);
             }
-            Method::PaneClose(target) => return self.handle_pane_close(request.id, target),
+            Method::PaneCloseGuarded(params) if params.expected_terminal.is_none() => {
+                return responses::encode_error(
+                    request.id,
+                    "terminal_identity_mismatch",
+                    "pane.close_guarded requires expected_terminal",
+                );
+            }
+            Method::PaneClose(target) | Method::PaneCloseGuarded(target) => {
+                return self.handle_pane_close(request.id, target);
+            }
             Method::PopupClose(_) => {
                 return if self.close_popup_pane() {
                     responses::encode_success(request.id, ResponseResult::Ok {})
@@ -1466,7 +1579,7 @@ impl App {
                     responses::encode_error(request.id, "popup_not_open", "no popup is open")
                 };
             }
-            Method::PaneSendKeys(params) => {
+            Method::PaneSendKeys(params) | Method::PaneSendKeysSessionChecked(params) => {
                 return self.handle_pane_send_keys(request.id, params, context);
             }
             Method::IntegrationList(_) => {

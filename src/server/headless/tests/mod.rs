@@ -125,6 +125,8 @@ fn test_headless_server_with_event_hub(event_hub: api::EventHub) -> HeadlessServ
         client_socket_identity,
         clients: HashMap::new(),
         native_graphics: Default::default(),
+        interactive_input_deadlines: HashMap::new(),
+        interactive_render_budget: None,
         #[cfg(unix)]
         next_client_id: 1,
         foreground_client_id: None,
@@ -145,6 +147,7 @@ fn test_headless_server_with_event_hub(event_hub: api::EventHub) -> HeadlessServ
         effective_size: headless_size,
         shutting_down: false,
         host_shutdown_requested: Arc::new(AtomicBool::new(false)),
+        host_shutdown_intent: Default::default(),
         host_shutdown_probe: crate::platform::host_shutdown_in_progress,
         handoff_in_progress: false,
         #[cfg(unix)]
@@ -265,6 +268,7 @@ async fn headless_api_reads_latest_title_without_spinner_event_flooding() {
 fn headless_pane_list(server: &mut HeadlessServer) -> Vec<api::schema::PaneInfo> {
     let (respond_to, response_rx) = std::sync::mpsc::channel();
     server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+        peer_pidfd: None,
         context: crate::api::ApiRequestContext::default(),
         request: api::schema::Request {
             id: "list-titles".into(),
@@ -323,6 +327,7 @@ fn headless_api_request_drains_all_pending_internal_events_before_reading_state(
     let (respond_to, response_rx) = std::sync::mpsc::channel();
     assert!(
         server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+            peer_pidfd: None,
             context: crate::api::ApiRequestContext::default(),
             request: api::schema::Request {
                 id: "headless_stop_after_events".into(),
@@ -742,6 +747,7 @@ async fn client_shell_attach_seeds_workspace() {
 
     assert!(
         server.handle_server_event(ServerEvent::ClientShellConnected {
+            peer_context: crate::api::ApiRequestContext::default(),
             surface_reuse: false,
             surface_delta: false,
             surface_scroll: false,
@@ -777,6 +783,7 @@ async fn completion_guard_endpoint_pairs_runtime_completions_with_snapshots() {
     server.app.state.active = Some(0);
     let (writer, control_rx, _render_rx) = test_client_writer();
     server.handle_server_event(ServerEvent::ClientShellConnected {
+        peer_context: crate::api::ApiRequestContext::default(),
         client_id: 78,
         principal: None,
         surface_cols: 80,
@@ -838,6 +845,7 @@ async fn client_shell_endpoint_request_uses_the_selected_connection() {
     let client_id = 41;
     assert!(
         server.handle_server_event(ServerEvent::ClientShellConnected {
+            peer_context: crate::api::ApiRequestContext::default(),
             surface_reuse: false,
             surface_delta: false,
             surface_scroll: false,
@@ -960,6 +968,7 @@ async fn client_shell_pairs_agent_view_set_replacement_and_clear_with_snapshots(
     let (writer, control_rx, _render_rx) = test_client_writer();
     assert!(
         server.handle_server_event(ServerEvent::ClientShellConnected {
+            peer_context: crate::api::ApiRequestContext::default(),
             surface_reuse: false,
             surface_delta: false,
             surface_scroll: false,
@@ -1065,6 +1074,7 @@ async fn client_shell_receives_metadata_then_shell_free_pane_surface() {
     let (writer, control_rx, render_rx) = test_client_writer();
     assert!(
         server.handle_server_event(ServerEvent::ClientShellConnected {
+            peer_context: crate::api::ApiRequestContext::default(),
             surface_reuse: false,
             surface_delta: false,
             surface_scroll: false,
@@ -1235,6 +1245,7 @@ fn connect_test_shell(
     let (writer, control, render) = test_client_writer();
     assert!(
         server.handle_server_event(ServerEvent::ClientShellConnected {
+            peer_context: crate::api::ApiRequestContext::default(),
             surface_reuse: false,
             surface_delta: false,
             surface_scroll: false,
@@ -1842,6 +1853,7 @@ async fn client_shell_config_diagnostics_follow_keybinding_ownership() {
     let (local_writer, local_control, _local_render) = test_client_writer();
     assert!(
         server.handle_server_event(ServerEvent::ClientShellConnected {
+            peer_context: crate::api::ApiRequestContext::default(),
             surface_reuse: false,
             surface_delta: false,
             surface_scroll: false,
@@ -1869,6 +1881,7 @@ async fn client_shell_config_diagnostics_follow_keybinding_ownership() {
     let (endpoint_writer, endpoint_control, _endpoint_render) = test_client_writer();
     assert!(
         server.handle_server_event(ServerEvent::ClientShellConnected {
+            peer_context: crate::api::ApiRequestContext::default(),
             surface_reuse: false,
             surface_delta: false,
             surface_scroll: false,
@@ -2143,6 +2156,7 @@ async fn client_local_navigation_does_not_emit_global_focus_transitions() {
     server.handle_client_shell_api_request(
         62,
         crate::api::ApiRequestMessage {
+            peer_pidfd: None,
             context: crate::api::ApiRequestContext::default(),
             request: crate::api::schema::Request {
                 id: "focus-own-tab".into(),
@@ -2236,6 +2250,7 @@ async fn client_local_navigation_emits_pane_focused_only_when_that_client_moves(
         server.handle_client_shell_api_request(
             client_id,
             api::ApiRequestMessage {
+                peer_pidfd: None,
                 context: crate::api::ApiRequestContext::default(),
                 request: api::schema::Request {
                     id: "navigate".into(),
@@ -2361,6 +2376,7 @@ async fn repeated_layout_action_reapplies_controller_geometry() {
     assert!(server.handle_client_shell_api_request(
         65,
         crate::api::ApiRequestMessage {
+            peer_pidfd: None,
             context: crate::api::ApiRequestContext::default(),
             request: crate::api::schema::Request {
                 id: "resize-layout".into(),
@@ -2570,12 +2586,16 @@ async fn public_close_reapplies_controller_geometry() {
     let (respond_to, _response_rx) = std::sync::mpsc::channel();
     assert!(
         server.handle_api_request_with_shutdown_check(crate::api::ApiRequestMessage {
+            peer_pidfd: None,
             context: crate::api::ApiRequestContext::default(),
             request: crate::api::schema::Request {
                 id: "public-close-geometry".into(),
-                method: crate::api::schema::Method::PaneClose(crate::api::schema::PaneTarget {
-                    pane_id: second_pane_id,
-                }),
+                method: crate::api::schema::Method::PaneClose(
+                    crate::api::schema::PaneCloseParams {
+                        pane_id: second_pane_id,
+                        expected_terminal: None,
+                    }
+                ),
             },
             respond_to,
             response_write_complete: None,
@@ -2770,6 +2790,7 @@ async fn public_background_tab_create_preserves_client_locations() {
 
     let (respond_to, _response_rx) = std::sync::mpsc::channel();
     server.handle_api_request_with_shutdown_check(crate::api::ApiRequestMessage {
+        peer_pidfd: None,
         context: crate::api::ApiRequestContext::default(),
         request: crate::api::schema::Request {
             id: "create-background-tab".into(),
@@ -2820,6 +2841,7 @@ async fn public_workspace_focus_preserves_each_clients_remembered_tabs() {
 
     let (respond_to, _response_rx) = std::sync::mpsc::channel();
     server.handle_api_request_with_shutdown_check(crate::api::ApiRequestMessage {
+        peer_pidfd: None,
         context: crate::api::ApiRequestContext::default(),
         request: crate::api::schema::Request {
             id: "focus-second-workspace".into(),
@@ -2903,6 +2925,7 @@ async fn public_agent_focus_replaces_a_diverged_client_shell_projection() {
         .unwrap();
     let (respond_to, response_rx) = std::sync::mpsc::channel();
     server.handle_api_request_with_shutdown_check(crate::api::ApiRequestMessage {
+        peer_pidfd: None,
         context: crate::api::ApiRequestContext::default(),
         request: crate::api::schema::Request {
             id: "focus-first-agent".into(),
@@ -2957,6 +2980,7 @@ async fn public_api_focus_replaces_every_client_shell_projection() {
     let (writer, control_rx, render_rx) = test_client_writer();
     assert!(
         server.handle_server_event(ServerEvent::ClientShellConnected {
+            peer_context: crate::api::ApiRequestContext::default(),
             surface_reuse: false,
             surface_delta: false,
             surface_scroll: false,
@@ -2979,6 +3003,7 @@ async fn public_api_focus_replaces_every_client_shell_projection() {
 
     let (respond_to, _response_rx) = std::sync::mpsc::channel();
     server.handle_api_request_with_shutdown_check(crate::api::ApiRequestMessage {
+        peer_pidfd: None,
         context: crate::api::ApiRequestContext::default(),
         request: crate::api::schema::Request {
             id: "test.client.shell.workspace.focus".into(),
@@ -3207,6 +3232,7 @@ async fn client_shell_streams_and_targets_popup_terminal_content() {
     let (writer, control_rx, render_rx) = test_client_writer();
     assert!(
         server.handle_server_event(ServerEvent::ClientShellConnected {
+            peer_context: crate::api::ApiRequestContext::default(),
             surface_reuse: false,
             surface_delta: false,
             surface_scroll: false,
@@ -3617,6 +3643,7 @@ async fn worktree_discovery_does_not_block_client_typing() {
         let (entered, release) = crate::worktree::test_list_gate::block(&repo);
         let (respond_to, response_rx) = std::sync::mpsc::channel();
         server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+            peer_pidfd: None,
             context: crate::api::ApiRequestContext::default(),
             request: api::schema::Request {
                 id: "blocked-read".into(),
@@ -4005,6 +4032,145 @@ async fn client_shell_mouse_motion_delivers_without_render_when_foreground() {
 }
 
 #[tokio::test]
+async fn client_shell_split_echo_bypasses_cadence_with_bounded_visible_burst() {
+    let mut server = test_headless_server();
+    let mut input_rx = install_focused_test_runtime(&mut server, b"PS> old");
+    let pane_id = server.app.state.workspaces[0].tabs[0].root_pane;
+    let public_pane_id = server.app.public_pane_id(0, pane_id).unwrap();
+    let (_control_rx, render_rx) = connect_matching_test_shell(&mut server, 1);
+    server.render_and_stream();
+    recv_pane_surface(&render_rx, "initial prompt");
+    server.sync_immediate_pty_sources();
+    server.app.render_dirty.take();
+
+    assert_eq!(
+        server.handle_server_event_with_render_impact(ServerEvent::ClientShellPaneInput {
+            client_id: 1,
+            pane_id: public_pane_id,
+            events: vec![crate::protocol::ClientPaneInputEvent::TextCommit(
+                "Z".into()
+            )],
+        }),
+        RenderImpact::None
+    );
+    assert_eq!(input_rx.try_recv().unwrap(), Bytes::from_static(b"Z"));
+    assert!(server.interactive_input_deadlines.contains_key(&pane_id));
+
+    // A full queue after an accepted key must not lose that key's priority.
+    for _ in 0..3 {
+        let runtime = server
+            .app
+            .state
+            .runtime_for_pane_in_workspace(&server.app.terminal_runtimes, 0, pane_id)
+            .unwrap();
+        runtime
+            .try_send_bytes(Bytes::from_static(b"queued"))
+            .unwrap();
+    }
+    server.interactive_input_deadlines.clear();
+    server.handle_server_event_with_render_impact(ServerEvent::ClientShellPaneInput {
+        client_id: 1,
+        pane_id: server.app.public_pane_id(0, pane_id).unwrap(),
+        events: vec![
+            crate::protocol::ClientPaneInputEvent::TextCommit("A".into()),
+            crate::protocol::ClientPaneInputEvent::TextCommit("B".into()),
+        ],
+    });
+    for _ in 0..3 {
+        assert_eq!(input_rx.try_recv().unwrap(), Bytes::from_static(b"queued"));
+    }
+    assert_eq!(input_rx.try_recv().unwrap(), Bytes::from_static(b"A"));
+    assert!(input_rx.try_recv().is_err());
+    assert!(server.interactive_input_deadlines.contains_key(&pane_id));
+
+    let start = Instant::now();
+    server.note_interactive_input(pane_id, start);
+    server.app.record_render_attempt(start, true);
+    // Escape-only PTY updates must not use the whole allowance before the glyph.
+    for index in 0..12 {
+        let now = start + Duration::from_micros(index * 50 + 50);
+        write_shared_test_pane(&mut server, pane_id, b"\x1b[0m");
+        server.app.render_dirty.request_pty(pane_id);
+        assert!(server.can_render_interactive(now));
+        let request = server.app.render_dirty.take();
+        assert!(server.render_retained_pane_surface_and_stream(&request.pty_sources));
+        while let Ok(message) = render_rx.try_recv() {
+            let ServerMessage::PaneSurfacePatch(patch) = read_server_message(message) else {
+                panic!("expected retained patch for escape-only update");
+            };
+            assert!(patch.rows.is_empty());
+        }
+        server.app.record_render_attempt(now, true);
+        server.record_interactive_render(now);
+    }
+    for (index, bytes) in [b"\rPS>    \rPS> ".as_slice(), b"Z", b"\r\n", b"PS> "]
+        .into_iter()
+        .enumerate()
+    {
+        let now = start + Duration::from_millis(index as u64 + 1);
+        write_shared_test_pane(&mut server, pane_id, bytes);
+        server.app.render_dirty.request_pty(pane_id);
+        assert!(!server.app.can_render_now(now));
+        assert!(!server.app.can_present_now(now));
+        assert!(server.can_render_interactive(now));
+        let request = server.app.render_dirty.take();
+        assert!(server.render_retained_pane_surface_and_stream(&request.pty_sources));
+        recv_pane_surface_patch(&render_rx, "split prompt update");
+        if index == 1 {
+            assert!(frame_text(
+                &server.clients[&1]
+                    .render_state
+                    .last_pane_surface()
+                    .unwrap()
+                    .frame
+            )
+            .contains("PS> Z"));
+        }
+        server.app.record_render_attempt(now, true);
+        server.record_interactive_render(now);
+    }
+
+    let busy = start + Duration::from_millis(5);
+    // Repeated keys cannot replenish the output budget within its epoch.
+    server.note_interactive_input(pane_id, busy);
+    server.app.render_dirty.request_pty(pane_id);
+    assert!(!server.can_render_interactive(busy));
+    assert!(!server.app.can_render_now(busy));
+    let next_render = server
+        .app
+        .next_headless_loop_deadline_with_git_refresh(busy, true, false)
+        .unwrap();
+    assert!(server.app.can_render_now(next_render));
+
+    let next_epoch = start + Duration::from_millis(17);
+    assert!(server.can_render_interactive(next_epoch));
+    server.app.render_dirty.take();
+    let unrelated = crate::layout::PaneId::from_raw(pane_id.raw() + 1000);
+    server
+        .app
+        .render_dirty
+        .set_immediate_pty_sources(HashSet::from([pane_id, unrelated]));
+    server.app.render_dirty.request_pty(unrelated);
+    assert!(!server.can_render_interactive(next_epoch));
+    server.app.render_dirty.request_pty(pane_id);
+    server
+        .app
+        .render_dirty
+        .set_immediate_pty_sources(HashSet::from([unrelated]));
+    assert!(
+        !server.can_render_interactive(next_epoch),
+        "hidden input target stays coalesced"
+    );
+    server
+        .app
+        .render_dirty
+        .set_immediate_pty_sources(HashSet::from([pane_id]));
+    assert!(server.can_render_interactive(start + Duration::from_millis(33)));
+    assert!(!server.can_render_interactive(start + Duration::from_millis(38)));
+    shutdown_test_runtimes(&mut server);
+}
+
+#[tokio::test]
 async fn client_shell_mouse_motion_promotes_and_requests_render() {
     let mut server = test_headless_server();
     let mut input_rx = install_focused_test_runtime(&mut server, b"\x1b[?1003h\x1b[?1006h");
@@ -4334,6 +4500,125 @@ fn with_terminal_session_test_server(
 }
 
 #[test]
+fn poisoned_client_keystrokes_and_paste_show_pane_notice_without_writes() {
+    with_terminal_session_test_server(|server, terminal_id, terminal_id_string, pane_id| {
+        let (runtime, mut input_rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_capacity(80, 24, 8);
+        // Deterministic enqueue-boundary race: the precheck was healthy, but
+        // poison becomes visible before the real producer attempts to enqueue.
+        assert_eq!(
+            super::super::pane_input::precheck_client_input(&runtime),
+            Ok(())
+        );
+        runtime.test_set_input_poisoned(true);
+        let enqueue_error = runtime
+            .try_send_bytes_with_source(
+                Bytes::from_static(b"rejected"),
+                crate::pty::input_consumer::InputSource::Unknown,
+            )
+            .expect_err("poison rejects enqueue after healthy precheck");
+        let typed_error = super::super::pane_input::classify_client_enqueue_error(
+            &runtime,
+            format!("terminal attach input failed: {enqueue_error}"),
+        );
+        assert_eq!(
+            typed_error,
+            super::super::pane_input::ClientInputError::PaneInputPoisoned
+        );
+        server
+            .app
+            .terminal_runtimes
+            .insert(terminal_id.clone(), runtime);
+        let (writer, control_rx, _render_rx) = test_client_writer();
+        server.clients.insert(
+            1,
+            ClientConnection::new_with_mode(
+                ClientConnectionMode::ClientShell,
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                1,
+                RenderEncoding::SemanticFrame,
+                Some(writer),
+            ),
+        );
+        server.notify_client_input_error(1, &pane_id, &typed_error);
+        assert!(matches!(
+            read_server_message(control_rx.recv_timeout(Duration::from_secs(1)).expect("enqueue race notice")),
+            ServerMessage::Notify { kind: protocol::NotifyKind::Toast, message, body: Some(body) }
+                if message.contains("pane_input_poisoned") && message.contains(&pane_id)
+                && body.contains(&format!("herdr pane clear-input-poison {pane_id}"))
+        ));
+        assert!(input_rx.try_recv().is_err());
+        let key = protocol::ClientPaneInputEvent::from_terminal_key(
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('x'),
+                crossterm::event::KeyModifiers::NONE,
+            )
+            .into(),
+        )
+        .expect("pane key");
+        for event in [
+            key,
+            protocol::ClientPaneInputEvent::TextCommit("x".into()),
+            protocol::ClientPaneInputEvent::Paste("staged".into()),
+        ] {
+            assert!(
+                !server.handle_server_event(ServerEvent::ClientShellPaneInput {
+                    client_id: 1,
+                    pane_id: pane_id.clone(),
+                    events: vec![event],
+                })
+            );
+            let notice = read_server_message(
+                control_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("poison notice"),
+            );
+            assert!(
+                matches!(notice, ServerMessage::Notify { kind: protocol::NotifyKind::Toast, message, body: Some(body) }
+                if message.contains("pane_input_poisoned") && message.contains(&pane_id)
+                && body.contains("Staged text may remain on line")
+                && body.contains(&format!("herdr pane clear-input-poison {pane_id}")))
+            );
+            assert!(
+                input_rx.try_recv().is_err(),
+                "poisoned client must not write"
+            );
+        }
+        server.clients.get_mut(&1).expect("client").mode = ClientConnectionMode::TerminalAttach {
+            terminal_id: terminal_id_string,
+        };
+        for data in [b"x".to_vec(), b"\x1b[200~staged\x1b[201~".to_vec()] {
+            assert!(!server.handle_server_event(ServerEvent::ClientInput { client_id: 1, data }));
+            assert!(
+                matches!(read_server_message(control_rx.recv_timeout(Duration::from_secs(1)).expect("raw poison notice")),
+                ServerMessage::Notify { kind: protocol::NotifyKind::Toast, message, .. } if message.contains(&pane_id))
+            );
+            assert!(input_rx.try_recv().is_err());
+        }
+        let runtime = server
+            .app
+            .terminal_runtimes
+            .get(&terminal_id)
+            .expect("runtime remains open");
+        assert!(runtime.input_is_poisoned(), "input must not clear poison");
+        runtime.test_set_input_poisoned(false);
+        assert!(server.handle_server_event(ServerEvent::ClientInput {
+            client_id: 1,
+            data: b"healthy".to_vec()
+        }));
+        assert_eq!(
+            input_rx.try_recv().expect("healthy input"),
+            Bytes::from_static(b"healthy")
+        );
+        assert!(
+            control_rx.try_recv().is_err(),
+            "healthy input needs no notice"
+        );
+    });
+}
+
+#[test]
 fn terminal_observers_wait_for_synchronized_output_with_or_without_baseline() {
     with_terminal_session_test_server(|server, terminal_id, target, _| {
         let connect = |server: &mut HeadlessServer, client_id| {
@@ -4446,14 +4731,14 @@ fn explicit_agent_history_read_requires_idle_on_alternate_screen() {
             };
 
             assert_eq!(
-                    server.agent_read_not_idle_error(&request),
-                    Some(api::schema::ErrorBody {
-                        code: "agent_not_idle".into(),
-                        message: format!(
-                            "cannot read 200 lines while {public_pane_id} is working: its alternate-screen history can only be captured by scrolling while idle. Wait and retry, or use --source visible"
-                        ),
-                    })
-                );
+                server.agent_read_not_idle_error(&request),
+                Some(api::schema::ErrorBody {
+                    code: "agent_not_idle".into(),
+                    message: format!(
+                        "cannot read 200 lines while {public_pane_id} is working: its alternate-screen history can only be captured by scrolling while idle. Wait and retry, or use --source visible"
+                    ),
+                })
+            );
 
             let mut default_request = request.clone();
             let api::schema::Method::AgentRead(params) = &mut default_request.method else {
@@ -4796,11 +5081,11 @@ fn terminal_control_rejects_attach_during_alt_screen_read() {
             .contains_key(&terminal_id_string));
         let reason = read_server_shutdown_reason(control_rx.recv().expect("shutdown message"));
         assert_eq!(
-                reason,
-                Some(format!(
-                    "terminal attach failed: terminal {terminal_id_string} has a read in progress; retry"
-                ))
-            );
+            reason,
+            Some(format!(
+                "terminal attach failed: terminal {terminal_id_string} has a read in progress; retry"
+            ))
+        );
     });
 }
 
@@ -5258,6 +5543,7 @@ fn windows_shutdown_probe_preserves_panes_and_agent_sessions() {
                 server.app.event_tx.try_send(death()).unwrap();
                 let (respond_to, response_rx) = std::sync::mpsc::channel();
                 server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+                    peer_pidfd: None,
                     context: api::ApiRequestContext::default(),
                     request: api::schema::Request {
                         id: "shutdown-race".into(),
@@ -5733,6 +6019,44 @@ fn client_pane_pixel_mouse_uses_runtime_pixel_encoding() {
     assert_eq!(
         input_rx.try_recv().expect("encoded pixel mouse"),
         Bytes::from_static(b"\x1b[<35;21;22M")
+    );
+    drop(runtime);
+    drop(_runtime_guard);
+    rt.shutdown_timeout(Duration::from_millis(100));
+}
+
+#[test]
+fn client_pane_cell_mouse_uses_pixel_units_when_sgr_pixels_is_set() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime");
+    let _runtime_guard = rt.enter();
+    let (runtime, mut input_rx) =
+        crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+            20,
+            5,
+            0,
+            b"\x1b[?1003h\x1b[?1006h\x1b[?1016h",
+            4,
+        );
+    runtime.resize(5, 20, 10, 20);
+
+    apply_client_pane_input_events(
+        &runtime,
+        &[crate::protocol::ClientPaneInputEvent::Mouse {
+            kind: crate::protocol::ClientMouseKind::Moved,
+            position: crate::protocol::ClientMousePosition::Cell { column: 2, row: 1 },
+            geometry: None,
+            modifiers: 0,
+            lines: 3,
+        }],
+        crate::pty::input_consumer::InputSource::Unknown,
+    )
+    .expect("cell-aligned pixel mouse input");
+    assert_eq!(
+        input_rx.try_recv().expect("encoded pixel-unit mouse"),
+        Bytes::from_static(b"\x1b[<35;25;30M")
     );
     drop(runtime);
     drop(_runtime_guard);
@@ -6700,6 +7024,7 @@ async fn client_shell_requests_host_pixels_for_an_unfocused_pixel_pane() {
     let (writer, control_rx, _render_rx) = test_client_writer();
     assert!(
         server.handle_server_event(ServerEvent::ClientShellConnected {
+            peer_context: crate::api::ApiRequestContext::default(),
             surface_reuse: false,
             surface_delta: false,
             surface_scroll: false,
@@ -7776,6 +8101,7 @@ fn notification_show_api_forwards_one_semantic_client_notification() {
 
     let (respond_to, response_rx) = std::sync::mpsc::channel();
     let changed = server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+        peer_pidfd: None,
         context: crate::api::ApiRequestContext::default(),
         request: api::schema::Request {
             id: "notify".into(),
@@ -7839,6 +8165,7 @@ fn notification_show_api_preserves_colon_in_forwarded_title() {
 
     let (respond_to, response_rx) = std::sync::mpsc::channel();
     let changed = server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+        peer_pidfd: None,
         context: crate::api::ApiRequestContext::default(),
         request: api::schema::Request {
             id: "notify".into(),
@@ -7885,6 +8212,7 @@ fn notification_show_api_validates_empty_title_before_disabled_delivery() {
 
     let (respond_to, response_rx) = std::sync::mpsc::channel();
     let changed = server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+        peer_pidfd: None,
         context: crate::api::ApiRequestContext::default(),
         request: api::schema::Request {
             id: "notify".into(),
@@ -7916,6 +8244,7 @@ fn notification_show_api_reports_no_foreground_client() {
 
     let (respond_to, response_rx) = std::sync::mpsc::channel();
     let changed = server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+        peer_pidfd: None,
         context: crate::api::ApiRequestContext::default(),
         request: api::schema::Request {
             id: "notify".into(),
@@ -7965,6 +8294,7 @@ fn notification_show_api_includes_sound_in_semantic_event() {
     let (respond_to, response_rx) = std::sync::mpsc::channel();
     assert!(
         server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+            peer_pidfd: None,
             context: crate::api::ApiRequestContext::default(),
             request: api::schema::Request {
                 id: "notify".into(),
@@ -8034,6 +8364,7 @@ fn completion_guard_server(writer: ClientWriter) -> (HeadlessServer, crate::layo
 fn completion_guard_api_report(server: &mut HeadlessServer, method: api::schema::Method) {
     let (respond_to, response_rx) = std::sync::mpsc::channel();
     server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+        peer_pidfd: None,
         context: crate::api::ApiRequestContext::default(),
         request: api::schema::Request {
             id: "completion-probe".into(),
@@ -8056,6 +8387,7 @@ fn report_agent_changed(
 ) -> bool {
     let (respond_to, response_rx) = std::sync::mpsc::channel();
     let changed = server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+        peer_pidfd: None,
         context: crate::api::ApiRequestContext::default(),
         request: api::schema::Request {
             id: format!("render-probe-{seq}"),
@@ -8127,20 +8459,41 @@ fn report_agent_session_changed(
     reason: &str,
     seq: u64,
 ) -> bool {
+    report_agent_session_with(
+        server,
+        pane_id,
+        "claude",
+        (Some(session), None),
+        reason,
+        seq,
+    )
+}
+
+/// Reports from this live test process, so an id is transport-bound and
+/// becomes the pane's actual `agent_session_id`, like a real local reporter.
+fn report_agent_session_with(
+    server: &mut HeadlessServer,
+    pane_id: &str,
+    agent: &str,
+    (id, path): (Option<&str>, Option<&str>),
+    reason: &str,
+    seq: u64,
+) -> bool {
     let (respond_to, response_rx) = std::sync::mpsc::channel();
     let changed = server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
-        context: crate::api::ApiRequestContext::default(),
+        peer_pidfd: None,
+        context: crate::api::ApiRequestContext::for_local_peer_pid(Some(std::process::id())),
         request: api::schema::Request {
             id: format!("session-probe-{seq}"),
             method: api::schema::Method::PaneReportAgentSession(
                 api::schema::PaneReportAgentSessionParams {
                     allow_cross_pane: false,
                     pane_id: pane_id.into(),
-                    source: "herdr:claude".into(),
-                    agent: "claude".into(),
+                    source: format!("herdr:{agent}"),
+                    agent: agent.into(),
                     seq: Some(seq),
-                    agent_session_id: Some(session.into()),
-                    agent_session_path: None,
+                    agent_session_id: id.map(str::to_string),
+                    agent_session_path: path.map(str::to_string),
                     session_start_source: Some(reason.into()),
                     resume_argv: None,
                 },
@@ -8201,6 +8554,100 @@ fn agent_session_replacement_that_resets_seen_requests_a_render() {
     );
 }
 
+fn agent_session_changed_events(
+    server: &HeadlessServer,
+    after: u64,
+) -> Vec<(String, String, Option<String>)> {
+    agent_session_changed_events_with_ids(server, after)
+        .into_iter()
+        .map(|event| (event.pane_id, event.session_id, event.previous_session_id))
+        .collect()
+}
+
+fn agent_session_changed_events_with_ids(
+    server: &HeadlessServer,
+    after: u64,
+) -> Vec<api::schema::PaneAgentSessionChangedEvent> {
+    server
+        .app
+        .event_hub
+        .events_after(after)
+        .into_iter()
+        .filter_map(|(_, event)| match event.data {
+            crate::api::schema::EventData::PaneAgentSessionChanged {
+                pane_id,
+                workspace_id,
+                agent,
+                session_id,
+                previous_session_id,
+                agent_session_id,
+                previous_agent_session_id,
+            } => {
+                assert_eq!(
+                    event.event,
+                    crate::api::schema::EventKind::PaneAgentSessionChanged
+                );
+                Some(api::schema::PaneAgentSessionChangedEvent {
+                    pane_id,
+                    workspace_id,
+                    agent,
+                    session_id,
+                    previous_session_id,
+                    agent_session_id,
+                    previous_agent_session_id,
+                })
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// smarty-dev#9124: a session report emits `pane.agent_session_changed` only
+/// when the pane's session id changes, never for a repeat of the same id.
+/// In-process, not E2E: it is the Windows/macOS coverage (tests/cli is
+/// Linux-only); the E2E is tests/cli/panes.rs
+/// `agent_session_changed_cli_reports_carry_the_actual_id_end_to_end`.
+#[test]
+fn agent_session_report_emits_session_changed_only_for_a_new_session() {
+    let (writer, _control_rx, _render_rx) = test_client_writer();
+    let (mut server, pane_id) = completion_guard_server(writer);
+    let public_pane_id = server.app.public_pane_id(0, pane_id).unwrap();
+
+    let start = server.app.event_hub.current_sequence();
+    report_agent_session_changed(&mut server, &public_pane_id, "session-a", "startup", 1);
+    assert_eq!(
+        agent_session_changed_events(&server, start),
+        vec![(public_pane_id.clone(), "session-a".to_string(), None)],
+        "the first session has no previous id"
+    );
+
+    let repeat = server.app.event_hub.current_sequence();
+    report_agent_session_changed(&mut server, &public_pane_id, "session-a", "resume", 2);
+    assert!(
+        agent_session_changed_events(&server, repeat).is_empty(),
+        "reporting the current session again emits nothing"
+    );
+
+    let replace = server.app.event_hub.current_sequence();
+    report_agent_session_changed(&mut server, &public_pane_id, "session-b", "clear", 3);
+    report_agent_session_changed(&mut server, &public_pane_id, "session-b", "clear", 4);
+    assert_eq!(
+        agent_session_changed_events(&server, replace),
+        vec![(
+            public_pane_id.clone(),
+            "session-b".to_string(),
+            Some("session-a".to_string())
+        )],
+        "A then B emits exactly one change, and the repeat of B none"
+    );
+    let events = agent_session_changed_events_with_ids(&server, replace);
+    assert_eq!(events[0].agent_session_id.as_deref(), Some("session-b"));
+    assert_eq!(
+        events[0].previous_agent_session_id.as_deref(),
+        Some("session-a")
+    );
+}
+
 #[test]
 fn api_report_agent_stores_valid_resume_argv_and_rejects_invalid() {
     let (writer, _control_rx, _render_rx) = test_client_writer();
@@ -8248,6 +8695,7 @@ fn api_report_agent_stores_valid_resume_argv_and_rejects_invalid() {
 
     let (respond_to, response_rx) = std::sync::mpsc::channel();
     server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+        peer_pidfd: None,
         context: api::ApiRequestContext::default(),
         request: api::schema::Request {
             id: "invalid-resume".into(),
@@ -8270,6 +8718,7 @@ fn api_report_agent_stores_valid_resume_argv_and_rejects_invalid() {
 
     let (respond_to, response_rx) = std::sync::mpsc::channel();
     server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+        peer_pidfd: None,
         context: api::ApiRequestContext::default(),
         request: api::schema::Request {
             id: "not-owner".into(),
@@ -8660,6 +9109,7 @@ fn stale_api_agent_report_does_not_forward_done_sound() {
 
     let (respond_to, response_rx) = std::sync::mpsc::channel();
     let changed = server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+        peer_pidfd: None,
         context: crate::api::ApiRequestContext::default(),
         request: api::schema::Request {
             id: "stale".into(),
@@ -8827,6 +9277,7 @@ impl CrossPaneGuardFixture {
         let (respond_to, response_rx) = std::sync::mpsc::channel();
         self.server
             .handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+                peer_pidfd: None,
                 request: api::schema::Request {
                     id: id.into(),
                     method,
@@ -8852,13 +9303,6 @@ impl CrossPaneGuardFixture {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn assert_cross_pane_denied(response: &str) {
-    let response: api::schema::ErrorResponse =
-        serde_json::from_str(response).expect("denial response");
-    assert_eq!(response.error.code, "cross_pane_input_denied");
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn assert_agent_prompted(response: &str) {
     let response: api::schema::SuccessResponse =
         serde_json::from_str(response).unwrap_or_else(|err| panic!("{err}: {response}"));
@@ -8876,14 +9320,21 @@ async fn headless_api_dispatch_uses_origin_context_for_cross_pane_guard() {
     let response = fixture.send_attributed(
         "headless-cross-pane",
         api::schema::Method::PaneSendText(api::schema::PaneSendTextParams {
+            expected_agent_session_id: None,
             pane_id: target_pane_id,
-            text: "blocked".into(),
+            text: "advisory".into(),
             allow_cross_pane: false,
         }),
     );
 
-    assert_cross_pane_denied(&response);
-    assert!(fixture.target_rx.try_recv().is_err());
+    // Advisory guard (Paul, 2026-10-13): cross-pane fleet input is accepted.
+    let response: api::schema::SuccessResponse =
+        serde_json::from_str(&response).unwrap_or_else(|err| panic!("{err}: {response}"));
+    assert!(matches!(
+        response.result,
+        api::schema::ResponseResult::Ok {}
+    ));
+    assert!(fixture.target_rx.try_recv().is_ok());
     fixture.shutdown();
 }
 
@@ -8892,6 +9343,9 @@ async fn headless_api_dispatch_uses_origin_context_for_cross_pane_guard() {
 async fn headless_deferred_agent_prompt_enforces_cross_pane_guard() {
     let prompt = |target: &str, allow_cross_pane| {
         api::schema::Method::AgentPrompt(api::schema::AgentPromptParams {
+            expected_agent_session_id: None,
+            expected_pane_id: None,
+            expected_agent_status: None,
             target: target.into(),
             text: "hello".into(),
             wait: None,
@@ -8900,9 +9354,10 @@ async fn headless_deferred_agent_prompt_enforces_cross_pane_guard() {
     };
     let mut fixture = CrossPaneGuardFixture::new();
 
-    let denied = fixture.send_attributed("prompt-denied", prompt("target-agent", false));
-    assert_cross_pane_denied(&denied);
-    assert!(fixture.target_rx.try_recv().is_err());
+    // Advisory guard (Paul, 2026-10-13): no opt-in needed any more.
+    let advisory = fixture.send_attributed("prompt-advisory", prompt("target-agent", false));
+    assert_agent_prompted(&advisory);
+    while fixture.target_rx.try_recv().is_ok() {}
 
     let allowed = fixture.send_attributed("prompt-allowed", prompt("target-agent", true));
     assert_agent_prompted(&allowed);

@@ -10,6 +10,7 @@ fn connect_media_shell(
     let (writer, control, _render) = test_client_writer();
     assert!(
         server.handle_server_event(ServerEvent::ClientShellConnected {
+            peer_context: crate::api::ApiRequestContext::default(),
             surface_reuse: false,
             surface_delta: false,
             surface_scroll: false,
@@ -52,6 +53,7 @@ fn media_api(
 ) -> std::sync::mpsc::Receiver<String> {
     let (respond_to, response_rx) = std::sync::mpsc::channel();
     server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+        peer_pidfd: None,
         context: crate::api::ApiRequestContext::default(),
         request: api::schema::Request {
             id: "media".into(),

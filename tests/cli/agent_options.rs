@@ -102,6 +102,19 @@ fn scripted_server(
     socket: &Path,
     reply: serde_json::Value,
 ) -> thread::JoinHandle<serde_json::Value> {
+    scripted_server_with_capabilities(
+        socket,
+        reply,
+        serde_json::json!({"live_handoff": true, "detached_server_daemon": true}),
+    )
+}
+
+/// Like `scripted_server`, but the pong advertises `capabilities`.
+fn scripted_server_with_capabilities(
+    socket: &Path,
+    reply: serde_json::Value,
+    capabilities: serde_json::Value,
+) -> thread::JoinHandle<serde_json::Value> {
     let listener = UnixListener::bind(socket).unwrap();
     listener.set_nonblocking(true).unwrap();
     thread::spawn(move || {
@@ -125,12 +138,14 @@ fn scripted_server(
                 .unwrap();
             let request: serde_json::Value = serde_json::from_str(&line).unwrap();
             if request["method"] == "ping" {
-                write_fake_pong(
-                    &mut stream,
-                    &request,
-                    "different-build-same-protocol",
-                    CURRENT_PROTOCOL,
-                );
+                let pong = serde_json::json!({"id": request["id"], "result": {
+                    "type": "pong",
+                    "version": "different-build-same-protocol",
+                    "protocol": CURRENT_PROTOCOL,
+                    "capabilities": capabilities,
+                }});
+                writeln!(stream, "{pong}").unwrap();
+                stream.flush().unwrap();
                 continue;
             }
             let mut reply = reply;
@@ -388,6 +403,91 @@ fn agent_prompt_accepts_cross_pane_opt_in_anywhere() {
     }
 }
 
+// Merge guard with master: a leading or after-TARGET opt-in combines with the
+// session/pane/status expectations and wait options (spaced and `=` forms),
+// all of which reach the wire on the checked method.
+#[test]
+fn agent_prompt_opt_in_combines_with_expectations_and_wait_options() {
+    let capabilities = serde_json::json!({
+        "live_handoff": false,
+        "expected_agent_session_guard": true,
+        "expected_agent_status_guard": true,
+    });
+    for (args, method, status) in [
+        (
+            &[
+                "agent",
+                "prompt",
+                "--allow-cross-pane",
+                "w1:p2",
+                "hi",
+                "--expected-session",
+                "session-a",
+                "--expected-pane=w1:p2",
+                "--expected-status",
+                "idle",
+                "--wait",
+                "--until=done",
+                "--timeout",
+                "1500",
+            ][..],
+            "agent.prompt_status_checked",
+            Some("idle"),
+        ),
+        (
+            &[
+                "agent",
+                "prompt",
+                "w1:p2",
+                "--allow-cross-pane",
+                "hi",
+                "--expected-session=session-a",
+                "--expected-pane",
+                "w1:p2",
+                "--wait",
+                "--until",
+                "done",
+                "--timeout=1500",
+            ][..],
+            "agent.prompt_session_checked",
+            None,
+        ),
+    ] {
+        let base = unique_test_dir();
+        fs::create_dir_all(&base).unwrap();
+        let socket = base.join("herdr.sock");
+        let server = scripted_server_with_capabilities(
+            &socket,
+            serde_json::json!({"result": {"type": "agent_prompted"}}),
+            capabilities.clone(),
+        );
+        let output = run_cli(&socket, args);
+        let request = server.join().unwrap();
+        cleanup_test_base(&base);
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let params = &request["params"];
+        assert_eq!(request["method"], method, "{args:?}: {request}");
+        assert_eq!(params["target"], "w1:p2", "{args:?}");
+        assert_eq!(params["text"], "hi", "{args:?}");
+        assert_eq!(params["allow_cross_pane"], true, "{args:?}");
+        assert_eq!(params["expected_agent_session_id"], "session-a", "{args:?}");
+        assert_eq!(params["expected_pane_id"], "w1:p2", "{args:?}");
+        match status {
+            Some(status) => assert_eq!(params["expected_agent_status"], status, "{args:?}"),
+            None => assert!(params.get("expected_agent_status").is_none(), "{args:?}"),
+        }
+        assert_eq!(
+            params["wait"],
+            serde_json::json!({"until": ["done"], "timeout_ms": 1500}),
+            "{args:?}"
+        );
+    }
+}
+
 // Removing the flag would leave no TEXT, so it stays the literal prompt text.
 #[test]
 fn agent_prompt_flag_shaped_text_stays_literal_without_opt_in() {
@@ -407,11 +507,13 @@ fn agent_prompt_flag_shaped_text_stays_literal_without_opt_in() {
     assert_ne!(request["params"]["allow_cross_pane"], true);
 }
 
-// Against the real server, an unattributable caller is refused loudly (non-zero
-// exit, the error on stderr, nothing on stdout), and the opt-in passes the input
-// origin guard from every argv position.
+// Against the real server (#265): the input-origin guard is advisory, so an
+// unattributable non-plugin caller is not refused as input_origin_unknown, with
+// or without the opt-in in any argv position, nor with flag-shaped literal TEXT.
+// This custom agent then answers agent_not_ready loudly (non-zero exit, the
+// error on stderr, nothing on stdout).
 #[test]
-fn agent_prompt_input_origin_unknown_refusal_is_loud_and_opt_in_passes_guard() {
+fn agent_prompt_input_origin_unknown_is_advisory_with_or_without_compatibility_flag() {
     let base = unique_test_dir();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
@@ -475,19 +577,10 @@ fn agent_prompt_input_origin_unknown_refusal_is_loud_and_opt_in_passes_guard() {
         error["error"]["code"].as_str().unwrap().to_owned()
     };
 
-    let refused = unattributable(&["agent", "prompt", &pane_id, "probe"]);
-    assert_eq!(error_code(&refused), "input_origin_unknown");
-    let refused: serde_json::Value = serde_json::from_slice(&refused.stderr).unwrap();
-    assert!(refused["error"]["message"]
-        .as_str()
-        .is_some_and(|message| message.contains("--allow-cross-pane")));
-    // The flag-shaped literal TEXT is not an opt-in.
-    let literal = unattributable(&["agent", "prompt", &pane_id, "--allow-cross-pane"]);
-    assert_eq!(error_code(&literal), "input_origin_unknown");
-
-    // With the opt-in the guard passes; this custom agent is then refused as
-    // not ready, which is the same answer an ordinary caller gets.
+    // No opt-in and flag-shaped literal TEXT get the same answer as the opt-in.
     for args in [
+        &["agent", "prompt", &pane_id, "probe"][..],
+        &["agent", "prompt", &pane_id, "--allow-cross-pane"][..],
         &["agent", "prompt", "--allow-cross-pane", &pane_id, "probe"][..],
         &["agent", "prompt", &pane_id, "--allow-cross-pane", "probe"][..],
         &["agent", "prompt", &pane_id, "probe", "--allow-cross-pane"][..],

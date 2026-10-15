@@ -1088,7 +1088,13 @@ mod tests {
 
     // Functional waits (including fixture setup) have a hang watchdog, not a
     // product latency assertion. Ignored perf tests measure the separate target.
-    const GIT_WATCH_HANG_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(10);
+    // Each refresh spawns several `git` processes; on a loaded Windows runner a
+    // single spawn can take seconds, so this only has to catch a lost event.
+    const GIT_WATCH_HANG_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(30);
+    // The isolated child bounds every step by its own watchdog above, and a
+    // scenario has many steps. The parent only catches a child that hangs
+    // outright, so its bound must exceed the sum of the child's step budgets.
+    const GIT_WATCH_CHILD_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(600);
     const GIT_WATCH_LATENCY_TARGET: std::time::Duration = std::time::Duration::from_secs(1);
 
     fn run_git_watch_test_in_child(name: &str) -> bool {
@@ -1115,32 +1121,35 @@ mod tests {
             .stderr(std::process::Stdio::piped())
             .spawn()
             .expect("run isolated git watch test");
+        // Drain both pipes while the child runs. A child that fills a pipe
+        // (Windows anonymous pipes hold 4 KiB, less than a panic backtrace)
+        // would otherwise block until the watchdog and hide its real failure.
+        fn drain(mut pipe: impl std::io::Read + Send + 'static) -> std::thread::JoinHandle<String> {
+            std::thread::spawn(move || {
+                let mut bytes = Vec::new();
+                let _ = pipe.read_to_end(&mut bytes);
+                String::from_utf8_lossy(&bytes).into_owned()
+            })
+        }
+        let stdout = drain(child.stdout.take().expect("isolated child stdout"));
+        let stderr = drain(child.stderr.take().expect("isolated child stderr"));
         let start = Instant::now();
-        let timed_out = loop {
-            if child
-                .try_wait()
-                .expect("observe isolated git watch test")
-                .is_some()
-            {
-                break false;
+        let (status, timed_out) = loop {
+            if let Some(status) = child.try_wait().expect("observe isolated git watch test") {
+                break (status, false);
             }
-            if start.elapsed() >= std::time::Duration::from_secs(30) {
+            if start.elapsed() >= GIT_WATCH_CHILD_WATCHDOG {
                 child.kill().expect("stop isolated git watch test");
-                break true;
+                break (child.wait().expect("join isolated git watch test"), true);
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         };
-        let output = child
-            .wait_with_output()
-            .expect("join isolated git watch test");
+        let stdout = stdout.join().expect("join isolated child stdout");
+        let stderr = stderr.join().expect("join isolated child stderr");
         assert!(
-            !timed_out
-                && output.status.success()
-                && String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
-            "isolated {name}: timed_out={timed_out}, status={}\n{}\n{}",
-            output.status,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+            !timed_out && status.success() && stdout.contains("1 passed; 0 failed"),
+            "isolated {name}: timed_out={timed_out}, elapsed={:?}, status={status}\n{stdout}\n{stderr}",
+            start.elapsed(),
         );
         true
     }
@@ -1156,7 +1165,7 @@ mod tests {
 
     /// Exercise the same sync -> scheduler -> worker -> App event application
     /// path used by a headless server with an attached app consumer.
-    /// Wait up to the 10s hang watchdog for an applied GitStatusRefreshed event.
+    /// Wait up to the hang watchdog for an applied GitStatusRefreshed event.
     /// The returned duration starts after the fixture's git command returns;
     /// ignored perf tests assert the separate 1s native-refresh latency target.
     #[track_caller]
@@ -1461,6 +1470,16 @@ mod tests {
         let repo = GitWatchRepo::new("deadlines");
         repo.init();
         let mut app = repo.app();
+        // The fixture's own git writes reach the native watcher asynchronously.
+        // A late hint can leave a debounce deadline, a pending refresh, or a
+        // discovery hint that (correctly) escalates the next hint into an
+        // identity refresh, which must run right after the in-flight worker.
+        // This test covers the plain debounce path, so start from a quiet
+        // boundary and drop a discovery hint whose wakeup was already coalesced.
+        drain_git_watch_hints(&mut app);
+        if let Some(watches) = &app.git_watches {
+            watches.take_discovery_hint();
+        }
         let now = Instant::now();
         app.last_git_repo_discovery_refresh = now;
         app.last_git_remote_status_refresh = now + std::time::Duration::from_secs(59);
@@ -1468,12 +1487,16 @@ mod tests {
             app.git_refresh_deadline(),
             Some(now + std::time::Duration::from_secs(60))
         );
+        // Mark a worker in flight the way start_git_status_refresh_if_due does,
+        // so its completion is not older than any identity request so far.
+        app.git_refresh_generation += 1;
+        let generation = app.git_refresh_generation;
         app.git_refresh_in_flight = true;
         assert!(!app.handle_internal_event_with_render_impact(AppEvent::GitFilesChanged));
         assert_eq!(app.git_refresh_deadline(), None);
         let deadline = app.git_watch_refresh_deadline.unwrap();
         app.handle_internal_event(AppEvent::GitStatusRefreshed {
-            generation: 0,
+            generation,
             results: Vec::new(),
             cache_updates: Vec::new(),
         });
@@ -1511,7 +1534,7 @@ mod tests {
         app
     }
 
-    /// Start the real worker now and wait (10 s hang watchdog, event-driven)
+    /// Start the real worker now and wait (hang watchdog, event-driven)
     /// for its completion without applying it.
     #[track_caller]
     fn start_and_capture_git_completion(app: &mut App) -> AppEvent {

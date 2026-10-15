@@ -99,11 +99,11 @@ herdr pane read w1:p2 --source recent --lines 50
 | ワークスペース | `workspace.create`、`workspace.list`、`workspace.get`、`workspace.focus`、`workspace.rename`、`workspace.move`、`workspace.move_block`、`workspace.report_metadata`、`workspace.close` |
 | Worktree | `worktree.list`、`worktree.create`、`worktree.create_project_checked`、`worktree.open`、`worktree.open_project_checked`、`worktree.remove` |
 | タブ | `tab.create`、`tab.list`、`tab.get`、`tab.focus`、`tab.rename`、`tab.move`、`tab.close` |
-| ペイン | `pane.split`、`pane.swap`、`pane.move`、`pane.zoom`、`pane.layout`、`pane.process_info`、`pane.neighbor`、`pane.edges`、`pane.focus_direction`、`pane.resize`、`pane.list`、`pane.current`、`pane.get`、`pane.last_input`、`pane.rename`、`pane.send_text`、`pane.send_keys`、`pane.send_input`、`pane.send_input_guarded`、`pane.read`、`pane.report_agent`、`pane.report_agent_session`、`pane.report_metadata`、`pane.clear_agent_authority`、`pane.release_agent`、`pane.close`、`pane.wait_for_output` |
+| ペイン | `pane.split`、`pane.swap`、`pane.move`、`pane.zoom`、`pane.layout`、`pane.process_info`、`pane.neighbor`、`pane.edges`、`pane.focus_direction`、`pane.resize`、`pane.list`、`pane.current`、`pane.get`、`pane.last_input`、`pane.rename`、`pane.send_text`、`pane.send_text_session_checked`、`pane.send_keys`、`pane.send_keys_session_checked`、`pane.send_text_path_checked`、`pane.send_keys_path_checked`、`pane.send_input`、`pane.send_input_guarded`、`pane.read`、`pane.report_agent`、`pane.report_agent_session`、`pane.report_metadata`、`pane.clear_agent_authority`、`pane.release_agent`、`pane.close`、`pane.close_guarded`、`pane.wait_for_output` |
 | 入力コンシューマー（ローカル JSON 専用） | `pane.input_consumer.enroll`、`pane.input_consumer.cut`、`pane.input_consumer.release` |
 | ポップアップ | `popup.close` |
 | レイアウト | `layout.export`、`layout.apply`、`layout.apply_restorable`、`layout.set_split_ratio` |
-| エージェント | `agent.list`、`agent.get`、`agent.read`、`agent.explain`、`agent.send_keys`、`agent.prompt`、`agent.register_self`、`agent.channel_info`、`agent.draft_state`、`agent.prompt_guarded`、`agent.wait`、`agent.rename`、`agent.focus`、`agent.start`、`agent.start_guarded` |
+| エージェント | `agent.list`、`agent.get`、`agent.read`、`agent.explain`、`agent.send_keys`、`agent.prompt`、`agent.prompt_session_checked`、`agent.register_self`、`agent.channel_info`、`agent.draft_state`、`agent.prompt_guarded`、`agent.wait`、`agent.rename`、`agent.focus`、`agent.start`、`agent.start_guarded` |
 | イベント | `events.subscribe`、`events.wait` |
 | インテグレーション | `integration.install`、`integration.uninstall` |
 | プラグイン | `plugin.link`、`plugin.list`、`plugin.unlink`、`plugin.enable`、`plugin.disable`、`plugin.action.list`、`plugin.action.invoke`、`plugin.log.list`、`plugin.pane.open`、`plugin.pane.focus`、`plugin.pane.close` |
@@ -136,9 +136,19 @@ herdr pane read w1:p2 --source recent --lines 50
 
 ACK は接続、epoch、リクエスト ID、セッション世代と一致する必要があります。`status` は `accepted`、`queued`、`rejected` で、`rejected` は型付きの `reason` が必須、`duplicate: true` は任意です。拒否は成功ではなく、その `reason` を持つ `agent_prompt_rejected` エラーになります。完全なフレームだけを送信します。フレーム、処理中リクエスト、確認待ち、epoch ごとの重複排除台帳には上限があり、容量不足では再利用可能なキーを追い出さず拒否します。配信前に `(registration_epoch, request_id, exact text, if_draft_empty)` を予約し、同じ内容の重複は最初の確認を共有して `duplicate` を付けます。内容の変更は `payload_mismatch` で拒否し、新しい ID を自動再試行として扱いません。サーバーと Pi はどちらも、保持された旧 epoch のエントリを含め、ガード値をペイロードの同一性に含めます。
 
+#### epoch のローテーション
+
+epoch の重複排除台帳がローテーションのしきい値に達すると、サーバーはその epoch で新しいリクエスト ID を予約しなくなります。新しい ID は `agent_channel_rotating` で失敗し、予約も配信もされません。予約済み ID の重複は引き続き元の確認を返します。その epoch に処理待ちのリクエストがなくなると、サーバーは制御フレームを 1 つ送信して接続を閉じます。
+
+```json
+{"type":"rotate","registration_epoch":"epoch_opaque","session_generation":"pi-session-token"}
+```
+
+Pi は、現在の接続、epoch、セッション世代と一致する rotate フレームにだけ反応します。ソケットを閉じて新しいソケットを開き、最初のリクエストとして現在の `session_generation`（対応している場合は `draft_guard` も）を付けて `agent.register_self` を再送し、`ready: true` を待ちます。古い接続の配信や ACK は再送しません。新しい登録が準備完了になるまで、`agent.channel_info` は `ready: false` を返し、配信は拒否されます。古い epoch を指定した配信は `registration_epoch_mismatch` で失敗します。ただし、古い epoch で予約済みのリクエストの重複は、その epoch がサーバーの保持する唯一の直前の epoch であり、現在のチャンネルが接続済み・フォアグラウンドで同じペインに紐付いている場合に限り、元の確認を返します。それ以外の場合も `registration_epoch_mismatch` で失敗します。呼び出し側は `agent.channel_info` を再度呼び、新しい `registration_epoch` を固定します。古いリクエストを新しい epoch で再実行してはいけません。
+
 #### 本文を返さないドラフト状態の問い合わせ
 
-`agent.draft_state` は `target` が必須で、別ペインへの明示的な許可として任意の boolean `allow_cross_pane`（既定値 `false`）を受け付けます。同じペインへの問い合わせに許可は不要です。登録済み受信側のエディタと UI hold を変更せずに観測します。既定の問い合わせタイムアウトは 2 秒です。ドラフト本文は返しません。
+`agent.draft_state` は `target` が必須で、互換性のため任意の boolean `allow_cross_pane`（既定値 `false`）を受け付けます。入力元チェックは助言的で、別ペインへの問い合わせも許可なしで受け付けられ、ログに記録されます。登録済み受信側のエディタと UI hold を変更せずに観測します。既定の問い合わせタイムアウトは 2 秒です。ドラフト本文は返しません。
 
 ```json
 {"id":"draft","method":"agent.draft_state","params":{"target":"w1:p1"}}
@@ -146,7 +156,7 @@ ACK は接続、epoch、リクエスト ID、セッション世代と一致す�
 {"id":"draft","result":{"status":"unknown","reason":"unsupported"}}
 ```
 
-`status: "known"` の `empty` は boolean、`hold` は `null`（hold なし）、`"dialog"`、`"custom"`、`"editor"` のいずれかです。結果にドラフト本文や文字数は含まれません。`status: "unknown"` の型付き `reason` は `unregistered`（チャネルなし）、`unsupported`（能力なし）、`timeout`（期限内の応答なし）、`unknown`（観測不能）です。unknown を空と扱わないでください。エージェント自身のペインへの問い合わせはデフォルトで許可され、別のペインへの問い合わせには `allow_cross_pane: true` が必要です。通常の外部オペレーターには `agent.prompt` と同じポリシーを適用します。認可は予約またはフレーム送信の前に確認されます。帰属や接続が不確実なら操作を拒否します。観測は予約でも後のプロンプトの許可でもなく、キャッシュした状態を後の安全な配信の根拠として渡してはいけません。
+`status: "known"` の `empty` は boolean、`hold` は `null`（hold なし）、`"dialog"`、`"custom"`、`"editor"` のいずれかです。結果にドラフト本文や文字数は含まれません。`status: "unknown"` の型付き `reason` は `unregistered`（チャネルなし）、`unsupported`（能力なし）、`timeout`（期限内の応答なし）、`unknown`（観測不能）です。unknown を空と扱わないでください。エージェントは自身のペインに加え、`allow_cross_pane` なしで別のペインにも問い合わせできます。入力元チェックは助言的で、別ペインや帰属を確認できない問い合わせは許可され、ログに記録されます。通常の外部オペレーターには `agent.prompt` と同じポリシーを適用します。チェックは予約またはフレーム送信の前に行われ、無効なプラグインアクショントークンを提示した場合は引き続き拒否されます。接続が不確実なら操作を拒否します。観測は予約でも後のプロンプトの許可でもなく、キャッシュした状態を後の安全な配信の根拠として渡してはいけません。
 
 既存の登録ソケット上で、問い合わせと応答は同じ epoch、リクエスト ID、セッション世代を使います。
 
@@ -168,7 +178,7 @@ ACK は接続、epoch、リクエスト ID、セッション世代と一致す�
 
 `if_draft_empty: true` を要求する前に `agent.channel_info.result.draft_guard == true` を確認してください。古いサーバーは新しいフィールドを無視する可能性があります。CLI は `agent prompt --if-draft-empty` と `agent prompt-guarded --if-draft-empty` の両方で能力を事前確認し、タイピングや従来の経路へフォールバックしません。簡便な `agent prompt` のフラグは `--wait`、`--until`、`--timeout` と併用できません。フラグなしでは従来の動作を維持します。生の `agent.prompt` はドラフトガードのメソッドではありません。
 
-要求されたガードは `deliver` フレームに `if_draft_empty: true` と `deadline_ms` を追加します。ガードなしのフレームはガードフラグを省略します。`deadline_ms` はサーバーの最初の予約時に固定する Unix エポックからの絶対ミリ秒期限であり、新しい公開 API パラメータではありません。重複は最初の期限を保持し、呼び出し元の異なるタイムアウトはペイロードの同一性を変えません。Pi はエディタ/hold の確認と submit 呼び出しの前に同期的に期限を検証します。`Date.now() >= deadline_ms` は `expired` で拒否し、送信もエディタ変更も行いません。ガード期限の欠落・不正は `unknown` です。
+要求されたガードは `deliver` フレームに `if_draft_empty: true`、`deadline_ms`、`remaining_ms` を追加します。ガードなしのフレームはガードフラグを省略します。期限はサーバーの最初の予約時にサーバーの単調時計上で固定され、新しい公開 API パラメータではありません。重複は最初の期限を保持し、呼び出し元の異なるタイムアウトはペイロードの同一性を変えません。`remaining_ms` はサーバーがフレームの書き込みを開始した時点でその期限に残っているミリ秒数（切り捨て）です。`deadline_ms` は同じ期限を Unix エポックからの絶対ミリ秒で表したもので、ログと `remaining_ms` を知らない受信側のために残されます。Pi は受信時に `remaining_ms` を自身の単調時計上の期限に変換し、受理にはその予算と `deadline_ms` の両方が期限内であることを要求します。予算により壁時計が戻っても遅れて受理されることはなく、`deadline_ms` により Pi がフレームを読む前に経過した時間でも遅れて受理されることはありません。`remaining_ms` がない場合は `deadline_ms` のみを使います。Pi はエディタ/hold の確認前と submit 呼び出し前に同期的に期限を検証します。予算または期限の経過は `expired` で拒否し、送信もエディタ変更も行いません。ガード期限の欠落・不正（`remaining_ms` があっても `deadline_ms` がない場合、および存在するが不正な `remaining_ms` または `deadline_ms` を含む）は `unknown` です。
 
 Pi は `pi.submitUserMessage` の呼び出し直前にエディタと hold を同期的に確認し、確認と呼び出しの間に await やスケジューリングの間隙を置かず、呼び出した後に受け入れ確認を待ちます。エディタを変更せず、タイピングや従来の入力経路は使いません。空でないドラフトは `draft_present`、`holdState()` が `undefined` 以外ならすべて `ui_hold`（`dialog`、`custom`、`editor` を含む）、getter 不在・例外・文字列でないドラフト・観測不能な状態は `unknown` で拒否します。これらは型付き `error.reason` を持つ `agent_prompt_rejected` エラーです。登録または能力の欠落は `unregistered` または `unsupported` です。これらの受け入れ前の拒否では送信せず、ドラフトを保持します。事前の状態問い合わせで検証を回避することはできません。
 
@@ -183,6 +193,8 @@ Pi は `pi.submitUserMessage` の呼び出し直前にエディタと hold を�
 `agent.wait` はサーバー所有でイベント駆動です。解決したペイン占有者に固定されるため、置換されたエージェントが待機を満たすことはありません。`agent.prompt` は `until` と `timeout_ms` を持つ省略可能な `wait` オブジェクトを受け付けます。これにより、プロンプト送信と待機開始を 1 つのリクエストで行い、別々の呼び出し間の競合を避けられます。解決したエージェントがすでに `blocked` の場合、`agent.prompt` は入力を送信せず、待機も開始せずに `agent_blocked` を返します。
 
 `workspace.move_block` は、順序付きの `workspace_ids` を `before_workspace_id` の前へアトミックに移動します。アンカーを省略するとブロックを末尾へ移動します。id は一意である必要があり、アンカーをブロックに含めることはできません。レスポンスにはサーバーが確定した順序付きワークスペース一覧が含まれます。
+
+すべてのワークスペースレコードはパスをちょうど 1 つ持ちます。任意の `worktree` オブジェクトは、Herdr がワークツリーとして開いたチェックアウト（`worktree.create`、`worktree.open`、`workspace.create_linked`）にのみ付き、その `checkout_path` がワークスペースのパスです。`cwd` はワークスペースに `worktree` がない場合にのみ存在し、ワークスペースのルートペイン（最初のタブの最初のペイン）の現在の作業ディレクトリ、または作成時のディレクトリです。Git チェックアウト内で `workspace.create` により作成したワークスペースには `cwd` はありますが `worktree` はありません。
 
 `session.snapshot` は、独自のローカルランタイムキャッシュを持つクライアント向けに、一度限りのブートストラップスナップショットを返します。レスポンスには、バージョン/プロトコルメタデータ、フォーカス中のワークスペース/タブ/ペイン id、ワークスペース、タブ、ペイン、タブレイアウト、エージェントの各レコードが含まれます。これは購読ではありません。キャッシュの初期化と復旧では、先に購読を開始し、後述のイベント購読セクションの手順でサーバーから現在の状態を読み取り、キャッシュを照合・更新します。イベントはキャッシュの無効化を知らせるものであり、スナップショットに無条件で再適用できるものではありません。再接続後やキャッシュが古い可能性がある場合は、`session.snapshot` を再度呼び出します。ワークスペースレコードには、関連付けられた worktree の出自情報も含まれます。リポジトリ全体の worktree 検出には引き続き `worktree.list` を使います。
 
@@ -257,50 +269,52 @@ command in a loop.
 
 | メソッド | 必須 params | 用途 |
 | --- | --- | --- |
-| `pane.input_consumer.enroll` | `pane_id`、`challenge` | ローカルソケットのピアを検証し、`epoch`、秘密の `epoch_key`、`nonce`、ペインの `tty` を発行します。 |
-| `pane.input_consumer.cut` | `epoch`、`epoch_key`、`seq`、`token`、`cut`、`digest`、`kind` | 区間を閉じます。`kind` は `submit` または `discard` です。 |
-| `pane.input_consumer.release` | `epoch`、`epoch_key` | 終了、一時停止、TTY 引き渡しの前に epoch を終了します。 |
+| `pane.input_consumer.enroll` | `pane_id`、`challenge` | ローカルソケットのピアを検証し、`epoch`、`nonce`、ペインの `tty`、固定したピア `peer`、サーバー署名 `sig` を発行します。 |
+| `pane.input_consumer.cut` | `epoch`、`seq`、`token`、`cut`、`digest`、`kind` | 区間を閉じます。`kind` は `submit` または `discard` です。 |
+| `pane.input_consumer.release` | `epoch` | 終了、一時停止、TTY 引き渡しの前に epoch を終了します。 |
 
-以下ではリクエストとレスポンスをそれぞれ別の JSON 行で示します。成功時は同じ `id` とフラットな `result` を返し、**`type` タグはありません**。`<epoch>`、`<epoch_key>`、`<nonce>` は説明用のプレースホルダーで、使用可能な認証情報ではありません。登録で返された値を秘密に扱って使用してください。
+以下ではリクエストとレスポンスをそれぞれ別の JSON 行で示します。成功時は同じ `id` とフラットな `result` を返し、**`type` タグはありません**。`<epoch>` と `<nonce>` は説明用のプレースホルダーです。コンシューマーが保持・送信する値に秘密はありません。リクエストは認証情報を持たず、cut と release を行えるのは登録したプロセスだけです。この値は入力の出所を示すラベルであり、入力を止めるゲートではありません。
 
 ```json
 {"id":"enroll","method":"pane.input_consumer.enroll","params":{"pane_id":"w1:p1","challenge":"<64 lowercase hex>"}}
-{"id":"enroll","result":{"epoch":"<epoch>","epoch_key":"<epoch_key>","nonce":"<nonce>","tty":{"dev":"<st_dev>","ino":"<st_ino>"}}}
+{"id":"enroll","result":{"epoch":"<epoch>","nonce":"<nonce>","tty":{"dev":"<st_dev>","ino":"<st_ino>"},"peer":{"pid":"<pid>","pidns":"<pid namespace inode>"},"sig":"<base64 Ed25519>"}}
 ```
 
 最初の区間が正確に `a\r`（16 進バイト `61 0d`）だけを含む場合、`cut = 2` です。`digest` はこの 2 バイトの SHA-256 であり、バックスラッシュ表記そのもののハッシュではありません。
 
 ```json
-{"id":"cut","method":"pane.input_consumer.cut","params":{"epoch":"<epoch>","epoch_key":"<epoch_key>","seq":1,"token":"example-submit-1","cut":2,"digest":"961a57df036f6c4f44ca8a054271c45e823f469bcc439f0255c40974c3e3d131","kind":"submit"}}
+{"id":"cut","method":"pane.input_consumer.cut","params":{"epoch":"<epoch>","seq":1,"token":"example-submit-1","cut":2,"digest":"961a57df036f6c4f44ca8a054271c45e823f469bcc439f0255c40974c3e3d131","kind":"submit"}}
 ```
 
 このカットに対するレスポンスの候補です（リクエストごとに 1 つのレスポンス）。
 
 ```json
-{"id":"cut","result":{"result":"client","principal":null,"mac":"<64 hex>"}}
-{"id":"cut","result":{"result":"client","principal":{"smarty_id":"kate","display_name":"Kate"},"mac":"<64 hex>"}}
-{"id":"cut","result":{"result":"api","mac":"<64 hex>"}}
-{"id":"cut","result":{"result":"mixed","mac":"<64 hex>"}}
-{"id":"cut","result":{"result":"unknown","reason":"input_log_unavailable","mac":"<64 hex>"}}
+{"id":"cut","result":{"result":"client","principal":null,"sig":"<base64 Ed25519>"}}
+{"id":"cut","result":{"result":"client","principal":{"smarty_id":"kate","display_name":"Kate"},"sig":"<base64 Ed25519>"}}
+{"id":"cut","result":{"result":"api","sig":"<base64 Ed25519>"}}
+{"id":"cut","result":{"result":"mixed","sig":"<base64 Ed25519>"}}
+{"id":"cut","result":{"result":"unknown","reason":"input_log_unavailable","sig":"<base64 Ed25519>"}}
 ```
 
 release の成功は空のオブジェクトを返します。拒否時は送信元判定の結果ではなく、`code` と `message` を持つ標準の `error` エンベロープを使用します。
 
 ```json
-{"id":"release","method":"pane.input_consumer.release","params":{"epoch":"<epoch>","epoch_key":"<epoch_key>"}}
+{"id":"release","method":"pane.input_consumer.release","params":{"epoch":"<epoch>"}}
 {"id":"release","result":{}}
 {"id":"cut","error":{"code":"token_conflict","message":"token_conflict"}}
 ```
 
 すべての params が必須で、`cut` と `release` に **`pane_id` はありません**。登録時には、ソケットピアの制御 TTY がペイン PTY と一致すること、フォアグラウンドグループのメンバーであること（`getpgid(peer) == tcgetpgrp(master)`）、ペインのセッションに属すること（`getsid(peer)`）を確認します。プロセスグループのインカーネーション（pgid とリーダーの開始時刻）ごとに最初の登録だけが成功し、そのインカーネーションが続く間、他のプロセスの登録は `already_enrolled` になります。最初のコンシューマー（同じ pid と開始時刻）は、epoch の終了後（release、無効化、Ctrl+Z と再開などのフォアグラウンド変更）に再登録でき、リプレイキャッシュが空の新しい epoch を受け取ります。追加の祖先チェックはありません。コンシューマーは拡張機能や子プロセスより先に登録し、ツールの子プロセスを別グループに分離する必要があります。`ICANON`、`ECHO`、`ICRNL`、`ISTRIP`、`IXON`、`IEXTEN` はすべてオフでなければなりません。各カットで raw モードと termios が登録時から変わっていないことを再確認し、失敗時は `unknown` を返して epoch を無効化します。先に `ping.result.capabilities.input_consumer == true` を確認してください。Linux 以外のサーバーは `false` を通知し、3 つのメソッドすべてを `unsupported_platform` で拒否します。
 
-**サーバー認証。** このビルドにはサーバー認証がありません。登録の応答には `sig` が含まれないため、コンシューマーはどのサーバーが応答したかを証明できず、その応答を認証されていない端末入力として扱う必要があります。`tty` が自分の stdin の `fstat` と一致することを確認してください。各カット応答の `mac` は、デコードした `epoch_key` による HMAC-SHA256 で、対象は `herdr-cut-v1`、`epoch`、`seq`、`token`、`cut`、`digest`、`kind`、`result`、`reason`、principal の `smarty_id` と `display_name`（ない場合は空文字列）です。各フィールドは u32 ビッグエンディアンのバイト長と UTF-8 バイトで符号化します。`challenge` は検証されますが、まだ署名には結び付けられていません。
+**ピアの固定。** 登録にはカーネルの `SO_PEERPIDFD`（Linux 6.5）、pidfs（6.9、64 ビット）、`PIDFD_GET_INFO`（6.13）が必要です。Herdr は登録接続の pidfd を epoch の間保持します。`cut` と `release` は、その接続の `SO_PEERPIDFD` が同じ pidfs inode を指し、そのプロセスが終了していない場合にだけ受け付けます。それ以外は `invalid_epoch` で拒否し、シーケンスも監査ログも変えません。これらの機能がない場合、またはサーバーの `/proc` が別の pid 名前空間のものである場合、登録は `peer_identity_unsupported` で拒否されます。pid や開始時刻によるフォールバックはありません。
+
+**サーバー認証。** コンシューマーは応答したソケットをそのまま信用してはいけません。インストール済みのサーバーは `root:herdr` のモード `2755` で、起動時に一度だけ Ed25519 鍵 `/etc/herdr/server.key`（`0640 root:herdr`）を読み、その後グループを手放します。そのためペインの子プロセスはこのグループを持たず、同じユーザーのプロセスはファイルからもサーバーのメモリからも鍵を読めません。`herdr` グループにメンバーがいる場合や、誰かのプライマリグループである場合、サーバーは鍵を読み込みません。`nsswitch.conf` は `passwd` と `group`（記載があれば `initgroups` も）を `files` または `files systemd` に対応付ける必要があり、`/etc/group` にはこのグループの gid を持つエントリがちょうど 1 つだけ（別名なし）あり、同じ名前の別エントリがあってはならず、`/etc/group` と `/etc/passwd` にこのグループのメンバーやプライマリ保持者がいてはならず、systemd userdb のドロップイン（`/etc/userdb`、`/run/userdb`、`/run/host/userdb`、`/usr/lib/userdb` の `*.membership`、`*.user` の `memberOf`、`*.group` の `members`）がこのグループを指定したり、この gid を別の名前で定義したりしてはなりません。NSS に `systemd` がある場合は、`/run/systemd/userdb` の各 Varlink userdb サービス（homed、machined、`DynamicUser=`、サードパーティのサービス。マルチプレクサーと NSS の再エクスポートは除く）が、このグループの `GetMemberships` に `NoRecordFound` で応答し、ユーザー列挙（名前なしの `GetUserRecord`）にこのグループをプライマリ gid とするユーザーや `memberOf` でこのグループを指すユーザーがいない必要があります。また、どのサービスもこの gid の `GetGroupRecord` に `NoRecordFound` で応答しなければなりません（別名や別のメンバー一覧を防ぐため）。列挙を拒否できるのは `io.systemd.Machine` だけです。すべての問い合わせは合計 2 秒以内に完了する必要があります。メンバーシップ、エラー、タイムアウト、不正な応答はいずれも拒否になります。サーバーが `herdr` を補助グループとして持って動いている場合も拒否します。補助グループは setgid の解除では外れず、メンバーがいる証拠でもあるためです。読めない、または解析できないレコードがある場合も拒否します。鍵は、書き込む前に同じ検査を行うレビュー済みの root セットアップ手順だけが配置します。サーバー側の検査は多層防御です。各フィールドは u32 ビッグエンディアンのバイト長と UTF-8 バイトで符号化し、数値は符号なし 10 進文字列です。登録の `sig` は `herdr-enroll-v2`、`challenge`、`epoch`、`nonce`、`pane_id`、ペインのスレーブの `tty.dev` と `tty.ino`、固定したピアの `peer.pid` と `peer.pidns`（`PIDFD_GET_INFO` によるピアの pid と、サーバーの pid 名前空間の nsfs inode）に対する Ed25519 署名です。自分の `challenge` と `pane_id` から組み立てたメッセージに対して `/etc/herdr/server.pub` で検証し、`tty` が自分の stdin の `fstat` と、`peer.pid` が自分の pid と、`peer.pidns` が `/proc/self/ns/pid` の inode と一致することを確認してください。各カット応答の `sig` は同じ鍵による Ed25519 署名で、対象は `herdr-cut-answer-v2`、`epoch`、`seq`、`token`、`cut`、`digest`、`kind`、`result`、`reason`、principal の `smarty_id` と `display_name`（ない場合は空文字列）です。新しい応答、完全一致の再試行、早期の `unknown` 応答はすべて署名され、release の応答は署名されません。使える鍵がない場合、サーバーは `false` を通知し、登録を `server_key_unavailable` で拒否します。署名なしのモードはありません。
 
 登録とマーカーの書き込みは、順序保証された単一のペインアクター操作です。マーカーは `ESC _ herdr-epoch;<nonce> ESC \\` です。それ以前の入力を捨て、期待するマーカーを取り除いてから数えます。オフセット 0 はマーカー直後の最初のバイトです。`cut` は文字インデックスではなく、**終端を含まないバイト数**です。バイト列 `a\r` なら `cut = 2` になります。区間は `[prev_cut, cut)` で、初期値は `prev_cut = 0` です。`digest` はその正確なバイト列の SHA-256 を小文字の 16 進数で表した値です。カット以降のバイトは次の区間に残ります。Herdr は、クライアント入力、API 入力、ターミナル応答など、他のすべての入力経路で予約済みマーカーの導入部を無害化します。
 
 承認済みの中立な応答を除き、単一のクライアント接続からの入力は `client` です。マッピング済みの principal は `smarty_id` と `display_name` を持ち、未マッピングなら `principal` は `null` です。API のみなら `api`、API とクライアントの混在、または 2 つのクライアント接続なら `mixed` です。両クライアントが同一人物にマッピングされていても同じです。不確かな区間は理由付きの `unknown` になります。中立なのは、承認された **サーバー生成の数値または固定形式**の応答だけです。対象は DA1–3、DSR/CPR、DECRQM、kitty キーボードフラグ、XTVERSION、数値 RGB の OSC 10/11/4 レポートです。OSC 52、CSI 20t/21t、DECRQSS、および未承認の応答はすべて unknown で、中立にはなりません。API のテキストと API が送った Enter も中立ではありません。
 
-新しいカットでは `seq` を 1 ずつ増やし、1 から始めます。`token` は冪等性と照合の識別子であり、権限ではありません。有効なキーを使った完全一致の再試行（同じ epoch、シーケンス、token、cut、digest、kind）は記録済みの結果を返します。既知の token のフィールドを変更すると `token_conflict` で拒否され、古い token を新しいシーケンスに使うことはできません。カットは、サーバーが終端バイトを書いてから **30 秒以内**に到着する必要があります。保持する受領情報には 10 分の上限があり、生の区間バイトと別途計上する完全再試行レコードは、**ペインあたり 1 MiB のメモリ上限**を共有します。競合検出を弱めるレコードの削除は行わず、容量超過は `replay_overflow` として epoch を無効化します。生バイトの保持容量を超えた場合も送信元を確定できません。digest の不一致や書き込み済み範囲を超える cut も `unknown` を返し、epoch を無効化します。コンシューマーの終了（pid/開始時刻）、フォアグラウンドグループの変更、ペインランタイムまたはサーバーの再起動、release で epoch は終了します。権限と受領情報は永続化されず、新しい epoch の再試行キャッシュは空です。
+新しいカットでは `seq` を 1 ずつ増やし、1 から始めます。`token` は冪等性と照合の識別子であり、権限ではありません。登録したプロセスからの完全一致の再試行（同じ epoch、シーケンス、token、cut、digest、kind）は記録済みの結果を返します。既知の token のフィールドを変更すると `token_conflict` で拒否され、古い token を新しいシーケンスに使うことはできません。カットは、サーバーが終端バイトを書いてから **30 秒以内**に到着する必要があります。保持する受領情報には 10 分の上限があり、生の区間バイトと別途計上する完全再試行レコードは、**ペインあたり 1 MiB のメモリ上限**を共有します。競合検出を弱めるレコードの削除は行わず、容量超過は `replay_overflow` として epoch を無効化します。生バイトの保持容量を超えた場合も送信元を確定できません。digest の不一致や書き込み済み範囲を超える cut も `unknown` を返し、epoch を無効化します。コンシューマーの終了（pid/開始時刻）、フォアグラウンドグループの変更、ペインランタイムまたはサーバーの再起動、release で epoch は終了します。権限と受領情報は永続化されず、新しい epoch の再試行キャッシュは空です。
 
 principal の解決はサーバーが行い、クライアント接続ごとに一度だけ固定します。Linux では、検証済み remote-client bridge から root sshd の証拠にたどり着き、単一の受理済み SSH キーフィンガープリントと Tailscale の `Node.StableID` の両方が、同じ一意の principal にマッピングされる必要があります。ローカル接続、証拠の欠落、不一致、重複したマッピングは未マッピングのままです。クライアントの `hello.user`、`SSH_CONNECTION`、その他のクライアント申告は信用しません。サーバーが Linux なら Mac クライアントもマッピングできます。`/etc/herdr/principals.json` は root 所有で、グループや他ユーザーが書き込めない必要があります。バージョン 1 の形式は次のとおりです。
 
@@ -310,7 +324,7 @@ principal の解決はサーバーが行い、クライアント接続ごとに�
 
 マップはサーバー起動時に読み込み、新規接続時に mtime を確認します。無効なマップではラベルを付けず、既存の接続は固定済みのマッピングを維持します。**SIGHUP によるリロードはありません**。マップ更新のために SIGHUP を送らないでください。
 
-`epoch_key` は秘密に保ち、**決してログに記録しないでください**。独立した所有者専用の入力コンシューマー監査ログに token、epoch、シーケンス、cut、digest、kind、result を記録します。キー、nonce、生の入力は記録しません。結果を返す前に追記と fsync が成功することが送信元判定の条件です。失敗時は理由 `input_log_unavailable` の `unknown` を返し、epoch を無効化します。完全一致の再試行は永続化済みのレコードを再利用します。この監査ログは、既存の API 書き込み前入力ログとは別です。
+独立した所有者専用の入力コンシューマー監査ログに token、epoch、シーケンス、cut、digest、kind、result を記録します。nonce、署名、生の入力は記録しません。結果を返す前に追記と fsync が成功することが送信元判定の条件です。失敗時は理由 `input_log_unavailable` の `unknown` を返し、epoch を無効化します。完全一致の再試行は永続化済みのレコードを再利用します。この監査ログは、既存の API 書き込み前入力ログとは別です。
 
 ### ペインへの最後の入力
 
@@ -350,7 +364,69 @@ principal の解決はサーバーが行い、クライアント接続ごとに�
 
 このガードが識別するのはターミナルであり、その中のエージェント名、プロセス、ネイティブエージェントセッションではありません。別途定められたペイン間入力ポリシーは変更しません。
 
+`pane.close` も同じ任意の `expected_terminal` 文字列を受け付けます。サーバーは確認とクローズを同じステップで行うため、その間に別のターミナルがペインを引き継ぐことはありません。ペインが存在しない、識別子が不明、文字列が不正、または別のターミナルが接続されている場合は `terminal_identity_mismatch` を返し、何も閉じません。ガードなしでクローズするにはフィールドを省略します。古いサーバーは `pane.close` のこのフィールドを無視するため、`ping.result.capabilities.pane_close_expected_terminal_guard == true` を確認してから `pane.close_guarded` を送ってください。このメソッドは `expected_terminal` が必須で、古いサーバーはメソッドを拒否します。`expected_terminal_guard` だけでは、サーバーがクローズのガードに対応しているとは限りません。CLI は `pane close --expected-terminal` に `pane.close_guarded` を使い、未対応のサーバーを `expected_terminal_unsupported` で拒否します。
+
+```json
+{"id":"guarded_close","method":"pane.close_guarded","params":{"pane_id":"w1:p1","expected_terminal":"term_opaque_from_pane_get"}}
+```
+
+### 期待するエージェントセッションのガード
+
+`agent.prompt`、`pane.send_text`、`pane.send_keys` は、省略可能な `expected_agent_session_id` 文字列を受け付けます。現在の `pane.get` または `agent.get` レコードから `agent_session_id` をコピーし、`agent_session.value` は使わないでください。Pi では後者が再開用のパスになることがあります。サーバーは報告されたネイティブ ID を別に保持します。ID が未報告なら `agent_session_unknown`、異なる ID なら `agent_session_mismatch` です。これらの初期拒否では入力バイトを一切書き込まず、実際の ID をレスポンスに含めません。
+
+サーバーは受理したセッション報告を、ローカルソケット接続元のプロセス ID と開始時刻に関連付けます。要求の受理時には、キャッシュされた検出結果ではなくネイティブの最新情報を使い、同じプロセスが生存し、ペインの PTY の現在のフォアグラウンドプロセスグループに属することも確認します。終了、停止、バックグラウンド化、未関連付け、または置き換えられた報告元は、終了検出がペインを更新する前でも、入力バイトを一切書き込まずに初期拒否の `agent_session_unknown` を返します。この確認は Linux のみで利用できます。macOS、Windows、未対応のプラットフォームは安全を確認できないため `expected_agent_session_unsupported` で拒否します。macOS はネイティブな証明の実装待ちです。短命なフックの報告元は、終了後のガード付き送信を許可できません。セッションの期待値を省略すると、このプロセス確認は行いません。
+
+固定した報告元と期待する ID は、要求とともに PTY アクターに渡されます。各 `write(2)` の直前に、アクターは自身の PTY マスターに対して最新のネイティブ確認を繰り返します。部分的な書き込み、再試行、フォーカス用プレフィックス、テキスト、300 ms 遅延した Enter も対象です。受理後に所有権が失われると `agent_session_lost` を返し、残りの入力と Enter を破棄します。テキストの一部やプレフィックスはすでに書き込まれている可能性があります。テキスト段階のバイトが書き込まれている場合、Linux はアクターの PTY マスターから対応する正確なスレーブを開き、完了を返す前に `tcflush(slave, TCIFLUSH)` を呼び、蓄積された未読入力を破棄します。このフラッシュは tty 全体に作用するため、すでに蓄積された他の未読入力も破棄する可能性があります。読み取り側がすでに消費したバイトは取り消せず、同じ Pi の下書きが残る場合があります。このエラーは、書き込まれた、または消費された総バイト数がゼロであることを保証しません。
+
+`agent_session_lost` の `error.partial_text_consumed` は真偽値または `null` で、`error.flush_failed` は正確なスレーブのオープンまたは `TCIFLUSH` の失敗を示します。フラッシュが成功した場合（またはテキスト段階のバイトが未書き込みでフラッシュが不要な場合）、`flush_failed` は `false` です。この場合、テキスト段階のバイトが PTY に到達し、消費された可能性がある場合に限り `partial_text_consumed` は `true`、一切書き込まれていない場合に限り `false` です。読み取り側の受領確認ではありません。正確なスレーブのオープンまたは `TCIFLUSH` が失敗した場合は、`partial_text_consumed: null`（不明）と `flush_failed: true` を返します。セッションガード付きのテキストとキー送信は、キューへの追加で成功を返すのではなく、アクターの型付き完了結果を待ちます。完了は PTY への書き込みを確認するもので、受信側エージェントによる応答確認ではありません。喪失エラーが公開するのは期待する ID のみで、実際の ID は公開しません。エラー後に自動再試行したり unchecked 操作へ切り替えたりしないでください。
+
+正確なスレーブのオープンまたは `TCIFLUSH` が失敗しても、Herdr は PTY マスターを閉じず、ユーザーのプロセスを終了しません。残りの要求を破棄して Enter を送らず、その要求を `flush_failed: true` で失敗させ、警告をログに記録します。以降のペイン入力はブロックされません。
+
+`pane.clear_input_poison`（`pane_id` を指定）、または CLI `herdr pane clear-input-poison <pane>` は引き続き利用でき、任意の呼び出し元を受け付けます。呼び出し元はログに記録されます。**警告:** 蓄積されたテキストが入力行に残っている可能性があります。解除前に確認して破棄してください。解除しても行が空であるとは限らず、その後の Enter で読み取り側がすでにバッファーに保持しているテキストが送信される可能性があります。自動解除や再試行のための解除は行わないでください。
+
+```json
+{"id":"clear_input_poison","method":"pane.clear_input_poison","params":{"pane_id":"w1:p1"}}
+```
+
+同梱の Pi 統合バージョン 12 と OMP 統合バージョン 12 は、ネイティブ ID と変更のない再開用パスの両方を報告します。古いパスのみの統合では `agent_session_unknown` になります。`herdr integration install pi` または `herdr integration install omp` で更新済みの統合を再インストールし、安全な区切りでエージェントを再起動または再読み込みして、更新済みフックを読み込み ID を報告させてください。このフックの読み込みは一時停止からの回復ではありません。同じネイティブセッションを再開または再読み込みしても、ガード付き送信は再び許可されません。新しいセッションを開始する（`/new`）か、エージェントを再起動してください。[フォローアップの issue](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/7577) を参照してください。
+
+`agent.prompt` は `expected_pane_id` も受け付け、ターゲット（エイリアスを含む）がその正確なペインに解決されることを要求します。異なるペインなら、初期拒否として入力バイトを一切書き込まずに `expected_pane_mismatch` を返します。これらの期待値は単独または組み合わせて使え、省略可能な `wait` オブジェクトとも併用できます。ペインへの送信はすでに正確な `pane_id` を指定するため、`expected_pane_id` フィールドはありません。初期チェックは受理時の Herdr の報告済みペイン状態に対してアトミックですが、エージェントがまだ報告していない内部セッション変更には対応できません。最後の最新プロセス／フォアグラウンド確認と `write(2)` の間のネイティブ確認／書き込みの隙間、および所有権喪失／フラッシュ／読み取り側の競合は残ります。読み取り側がフラッシュ前に蓄積されたバイトを消費する可能性があります。完了やフラッシュは、書き込まれた、または消費された総バイト数がゼロであることを保証しません。App からアクターへのキューと遅延 Enter の待機はガードされますが、これらのネイティブの競合をなくすものではありません。期待値を省略すると既存の動作を維持し、ペイン間入力ポリシーも変わりません。
+
+`ping.result.capabilities.expected_agent_session_guard == true` を確認してください（対応し `true` を通知するのは Linux のみです。macOS と Windows は `false` を通知し、安全を確認できないため拒否します。macOS はネイティブな証明の実装待ちです）。ガード付き操作には `agent.prompt_session_checked`、`pane.send_text_session_checked`、`pane.send_keys_session_checked` を使います。checked prompt メソッドには少なくとも 1 つの期待値が必要で、checked ペイン送信には `expected_agent_session_id` が必要です。古いサーバーはこれらの名前を `invalid_request` で拒否し、ガードを黙って無視しません。ping と操作の間でサーバーが置き換わった場合も同様です。拒否後に unchecked メソッドへフォールバックしないでください。CLI は `--expected-session` と `agent prompt --expected-pane` にこれらのエイリアスを使い、能力がない場合には操作を送らずに `expected_agent_session_unsupported` を返します。
+
+```json
+{"id":"checked_prompt","method":"agent.prompt_session_checked","params":{"target":"worker","text":"review this change","expected_agent_session_id":"reported_id_from_agent_get","expected_pane_id":"w1:p1","wait":{"until":["idle"],"timeout_ms":30000}}}
+{"id":"checked_text","method":"pane.send_text_session_checked","params":{"pane_id":"w1:p1","text":"hello","expected_agent_session_id":"reported_id_from_pane_get"}}
+{"id":"checked_keys","method":"pane.send_keys_session_checked","params":{"pane_id":"w1:p1","keys":["Enter"],"expected_agent_session_id":"reported_id_from_pane_get"}}
+```
+
+### 書き込み時のパスガード
+
+`pane.send_text_path_checked` と `pane.send_keys_path_checked` は、`pane.send_text` と `pane.send_keys` の params に加えて、必須の文字列 `refuse_if_exists`（絶対パス）を受け取ります。Herdr はリクエストの受理時にはパスを確認しません。PTY ライターは最初のリクエストバイトの書き込みが成功するまで、各書き込み試行の直前に `lstat` を実行します。最初のバイトを書き込む前に存在する claim はリクエストを防ぎ、書き込み開始後はリクエストを完了します。書き込みが 0 バイトのまま `EAGAIN`（ブロックする）または `EINTR`（中断された）を返した場合、パスガードは有効なままで、次の試行で再確認します。`lstat` が成功した場合（ファイルの種類を問わず、リンク先のないシンボリックリンクも含む）、Herdr は `guard_path_present` で拒否し、リクエストの書き込みは 0 バイト、`error.partial_text_consumed: false`、`error.flush_failed: false` となります。フラッシュは行いません。書き込みが続行するのはパスが存在しない場合（`ENOENT`、またはディレクトリでない構成要素による `ENOTDIR`）だけです。それ以外の `lstat` エラー（親ディレクトリの `EACCES`、`ELOOP`、`EIO` など）でもバイトを破棄し、メッセージに OS エラーを含む `guard_path_unverifiable` を返します。他のフィールドは `guard_path_present` と同じです。開始後はパスを再検査せず、部分チャンク、再試行、遅延 Enter を完了します。パスガードは未読入力をフラッシュしないため、無関係なキュー入力は保持されます。相対パスは `invalid_request` を返します。レスポンスはキュー投入ではなく、PTY ライターの完了を報告します。`expected_agent_session_id` も併用できますが、その場合は `expected_agent_session_guard` も必要です。その独立したガードの各書き込み前のネイティブチェックとセッション喪失時のフラッシュ動作は変わりません。
+
+`ping.result.capabilities.refuse_if_exists_guard == true` を確認してください（Unix サーバーのみ。Windows は `false` を通知し、`refuse_if_exists_unsupported` で拒否します）。古いサーバーはこれらのメソッド名を `invalid_request` で拒否するため、ping とリクエストの間にサーバーが置き換えられても安全側で失敗します。拒否された後に `pane.send_text` や `pane.send_keys` へフォールバックしないでください。別々の `lstat` と最初の `write(2)` は同期ではなく、その間に作成された claim を見逃す可能性があります（受容された技術的リスク [smarty-dev#12584](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/12584)）。
+
+```json
+{"id":"claim_checked_keys","method":"pane.send_keys_path_checked","params":{"pane_id":"w1:p1","keys":["esc"],"refuse_if_exists":"/run/user/1000/floor/claim"}}
+```
+
+### 検出されたエージェント状態の期待値ガード
+
+エージェントプロンプトの params は、省略可能な `expected_agent_status` フィールドを受け付けますが、**`expected_agent_session_id` が必須**です。状態だけのガードは未対応で、セッション期待値なしの状態期待値は `invalid_request` になります。状態に `"idle"` を指定すると、受理時に Herdr が**検出した**エージェント状態が idle であることを要求します。初期不一致では入力バイトを書き込む前に `expected_status_mismatch` を返します。省略すると既存のプロンプト動作を維持します。明示的な `null`、文字列以外、または未知の状態は `invalid_request` となり、ガードなしのプロンプトにはなりません。
+
+`ping.result.capabilities.expected_agent_status_guard == true` を確認し、状態ガード付きプロンプトには `agent.prompt_status_checked` を使ってください。このメソッドには `expected_agent_status` と `expected_agent_session_id` の両方が必要です。セッションガードのみをサポートするものを含め、古いサーバーは状態フィールドを黙って無視せず、未知のメソッドを拒否します。CLI は `--expected-status` が指定されるとこのメソッドを使い、未対応サーバーを `expected_agent_status_unsupported` で拒否します。旧メソッドでの再試行はありません。期待値を黙って外したり、拒否後に別のプロンプトメソッドへフォールバックしたりしないでください。対応サーバーは `agent.prompt` と `agent.prompt_session_checked` に指定されたフィールドも強制しますが、これらの名前だけでは古いサーバーでの強制を保証できません。
+
+```json
+{"id":"status_checked_prompt","method":"agent.prompt_status_checked","params":{"target":"worker","text":"review this change","expected_agent_session_id":"reported_id_from_agent_get","expected_agent_status":"idle"}}
+```
+
+比較にはフックとスクリーン検出から得た有効な検出状態を使い、ペインの既読状態や `done` 表示は使いません。`done` と表示される idle エージェントも `"idle"` を満たします。必須のセッション期待値に加え、`expected_pane_id` と省略可能な `wait` オブジェクトも指定できます。検出状態の条件は既存のセッション／報告元ガードに付随し、受理時と PTY 書き込み前に確認します。受理後に検出状態が不一致となった場合も `expected_status_mismatch` を返し、リクエストの残りのバイトを停止して、それ以降の Enter を送りません。入力の一部がすでに書き込まれている可能性があり、この後段のエラーは総書き込みバイト数がゼロであることを保証しません。セッション所有権の喪失は引き続き別の `agent_session_lost` エラーです。
+
+検出された idle は**最後に観測した状態**であり、実際のエージェントが busy ではないことのトランザクション的な証明ではありません。フックとスクリーンの観測には遅延があり、確認後に busy になることもあります。破壊的なコマンドには引き続きエージェント側の busy チェックが必要です。idle になるまで待つ操作ではなく、`wait` は引き続き送信後の活動と安定状態を観測します。
+
 `pane.send_keys` と `pane.send_input.keys` は Herdr のキーコンボ文字列を受け付けます: 通常の印字可能キー、`enter` や `esc` のような特殊キー、`ctrl+h`、`control+j`、`alt+x`、`shift+tab` のような修飾キーコード、`f1` のようなファンクションキー、`minus` や `plus` のような名前付き記号です。`prefix+` のバインド文字列は受け付けません。
+
+macOS では、`pane.send_input`（`pane run` が使用）と `agent.start` は、コマンドを入力キューに受け入れる前に、ターミナルの現在のカノニカルモードの入力上限を確認します。Enter を含むエンコード済みの行が上限を超える場合、入力全体を拒否します。シェルプロンプトが表示されてから再試行してください。複数の短い行と raw モードの入力は引き続き使用できます。成功応答はキューへの受け入れを示し、コマンドの実行完了を意味しません。この確認は今回の送信だけを対象とし、以前の未完了行を検査したり、キューで待機中にターミナルモードが変わらないことを保証したりするものではありません。
 
 ```json
 {"id":"req_current","method":"pane.current","params":{"caller_pane_id":"w1:p1"}}
@@ -711,10 +787,10 @@ Herdr は `HERDR_SOCKET_PATH`、`HERDR_BIN_PATH`、`HERDR_ENV=1`、`HERDR_PLUGIN
 `input_origin_unknown` を返します。明示的な `allow_cross_pane` は引き続き別の
 上書き手段です。トークンは発行元サーバー上で、アクションのプロセスが生存している
 間だけ、最長 10 分有効です。サーバーが保持する許可は失効済みのものを含めて最大
-256 件で、有効または保留中の許可で満杯の場合、アクションはトークンなしで通常の
-入力ルールに従って実行され、新しい許可は発行されません。この場合、グローバルな
-アクションはアクショントークン導入前と同じ通常のクライアントとして実行され、
-そのルールでは既存のペインへの書き込みが許可されます。
+256 件です。有効または保留中の許可で満杯の場合、安全な乱数を生成できない場合、または
+呼び出し元のターミナルを結び付けられない場合は、許可は発行されず、ユーザーが呼び出した
+アクションはグローバルかペインかにかかわらず起動しません。Herdr は、アクションが
+セキュリティ許可を取得できなかったことを示すエラーを表示します。もう一度お試しください。
 スタートアップフックとイベントフックには渡されません。ログに含めないでください。
 同じ OS ユーザーのプロセスは互いの環境を読み取れる場合があるため、プロセス間の
 隔離境界ではありません。
@@ -816,7 +892,7 @@ JSON のデコードまで到達したリクエスト行では、メソッドや
 
 どちらのメソッドも、Herdr サーバーの再起動後に報告元の現在のセッションを再開するコマンドを、省略可能な `resume_argv` 配列で受け付けます。配列は最大 64 要素、合計 8 KiB までです。最初の要素はパスではなく単純なコマンド名でなければならず、どの要素にもアポストロフィや制御文字を含めることはできません。無効な値は `invalid_resume_argv` で失敗し、その報告は適用されません。カスタムエージェントは、コマンドを付ける前に `pane.report_agent` でペインを保持している必要があり、そうでない場合は `resume_not_accepted` で失敗します。Herdr は同じ `source` と `agent` がペインを保持している間だけコマンドを保持し、そのエージェントに対する Herdr 組み込みの resume コマンドより優先します。古い Herdr はこのフィールドを無視します。
 
-`resume_argv` を含む報告はコンテンツ書き込みです。Herdr はローカルのエージェント呼び出し元とその子プロセスをターミナルに帰属させ、別ペインへの報告を `cross_pane_input_denied` で拒否します。帰属を確認できない呼び出し元には `input_origin_unknown` を返します。両メソッドは明示的に許可する `allow_cross_pane`（既定値 `false`）を受け付け、CLI では `herdr pane report-agent ... --allow-cross-pane -- <resume-command...>` または `herdr pane report-agent-session ... --allow-cross-pane -- <resume-command...>` を使用します。`resume_argv` のない報告はメタデータのみで、この許可は不要です。明示的な許可はペイン間ポリシーのみを回避し、resume の検証や報告の権限ルールは回避しません。
+`resume_argv` を含む報告はコンテンツ書き込みです。Herdr はローカルのエージェント呼び出し元とその子プロセスをターミナルに帰属させ、別ペインへの報告や帰属を確認できない報告をログに記録します。入力元チェックは助言的で、これらを拒否しません。両メソッドは互換性のため `allow_cross_pane`（既定値 `false`）を引き続き受け付け、CLI では `herdr pane report-agent ... --allow-cross-pane -- <resume-command...>` または `herdr pane report-agent-session ... --allow-cross-pane -- <resume-command...>` を使用します。`resume_argv` のない報告はメタデータのみで、この許可は不要です。明示的な許可はペイン間ポリシーのみを回避し、resume の検証や報告の権限ルールは回避しません。
 
 ```json
 {
@@ -846,6 +922,8 @@ Herdr に保存されたネイティブセッション参照があるとき、`p
 ```
 
 ネイティブセッション参照が保存されていない場合、このフィールドは省略されます。
+
+`agent.list` と `agent.get` のレスポンスには常に `name` が含まれます。明示的に名前が設定されている場合は文字列、ペインのエージェントに名前がない場合は `null` です。名前は `agent.rename` で設定する任意のラベルであり、エージェントの種類、`display_agent`、ペインのラベルとは別です。Herdr が名前を自動生成することはありません。
 
 `pane.get`、`pane.list`、`agent.get`、`agent.list` は、ペインの PTY を現在制御しているプロセスの cwd を解決できるときに `foreground_cwd` も公開します。既存の `cwd` フィールドは、ラベル、follow-cwd 挙動、復元されたセッション状態に使われるペイン/ワークスペースの cwd のままです。
 
@@ -917,6 +995,14 @@ workspace の get/list 応答は結果の `tokens` マップを公開し、ス�
 すべての項目が有効でなければなりません。参照先ペインが 1 つでも存在しない場合、Herdr はリクエスト全体をエラーで拒否し、接続を閉じます。他の項目が購読されたと仮定せず、ペイン一覧を更新して再試行してください。
 ライフサイクルイベントの購読はリクエストが受理された時点から始まり、それ以前に保持されていたイベントは再生しません。
 
+購読が拒否された場合、リクエストの `id` と安定した `error.code` を含むエラーレスポンスを 1 つ返し、ストリームを開始せずに接続を閉じます:
+
+- `invalid_request`: リクエストまたは購読項目の形式が不正か、このサーバーが対応していない購読 `type` を指定しています (例: 古い Herdr に `pane.agent_session_changed` を要求した場合)。
+- `pane_not_found`: ペイン単位の項目が存在しないペインを指定しています。
+- `server_unavailable`: サーバーがリクエストを処理できませんでした (例: 終了処理中)。
+
+ソケットが接続を受け付けない場合はレスポンスがありません。サーバーが起動していないものとして扱ってください。
+
 ライフサイクルとエージェント状態のイベントは、各購読内の順序を保った上限付きのバッチで送信されます。イベント履歴は永続ログではありません。購読の初期化中も含め、購読者が保持範囲より遅れた場合、サーバーは元のリクエスト `id` と `error.code: "events_lost"` を含むエラーレスポンスを送り、その購読接続を閉じます。欠落したイベントを通知せずに配信を続けることはありません。他のクライアント接続には影響しません。履歴はイベント種別間で共有されるため、失われたイベントが購読条件に一致しなかった可能性があっても、保持範囲を超えたことを通知します。
 
 `events_lost` を受け取ったら、キャッシュを古い状態として扱います。新しい購読を開始して `subscription_started` を待ち、読み取りを続けながら別の接続で `session.snapshot` を取得してください。サーバーの現在の状態でキャッシュを照合し、スナップショットでキャッシュ全体を置き換えます。イベントはキャッシュの無効化通知として扱い、再取得の契機にします。取得は直列に行い、取得中にイベントが届いた場合は完了後に再取得してください。
@@ -925,7 +1011,7 @@ workspace の get/list 応答は結果の `tokens` マップを公開し、ス�
 
 ワークスペースのイベント購読には `workspace.created`、`workspace.updated`、`workspace.metadata_updated`、`workspace.renamed`、`workspace.moved`、`workspace.reordered`、`workspace.closed`、`workspace.focused` があります。`workspace.metadata_updated` はプラグインイベントフックを実行せずにトークン変更と TTL 失効を報告します。その他のワークスペースイベントは Herdr の UI/ランタイムのライフサイクルを記述します。ワークスペースが worktree グループに属している場合、`workspace.created` は任意の `workspace.worktree` 出自情報を含みます。`workspace.moved` は、移動した `workspace_id`、要求された `insert_index`、更新済みの順序付き `workspaces` リストを含みます。`workspace.reordered` は、アトミックに移動した `workspace_ids`、省略可能な `before_workspace_id`、サーバーが確定した順序付き `workspaces` リストを含みます。削除前に Herdr がまだ識別できる場合、`workspace.closed` は最終的な `workspace` スナップショットを含みます。
 タブのイベント購読には `tab.created`、`tab.closed`、`tab.focused`、`tab.renamed`、`tab.moved` があります。`tab.moved` は、移動した `tab_id`、`workspace_id`、要求された `insert_index`、そのワークスペースの更新済みの順序付き `tabs` リストを含みます。
-ペインのイベント購読には `pane.created`、`pane.updated`、`pane.closed`、`pane.focused`、`pane.moved`、`pane.exited`、`pane.agent_detected`、`pane.output_matched`、`pane.agent_status_changed`、`pane.scroll_changed` があります。`pane.focused` は、このサーバーに接続した任意のクライアントでの手動ペイン選択も報告します。他のクライアントの表示は移動させず、ペイロードにクライアントの識別情報は含みません。選択済みのペインを再度選んでも発行しません。ターミナルタイトルの変更は `pane.updated` を発行することがありますが、生のタイトルでスピナーだけが変化し、`terminal_title_stripped` が変わらない場合は発行しません。`pane.scroll_changed` は 1 つの `pane_id` を対象とし、Herdr がスクロールスナップショットの変化を検出するたびに `pane_id`、`workspace_id`、現在の `scroll` 情報を発行します。
+ペインのイベント購読には `pane.created`、`pane.updated`、`pane.closed`、`pane.focused`、`pane.moved`、`pane.exited`、`pane.agent_detected`、`pane.output_matched`、`pane.agent_status_changed`、`pane.agent_session_changed`、`pane.scroll_changed` があります。`pane.focused` は、このサーバーに接続した任意のクライアントでの手動ペイン選択も報告します。他のクライアントの表示は移動させず、ペイロードにクライアントの識別情報は含みません。選択済みのペインを再度選んでも発行しません。ターミナルタイトルの変更は `pane.updated` を発行することがありますが、生のタイトルでスピナーだけが変化し、`terminal_title_stripped` が変わらない場合は発行しません。`pane.scroll_changed` は 1 つの `pane_id` を対象とし、Herdr がスクロールスナップショットの変化を検出するたびに `pane_id`、`workspace_id`、現在の `scroll` 情報を発行します。`pane.agent_session_changed` は `pane.agent_status_changed` と同様に 1 つの `pane_id` を対象とします。そのペインのエージェントが (`pane.report_agent_session`、またはセッションを含む `pane.report_agent` で) 現在と異なる id のセッションを報告したとき、または同じセッションが異なる実際のエージェントセッション id で報告されたとき (id が設定された、消えた、または別の id に変わった場合) に発行されます。現在のセッションを同じ実際の id で再度報告しても発行しません。イベントは `pane_id`、`workspace_id`、`agent`、`session_id`、`previous_session_id`、`agent_session_id`、`previous_agent_session_id` を含み、ペインに以前のセッションがなかった場合 `previous_session_id` は `null` です。`session_id` はペインの `agent_session.value` と一致します。報告された `agent_session_id`、Pi と omp では `agent_session_path` が報告されていればそのパスです。`agent_session_id` はこの報告の後に `pane get` が `agent_session_id` として返す実際の id で、`previous_agent_session_id` は報告前の id です。どちらも、実際の id が紐付いていない場合 (たとえば最初のパスのみの報告や、id のない別セッションの報告) は `null` です。すでに紐付いている同じセッションをパスのみで報告した場合は id が保持されます。そのため購読者は `agent_session_id` が `null` であることで、実際の id なしで登録されたセッションを検出できます。Herdr 公式のエージェント統合が報告したセッションのみを追跡します。
 レイアウトのイベント購読には `layout.updated` があります。このイベントは 1 つのタブについて更新済みの `PaneLayoutSnapshot` を運びます。`session.snapshot` でキャッシュを管理するクライアントは、このイベントを契機にサーバーから対象のレイアウトを再取得してください。遅れて届いたペイロードは、最新のスナップショットより古い可能性があります。
 
 worktree のイベント購読には `worktree.created`、`worktree.opened`、`worktree.removed` があります。worktree イベントは Git チェックアウトのライフサイクルを記述します。`worktree.created` は開かれた `workspace` と作成された `worktree` を含みます。`worktree.opened` は対象の `workspace`、開かれた `worktree`、`already_open` を含みます。`worktree.removed` は `workspace_id`、削除された `worktree`、`forced` を含みます。
@@ -934,9 +1020,11 @@ worktree のイベント購読には `worktree.created`、`worktree.opened`、`w
 
 ## API 入力ログ
 
-`pane.send_text`、`pane.send_input`、`pane.send_keys`、`agent.send_keys`、`agent.prompt` がペインに書き込む前に、herdr は状態ディレクトリの `api-input.jsonl`（例: `~/.local/state/herdr/api-input.jsonl`。所有者だけが読めるファイル）に JSON を 1 行追記します。行には時刻（`ts_ms`）、メソッド、対象のペインとターミナル、バイト数、そしてソケットのピアプロセスから herdr が知る呼び出し元（pid、ペイン、エージェント名、エージェントセッション）が入ります。テキストは記録しません。herdr がこの行を書けない場合、入力は `input_log_unavailable` で拒否されます。
+`pane.send_text`、`pane.send_input`、`pane.send_keys`、`agent.send_keys`、`agent.prompt` がペインに書き込む前、または `agent.prompt_guarded` がエージェントチャネルに配信する前に、herdr は状態ディレクトリの `api-input.jsonl`（例: `~/.local/state/herdr/api-input.jsonl`。所有者だけが読めるファイル）に JSON を 1 行追記します。行には時刻（`ts_ms`）、メソッド、対象のペインとターミナル、バイト数、そしてソケットのピアプロセスから herdr が知る呼び出し元（pid、ペイン、エージェント名、エージェントセッション）が入ります。テキストは記録しません。ログが 32 MiB に達すると、herdr は次の行を追記する前にログを `api-input.jsonl.1` にリネームします（以前の世代は置き換えられます）。ログが上限に達していてこのローテーションに失敗した場合、入力は `input_log_full` で拒否され、エラーにはログのパスとローテーションのエラーが含まれます。その他の理由で herdr がこの行を書けない場合、入力は `input_log_unavailable` で拒否されます。セッションチェック付きの形式（`pane.send_text_session_checked`、`pane.send_keys_session_checked`、`agent.prompt_session_checked`）は、期待セッションのチェックが入力を受け入れた後、基本メソッドとまったく同じように基本メソッド名で記録されます。
 
 Linux と macOS では、`caller.exe` と `caller.ppid` に書き込み時の実行ファイルのベース名（変更可能なプロセスラベルではありません）と親 PID を記録します。呼び出し元がどのペインにも属さない場合も同じです。Linux では、呼び出し元の cgroup に systemd の `.service` または `.scope` がある場合、`caller.unit` も記録します。取得できないフィールドは省略し、Windows やその他のプラットフォームではこれらのフィールドを記録しません。メタデータの取得失敗によって入力を拒否することはありません。打鍵された入力は API ログに記録しません。
+
+ソケットのピア識別情報がある行には、必ず `caller.ancestry` を記録します。値は `outside`（このサーバーの子孫ではないと証明された）、`unknown`（証明を完了できない、または未対応）、`reached`（祖先の探索がこのサーバーに到達した）です。これはペインの帰属とは独立しており、`caller.pane` が null であるだけでは祖先の判定になりません。入力ガードがリクエスト内で取得した証明があれば、ログはそれを再利用します。Linux ではさらに `caller.sid`（ピアの OS セッション ID。`getsid` と同じ ID を既存のプロセススナップショットから読み取る）と `caller.ancestry_root_pid`（探索で最後に調べた固定済み PID。`reached` ならサーバーの PID、それ以外は証明が止まるまでに調べた最上位の祖先）を記録します。この 2 フィールドは取得できない場合は省略し、他のプラットフォームにはありません。`caller.ancestor_exe` と `caller.ancestor_pid` は観測できた最も近い Herdr 以外の祖先を示します。`caller.pane_env_present` は `HERDR_PANE_ID` の存在だけを記録し、その値は記録しません。これらは診断用のフィールドであり、権限を付与したり入力ガードを変更したりしません。
 
 これにより、エージェントのセッションを読む側は、ターミナルのバイト列に何も加えずに、API がペインに送ったターンと打鍵されたターンを区別できます。
 

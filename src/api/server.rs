@@ -22,9 +22,9 @@ use crate::api::{
 };
 use crate::ipc::{
     bind_local_listener, is_connection_closed_error, local_stream_peer_closed,
-    local_stream_peer_identity, poll_local_stream_read, remove_socket_file_if_owned,
-    set_local_stream_polling, socket_file_identity, LocalStream, LocalStreamRead,
-    SocketFileIdentity,
+    local_stream_peer_identity, local_stream_peer_pidfd, poll_local_stream_read,
+    remove_socket_file_if_owned, set_local_stream_polling, socket_file_identity, LocalStream,
+    LocalStreamRead, SocketFileIdentity,
 };
 use crate::server::shutdown::{ServerStop, ShutdownReason};
 
@@ -152,7 +152,15 @@ fn default_capabilities() -> Option<ServerCapabilities> {
         ssh_agent_registration: false,
         guarded_live_handoff: crate::platform::capabilities().live_handoff,
         expected_terminal_guard: true,
-        input_consumer: crate::platform::input_consumer_supported(),
+        pane_close_expected_terminal_guard: true,
+        // Native live-generation and PTY foreground proof is required. Other
+        // platforms deliberately refuse guarded session delivery.
+        expected_agent_session_guard: crate::platform::expected_agent_session_guard_supported(),
+        expected_agent_status_guard: crate::platform::expected_agent_session_guard_supported(),
+        // The Unix PTY writer checks the path before each write(2).
+        refuse_if_exists_guard: cfg!(unix),
+        input_consumer: crate::platform::input_consumer_supported()
+            && crate::platform::server_key_available(),
     })
 }
 
@@ -463,7 +471,7 @@ fn restrict_socket_permissions(path: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(test)]
-fn handle_connection(
+pub(crate) fn handle_connection(
     stream: LocalStream,
     api_tx: &ApiRequestSender,
     event_hub: &EventHub,
@@ -497,6 +505,9 @@ fn handle_connection_with_stop(
     if let Err(err) = stream.set_send_timeout(Some(STREAM_WRITE_TIMEOUT)) {
         debug!(err = %err, "api connection write timeout unavailable");
     }
+    // The input consumer pins cut and release to the enroll connection's pidfs
+    // identity; take it before the request is read (smarty-dev#2636 E′ item 4).
+    let peer_pidfd = local_stream_peer_pidfd(&stream);
 
     let Some(line) = read_initial_request_line(&mut stream)? else {
         return Ok(());
@@ -665,10 +676,17 @@ fn handle_connection_with_stop(
             }
             write_text_line_allow_disconnect(&mut stream, &response)
         }
-        Method::AgentPrompt(params) => {
+        Method::AgentPrompt(params)
+        | Method::AgentPromptSessionChecked(params)
+        | Method::AgentPromptStatusChecked(params) => {
             let response = prompt_agent(
                 request_id.clone(),
                 params,
+                match method {
+                    "agent.prompt_status_checked" => super::wait::AgentPromptKind::StatusChecked,
+                    "agent.prompt_session_checked" => super::wait::AgentPromptKind::SessionChecked,
+                    _ => super::wait::AgentPromptKind::Legacy,
+                },
                 context,
                 &mut stream,
                 api_tx,
@@ -692,6 +710,43 @@ fn handle_connection_with_stop(
             let response =
                 wait_for_output(request_id.clone(), params, &mut stream, api_tx, running)?;
             finish_wait_response(&mut stream, response, &request_id, method, changes_ui)
+        }
+        method_body @ (Method::PaneInputConsumerEnroll(_)
+        | Method::PaneInputConsumerCut(_)
+        | Method::PaneInputConsumerRelease(_)) => {
+            let response = if server_stop.is_some_and(ServerStop::is_requested) {
+                error_response_json(
+                    request_id.clone(),
+                    "server_unavailable",
+                    "server is shutting down".into(),
+                )
+            } else {
+                dispatch_to_app(
+                    Request {
+                        id: request_id.clone(),
+                        method: method_body,
+                    },
+                    api_tx,
+                    None,
+                    context,
+                    peer_pidfd,
+                    None,
+                    None,
+                )
+            };
+            let result = write_text_line_allow_disconnect(&mut stream, &response);
+            match &result {
+                Ok(()) => crate::logging::api_request_completed(
+                    &request_id,
+                    method,
+                    api_response_outcome(&response),
+                    changes_ui,
+                ),
+                Err(err) => {
+                    crate::logging::api_request_failed(&request_id, method, &err.to_string())
+                }
+            }
+            result
         }
         method_body => {
             let (response_write_tx, response_write_rx) = std::sync::mpsc::channel();
@@ -851,6 +906,7 @@ fn handle_request_with_context(
             let _ = api_tx.send(ApiRequestMessage {
                 request,
                 context,
+                peer_pidfd: None,
                 respond_to,
                 response_write_complete: None,
             });
@@ -878,6 +934,7 @@ fn handle_request_with_context(
         api_tx,
         None,
         context,
+        None,
         response_write_complete,
         None,
     )
@@ -898,6 +955,7 @@ fn dispatch_draft_state_with_timeout(
         api_tx,
         Some(timeout),
         context,
+        None,
         response_write_complete,
         Some(("timeout", "draft observation timed out")),
     );
@@ -977,6 +1035,8 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::AgentChannelInfo(_) => "agent.channel_info",
         Method::AgentDraftState(_) => "agent.draft_state",
         Method::AgentPromptGuarded(_) => "agent.prompt_guarded",
+        Method::AgentPromptSessionChecked(_) => "agent.prompt_session_checked",
+        Method::AgentPromptStatusChecked(_) => "agent.prompt_status_checked",
         Method::AgentWait(_) => "agent.wait",
         Method::PaneSplit(_) => "pane.split",
         Method::PaneSwap(_) => "pane.swap",
@@ -997,6 +1057,7 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::PaneResize(_) => "pane.resize",
         Method::PaneScroll(_) => "pane.scroll",
         Method::PaneClear(_) => "pane.clear",
+        Method::PaneClearInputPoison(_) => "pane.clear_input_poison",
         Method::PaneEditScrollback(_) => "pane.edit_scrollback",
         Method::PaneSelectionRead(_) => "pane.selection.read",
         Method::PaneCopyMotion(_) => "pane.copy_motion",
@@ -1014,7 +1075,11 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::PaneLinkResolve(_) => "pane.link.resolve",
         Method::PaneRename(_) => "pane.rename",
         Method::PaneSendText(_) => "pane.send_text",
+        Method::PaneSendTextSessionChecked(_) => "pane.send_text_session_checked",
         Method::PaneSendKeys(_) => "pane.send_keys",
+        Method::PaneSendKeysSessionChecked(_) => "pane.send_keys_session_checked",
+        Method::PaneSendTextPathChecked(_) => "pane.send_text_path_checked",
+        Method::PaneSendKeysPathChecked(_) => "pane.send_keys_path_checked",
         Method::PaneSendInput(_) => "pane.send_input",
         Method::PaneSendInputGuarded(_) => "pane.send_input_guarded",
         Method::PaneRead(_) => "pane.read",
@@ -1024,6 +1089,7 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::PaneClearAgentAuthority(_) => "pane.clear_agent_authority",
         Method::PaneReleaseAgent(_) => "pane.release_agent",
         Method::PaneClose(_) => "pane.close",
+        Method::PaneCloseGuarded(_) => "pane.close_guarded",
         Method::PopupClose(_) => "popup.close",
         Method::EventsSubscribe(_) => "events.subscribe",
         Method::EventsWait(_) => "events.wait",
@@ -1434,7 +1500,7 @@ pub(super) fn dispatch_to_app_with_timeout_and_context(
     timeout: Option<Duration>,
     context: ApiRequestContext,
 ) -> String {
-    dispatch_to_app(request, api_tx, timeout, context, None, None)
+    dispatch_to_app(request, api_tx, timeout, context, None, None, None)
 }
 
 pub(super) fn dispatch_to_app_with_caller_timeout(
@@ -1449,15 +1515,18 @@ pub(super) fn dispatch_to_app_with_caller_timeout(
         timeout,
         context,
         None,
+        None,
         Some(("timeout", "timed out waiting for agent status")),
     )
 }
 
+#[allow(clippy::too_many_arguments)] // One private dispatcher; each caller names its options.
 fn dispatch_to_app(
     request: Request,
     api_tx: &ApiRequestSender,
     timeout: Option<Duration>,
     context: ApiRequestContext,
+    peer_pidfd: Option<crate::platform::PeerPidfd>,
     response_write_complete: Option<std::sync::mpsc::Receiver<()>>,
     timeout_response: Option<(&str, &str)>,
 ) -> String {
@@ -1466,6 +1535,7 @@ fn dispatch_to_app(
     if let Err(err) = api_tx.send(ApiRequestMessage {
         request,
         context,
+        peer_pidfd,
         respond_to,
         response_write_complete,
     }) {
@@ -1520,6 +1590,9 @@ fn caller_timeout_dispatch_uses_timeout_error() {
         Request {
             id: "prompt-timeout".into(),
             method: Method::AgentPrompt(crate::api::schema::AgentPromptParams {
+                expected_agent_session_id: None,
+                expected_pane_id: None,
+                expected_agent_status: None,
                 target: "reviewer".into(),
                 text: "review this".into(),
                 wait: None,
@@ -1554,9 +1627,21 @@ mod tests {
     use interprocess::local_socket::traits::Listener as _;
 
     #[test]
-    fn input_consumer_capability_is_advertised_only_on_linux() {
+    fn input_consumer_capability_requires_linux_and_the_server_key() {
         let caps = default_capabilities().expect("capabilities");
-        assert_eq!(caps.input_consumer, cfg!(target_os = "linux"));
+        assert_eq!(
+            caps.input_consumer,
+            cfg!(target_os = "linux") && crate::platform::server_key_available()
+        );
+    }
+
+    #[test]
+    fn session_reporter_foreground_capability_requires_native_live_proof() {
+        let caps = default_capabilities().expect("capabilities");
+        assert_eq!(
+            caps.expected_agent_session_guard,
+            crate::platform::expected_agent_session_guard_supported()
+        );
     }
     use std::collections::HashMap;
     use std::io::{BufRead, BufReader, Read};
@@ -1987,6 +2072,7 @@ mod tests {
             state_labels: HashMap::new(),
             tokens: HashMap::new(),
             agent_session: None,
+            agent_session_id: None,
             scroll: None,
             revision: 0,
         }
@@ -2236,6 +2322,10 @@ mod tests {
                 ssh_agent_registration: false,
                 guarded_live_handoff: true,
                 expected_terminal_guard: true,
+                pane_close_expected_terminal_guard: true,
+                expected_agent_session_guard: true,
+                expected_agent_status_guard: true,
+                refuse_if_exists_guard: true,
                 input_consumer: false,
             }),
             None,
@@ -2246,6 +2336,31 @@ mod tests {
         let parsed: SuccessResponse = serde_json::from_str(&response).unwrap();
         assert_eq!(parsed.id, "req_1");
         assert!(matches!(parsed.result, ResponseResult::Pong { .. }));
+    }
+
+    #[test]
+    fn expected_status_guard_is_advertised_only_with_session_guard_support() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let response = handle_request(
+            Request {
+                id: "capability-ping".into(),
+                method: Method::Ping(crate::api::schema::PingParams::default()),
+            },
+            &tx,
+            default_capabilities(),
+            None,
+            None,
+            None,
+        );
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            response["result"]["capabilities"]["expected_agent_status_guard"],
+            crate::platform::expected_agent_session_guard_supported()
+        );
+        assert_eq!(
+            response["result"]["capabilities"]["expected_agent_status_guard"],
+            response["result"]["capabilities"]["expected_agent_session_guard"]
+        );
     }
 
     #[test]
@@ -2607,6 +2722,70 @@ mod tests {
     }
 
     #[test]
+    fn expected_status_guard_requires_session_before_lookup_or_dispatch() {
+        for method in [
+            "agent.prompt",
+            "agent.prompt_session_checked",
+            "agent.prompt_status_checked",
+        ] {
+            for wait in [false, true] {
+                let (api_tx, mut api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+                let (mut client, server, path) = local_stream_pair("status-only-invalid");
+                let mut params = serde_json::json!({"target": "reviewer", "text": "hello", "expected_agent_status": "idle", "expected_pane_id": "w1:p1"});
+                if wait {
+                    params["wait"] = serde_json::json!({"timeout_ms": 100});
+                }
+                writeln!(
+                    client,
+                    "{}",
+                    serde_json::json!({"id": "status-only", "method": method, "params": params})
+                )
+                .unwrap();
+                let running = Arc::new(AtomicBool::new(true));
+                handle_connection(server, &api_tx, &EventHub::default(), &running, None).unwrap();
+                let response: ErrorResponse =
+                    serde_json::from_str(&read_line(&mut client)).unwrap();
+                assert_eq!(response.error.code, "invalid_request");
+                assert!(
+                    api_rx.try_recv().is_err(),
+                    "invalid status guard must not resolve or dispatch"
+                );
+                fs::remove_file(path).unwrap();
+            }
+        }
+        // The new alias requires both guards; the old alias still requires identity.
+        for (method, params) in [
+            (
+                "agent.prompt_status_checked",
+                serde_json::json!({"target": "reviewer", "text": "hello", "expected_agent_session_id": "session=a"}),
+            ),
+            (
+                "agent.prompt_status_checked",
+                serde_json::json!({"target": "reviewer", "text": "hello"}),
+            ),
+            (
+                "agent.prompt_session_checked",
+                serde_json::json!({"target": "reviewer", "text": "hello"}),
+            ),
+        ] {
+            let (api_tx, mut api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+            let (mut client, server, path) = local_stream_pair("missing-checked-guards");
+            writeln!(
+                client,
+                "{}",
+                serde_json::json!({"id": "missing-guard", "method": method, "params": params})
+            )
+            .unwrap();
+            let running = Arc::new(AtomicBool::new(true));
+            handle_connection(server, &api_tx, &EventHub::default(), &running, None).unwrap();
+            let response: ErrorResponse = serde_json::from_str(&read_line(&mut client)).unwrap();
+            assert_eq!(response.error.code, "invalid_request");
+            assert!(api_rx.try_recv().is_err());
+            fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
     fn subscription_setup_errors_preserve_request_id_and_reject_entire_stream() {
         let (api_tx, mut api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
         let event_hub = EventHub::default();
@@ -2722,87 +2901,105 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn agent_prompt_wait_preserves_local_peer_context() {
-        let (api_tx, mut api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
-        let (mut client, server, path) = local_stream_pair("agent-prompt-context");
-        client
-            .write_all(
-                br#"{"id":"prompt_wait","method":"agent.prompt","params":{"target":"target","text":"hello","wait":{"timeout_ms":100}}}"#,
-            )
-            .unwrap();
-        client.write_all(b"\n").unwrap();
-        client.flush().unwrap();
+        for method in [
+            "agent.prompt",
+            "agent.prompt_session_checked",
+            "agent.prompt_status_checked",
+        ] {
+            let (api_tx, mut api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+            let (mut client, server, path) = local_stream_pair("agent-prompt-context");
+            client
+                .write_all(
+                    serde_json::json!({"id": "prompt_wait", "method": method,
+                    "params": {"target": "target", "text": "hello", "wait": {"timeout_ms": 100},
+                        "expected_agent_session_id": "session=a", "expected_agent_status": "idle"}})
+                    .to_string()
+                    .as_bytes(),
+                )
+                .unwrap();
+            client.write_all(b"\n").unwrap();
+            client.flush().unwrap();
 
-        let running = Arc::new(AtomicBool::new(true));
-        let server_running = Arc::clone(&running);
-        let event_hub = EventHub::default();
-        let server_thread = std::thread::spawn(move || {
-            handle_connection(server, &api_tx, &event_hub, &server_running, None)
-        });
+            let running = Arc::new(AtomicBool::new(true));
+            let server_running = Arc::clone(&running);
+            let event_hub = EventHub::default();
+            let server_thread = std::thread::spawn(move || {
+                handle_connection(server, &api_tx, &event_hub, &server_running, None)
+            });
 
-        let agent_get = api_rx.blocking_recv().expect("agent.get dispatch");
-        assert!(matches!(agent_get.request.method, Method::AgentGet(_)));
-        agent_get
-            .respond_to
-            .send(
-                serde_json::to_string(&SuccessResponse {
-                    id: agent_get.request.id,
-                    result: ResponseResult::AgentInfo {
-                        agent: crate::api::schema::AgentInfo {
-                            terminal_id: "term_1".into(),
-                            name: Some("target".into()),
-                            agent: Some("pi".into()),
-                            title: None,
-                            terminal_title: None,
-                            terminal_title_stripped: None,
-                            display_agent: None,
-                            agent_status: crate::api::schema::AgentStatus::Idle,
-                            screen_detection_skipped: false,
-                            state_labels: HashMap::new(),
-                            tokens: HashMap::new(),
-                            agent_session: None,
-                            workspace_id: "ws_1".into(),
-                            tab_id: "tab_1".into(),
-                            pane_id: "pane_1".into(),
-                            focused: true,
-                            launch_pending: false,
-                            interactive_ready: true,
-                            state_change_seq: 1,
-                            completion_seq: None,
-                            cwd: None,
-                            foreground_cwd: None,
-                            revision: 0,
+            let agent_get = api_rx.blocking_recv().expect("agent.get dispatch");
+            assert!(matches!(agent_get.request.method, Method::AgentGet(_)));
+            agent_get
+                .respond_to
+                .send(
+                    serde_json::to_string(&SuccessResponse {
+                        id: agent_get.request.id,
+                        result: ResponseResult::AgentInfo {
+                            agent: crate::api::schema::AgentInfo {
+                                terminal_id: "term_1".into(),
+                                name: Some("target".into()),
+                                agent: Some("pi".into()),
+                                title: None,
+                                terminal_title: None,
+                                terminal_title_stripped: None,
+                                display_agent: None,
+                                agent_status: crate::api::schema::AgentStatus::Idle,
+                                screen_detection_skipped: false,
+                                state_labels: HashMap::new(),
+                                tokens: HashMap::new(),
+                                agent_session: None,
+                                agent_session_id: None,
+                                workspace_id: "ws_1".into(),
+                                tab_id: "tab_1".into(),
+                                pane_id: "pane_1".into(),
+                                focused: true,
+                                launch_pending: false,
+                                interactive_ready: true,
+                                state_change_seq: 1,
+                                completion_seq: None,
+                                cwd: None,
+                                foreground_cwd: None,
+                                revision: 0,
+                            },
                         },
-                    },
-                })
-                .unwrap(),
-            )
-            .unwrap();
+                    })
+                    .unwrap(),
+                )
+                .unwrap();
 
-        let prompt = api_rx.blocking_recv().expect("agent.prompt dispatch");
-        assert_eq!(
-            prompt.context.local_peer_pid(),
-            Some(std::process::id()),
-            "wait-mode prompt must retain the socket origin"
-        );
-        assert_eq!(
-            prompt.context.local_peer_identity,
-            crate::platform::process_identity(std::process::id()),
-            "wait-mode prompt must retain the captured socket process instance"
-        );
-        assert!(matches!(prompt.request.method, Method::AgentPrompt(_)));
-        let prompt_id = prompt.request.id.clone();
-        prompt
-            .respond_to
-            .send(error_response_json(
-                prompt_id,
-                "cross_pane_input_denied",
-                "agent-originated input cannot target a different pane".into(),
-            ))
-            .unwrap();
+            let prompt = api_rx.blocking_recv().expect("agent.prompt dispatch");
+            assert_eq!(
+                prompt.context.local_peer_pid(),
+                Some(std::process::id()),
+                "wait-mode prompt must retain the socket origin"
+            );
+            assert_eq!(
+                prompt.context.local_peer_identity,
+                crate::platform::process_identity(std::process::id()),
+                "wait-mode prompt must retain the captured socket process instance"
+            );
+            assert_eq!(api_method_name(&prompt.request.method), method);
+            let forwarded = serde_json::to_value(&prompt.request).unwrap();
+            assert_eq!(forwarded["params"]["expected_agent_status"], "idle");
+            assert_eq!(
+                forwarded["params"]["expected_agent_session_id"],
+                "session=a"
+            );
+            let prompt_id = prompt.request.id.clone();
+            prompt
+                .respond_to
+                .send(error_response_json(
+                    prompt_id,
+                    "cross_pane_input_denied",
+                    "agent-originated input cannot target a different pane".into(),
+                ))
+                .unwrap();
 
-        let response: serde_json::Value = serde_json::from_str(&read_line(&mut client)).unwrap();
-        assert_eq!(response["error"]["code"], "cross_pane_input_denied");
-        server_thread.join().unwrap().unwrap();
-        let _ = std::fs::remove_file(path);
+            let response: serde_json::Value =
+                serde_json::from_str(&read_line(&mut client)).unwrap();
+            assert_eq!(response["error"]["code"], "cross_pane_input_denied");
+            server_thread.join().unwrap().unwrap();
+            let _ = std::fs::remove_file(path);
+        }
     }
 }

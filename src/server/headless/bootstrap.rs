@@ -15,6 +15,14 @@ pub fn run_server() -> io::Result<()> {
         }
     }
     crate::platform::raise_server_nofile_limit();
+    // Covers a normal start (and its session restore) and both handoff importers.
+    crate::platform::check_server_scheduling(if handoff_import {
+        "handoff-import"
+    } else if args.iter().any(|arg| arg == "--import-from-running") {
+        "import-from-running"
+    } else {
+        "start"
+    });
 
     if handoff_import {
         let socket_path = args
@@ -254,6 +262,10 @@ fn serve_handoff_import(mut received: crate::server::handoff::ReceivedHandoff) -
         // Carried across before any client attaches, so the first title sent is
         // the override rather than the configured one it replaced.
         server.api_window_title = received.manifest.api_window_title.take();
+        // A restart announced before the handoff still commits after it.
+        server
+            .host_shutdown_intent
+            .set(received.manifest.host_shutdown_intent);
         if std::env::var("HERDR_TEST_HANDOFF_IMPORT_FAIL").as_deref() == Ok("hang_before_ready") {
             // A replacement that holds the public sockets but never becomes ready.
             loop {

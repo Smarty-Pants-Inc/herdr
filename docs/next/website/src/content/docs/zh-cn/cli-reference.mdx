@@ -196,7 +196,7 @@ herdr tab close <tab_id>
 
 标签页是工作区内的另一个终端布局。不指定 `--workspace` 时,`tab create` 使用活动工作区;如果没有活动工作区则失败。JSON 响应中的 `.result.tab.tab_id` 和 `.result.root_pane.pane_id` 是对应 ID。关闭工作区的最后一个标签页也会关闭该工作区。启用 `ui.confirm_close` 时，如果关闭父工作树的最后一个标签页会连带关闭整个工作树组，`tab close` 会返回 `confirmation_required` 错误。
 
-启用 `ui.confirm_close` 时，通过快捷键或标签页菜单关闭工作区的最后一个标签页前，TUI 会要求确认。普通的 CLI/API 标签页关闭操作仍立即执行。
+启用 `ui.confirm_close` 时，通过快捷键或标签页／窗格菜单关闭工作区的最后一个标签页或唯一窗格前，TUI 会要求确认。普通的窗格关闭及 CLI/API 关闭操作仍立即执行。
 
 创建工作区、标签页和拆分窗格默认不改变焦点。`--focus` 选择新布局;`--no-focus` 显式表达默认行为。不指定 `--cwd` 时,新终端遵循 `terminal.new_cwd` 设置,默认跟随来源窗格或工作区。每个 `--env KEY=VALUE` 在新的根 shell 中添加或替换一个环境变量。
 
@@ -220,8 +220,11 @@ herdr pane swap --source-pane ID --target-pane ID
 herdr pane move <pane_id> --tab <tab_id> --split right|down [--target-pane ID] [--ratio FLOAT] [--focus|--no-focus]
 herdr pane move <pane_id> --new-tab [--workspace ID] [--label TEXT] [--focus|--no-focus]
 herdr pane move <pane_id> --new-workspace [--label TEXT] [--tab-label TEXT] [--focus|--no-focus]
-herdr pane close <pane_id>
+herdr pane clear-input-poison <pane>
+herdr pane close <pane_id> [--expected-terminal TERMINAL_ID]
 ```
+
+`pane close --expected-terminal <terminal_id>` 仅在窗格仍持有该终端时才关闭窗格。关闭你自己启动的窗格时使用它:`terminal_id` 是不透明值,请从创建窗格的响应或 `pane get` 中复制。如果窗格现在持有另一个终端(例如服务器被替换后,新终端复用了同一窗格 ID),服务器会以 `terminal_identity_mismatch` 拒绝,并且不关闭任何窗格。服务器在同一步骤中检查标识并关闭窗格,因此其间不会有别的终端接管该窗格。如果服务器未声明支持,CLI 返回 `expected_terminal_unsupported`,不关闭任何窗格。不带该参数时,`pane close` 的行为不变。
 
 接受 `--current` 的窗格命令在 Herdr 窗格内运行时使用调用方的 `HERDR_PANE_ID`。对 `pane split` 而言，显式窗格 ID 或 `--pane ID` 拆分指定窗格。省略目标时，若存在 `HERDR_PANE_ID` 则拆分调用方窗格，否则使用当前聚焦的窗格。`--current` 必须有调用方窗格；缺少 `HERDR_PANE_ID` 时会报错。拆分响应中的新窗格 ID 位于 `.result.pane.pane_id`。
 
@@ -240,8 +243,8 @@ herdr pane read <pane_id> --source recent-unwrapped --lines 120
 发送输入:
 
 ```bash
-herdr pane send-text <pane_id> <text>
-herdr pane send-keys <pane_id> <key> [key ...]
+herdr pane send-text <pane_id> [--expected-session ID] [--refuse-if-exists PATH] <text>
+herdr pane send-keys <pane_id> [--expected-session ID] [--refuse-if-exists PATH] <key> [key ...]
 herdr pane run <pane_id> <command>
 ```
 
@@ -250,6 +253,24 @@ herdr pane run <pane_id> <command>
 标准拼写是 `esc`;也接受 `escape`。
 
 `pane run` 会遵循当前的 bracketed paste 模式,并把文本和 Enter 作为一个原子操作提交。发送命令时优先用它,而不是 `send-text` 加 `send-keys Enter`;单独的发送操作仍是底层操作,不会提交命令。
+
+在 `agent prompt`、`pane send-text` 或 `pane send-keys` 上使用 `--expected-session ID`，可拒绝向不同的已上报原生智能体会话发送输入。请从 `pane get` 或 `agent get` 复制当前的 `agent_session_id`。这是上报的 ID，不是 `agent_session.value`：对 Pi，该值可以是恢复路径，而 Herdr 会单独保留上报的 ID。没有上报 ID 时，带守卫的输入返回 `agent_session_unknown`；ID 不同时返回 `agent_session_mismatch`。这些初始拒绝不会泄露实际 ID，也不会写入任何输入字节。
+
+`agent prompt` 的目标可以是别名。添加 `--expected-pane ID` 可要求它仍解析到先前观察到的窗格；解析到不同窗格时返回 `expected_pane_mismatch`，不写入任何输入字节。两个预期条件可以单独或一起使用，也可与 `--wait` 一起使用。`pane send-text` 和 `pane send-keys` 已经指定精确且规范化的 `pane_id`，因此不接受 `--expected-pane`。
+
+使用 `--expected-session` 时，服务器在接受请求时固定会话上报者的进程 ID 和启动时间，然后在每次 `write(2)` 前重新检查该进程仍存活且属于此 PTY 的前台进程组。部分写入、重试、任何焦点前缀、文本和延迟的 Enter 都受此检查约束。接受后若失去所有权，会返回 `agent_session_lost`：丢弃剩余输入和 Enter，但可能已经写入部分文本或前缀。如果已写入文本阶段的字节，Linux 会从 actor 的 PTY master 打开其对应的确切 slave，并在返回完成结果前调用 `tcflush(slave, TCIFLUSH)`，丢弃已暂存但尚未读取的输入。此刷新作用于整个 tty，也可能丢弃其他已经暂存的未读输入。它无法撤回读取方已经消费的字节；同一个 Pi 草稿可能仍然保留。
+
+`agent_session_lost` 的 `partial_text_consumed` 为布尔值或 `null`，`flush_failed` 表示打开确切 slave 或执行 `TCIFLUSH` 是否失败。刷新成功时（或未写入文本阶段的字节、无需刷新时），`flush_failed` 为 `false`：当且仅当文本阶段的字节已到达 PTY、可能已被消费时，`partial_text_consumed` 为 `true`；当且仅当没有写入任何文本阶段的字节时，为 `false`。这不是读取方的接收确认。如果打开确切 slave 或执行 `TCIFLUSH` 失败，错误返回 `partial_text_consumed: null`（未知）和 `flush_failed: true`。带守卫的发送返回 PTY actor 的完成结果，而非仅确认入队成功；这并不是接收方智能体的确认。由于输入可能已部分写入，出错后不要自动重试或移除预期条件。这些错误绝不会泄露实际会话 ID。
+
+如果打开确切 slave 或执行 `TCIFLUSH` 失败，Herdr 不会关闭 PTY master，也不会终止用户进程。它会丢弃剩余请求、不发送 Enter，以 `flush_failed: true` 使该请求失败，并记录警告。之后的窗格输入不会被阻止。
+
+`herdr pane clear-input-poison <pane>`（API `pane.clear_input_poison`）仍然可用，并接受任何调用方；调用方来源会记录到日志。清除前 Herdr 会再次丢弃窗格中未读取的输入（`TCIFLUSH`）；若失败则拒绝清除，窗格保持污染状态。**警告：** 前台程序已读取的文本仍留在其自身缓冲区，之后的 Enter 可能提交它。清除前请检查窗格。不要自动清除，也不要将清除作为重试策略。
+
+初始检查与接受请求时 Herdr 的已上报窗格状态是原子的。它无法检测智能体尚未上报的会话变化。仍有两类残余竞态：最后一次实时进程／前台原生检查与 `write(2)` 之间的检查／写入间隙，以及所有权丢失／刷新／读取方之间的竞态；读取方可能在刷新前消费已暂存的字节。完成结果和刷新都不保证总写入或总消费字节数为零。App 到 actor 的队列和延迟 Enter 的等待受守卫保护，但不能消除这些原生竞态。CLI 要求 `expected_agent_session_guard`，仅 Linux 支持并通告此能力。macOS 和 Windows 在无法确认安全时拒绝操作；macOS 的原生证明尚待实现。缺少支持时，CLI 返回 `expected_agent_session_unsupported`，不发送带守卫的操作，并使用 checked 方法名，因此即使能力检查后服务器被替换，也会在无法确认安全时拒绝操作。省略这些标志会保留现有行为和独立的跨窗格输入策略。
+
+已知限制：暂停后，恢复或重新加载同一个原生会话不会恢复带守卫发送的资格；请开启新会话（`/new`）或重启智能体。参见[后续问题](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/7577)。
+
+在 `pane send-text` 或 `pane send-keys` 上使用 `--refuse-if-exists PATH`，会在第一个请求字节成功写入前的每次写入尝试之前用 `lstat` 检查 PATH，而不是在接纳请求时检查。第一个字节写入前已存在的 claim 会阻止请求；一旦开始写入，请求就会完成。如果写入尝试返回 `EAGAIN`（会阻塞）或 `EINTR`（被中断），尚未写入任何字节，则重试前会再次检查 PATH。路径存在时返回 `guard_path_present`，退出码为 1，请求写入为 0 字节，`partial_text_consumed: false`、`flush_failed: false`。若无法检查路径（例如父目录不可搜索），则安全失败，返回 `guard_path_unverifiable` 和相同的 0 字节结果。只有路径不存在时才开始写入。开始后不再检查路径，部分分块、重试和延迟的 Enter 都会完成。路径守卫从不刷新未读输入，因此无关的排队输入会保留。独立的 `--expected-session` 守卫仍在每次写入前检查，并保留其会话丢失时的刷新行为。分开的 `lstat` 和第一次 `write(2)` 不是同步机制，可能漏掉在两者之间创建的 claim（已接受的技术风险 [smarty-dev#12584](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/12584)）。CLI 会以自身的工作目录为基准，把相对 PATH 转为绝对路径。它需要服务器能力 `refuse_if_exists_guard`（仅 Unix）；缺少该能力时，CLI 不发送并返回 `refuse_if_exists_unsupported`。CLI 使用带检查的方法 `pane.send_text_path_checked` 和 `pane.send_keys_path_checked`，因此旧服务器会拒绝请求，而不会忽略该标志。省略该标志时行为不变。
 
 从自定义钩子上报智能体状态:
 
@@ -321,7 +342,7 @@ herdr agent list
 herdr agent get <target>
 herdr agent read <target> [--source visible|recent|recent-unwrapped|detection] [--lines N] [--format text|ansi] [--ansi]
 herdr agent send-keys <target> <key> [key ...]
-herdr agent prompt <target> <text> [--if-draft-empty | --wait [--until STATUS]... [--timeout MS]] [--allow-cross-pane]
+herdr agent prompt <target> <text> [--if-draft-empty | [--expected-session ID] [--expected-pane ID] [--expected-status STATUS] [--wait [--until STATUS]... [--timeout MS]]] [--allow-cross-pane]
 herdr agent rename <target> <name>|--clear
 herdr agent focus <target>
 herdr agent wait <target> [--until STATUS]... [--timeout MS]
@@ -338,6 +359,18 @@ herdr agent explain --file PATH --agent LABEL [--json|--verbose]
 成功的 start 只有在预期智能体占用同一终端并可接受交互输入后才返回。如果启动期间检测到 `blocked`,命令会立即返回 `agent_not_ready`。该名称仍可用于 `agent read` 和 `agent send-keys`,检测变为 `idle` 后即可用于发送提示。默认启动超时是 30000 毫秒;显式值必须大于 3000 且不超过 300000。
 
 不带 `--if-draft-empty` 时，`agent prompt` 保留原有行为，遵循当前的 bracketed paste 模式，即使智能体处于 working，也会将文本和延迟的 Enter 作为一次有序提交写入。不带 `--wait` 时，成功只确认写入完成，不代表轮次已经开始。在 Windows 上，Codex 在 Enter 前会收到粘贴边界，因此提交不依赖提示大小；调用方的超时包含提交时间。如果智能体已经是 `blocked`,它不会发送输入,而是返回 `agent_blocked`。使用 `--wait` 时,从其他非 working 状态接受的提示必须在提交后的最多五秒内产生可观察的 `working` 或 `blocked` 状态，否则 Herdr 返回 `agent_prompt_stalled`；如果调用方的超时先到期，则返回普通的 `timeout` 错误。这可防止无关的 `idle`、`done` 或会话变化错误地完成等待。观察到活动后，它会等待请求的第一个稳定状态。它不会跟踪单独的轮次。如果智能体已经处于 working，当前轮次的完成可能满足等待。`--until` 用于缩小匹配状态，不带 `--wait` 时会被拒绝。独立的 `agent wait` 在当前状态匹配时立即返回。两者默认匹配 `idle`、`done` 或 `blocked`；需要 `unknown` 时请明确使用 `--until unknown`。
+
+为 `agent prompt` 添加 `--expected-status idle`，可要求 Herdr 在接受请求时**检测到的**智能体状态为 idle，否则拒绝提交。初始不匹配返回 `expected_status_mismatch`，不会写入任何输入字节。该检查比较钩子和屏幕检测得出的有效状态，与窗格是否标记为已查看无关：显示为 `done` 的 idle 智能体仍满足 idle 预期。省略该标志会保留现有行为，包括向 working 状态的智能体发送提示。
+
+```bash
+herdr agent prompt reviewer "Review the current diff" --expected-session "$session_id" --expected-status idle
+```
+
+`--expected-status` **必须与 `--expected-session` 一起使用**；请将 `agent get` 上报的 `agent_session_id` 复制到上例的 `session_id`。不支持仅指定状态的守卫。该标志对应 API 的可选 `expected_agent_status` 字段，需要 `expected_agent_status_guard` 支持。缺少支持时，CLI 返回 `expected_agent_status_unsupported`，不会发送提示。只要指定 `--expected-status`，CLI 就使用 `agent.prompt_status_checked`：旧服务器会拒绝此方法，而不是静默忽略状态字段。不会用旧方法重试；不要移除预期条件后自动重试。还可以组合使用 `--expected-pane` 和 `--wait`。
+
+检测状态条件与现有会话／上报者守卫一起，在接受请求时和 PTY 写入前检查。后续检测状态不匹配也会返回 `expected_status_mismatch`，停止请求的剩余字节，不再发送 Enter。可能已经写入部分输入，因此此后续错误不保证总写入字节数为零。这不是等待 idle 的操作。
+
+检测到的 idle 是**最后观察到的状态**，并非实际智能体不忙的事务性证明。钩子和屏幕检测可能滞后，智能体也可能在检查后变忙。破坏性命令仍需要智能体侧的忙碌检查；该标志不提供此检查。`--wait` 观察提交后的活动和稳定状态，并不会加强接受请求时的检查。
 
 `idle` 和 `done` 都表示可以接受输入。CLI/API 使用服务器的已查看状态：`done` 表示尚未标记为已查看的 idle；显式 `pane focus` / `agent focus` 会标记目标，读取不会。每个 TUI 客户端独立记录它已显示的完成状态，因此其 Done 标记可能与 CLI 或其他客户端不同。`blocked` 表示 Herdr 识别到审批或提问界面。`unknown` 表示智能体存在但无法可靠分类,不代表工作成功。
 
@@ -367,7 +400,7 @@ herdr agent prompt-guarded w1:p1 "Review this change" \
   --request-id review-1 --timeout-ms 10000
 ```
 
-`prompt-guarded` 只通过智能体已注册的 socket 通道发送字面文本，绝不向 PTY 写入提示文本、准备字节或 Enter，不改变输入焦点，也不回退到 `agent prompt`。不带 `--if-draft-empty` 时，现有 `agent prompt` 行为保持不变。目标、文本、两个固定标识和请求 ID 都不能为空。`--timeout-ms` 等待的是接纳回执，而非轮次完成；默认 10000，允许 1–300000 毫秒。`--allow-cross-pane` 显式允许现有跨窗格输入策略中的操作，但不会绕过通道或身份检查。
+`prompt-guarded` 只通过智能体已注册的 socket 通道发送字面文本，绝不向 PTY 写入提示文本、准备字节或 Enter，不改变输入焦点，也不回退到 `agent prompt`。不带 `--if-draft-empty` 时，现有 `agent prompt` 行为保持不变。目标、文本、两个固定标识和请求 ID 都不能为空。`--timeout-ms` 等待的是接纳回执，而非轮次完成；默认 10000，允许 1–300000 毫秒。`--allow-cross-pane` 为兼容性保留；不带它时跨窗格输入也会被允许并记录日志。二者都不会绕过通道或身份检查。
 
 `agent prompt --if-draft-empty` 是已注册通道的便捷入口：它在发送前要求 `draft_guard: true`，复制当前终端/epoch 标识并生成请求 ID，然后以 `if_draft_empty: true` 调用 `agent.prompt_guarded`。绝不回退到键入或原有提示投递。此标志不能与原有的 `--wait`、`--until`、`--timeout` 组合；这类组合在发送前即被拒绝。要指定接纳回执期限，请用 `prompt-guarded --timeout-ms`。
 
@@ -375,7 +408,7 @@ herdr agent prompt-guarded w1:p1 "Review this change" \
 
 守卫帧带有期限；Pi 在上述检查和调用前同步拒绝已过期帧，原因为 `expired`，不提交提示也不修改编辑器。守卫期限缺失或无效时以 `unknown` 拒绝。在 socket 发送前发生的类型化失败表示没有发送；可能已接纳后的回执丢失仍是 `delivery_unknown`，绝不重放。
 
-`agent draft-state` 通过注册通道执行只读、隐藏文本的观察，默认查询超时为两秒。known 结果只报告草稿是否为空以及 UI hold（`null`、`"dialog"`、`"custom"` 或 `"editor"`）；绝不返回草稿文本或字符数。否则返回 `{status: "unknown", reason}`，原因为 `unregistered`（无通道）、`unsupported`（无能力）、`timeout`（未及时回复）或 `unknown`（状态不可观察）。unknown 不代表草稿为空。智能体默认可查询自己的窗格；查询其他窗格需要 `--allow-cross-pane`。普通外部操作员遵循与 `agent.prompt` 相同的策略。授权在预留或发送帧之前检查。查询不是后续发送的授权；守卫提示会在接纳时重新检查。
+`agent draft-state` 通过注册通道执行只读、隐藏文本的观察，默认查询超时为两秒。known 结果只报告草稿是否为空以及 UI hold（`null`、`"dialog"`、`"custom"` 或 `"editor"`）；绝不返回草稿文本或字符数。否则返回 `{status: "unknown", reason}`，原因为 `unregistered`（无通道）、`unsupported`（无能力）、`timeout`（未及时回复）或 `unknown`（状态不可观察）。unknown 不代表草稿为空。输入来源检查仅为建议性：智能体查询其他窗格会被允许并记录日志，`--allow-cross-pane` 为兼容性保留但不再需要。普通外部操作员遵循与 `agent.prompt` 相同的策略。授权在预留或发送帧之前检查。查询不是后续发送的授权；守卫提示会在接纳时重新检查。
 
 成功返回 `status: "accepted"`（已接纳到活动会话的输入）或 `"queued"`（已进入该会话的后续消息队列），以及固定的终端、epoch、请求 ID 和会话代数。两种状态都不保证模型轮次已完成或成功。同一 epoch 中，相同请求 ID、完全相同文本和相同 `if_draft_empty` 值共享首次结果，不会再次提交；改变文本或守卫值返回 `payload_mismatch`。新 ID 表示新请求，不是安全重试。
 
@@ -464,13 +497,14 @@ herdr integration status [--outdated-only]
 
 ```bash
 herdr plugin install <owner>/<repo>[/subdir...] [--ref REF] [--yes]
+herdr plugin update [<plugin_id|owner/repo[/subdir...]>...] [--yes]
 herdr plugin list [--plugin ID] [--json]
 herdr plugin uninstall <plugin_id|owner/repo[/subdir...]>
 herdr plugin enable <plugin_id>
 herdr plugin disable <plugin_id>
 ```
 
-`plugin install` 只接受 GitHub 简写,比如 `ogulcancelik/herdr-plugin-examples/worktree-bootstrap`。它使用 `git`,在交互式终端显示信任预览,运行受支持的清单构建命令,并把 GitHub 安装保存在 Herdr 管理的目录中。非交互式安装用 `--yes`。重新安装 GitHub 管理的插件会替换该托管检出。不允许覆盖安装到本地链接的插件之上。插件清单必须声明 `min_herdr_version`;当插件要求更新的 Herdr 二进制时,install 和 link 会失败。`plugin list` 默认是人类可读的;要原始 API 响应就传 `--json`。
+`plugin install` 只接受 GitHub 简写,比如 `ogulcancelik/herdr-plugin-examples/worktree-bootstrap`。它使用 `git`,在交互式终端显示信任预览,运行受支持的清单构建命令,并把 GitHub 安装保存在 Herdr 管理的目录中。非交互式安装用 `--yes`。`plugin update` 不指定目标时更新全部 GitHub 托管插件,指定目标时只更新对应的插件 id 或 GitHub 来源。它保留安装时记录的 ref,跳过未变化的提交,批量更新时忽略本地链接的插件。重新安装会创建新目录;运行中的插件保留原文件,新调用使用新安装。不允许覆盖安装到本地链接的插件之上。插件清单必须声明 `min_herdr_version`;当插件要求更新的 Herdr 二进制时,install 和 link 会失败。`plugin list` 默认是人类可读的;要原始 API 响应就传 `--json`。
 
 本地开发:
 
@@ -479,7 +513,7 @@ herdr plugin link <path> [--disabled]
 herdr plugin unlink <plugin_id>
 ```
 
-`plugin link` 接受包含 `herdr-plugin.toml` 的插件目录,或直接指向清单的路径。从本地检出编写或测试插件时,它仍然是正确的命令。`plugin unlink` 注销插件、不动文件。`plugin uninstall` 注销插件,并同时删除 Herdr 管理的 GitHub 检出文件。对 GitHub 安装,uninstall 既接受插件 id,也接受与 install 相同的 `owner/repo[/subdir...]` 简写。动作、事件钩子、窗格和链接处理器在清单中声明;运行时动作注册不在 v1 范围内。
+`plugin link` 接受包含 `herdr-plugin.toml` 的插件目录,或直接指向清单的路径。从本地检出编写或测试插件时,它仍然是正确的命令。`plugin unlink` 和 `plugin uninstall` 注销插件并保留文件,让运行中的插件完成工作。更新和重新安装也会保留旧版本;新调用无需重新加载配置便会使用新安装。使用旧安装的服务器退出后,下一次成功安装、更新或服务器启动会清理过时的托管安装。重新加载配置不会释放旧安装。插件必须在父命令或窗格退出前停止分离的后台进程;服务器退出后仍存活的进程不受清理保护。没有清理跟踪的旧安装和本地链接文件会保留。对 GitHub 安装,uninstall 既接受插件 id,也接受与 install 相同的 `owner/repo[/subdir...]` 简写。动作、事件钩子、窗格和链接处理器在清单中声明;运行时动作注册不在 v1 范围内。
 
 配置目录:
 
@@ -514,7 +548,7 @@ herdr plugin pane close <pane_id>
 
 `plugin pane open` 要求插件已链接、已启用并与当前平台兼容。它把清单声明的 `[[panes]]` 命令作为 Herdr 管理的终端窗格启动。清单的默认值是 `overlay`,在活动窗格上方打开一个临时的缩放覆盖层。它也可以作为分割、新标签页、缩放窗格,或不改变标签页布局的会话级模态 `popup` 打开。`--width` 和 `--height` 以终端单元格数或 `80%` 这样的百分比设置弹窗外层尺寸;省略时默认为终端大小的一半,过小的值会限制为弹窗最小尺寸。弹窗不是 Herdr 窗格,不会收到 `HERDR_PANE_ID`,也不参与 pane 或智能体 API。非终端的原生插件窗格是之后的能力面。
 
-新窗格使用 `TERM_PROGRAM=herdr` 标识自身，并将 `TERM_PROGRAM_VERSION` 设为 Herdr 的版本。它们保留 `TERM=xterm-256color` 和 `COLORTERM=truecolor`。应用显式的启动环境值之前，Herdr 会移除继承的外层终端会话标记（iTerm2、WezTerm、Kitty、Windows Terminal、tmux、screen 和 Zellij）、iTerm2 的 `LC_TERMINAL` 身份，以及已知的 Claude Code、Codex 和 OMP 会话标记。这可防止新窗格冒充最初启动服务器的终端或智能体会话。API 密钥和显示设置等普通环境变量仍会继承，而不会被连接客户端的环境替换。SSH 智能体转发有自己的重连处理。现有窗格进程不受此清理影响。
+新窗格使用 `TERM_PROGRAM=herdr` 标识自身，并将 `TERM_PROGRAM_VERSION` 设为 Herdr 的版本。它们保留 `TERM=xterm-256color` 和 `COLORTERM=truecolor`。由于 Herdr 会在调整大小时重排文本,新窗格还会获得 `fish_handle_reflow=0`;继承或显式指定的 `fish_handle_reflow` 值会保留。应用显式的启动环境值之前，Herdr 会移除继承的外层终端会话标记（iTerm2、WezTerm、Kitty、Windows Terminal、tmux、screen 和 Zellij）、iTerm2 的 `LC_TERMINAL` 身份，以及已知的 Claude Code、Codex 和 OMP 会话标记。这可防止新窗格冒充最初启动服务器的终端或智能体会话。API 密钥和显示设置等普通环境变量仍会继承，而不会被连接客户端的环境替换。SSH 智能体转发有自己的重连处理。现有窗格进程不受此清理影响。
 
 `--env KEY=VALUE` 可以在启动进程的命令上重复使用,只作用于新启动的进程。当与调用方提供的环境变量冲突时,`HERDR_SOCKET_PATH`、`HERDR_BIN_PATH`、`HERDR_ENV`、`HERDR_WORKSPACE_ID`、`HERDR_TAB_ID`、`HERDR_PANE_ID`、`HERDR_PLUGIN_ID`、`HERDR_PLUGIN_ROOT`、`HERDR_PLUGIN_CONFIG_DIR`、`HERDR_PLUGIN_STATE_DIR`、`HERDR_PLUGIN_ENTRYPOINT_ID` 和 `HERDR_PLUGIN_CONTEXT_JSON` 等 Herdr 管理的变量保持权威。
 

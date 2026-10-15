@@ -12,6 +12,22 @@ use super::responses::{encode_error, encode_error_body, encode_success};
 
 const AGENT_PROMPT_SUBMIT_DELAY: Duration = Duration::from_millis(300);
 
+/// A typed status refusal uses the same delivery/flush evidence as session loss.
+fn expected_status_mismatch_response(id: String, error: &std::io::Error) -> String {
+    let (partial, flush_failed) =
+        crate::pty::actor::agent_session_loss_details(error).unwrap_or((None, false));
+    serde_json::json!({
+        "id": id,
+        "error": {
+            "code": "expected_status_mismatch",
+            "message": error.to_string(),
+            "partial_text_consumed": partial,
+            "flush_failed": flush_failed
+        }
+    })
+    .to_string()
+}
+
 // Codex's Windows input reader does not surface bracketed paste. It detects the prompt as a
 // "paste burst" and, while that burst is buffered, rewrites a following Enter into a newline
 // instead of submitting. The burst only flushes after an idle timeout, so any size-based delay is
@@ -79,10 +95,30 @@ impl App {
         encode_success(id, ResponseResult::AgentStarted { agent, argv })
     }
 
+    /// Both published aliases and legacy methods with an optional expectation
+    /// must use actor completion, on every server/client API invocation route.
+    pub(crate) fn api_request_requires_deferred_input(
+        request: &crate::api::schema::Request,
+    ) -> bool {
+        use crate::api::schema::Method;
+        match &request.method {
+            Method::AgentPrompt(_)
+            | Method::AgentPromptSessionChecked(_)
+            | Method::AgentPromptStatusChecked(_)
+            | Method::PaneSendTextSessionChecked(_)
+            | Method::PaneSendKeysSessionChecked(_)
+            | Method::PaneSendTextPathChecked(_)
+            | Method::PaneSendKeysPathChecked(_) => true,
+            Method::PaneSendText(params) => params.expected_agent_session_id.is_some(),
+            Method::PaneSendKeys(params) => params.expected_agent_session_id.is_some(),
+            _ => false,
+        }
+    }
+
     pub(crate) fn handle_deferred_agent_api_request(
         &mut self,
         request: crate::api::schema::Request,
-        context: crate::api::ApiRequestContext,
+        mut context: crate::api::ApiRequestContext,
         respond_to: std::sync::mpsc::Sender<String>,
     ) -> bool {
         if matches!(
@@ -92,15 +128,64 @@ impl App {
         ) {
             return self.handle_deferred_guarded_agent_prompt(request, context, respond_to);
         }
-        if !matches!(request.method, crate::api::schema::Method::AgentPrompt(_)) {
+        if !Self::api_request_requires_deferred_input(&request) {
             return false;
         }
-        if let Some(response) = self.cross_pane_input_denial(&request, context) {
+        if let Some(response) = self.session_checked_guard_denial(&request) {
             let _ = respond_to.send(response);
             return true;
         }
-        let crate::api::schema::Method::AgentPrompt(params) = request.method else {
-            return false;
+        if let Some(response) = self.cross_pane_input_denial_with_ancestry(&request, &mut context) {
+            let _ = respond_to.send(response);
+            return true;
+        }
+        let params = match request.method {
+            crate::api::schema::Method::AgentPrompt(params)
+            | crate::api::schema::Method::AgentPromptSessionChecked(params)
+            | crate::api::schema::Method::AgentPromptStatusChecked(params) => params,
+            crate::api::schema::Method::PaneSendText(params)
+            | crate::api::schema::Method::PaneSendTextSessionChecked(params) => {
+                self.defer_session_checked_pane_input(
+                    request.id,
+                    super::panes::SessionCheckedPaneInput::Text(params),
+                    None,
+                    context,
+                    respond_to,
+                );
+                return true;
+            }
+            crate::api::schema::Method::PaneSendTextPathChecked(params) => {
+                self.defer_session_checked_pane_input(
+                    request.id,
+                    super::panes::SessionCheckedPaneInput::Text(params.input),
+                    Some(params.refuse_if_exists.into()),
+                    context,
+                    respond_to,
+                );
+                return true;
+            }
+            crate::api::schema::Method::PaneSendKeysPathChecked(params) => {
+                self.defer_session_checked_pane_input(
+                    request.id,
+                    super::panes::SessionCheckedPaneInput::Keys(params.input),
+                    Some(params.refuse_if_exists.into()),
+                    context,
+                    respond_to,
+                );
+                return true;
+            }
+            crate::api::schema::Method::PaneSendKeys(params)
+            | crate::api::schema::Method::PaneSendKeysSessionChecked(params) => {
+                self.defer_session_checked_pane_input(
+                    request.id,
+                    super::panes::SessionCheckedPaneInput::Keys(params),
+                    None,
+                    context,
+                    respond_to,
+                );
+                return true;
+            }
+            _ => return false,
         };
         let validated = match self.validate_agent_prompt(request.id, &params) {
             Ok(validated) => validated,
@@ -123,6 +208,15 @@ impl App {
             };
             let response = match completion.recv() {
                 Ok(Ok(())) => encode_success(id, ResponseResult::AgentPrompted { agent }),
+                Ok(Err(err)) if crate::pty::actor::is_expected_status_mismatch(&err) => {
+                    expected_status_mismatch_response(id, &err)
+                }
+                Ok(Err(err)) if crate::pty::actor::is_agent_session_lost(&err) => {
+                    super::panes::session_loss_response(id, &err)
+                }
+                Ok(Err(err)) if crate::pty::actor::is_pane_input_poisoned(&err) => {
+                    encode_error(id, "pane_input_poisoned", err.to_string())
+                }
                 Ok(Err(err)) if err.kind() == std::io::ErrorKind::TimedOut => {
                     encode_error(id, "timeout", err.to_string())
                 }
@@ -151,6 +245,33 @@ impl App {
         true
     }
 
+    fn defer_session_checked_pane_input(
+        &mut self,
+        id: String,
+        input: super::panes::SessionCheckedPaneInput,
+        refuse_if_exists: Option<std::path::PathBuf>,
+        context: crate::api::ApiRequestContext,
+        respond_to: std::sync::mpsc::Sender<String>,
+    ) {
+        match self.queue_session_checked_pane_input(id.clone(), input, refuse_if_exists, context) {
+            Ok(completion) => {
+                std::thread::spawn(move || {
+                    let result = completion.recv().unwrap_or_else(|_| {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::BrokenPipe,
+                            "pty actor closed",
+                        ))
+                    });
+                    let _ =
+                        respond_to.send(super::panes::pane_input_completion_response(id, result));
+                });
+            }
+            Err(response) => {
+                let _ = respond_to.send(response);
+            }
+        }
+    }
+
     /// Runs every check that can reject a prompt without touching the pane.
     fn validate_agent_prompt(
         &self,
@@ -168,6 +289,16 @@ impl App {
             Ok(resolved) => resolved,
             Err(err) => return Err(encode_error_body(id, self.agent_target_error_body(err))),
         };
+        self.check_expected_pane(params.expected_pane_id.as_deref(), &resolved)
+            .map_err(|error| encode_error_body(id.clone(), error))?;
+        let guard = self
+            .capture_expected_agent_input_guard(
+                params.expected_agent_status,
+                params.expected_agent_session_id.as_deref(),
+                resolved.ws_idx,
+                resolved.pane_id,
+            )
+            .map_err(|error| encode_error_body(id.clone(), error))?;
         let Some(terminal_id) = self
             .state
             .workspaces
@@ -218,6 +349,7 @@ impl App {
             pane_id: resolved.pane_id,
             expected_agent,
             agent,
+            guard,
         })
     }
 
@@ -240,6 +372,7 @@ impl App {
             pane_id,
             expected_agent,
             agent,
+            guard,
         } = validated;
         let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
             return Err(agent_not_found(id, &params.target));
@@ -260,6 +393,7 @@ impl App {
             .and_then(|wait| wait.submission_deadline);
         #[cfg(not(windows))]
         let submit_deadline = None;
+        let mut guarded_prefix = Vec::new();
         if expected_agent == crate::detect::Agent::GithubCopilot {
             // Copilot ignores synthetic Enter after focus loss until it receives focus gained.
             let focus = match crate::ghostty::encode_focus(crate::ghostty::FocusEvent::Gained) {
@@ -268,7 +402,11 @@ impl App {
                     return Err(encode_error(id, "agent_prompt_failed", err.to_string()));
                 }
             };
-            if let Err(err) = runtime.try_send_bytes_with_source(
+            if guard.is_some() {
+                // Focus and prompt are one guarded request: never send an
+                // unguarded packet before the actor's ownership proof.
+                guarded_prefix = focus;
+            } else if let Err(err) = runtime.try_send_bytes_with_source(
                 Bytes::from(focus),
                 crate::pty::input_consumer::InputSource::Api,
             ) {
@@ -285,15 +423,35 @@ impl App {
         } else {
             text
         };
-        let completion = runtime
-            .queue_user_input_submission_with_source(
+        let completion = if let Some(guard) = guard {
+            guarded_prefix.extend_from_slice(&text);
+            runtime.queue_guarded_user_input_submission_with_source(
+                Bytes::from(guarded_prefix),
+                Bytes::from(enter),
+                AGENT_PROMPT_SUBMIT_DELAY,
+                guard,
+                crate::pty::input_consumer::InputSource::Api,
+            )
+        } else {
+            runtime.queue_user_input_submission_with_source(
                 Bytes::from(text),
                 Bytes::from(enter),
                 AGENT_PROMPT_SUBMIT_DELAY,
                 submit_deadline,
                 crate::pty::input_consumer::InputSource::Api,
             )
-            .map_err(|err| encode_error(id.clone(), "agent_prompt_failed", err.to_string()))?;
+        }
+        .map_err(|err| {
+            if crate::pty::actor::is_expected_status_mismatch(&err) {
+                expected_status_mismatch_response(id.clone(), &err)
+            } else if crate::pty::actor::is_agent_session_lost(&err) {
+                super::panes::session_loss_response(id.clone(), &err)
+            } else if crate::pty::actor::is_pane_input_poisoned(&err) {
+                encode_error(id.clone(), "pane_input_poisoned", err.to_string())
+            } else {
+                encode_error(id.clone(), "agent_prompt_failed", err.to_string())
+            }
+        })?;
         // Receipt is issued on enqueue, before the asynchronous submission completes.
         self.accepted_api_inputs.push(pane_id);
         Ok((id, agent, completion))
@@ -481,6 +639,7 @@ struct ValidatedAgentPrompt {
     pane_id: crate::layout::PaneId,
     expected_agent: crate::detect::Agent,
     agent: crate::api::schema::AgentInfo,
+    guard: Option<crate::pty::actor::SessionInputGuard>,
 }
 
 fn agent_not_ready(id: String, target: &str) -> String {
@@ -527,6 +686,101 @@ mod tests {
         app
     }
 
+    fn pane_request_params(
+        pane_id: &str,
+        expected_agent_session_id: Option<&str>,
+        allow_cross_pane: bool,
+    ) -> serde_json::Value {
+        let mut params = serde_json::json!({
+            "pane_id": pane_id,
+            "text": "hello",
+            "keys": ["enter"],
+            "allow_cross_pane": allow_cross_pane,
+        });
+        if let Some(expected) = expected_agent_session_id {
+            params["expected_agent_session_id"] = serde_json::json!(expected);
+        }
+        params
+    }
+
+    #[test]
+    fn deferred_input_route_covers_aliases_and_optional_base_expectations() {
+        for method in [
+            "pane.send_text",
+            "pane.send_text_session_checked",
+            "pane.send_keys",
+            "pane.send_keys_session_checked",
+        ] {
+            for expected in [None, Some("opaque-session")] {
+                let request: crate::api::schema::Request =
+                    serde_json::from_value(serde_json::json!({
+                        "id": "route", "method": method,
+                        "params": pane_request_params(
+                            "w1:p1",
+                            expected,
+                            false,
+                        ),
+                    }))
+                    .expect("pane request");
+                assert_eq!(
+                    App::api_request_requires_deferred_input(&request),
+                    method.ends_with("_session_checked") || expected.is_some(),
+                    "{method}: {expected:?}",
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn deferred_guarded_pane_denials_enqueue_nothing() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let pane = app.public_pane_id(0, pane_id).expect("pane ID");
+        assert!(app.check_expected_agent_session(None, 0, pane_id).is_ok());
+        let (runtime, mut input_rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.state.insert_test_runtime(pane_id, runtime);
+        for method in [
+            "pane.send_text",
+            "pane.send_keys",
+            "pane.send_text_session_checked",
+            "pane.send_keys_session_checked",
+        ] {
+            for expected in [None, Some("opaque-session")] {
+                if expected.is_none() && !method.ends_with("_session_checked") {
+                    continue;
+                }
+                let request = serde_json::from_value(serde_json::json!({
+                    "id": "denied", "method": method,
+                    "params": pane_request_params(&pane, expected, true),
+                }))
+                .expect("pane request");
+                let (respond_to, response_rx) = std::sync::mpsc::channel();
+                assert!(app.handle_deferred_agent_api_request(
+                    request,
+                    Default::default(),
+                    respond_to
+                ));
+                let response: crate::api::schema::ErrorResponse = serde_json::from_str(
+                    &response_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(
+                    response.error.code,
+                    if !crate::platform::expected_agent_session_guard_supported() {
+                        "expected_agent_session_unsupported"
+                    } else if expected.is_some() {
+                        "agent_session_unknown"
+                    } else {
+                        "invalid_request"
+                    },
+                    "{method}: {expected:?}",
+                );
+                assert!(input_rx.try_recv().is_err());
+                assert!(app.accepted_api_inputs.is_empty());
+            }
+        }
+    }
+
     fn start_deferred_agent_prompt(
         app: &mut App,
         id: &str,
@@ -550,6 +804,54 @@ mod tests {
             .expect("agent prompt responds after submission")
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn expected_status_mismatch_response_preserves_native_loss_and_flush_details() {
+        let guard = crate::pty::actor::SessionInputGuard {
+            reporter: crate::platform::process_identity(std::process::id())
+                .expect("live test process"),
+            expected_agent_session_id: "private-status-session".into(),
+            expected_agent_status: Some(crate::api::schema::AgentStatus::Idle),
+            agent_status: std::sync::Weak::new(),
+            status_mismatch: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            binding_validity: std::sync::Weak::new(),
+        };
+        for (error, partial, flush_failed) in [
+            (
+                crate::pty::actor::agent_session_lost(&guard, false),
+                Some(false),
+                false,
+            ),
+            (
+                crate::pty::actor::agent_session_lost(&guard, true),
+                Some(true),
+                false,
+            ),
+            (
+                crate::pty::actor::agent_session_flush_failed(&guard),
+                None,
+                true,
+            ),
+        ] {
+            assert!(crate::pty::actor::is_expected_status_mismatch(&error));
+            assert!(!crate::pty::actor::is_agent_session_lost(&error));
+            assert_eq!(
+                crate::pty::actor::agent_session_loss_details(&error),
+                Some((partial, flush_failed))
+            );
+            let response: serde_json::Value =
+                serde_json::from_str(&expected_status_mismatch_response("status".into(), &error))
+                    .expect("status response JSON");
+            assert_eq!(response["error"]["code"], "expected_status_mismatch");
+            assert_eq!(
+                response["error"]["partial_text_consumed"],
+                serde_json::json!(partial)
+            );
+            assert_eq!(response["error"]["flush_failed"], flush_failed);
+            assert!(response.get("result").is_none());
+        }
+    }
+
     #[cfg(windows)]
     #[tokio::test]
     async fn windows_codex_prompt_flushes_paste_burst_before_enter() {
@@ -568,6 +870,9 @@ mod tests {
             &mut app,
             "req",
             AgentPromptParams {
+                expected_agent_session_id: None,
+                expected_pane_id: None,
+                expected_agent_status: None,
                 target: "reviewer".into(),
                 text: "A != B".into(),
                 wait: None,
@@ -669,6 +974,9 @@ mod tests {
             &mut app,
             "req",
             AgentPromptParams {
+                expected_agent_session_id: None,
+                expected_pane_id: None,
+                expected_agent_status: None,
                 target: public_pane_id,
                 text: "A != B".into(),
                 wait: None,
@@ -701,6 +1009,9 @@ mod tests {
             &mut app,
             "req-raw",
             AgentPromptParams {
+                expected_agent_session_id: None,
+                expected_pane_id: None,
+                expected_agent_status: None,
                 target: "reviewer".into(),
                 text: "A != B".into(),
                 wait: None,
@@ -717,6 +1028,9 @@ mod tests {
             &mut app,
             "req-label",
             AgentPromptParams {
+                expected_agent_session_id: None,
+                expected_pane_id: None,
+                expected_agent_status: None,
                 target: "opencode".into(),
                 text: "wrong target".into(),
                 wait: None,
@@ -746,6 +1060,9 @@ mod tests {
             &mut app,
             "req",
             AgentPromptParams {
+                expected_agent_session_id: None,
+                expected_pane_id: None,
+                expected_agent_status: None,
                 target: "reviewer".into(),
                 text: "hello".into(),
                 wait: None,
@@ -780,6 +1097,9 @@ mod tests {
             &mut app,
             "log-failure",
             AgentPromptParams {
+                expected_agent_session_id: None,
+                expected_pane_id: None,
+                expected_agent_status: None,
                 target: "reviewer".into(),
                 text: "must not send".into(),
                 wait: None,
@@ -821,6 +1141,9 @@ mod tests {
                 &mut app,
                 "req",
                 AgentPromptParams {
+                    expected_agent_session_id: None,
+                    expected_pane_id: None,
+                    expected_agent_status: None,
                     target: target.into(),
                     text: text.into(),
                     wait: None,
@@ -856,6 +1179,9 @@ mod tests {
             &mut app,
             "req",
             AgentPromptParams {
+                expected_agent_session_id: None,
+                expected_pane_id: None,
+                expected_agent_status: None,
                 target: "reviewer".into(),
                 text: "unrelated prompt".into(),
                 wait: None,
@@ -898,6 +1224,9 @@ mod tests {
             &mut app,
             "req",
             AgentPromptParams {
+                expected_agent_session_id: None,
+                expected_pane_id: None,
+                expected_agent_status: None,
                 target: "reviewer".into(),
                 text: "A != B".into(),
                 wait: None,
@@ -983,6 +1312,9 @@ mod tests {
             &mut app,
             "req-pending",
             AgentPromptParams {
+                expected_agent_session_id: None,
+                expected_pane_id: None,
+                expected_agent_status: None,
                 target: "reviewer".into(),
                 text: "A != B".into(),
                 wait: None,

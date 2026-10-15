@@ -364,9 +364,9 @@ fn agent_command() -> Command {
                 .arg(required("target", "TARGET").allow_hyphen_values(true))
                 .arg(
                     flag("allow-cross-pane")
-                        .help("Deliberately allow an agent-originated query to observe another pane"),
+                        .help("Accepted for compatibility; cross-pane agent queries are allowed and logged without it"),
                 )
-                .after_help("Callers are authorized like agent prompt: an agent may observe its own pane, and another pane only with --allow-cross-pane. An unregistered pane, an old extension, or an unavailable reply returns unknown. This snapshot does not authorize a later prompt; use --if-draft-empty for an atomic check."),
+                .after_help("Callers are authorized like agent prompt: an agent may observe its own pane, and another pane is allowed and logged without --allow-cross-pane. An unregistered pane, an old extension, or an unavailable reply returns unknown. This snapshot does not authorize a later prompt; use --if-draft-empty for an atomic check."),
         )
         .subcommand(
             Command::new("prompt-guarded")
@@ -391,7 +391,7 @@ fn agent_command() -> Command {
                 )
                 .arg(
                     flag("allow-cross-pane")
-                        .help("Deliberately allow an agent-originated request to target another pane"),
+                        .help("Accepted for compatibility; cross-pane agent input is allowed and logged without it"),
                 )
                 .arg(
                     flag("if-draft-empty")
@@ -416,7 +416,7 @@ fn agent_command() -> Command {
                 .arg(required("key", "KEY").num_args(1..).action(ArgAction::Append))
                 .arg(
                     flag("allow-cross-pane")
-                        .help("Deliberately allow an agent-originated request to target another pane"),
+                        .help("Accepted for compatibility; cross-pane agent input is allowed and logged without it"),
                 )
                 .after_help("Use esc as the canonical Escape key name; escape is also accepted. Use -- before payload arguments that match an option."),
         )
@@ -426,9 +426,22 @@ fn agent_command() -> Command {
                 .override_usage("herdr agent prompt <TARGET> <TEXT> [OPTIONS]")
                 .arg(required("target", "TARGET"))
                 .arg(required("text", "TEXT"))
+                .arg(expected_session_option())
+                .arg(option("expected-pane", "ID")
+                    .help("Refuse unless the agent target resolves to this pane_id; requires server support"))
+                .arg(option("expected-status", "STATUS")
+                    .requires("expected-session")
+                    .value_parser(["idle", "working", "blocked", "done", "unknown"])
+                    .help("Refuse unless the detected agent status matches; requires --expected-session and server support"))
                 .arg(
                     flag("if-draft-empty")
-                        .conflicts_with_all(["wait", "until", "timeout"])
+                        .conflicts_with_all([
+                            "wait",
+                            "until",
+                            "timeout",
+                            "expected-session",
+                            "expected-pane",
+                        ])
                         .help("Use the registered Pi channel; refuse on a draft, UI hold, or unknown state; never type"),
                 )
                 .arg(
@@ -449,7 +462,7 @@ fn agent_command() -> Command {
                 )
                 .arg(
                     flag("allow-cross-pane")
-                        .help("Deliberately allow an agent-originated request to target another pane"),
+                        .help("Accepted for compatibility; cross-pane agent input is allowed and logged without it"),
                 )
                 .after_help(
                     "If the agent is already blocked, submission is rejected with agent_blocked before any input is sent. When an accepted submission starts from another non-working state, --wait requires an observed working or blocked state within 5000ms; otherwise it returns agent_prompt_stalled. A caller timeout that expires first returns timeout. It then matches idle, done, or blocked by default, or any exact --until state. It does not track turns: if the agent is already working, that active turn's completion may match.",
@@ -518,7 +531,7 @@ fn agent_command() -> Command {
                 )
                 .arg(
                     flag("allow-cross-pane")
-                        .help("Deliberately allow an agent-originated request to target another pane"),
+                        .help("Accepted for compatibility; cross-pane agent input is allowed and logged without it"),
                 )
                 .arg(
                     Arg::new("agent_args")
@@ -678,15 +691,22 @@ fn pane_command() -> Command {
                 .arg(flag("focus"))
                 .arg(flag("no-focus")),
         )
-        .subcommand(id_command("close", "pane_id", "Close a pane"))
+        .subcommand(id_command("close", "pane_id", "Close a pane").arg(expected_terminal_option()))
+        .subcommand(id_command(
+            "clear-input-poison",
+            "pane_id",
+            "Operator only: discard unread pane input, then unblock it (not from inside a pane)",
+        ))
         .subcommand(
             Command::new("send-text")
                 .about("Send literal text to a pane")
+                .arg(expected_session_option())
+                .arg(refuse_if_exists_option())
                 .arg(required("pane_id", "PANE_ID"))
                 .arg(required("text", "TEXT").num_args(1..).action(ArgAction::Append))
                 .arg(
                     flag("allow-cross-pane")
-                        .help("Deliberately allow an agent-originated request to target another pane"),
+                        .help("Accepted for compatibility; cross-pane agent input is allowed and logged without it"),
                 )
                 .after_help(
                     "Use -- before TEXT when the payload matches an option.\n\nnext: herdr pane run <PANE_ID> <COMMAND> sends text and Enter in one call",
@@ -695,11 +715,13 @@ fn pane_command() -> Command {
         .subcommand(
             Command::new("send-keys")
                 .about("Send key presses to a pane")
+                .arg(expected_session_option())
+                .arg(refuse_if_exists_option())
                 .arg(required("pane_id", "PANE_ID"))
                 .arg(required("key", "KEY").num_args(1..).action(ArgAction::Append))
                 .arg(
                     flag("allow-cross-pane")
-                        .help("Deliberately allow an agent-originated request to target another pane"),
+                        .help("Accepted for compatibility; cross-pane agent input is allowed and logged without it"),
                 )
                 .after_help("Use esc as the canonical Escape key name; escape is also accepted. Use -- before payload arguments that match an option."),
         )
@@ -740,7 +762,7 @@ fn pane_command() -> Command {
                 .arg(expected_terminal_option())
                 .arg(
                     flag("allow-cross-pane")
-                        .help("Deliberately allow an agent-originated request to target another pane"),
+                        .help("Accepted for compatibility; cross-pane agent input is allowed and logged without it"),
                 )
                 .after_help("Use -- before command arguments that match an option."),
         )
@@ -748,6 +770,17 @@ fn pane_command() -> Command {
         .subcommand(report_agent_session_command())
         .subcommand(release_agent_command())
         .subcommand(report_metadata_command())
+}
+
+fn expected_session_option() -> Arg {
+    option("expected-session", "ID")
+        .help("Refuse unless the pane still reports this agent session ID at enqueue; requires server support")
+}
+
+fn refuse_if_exists_option() -> Arg {
+    option("refuse-if-exists", "PATH").help(
+        "Refuse before the first byte (guard_path_present, zero bytes, no flush) if PATH exists; recheck zero-byte retries, never interrupt after writing starts; requires server support",
+    )
 }
 
 fn expected_terminal_option() -> Arg {
@@ -1313,6 +1346,53 @@ mod tests {
     }
 
     #[test]
+    fn session_expectation_flags_have_scoped_help_and_completions() {
+        let cmd = super::command();
+        for path in [
+            &["agent", "prompt"][..],
+            &["pane", "send-text"][..],
+            &["pane", "send-keys"][..],
+        ] {
+            let leaf = command_path(&cmd, path);
+            assert!(has_option(leaf, "expected-session"));
+            assert_eq!(
+                has_option(leaf, "expected-pane"),
+                path == ["agent", "prompt"]
+            );
+            assert!(long_help(path).contains("--expected-session"));
+        }
+        assert!(long_help(&["agent", "prompt"]).contains("--expected-pane"));
+        assert!(long_help(&["agent", "prompt"]).contains("--expected-status"));
+        assert!(has_option(
+            command_path(&cmd, &["agent", "prompt"]),
+            "expected-status"
+        ));
+        for path in [
+            &["agent", "send-keys"][..],
+            &["agent", "start"][..],
+            &["pane", "run"][..],
+        ] {
+            let leaf = command_path(&cmd, path);
+            assert!(!has_option(leaf, "expected-session"));
+            assert!(!has_option(leaf, "expected-pane"));
+            assert!(!has_option(leaf, "expected-status"));
+        }
+        for shell in [
+            clap_complete::Shell::Bash,
+            clap_complete::Shell::Fish,
+            clap_complete::Shell::Zsh,
+        ] {
+            let mut command = super::command();
+            let mut output = Vec::new();
+            clap_complete::generate(shell, &mut command, "herdr", &mut output);
+            let output = String::from_utf8(output).unwrap();
+            assert!(output.contains("expected-session"), "{shell:?}");
+            assert!(output.contains("expected-pane"), "{shell:?}");
+            assert!(output.contains("expected-status"), "{shell:?}");
+        }
+    }
+
+    #[test]
     fn channel_commands_are_public_but_self_registration_is_not() {
         let cmd = super::command();
         let info = command_path(&cmd, &["agent", "channel-info"]);
@@ -1444,8 +1524,67 @@ mod tests {
                 "--wait"
             ])
             .is_err());
+        for expectation in ["--expected-session=s", "--expected-pane=p"] {
+            assert!(super::command()
+                .try_get_matches_from([
+                    "herdr",
+                    "agent",
+                    "prompt",
+                    "worker",
+                    "hello",
+                    "--if-draft-empty",
+                    expectation,
+                ])
+                .is_err());
+        }
         assert!(super::command()
             .try_get_matches_from(["herdr", "agent", "draft-state", "--", "--help"])
+            .is_ok());
+    }
+
+    #[test]
+    fn agent_prompt_expected_status_requires_session_and_strict_enum() {
+        for args in [
+            &[
+                "herdr",
+                "agent",
+                "prompt",
+                "reviewer",
+                "hello",
+                "--expected-status",
+                "idle",
+            ][..],
+            &[
+                "herdr",
+                "agent",
+                "prompt",
+                "reviewer",
+                "hello",
+                "--expected-status=idle",
+                "--expected-pane=w1:p1",
+            ][..],
+            &[
+                "herdr",
+                "agent",
+                "prompt",
+                "reviewer",
+                "hello",
+                "--expected-status=null",
+                "--expected-session=s",
+            ][..],
+        ] {
+            assert!(super::command().try_get_matches_from(args).is_err());
+        }
+        assert!(super::command()
+            .try_get_matches_from([
+                "herdr",
+                "agent",
+                "prompt",
+                "reviewer",
+                "hello",
+                "--expected-status=idle",
+                "--expected-session=s",
+            ])
             .is_ok());
     }
 

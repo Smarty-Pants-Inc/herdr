@@ -1,4 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { rm } from "node:fs/promises";
 import net, { createServer, type Server } from "node:net";
 import { tmpdir } from "node:os";
@@ -169,6 +170,111 @@ test("OpenCode stays disabled without the Herdr socket environment", async () =>
 });
 
 for (const integration of integrations) {
+  for (const phase of ["startup", "same-path ID change"] as const) {
+    test(`${integration.name} reports both session ID and path on ${phase}`, async () => {
+      const requests = await startRecordingServer(
+        `${integration.name.toLowerCase().replaceAll(" ", "-")}-session-ref`,
+      );
+      const { handlers, pi } = createExtensionHarness();
+      const { default: install } = await importFresh(integration.modulePath);
+      install(pi);
+
+      const sessionPath = "/tmp/herdr-resume-session.jsonl";
+      let sessionId = "actual-session-id";
+      const context = {
+        ...piContext(() => true),
+        sessionManager: {
+          getSessionFile: () => sessionPath,
+          getSessionId: () => sessionId,
+        },
+      };
+      await handlers.get("session_start")?.({ reason: "startup" }, context);
+      await waitFor(() => requests.length === 2);
+
+      if (phase === "same-path ID change") {
+        sessionId = "replacement-session-id";
+        await handlers.get("agent_start")?.({}, context);
+        await waitFor(() => requests.length === 4);
+      }
+
+      const phaseRequests = phase === "startup" ? requests : requests.slice(2);
+      const agent = integration.name === "Pi" ? "pi" : "omp";
+      for (const method of ["pane.report_agent_session", "pane.report_agent"]) {
+        const request = phaseRequests.find(
+          (request) => isRecord(request) && request.method === method,
+        );
+        expect(isRecord(request) && isRecord(request.params)).toBe(true);
+        if (!isRecord(request) || !isRecord(request.params)) {
+          throw new Error(`Missing ${method} parameters`);
+        }
+        expect(request.params).toMatchObject({
+          pane_id: "test:p1",
+          source: `herdr:${agent}`,
+          agent,
+          agent_session_id: sessionId,
+          agent_session_path: sessionPath,
+        });
+        if (method === "pane.report_agent") {
+          expect(request.params.state).toBe(phase === "startup" ? "idle" : "working");
+        } else {
+          expect(request.params.session_start_source).toBe(
+            phase === "startup" || agent === "omp" ? "startup" : undefined,
+          );
+        }
+      }
+      const sequences = requests.map((request) =>
+        isRecord(request) && isRecord(request.params) ? request.params.seq : undefined,
+      );
+      expect(sequences.every((seq) => typeof seq === "number")).toBe(true);
+      expect(new Set(sequences).size).toBe(requests.length);
+      if (phase === "same-path ID change") {
+        expect(Math.min(...(sequences.slice(2) as number[]))).toBeGreaterThan(
+          Math.max(...(sequences.slice(0, 2) as number[])),
+        );
+      }
+    });
+  }
+
+  for (const sessionRef of [
+    { name: "ID only", id: "actual-session-id", path: undefined },
+    { name: "path only", id: undefined, path: "/tmp/herdr-resume-session.jsonl" },
+    { name: "no reference", id: undefined, path: undefined },
+  ]) {
+    test(`${integration.name} preserves ${sessionRef.name} session reporting`, async () => {
+      const requests = await startRecordingServer(
+        `${integration.name.toLowerCase().replaceAll(" ", "-")}-partial-session-ref`,
+      );
+      const { handlers, pi } = createExtensionHarness();
+      const { default: install } = await importFresh(integration.modulePath);
+      install(pi);
+      await handlers.get("session_start")?.(
+        { reason: "startup" },
+        {
+          ...piContext(() => true),
+          sessionManager: {
+            getSessionFile: () => sessionRef.path,
+            getSessionId: () => sessionRef.id,
+          },
+        },
+      );
+      const hasRef = sessionRef.id !== undefined || sessionRef.path !== undefined;
+      await waitFor(() => requests.length === (hasRef ? 2 : 1));
+      expect(requests.map((request) => isRecord(request) ? request.method : undefined)).toEqual(
+        hasRef ? ["pane.report_agent_session", "pane.report_agent"] : ["pane.report_agent"],
+      );
+      for (const request of requests) {
+        expect(isRecord(request) && isRecord(request.params)).toBe(true);
+        if (!isRecord(request) || !isRecord(request.params)) {
+          throw new Error("Missing report parameters");
+        }
+        expect(request.params.agent_session_id).toBe(sessionRef.id);
+        expect(request.params.agent_session_path).toBe(sessionRef.path);
+        expect(Object.hasOwn(request.params, "agent_session_id")).toBe(sessionRef.id !== undefined);
+        expect(Object.hasOwn(request.params, "agent_session_path")).toBe(sessionRef.path !== undefined);
+      }
+    });
+  }
+
   test(`${integration.name} maps the Windows socket marker path to a named pipe endpoint`, async () => {
     const markerPath = `herdr-${integration.name.toLowerCase().replaceAll(" ", "-")}-${process.pid}.sock`;
     configureIntegrationEnvironment(markerPath);
@@ -298,6 +404,61 @@ test("Pi reports a Windows session path", async () => {
   await waitFor(() => requests.length === 2);
 
   expect(requests.map(requestSessionPath)).toEqual([sessionPath, sessionPath]);
+});
+
+// smarty-dev#10398: an unset or empty HERDR_PANE_ID must not silence the extension. Herdr rebinds
+// a report with an unknown or empty pane_id to the reporting process's pane.
+for (const [label, paneIdValue] of [
+  ["unset", undefined],
+  ["empty", ""],
+] as const) {
+  test(`Pi still reports its session and state with pane_id "" when HERDR_PANE_ID is ${label}`, async () => {
+    const requests = await startRecordingServer(`pi-no-pane-id-${label}`);
+    if (paneIdValue === undefined) {
+      delete process.env.HERDR_PANE_ID;
+    } else {
+      process.env.HERDR_PANE_ID = paneIdValue;
+    }
+    const { handlers, pi } = createExtensionHarness();
+    const { default: install } = await importFresh("./pi/herdr-agent-state.ts");
+    install(pi);
+
+    await handlers.get("session_start")?.(
+      { reason: "startup" },
+      {
+        ...piContext(() => true),
+        sessionManager: {
+          getSessionFile: () => "/home/user/.pi/agent/sessions/pi-session.jsonl",
+          getSessionId: () => "pi-session",
+        },
+      },
+    );
+    await waitFor(() => requests.length === 2);
+
+    const methods = requests.map((request) => (isRecord(request) ? request.method : undefined));
+    expect(methods.sort()).toEqual(["pane.report_agent", "pane.report_agent_session"]);
+    for (const request of requests) {
+      expect(isRecord(request) && isRecord(request.params) && request.params.pane_id).toBe("");
+      expect(isRecord(request) && isRecord(request.params) && request.params.agent_session_id).toBe(
+        "pi-session",
+      );
+    }
+    expect(requestStates(requests)).toEqual(["idle"]);
+  });
+}
+
+test("Pi stays disabled without HERDR_ENV or the Herdr socket even when HERDR_PANE_ID is set", async () => {
+  const requests = await startRecordingServer("pi-disabled");
+  for (const unset of ["HERDR_ENV", "HERDR_SOCKET_PATH"]) {
+    configureIntegrationEnvironment(socketPath!);
+    delete process.env[unset];
+    const { handlers, pi } = createExtensionHarness();
+    const { default: install } = await importFresh("./pi/herdr-agent-state.ts");
+    install(pi);
+    expect(handlers.size).toBe(0);
+  }
+  await Bun.sleep(25);
+  expect(requests).toEqual([]);
 });
 
 test("Pi reports idle only after the agent settles", async () => {
@@ -792,11 +953,13 @@ function channelContext(generation = "session-1") {
 
 async function loadChannelAsset(
   submit?: (request: AdmissionRequest) => Promise<AdmissionReceipt | unknown>,
+  hostCapabilities?: Record<string, unknown>,
 ) {
   const harness = createExtensionHarness();
   const calls: AdmissionRequest[] = [];
   const pi = {
     ...harness.pi,
+    ...(hostCapabilities ? { hostCapabilities } : {}),
     submitUserMessage: submit ? async (request: AdmissionRequest) => {
       calls.push(request);
       return submit(request);
@@ -865,7 +1028,7 @@ for (const mode of ["rpc", "print", "json", undefined]) {
   });
 }
 
-registeredChannelTest("Pi opens registration directly in-process only at TUI session_start, with no inherited pane/pid assertion", async () => {
+registeredChannelTest("Pi opens its channel connection in-process at extension load and registers only at TUI session_start, with no inherited pane/pid assertion", async () => {
   const { connections, reports } = await startChannelServer();
   process.env.HERDR_PANE_ID = "stale:p999";
   const connectionPids: number[] = [];
@@ -876,12 +1039,98 @@ registeredChannelTest("Pi opens registration directly in-process only at TUI ses
   const { handlers, calls } = await loadChannelAsset(accepted);
   handlers.get("agent_start")?.({}, channelContext());
   await Bun.sleep(30);
-  expect(connectionPids).toEqual([]);
+  expect(connectionPids).toEqual([process.pid]); // The channel connection, opened at load.
+  expect(connections).toEqual([]); // No registration before session_start.
+  expect(reports).toEqual([]);
   await handlers.get("session_start")?.({}, channelContext());
   await waitFor(() => connections.length === 1 && reports.length === 1);
+  // session_start registers over the load-time connection; only the state report connects.
   expect(connectionPids).toEqual([process.pid, process.pid]);
   expect(connections[0].registration.params).toEqual({ session_generation: "session-1" });
   expect(calls).toEqual([]); // Ready registration is not an input receipt.
+});
+
+registeredChannelTest("Pi registers its channel without HERDR_PANE_ID, since Herdr attributes the peer itself (smarty-dev#10398)", async () => {
+  const { connections, reports } = await startChannelServer();
+  delete process.env.HERDR_PANE_ID;
+  const { handlers, calls } = await loadChannelAsset(accepted);
+  await handlers.get("session_start")?.({}, channelContext());
+  await waitFor(() => connections.length === 1 && reports.length === 1);
+  expect(connections[0].registration.params).toEqual({ session_generation: "session-1" });
+  expect(calls).toEqual([]);
+});
+
+// Pi runs a native /new, /resume or /fork session_start inside a temporary input fence. Input
+// whose async context descends from that callback is refused for good once the fence ends
+// (pi#163 security r3). This fixture models only that async-context rule, not Pi admission.
+function inputFenceFixture() {
+  const fence = new AsyncLocalStorage<{ active: boolean }>();
+  const submit = (request: AdmissionRequest): Promise<AdmissionReceipt> => {
+    const scope = fence.getStore();
+    if (scope && !scope.active) {
+      return Promise.resolve({
+        status: "rejected", reason: "session_changed", sessionGeneration: request.sessionGeneration,
+      });
+    }
+    return accepted(request);
+  };
+  const fenced = async (operation: () => unknown) => {
+    const scope = { active: true };
+    try {
+      return await fence.run(scope, async () => await operation());
+    } finally {
+      scope.active = false;
+    }
+  };
+  return { submit, fenced };
+}
+
+registeredChannelTest("Pi channel ingress never descends from a fenced session_start, across replacement and reconnect", async () => {
+  const { connections } = await startChannelServer();
+  const { submit, fenced } = inputFenceFixture();
+  const asset = await loadChannelAsset(submit);
+  await fenced(() => asset.handlers.get("session_start")?.({}, channelContext()));
+  await waitFor(() => connections.length === 1);
+  deliver(connections[0], "first");
+  await waitFor(() => connections[0].acks.length === 1);
+  expect(connections[0].acks[0]).toMatchObject({ request_id: "first", status: "accepted" });
+  // A native /new: the old registration is retired inside the fence, yet the replacement
+  // connection and its reader still run outside it.
+  await fenced(() => asset.handlers.get("session_start")?.({ reason: "new" }, channelContext("session-2")));
+  await waitFor(() => connections.length === 2 && connections[0].closed);
+  deliver(connections[1], "second");
+  await waitFor(() => connections[1].acks.length === 1);
+  expect(connections[1].acks[0]).toMatchObject({
+    request_id: "second", status: "accepted", session_generation: "session-2",
+  });
+  // Transport loss after a fenced session_start reconnects outside the fence too.
+  connections[1].socket.destroy();
+  await waitFor(() => connections.length === 3);
+  deliver(connections[2], "third");
+  await waitFor(() => connections[2].acks.length === 1);
+  expect(connections[2].acks[0]).toMatchObject({ request_id: "third", status: "accepted" });
+  expect(asset.calls.map((call) => call.requestId)).toEqual(["first", "second", "third"]);
+});
+
+registeredChannelTest("Pi reconnects outside the fence when the load-time connection closed before a fenced session_start", async () => {
+  const { connections } = await startChannelServer();
+  const clients: net.Socket[] = [];
+  net.createConnection = ((...args: unknown[]) => {
+    const socket = Reflect.apply(originalCreateConnection, net, args);
+    clients.push(socket);
+    return socket;
+  }) as typeof net.createConnection;
+  const { submit, fenced } = inputFenceFixture();
+  const asset = await loadChannelAsset(submit);
+  expect(clients).toHaveLength(1);
+  clients[0].destroy(); // e.g. Herdr's initial-request timeout before a slow startup finished.
+  await Bun.sleep(30);
+  expect(clients).toHaveLength(1); // No session wants a channel yet: nothing reconnects.
+  await fenced(() => asset.handlers.get("session_start")?.({}, channelContext()));
+  await waitFor(() => connections.length === 1);
+  deliver(connections[0], "fresh");
+  await waitFor(() => connections[0].acks.length === 1);
+  expect(connections[0].acks[0]).toMatchObject({ request_id: "fresh", status: "accepted" });
 });
 
 test("Pi Windows state reports still work but never advertise the unsupported receipt channel", async () => {
@@ -1672,7 +1921,7 @@ function draftContext(ui: Record<string, any> = {}) {
 function guardedDeliver(connection: ChannelConnection, requestId = "guarded", text = "remote prompt", guard = true) {
   connection.socket.write(`${JSON.stringify({
     ...delivery(connection, requestId, text), if_draft_empty: guard,
-    ...(guard ? { deadline_ms: Date.now() + 60_000 } : {}),
+    ...(guard ? { deadline_ms: Date.now() + 60_000, remaining_ms: 60_000 } : {}),
   })}\n`);
 }
 
@@ -1760,6 +2009,153 @@ registeredChannelTest("Pi guarded empty draft submits exactly once and leaves ed
   expect(connections[0].acks[1]).toMatchObject({ status: "accepted", duplicate: true });
   expect(editor).toBe("");
   expect(mutations).toBe(0);
+});
+
+// Pi keeps a receiving session's input fenced until every session_start handler of a native
+// /new, /resume or /fork has returned, without rotating the generation captured in session_start.
+// This fixture models that admission rule: refused as session_changed while held, admitted after.
+function lifecycleFenceFixture() {
+  const state = { held: false };
+  const submit = (request: AdmissionRequest): Promise<AdmissionReceipt> => state.held
+    ? Promise.resolve({ status: "rejected", reason: "session_changed", sessionGeneration: request.sessionGeneration })
+    : accepted(request);
+  return { state, submit };
+}
+
+// A Pi that announces the lifted fence with session_ready advertises it as a host capability.
+const SESSION_READY_PI = { sessionReadyEvent: true };
+
+// A native /new to session-2 whose input is still fenced by a slower session_start handler, with
+// this extension already registered for session-2 on a fresh connection.
+async function guardedChannelInsideNewFence(sessionReadyPi = true) {
+  const { connections } = await startChannelServer();
+  const { state, submit } = lifecycleFenceFixture();
+  const asset = await loadChannelAsset(submit, sessionReadyPi ? SESSION_READY_PI : {});
+  const draft = { editor: "" };
+  await asset.handlers.get("session_start")?.({}, draftContext({ getEditorText: () => draft.editor }));
+  await waitFor(() => connections.length === 1);
+  state.held = true;
+  const context: Record<string, any> = {
+    ...draftContext({ getEditorText: () => draft.editor }), userMessageSessionGeneration: "session-2",
+  };
+  await asset.handlers.get("session_start")?.({ reason: "new" }, context);
+  await waitFor(() => connections.length === 2 && connections[0].closed);
+  const sessionReady = (sessionGeneration = "session-2") =>
+    asset.handlers.get("session_ready")?.({ type: "session_ready", reason: "new", sessionGeneration }, context);
+  return { connection: connections[1], connections, state, asset, draft, context, sessionReady };
+}
+
+registeredChannelTest("Pi guarded delivery refused at the /new fence is held without polling, then admitted once on session_ready", async () => {
+  const { connection, connections, state, asset, sessionReady } = await guardedChannelInsideNewFence();
+  guardedDeliver(connection, "chan-3");
+  await waitFor(() => asset.calls.length === 1);
+  // Held: no ACK and no timer re-attempt while the fence is up.
+  await Bun.sleep(400);
+  expect(asset.calls).toHaveLength(1);
+  expect(connection.acks).toEqual([]);
+  state.held = false; // The remaining session_start handlers returned; Pi lifts the fence.
+  sessionReady();
+  // Re-attempted in the session_ready callback itself, before any microtask.
+  expect(asset.calls).toHaveLength(2);
+  await waitFor(() => connection.acks.length === 1);
+  expect(connection.acks[0]).toEqual({
+    type: "ack", registration_epoch: "epoch-2", request_id: "chan-3",
+    session_generation: "session-2", status: "accepted",
+  });
+  // Both attempts target the live generation; the redelivery uses a fresh Pi key.
+  expect(asset.calls[0].registrationEpoch).toBe("epoch-2");
+  expect(asset.calls[1].registrationEpoch).not.toBe("epoch-2");
+  for (const call of asset.calls) {
+    expect(call).toMatchObject({ requestId: "chan-3", sessionGeneration: "session-2", text: "remote prompt" });
+  }
+  // Once only: a later session_ready finds nothing held.
+  sessionReady();
+  await Bun.sleep(50);
+  expect(asset.calls).toHaveLength(2);
+  expect(connection.acks).toHaveLength(1);
+  // The same channel keeps admitting without another registration.
+  guardedDeliver(connection, "chan-4");
+  await waitFor(() => connection.acks.length === 2);
+  expect(connection.acks[1]).toMatchObject({ request_id: "chan-4", status: "accepted" });
+  expect(asset.calls).toHaveLength(3);
+  expect(connections).toHaveLength(2);
+});
+
+registeredChannelTest("Pi held guarded delivery rechecks the draft at session_ready and refuses draft_present without calling Pi", async () => {
+  const { connection, state, asset, draft, sessionReady } = await guardedChannelInsideNewFence();
+  guardedDeliver(connection, "draft");
+  await waitFor(() => asset.calls.length === 1);
+  draft.editor = "typed meanwhile";
+  await Bun.sleep(300);
+  expect(connection.acks).toEqual([]);
+  state.held = false;
+  sessionReady();
+  await waitFor(() => connection.acks.length === 1);
+  expect(connection.acks[0]).toMatchObject({ request_id: "draft", status: "rejected", reason: "draft_present" });
+  expect(asset.calls).toHaveLength(1);
+});
+
+registeredChannelTest("Pi held guarded delivery gets Pi's original refusal before its deadline when session_ready never comes", async () => {
+  const { connection, asset, sessionReady } = await guardedChannelInsideNewFence();
+  const deadline = Date.now() + 700;
+  connection.socket.write(`${JSON.stringify({
+    ...delivery(connection, "deadline", "remote prompt"), if_draft_empty: true, deadline_ms: deadline,
+  })}\n`);
+  await waitFor(() => asset.calls.length === 1);
+  await Bun.sleep(200);
+  expect(connection.acks).toEqual([]);
+  await waitFor(() => connection.acks.length === 1, 2_000);
+  // Acknowledged ahead of the deadline, so Herdr's own wait cannot report it as unknown.
+  expect(Date.now()).toBeLessThan(deadline);
+  expect(connection.acks[0]).toMatchObject({ request_id: "deadline", status: "rejected", reason: "session_changed" });
+  expect(asset.calls).toHaveLength(1);
+  // An expired hold is gone: a late session_ready does not deliver it.
+  sessionReady();
+  await Bun.sleep(50);
+  expect(asset.calls).toHaveLength(1);
+  expect(connection.acks).toHaveLength(1);
+  // Unguarded input is never held: its single deferred attempt's refusal passes through.
+  guardedDeliver(connection, "unguarded", "remote prompt", false);
+  await waitFor(() => connection.acks.length === 2);
+  expect(connection.acks[1]).toMatchObject({ request_id: "unguarded", status: "rejected", reason: "session_changed" });
+  sessionReady();
+  await Bun.sleep(50);
+  expect(asset.calls).toHaveLength(2);
+});
+
+registeredChannelTest("Pi held guarded delivery is not retried on a mismatched session_ready or a rotated generation", async () => {
+  const { connection, state, asset, context, sessionReady } = await guardedChannelInsideNewFence();
+  guardedDeliver(connection, "mismatch");
+  await waitFor(() => asset.calls.length === 1);
+  state.held = false;
+  sessionReady("session-other");
+  await waitFor(() => connection.acks.length === 1);
+  expect(connection.acks[0]).toMatchObject({ request_id: "mismatch", status: "rejected", reason: "session_changed" });
+  expect(asset.calls).toHaveLength(1);
+  // A real session change rotates the generation: never held, and no ACK for the dead generation.
+  asset.pi.submitUserMessage = async (request: AdmissionRequest) => {
+    asset.calls.push(request);
+    context.userMessageSessionGeneration = "session-rotated";
+    return { status: "rejected", reason: "session_changed", sessionGeneration: request.sessionGeneration };
+  };
+  guardedDeliver(connection, "rotated");
+  await waitFor(() => connection.closed);
+  sessionReady("session-2");
+  sessionReady("session-rotated");
+  await Bun.sleep(100);
+  expect(asset.calls).toHaveLength(2);
+  expect(connection.acks).toHaveLength(1);
+});
+
+registeredChannelTest("Pi without the session_ready capability passes the fence refusal through, with no retry", async () => {
+  const { connection, asset } = await guardedChannelInsideNewFence(false);
+  expect(asset.handlers.has("session_ready")).toBe(false);
+  guardedDeliver(connection, "old-pi");
+  await waitFor(() => connection.acks.length === 1);
+  expect(connection.acks[0]).toMatchObject({ request_id: "old-pi", status: "rejected", reason: "session_changed" });
+  await Bun.sleep(400);
+  expect(asset.calls).toHaveLength(1);
+  expect(connection.acks).toHaveLength(1);
 });
 
 registeredChannelTest("Pi guarded checks and invokes in the same socket callback before any microtask, then waits only for receipt", async () => {
@@ -2133,26 +2529,169 @@ for (const [name, deadline] of [
 registeredChannelTest("Pi guarded deadline elapsed during synchronous UI inspection refuses before submit", async () => {
   const { connections } = await startChannelServer();
   const asset = await loadChannelAsset(accepted);
-  const deadline = Date.now() + 60_000;
-  const originalNow = Date.now;
+  const originalMonotonic = performance.now;
   try {
     await asset.handlers.get("session_start")?.({}, draftContext({
       getEditorText: () => "",
       holdState: () => {
-        Date.now = () => deadline;
-        queueMicrotask(() => { Date.now = originalNow; });
+        // The UI read itself spends the whole budget on Pi's monotonic clock.
+        const spentAt = originalMonotonic.call(performance) + 60_000;
+        performance.now = () => spentAt;
+        queueMicrotask(() => { performance.now = originalMonotonic; });
         return undefined;
       },
     }));
     await waitFor(() => connections.length === 1);
     const connection = connections[0];
-    connection.socket.write(`${JSON.stringify({ ...delivery(connection), if_draft_empty: true, deadline_ms: deadline })}\n`);
+    connection.socket.write(`${JSON.stringify({
+      ...delivery(connection), if_draft_empty: true, deadline_ms: Date.now() + 60_000, remaining_ms: 60_000,
+    })}\n`);
     await waitFor(() => connection.acks.length === 1);
     expect(connection.acks[0]).toMatchObject({ status: "rejected", reason: "expired" });
     expect(asset.calls).toEqual([]);
   } finally {
+    performance.now = originalMonotonic;
+  }
+});
+
+// smarty-dev#8792. These drive the real extension over a real socket but stand in for Herdr and Pi
+// core (a fake channel server and submitUserMessage), and step the wall clock by replacing
+// Date.now: an E2E run cannot step the host's wall clock. They are not E2E for that reason.
+const WALL_STEP_BACK_MS = 3_600_000;
+function stepWallClockBack(): () => void {
+  const originalNow = Date.now;
+  Date.now = () => originalNow() - WALL_STEP_BACK_MS;
+  return () => { Date.now = originalNow; };
+}
+function spinMonotonic(ms: number) {
+  const until = performance.now() + ms;
+  while (performance.now() < until) { /* a slow synchronous UI read */ }
+}
+
+registeredChannelTest("Pi guarded admission refuses after its budget even when the wall clock steps back between send and check", async () => {
+  const { connections } = await startChannelServer();
+  const asset = await loadChannelAsset(accepted);
+  let restoreWall = () => {};
+  try {
+    await asset.handlers.get("session_start")?.({}, draftContext({
+      getEditorText: () => "",
+      holdState: () => { spinMonotonic(80); return undefined; },
+    }));
+    await waitFor(() => connections.length === 1);
+    const connection = connections[0];
+    // Herdr samples deadline_ms, then the wall clock steps back an hour before Pi checks. A wall
+    // comparison would pass both checks; the 50 ms budget is spent during the UI read.
+    const frame = { ...delivery(connection), if_draft_empty: true, deadline_ms: Date.now() + 50, remaining_ms: 50 };
+    restoreWall = stepWallClockBack();
+    connection.socket.write(`${JSON.stringify(frame)}\n`);
+    await waitFor(() => connection.acks.length === 1);
+    expect(connection.acks[0]).toMatchObject({ status: "rejected", reason: "expired" });
+    expect(asset.calls).toEqual([]);
+  } finally {
+    restoreWall();
+  }
+});
+
+registeredChannelTest("Pi held guarded delivery expires on its budget, not the wall clock, after a backward wall-clock step", async () => {
+  const { connection, asset, sessionReady, state } = await guardedChannelInsideNewFence();
+  let restoreWall = () => {};
+  try {
+    const sentAt = performance.now();
+    const frame = { ...delivery(connection, "held"), if_draft_empty: true, deadline_ms: Date.now() + 600, remaining_ms: 600 };
+    restoreWall = stepWallClockBack();
+    connection.socket.write(`${JSON.stringify(frame)}\n`);
+    await waitFor(() => asset.calls.length === 1);
+    // The hold still settles with Pi's refusal ahead of the 600 ms budget, not an hour later.
+    await waitFor(() => connection.acks.length === 1, 2_000);
+    expect(performance.now() - sentAt).toBeLessThan(600);
+    expect(connection.acks[0]).toMatchObject({ request_id: "held", status: "rejected", reason: "session_changed" });
+    // A session_ready after the budget, with the wall clock still behind, admits nothing.
+    state.held = false;
+    sessionReady();
+    await Bun.sleep(50);
+    expect(asset.calls).toHaveLength(1);
+    expect(connection.acks).toHaveLength(1);
+  } finally {
+    restoreWall();
+  }
+});
+
+registeredChannelTest("Pi guarded frame received after a pause past deadline_ms is refused despite a fresh budget", async () => {
+  const { connections } = await startChannelServer();
+  const asset = await loadChannelAsset(accepted);
+  await asset.handlers.get("session_start")?.({}, draftContext());
+  await waitFor(() => connections.length === 1);
+  const connection = connections[0];
+  // Herdr sends a 60 s budget; Pi's event loop is then paused for ten minutes before its handler
+  // reads the frame. The budget starts at receipt and is still fresh, but the wall clock has
+  // passed deadline_ms, so admission must refuse.
+  const frame = { ...delivery(connection, "paused"), if_draft_empty: true, deadline_ms: Date.now() + 60_000, remaining_ms: 60_000 };
+  const originalNow = Date.now;
+  Date.now = () => originalNow() + 600_000;
+  try {
+    connection.socket.write(`${JSON.stringify(frame)}\n`);
+    await waitFor(() => connection.acks.length === 1);
+    expect(connection.acks[0]).toMatchObject({ request_id: "paused", status: "rejected", reason: "expired" });
+    expect(asset.calls).toEqual([]);
+  } finally {
     Date.now = originalNow;
   }
+});
+
+registeredChannelTest("Pi guarded admission requires both remaining_ms and deadline_ms, with deadline_ms alone as the fallback", async () => {
+  const { connections } = await startChannelServer();
+  const asset = await loadChannelAsset(accepted);
+  await asset.handlers.get("session_start")?.({}, draftContext());
+  await waitFor(() => connections.length === 1);
+  const connection = connections[0];
+  const send = (requestId: string, fields: Record<string, unknown>) =>
+    connection.socket.write(`${JSON.stringify({ ...delivery(connection, requestId), if_draft_empty: true, ...fields })}\n`);
+  // A live budget with a past deadline_ms refuses: the wall deadline is also enforced.
+  send("budget-live", { deadline_ms: Date.now() - 1_000, remaining_ms: 60_000 });
+  await waitFor(() => connection.acks.length === 1);
+  expect(connection.acks[0]).toMatchObject({ request_id: "budget-live", status: "rejected", reason: "expired" });
+  // A spent budget refuses even when the absolute deadline is far away.
+  send("budget-spent", { deadline_ms: Date.now() + 60_000, remaining_ms: 0 });
+  await waitFor(() => connection.acks.length === 2);
+  expect(connection.acks[1]).toMatchObject({ request_id: "budget-spent", reason: "expired" });
+  // An older Herdr sends deadline_ms alone: it still admits until that deadline.
+  send("legacy", { deadline_ms: Date.now() + 60_000 });
+  await waitFor(() => connection.acks.length === 3);
+  expect(connection.acks[2]).toMatchObject({ request_id: "legacy", status: "accepted" });
+  // A present but malformed budget fails closed; it never falls back to deadline_ms.
+  let acks = 3;
+  for (const [index, budget] of [-1, 1.5, "60000", null, {}, Number.MAX_SAFE_INTEGER + 1].entries()) {
+    send(`bad-${index}`, { deadline_ms: Date.now() + 60_000, remaining_ms: budget });
+    acks += 1;
+    await waitFor(() => connection.acks.length === acks);
+    expect(connection.acks[acks - 1]).toMatchObject({ request_id: `bad-${index}`, status: "rejected", reason: "unknown" });
+  }
+  // A present but malformed deadline_ms fails closed even with a live budget.
+  for (const [index, deadline] of [1.5, "60000", null, {}].entries()) {
+    send(`bad-wall-${index}`, { deadline_ms: deadline, remaining_ms: 60_000 });
+    acks += 1;
+    await waitFor(() => connection.acks.length === acks);
+    expect(connection.acks[acks - 1]).toMatchObject({ request_id: `bad-wall-${index}`, status: "rejected", reason: "unknown" });
+  }
+  // Both live: admitted.
+  send("both-live", { deadline_ms: Date.now() + 60_000, remaining_ms: 60_000 });
+  acks += 1;
+  await waitFor(() => connection.acks.length === acks);
+  expect(connection.acks[acks - 1]).toMatchObject({ request_id: "both-live", status: "accepted" });
+  expect(asset.calls.map((call) => call.requestId)).toEqual(["legacy", "both-live"]);
+});
+
+registeredChannelTest("Pi refuses remaining_ms without deadline_ms as unknown and never reaches ingress", async () => {
+  const { connections } = await startChannelServer();
+  const asset = await loadChannelAsset(accepted);
+  await asset.handlers.get("session_start")?.({}, draftContext());
+  await waitFor(() => connections.length === 1);
+  const connection = connections[0];
+  // A live budget alone would skip the wall-clock check, refunding a pause before receipt.
+  connection.socket.write(`${JSON.stringify({ ...delivery(connection, "budget-only"), if_draft_empty: true, remaining_ms: 60_000 })}\n`);
+  await waitFor(() => connection.acks.length === 1);
+  expect(connection.acks[0]).toMatchObject({ request_id: "budget-only", status: "rejected", reason: "unknown" });
+  expect(asset.calls).toEqual([]);
 });
 
 for (const deadline of ["1e999", "-1e999"]) {

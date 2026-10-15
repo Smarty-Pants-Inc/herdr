@@ -360,6 +360,7 @@ impl App {
             state_labels: presentation.state_labels,
             tokens: terminal.metadata_tokens.values(),
             agent_session: terminal_agent_session_info(terminal),
+            agent_session_id: terminal.reported_agent_session_id().map(str::to_owned),
             scroll: None,
             revision: terminal.revision,
         })
@@ -409,11 +410,21 @@ impl App {
                     checkout_path: space.checkout_path.display().to_string(),
                     is_linked_worktree: space.is_linked_worktree,
                 }),
+            // One path per row: a worktree row's path is `worktree.checkout_path`;
+            // a root pane that `cd`s elsewhere must not contradict it.
+            cwd: ws
+                .worktree_space()
+                .is_none()
+                .then(|| {
+                    ws.resolved_identity_cwd_from(&self.state.terminals, &self.terminal_runtimes)
+                })
+                .flatten()
+                .map(|cwd| cwd.display().to_string()),
         }
     }
 }
 
-fn terminal_agent_session_info(
+pub(super) fn terminal_agent_session_info(
     terminal: &crate::terminal::TerminalState,
 ) -> Option<crate::api::schema::AgentSessionInfo> {
     if let Some(authority) = terminal.hook_authority.as_ref() {

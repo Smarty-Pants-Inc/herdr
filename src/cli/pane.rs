@@ -1,10 +1,11 @@
 use crate::api::schema::{
-    Method, OutputMatch, PaneCurrentParams, PaneDirection, PaneEdgesParams,
+    Method, OutputMatch, PaneCloseParams, PaneCurrentParams, PaneDirection, PaneEdgesParams,
     PaneFocusDirectionParams, PaneInputSetParams, PaneLayoutParams, PaneListParams,
     PaneMoveDestination, PaneMoveParams, PaneNeighborParams, PaneProcessInfoParams, PaneReadParams,
     PaneReleaseAgentParams, PaneRenameParams, PaneReportAgentParams, PaneReportAgentSessionParams,
     PaneReportMetadataParams, PaneResizeParams, PaneRightClickTarget, PaneSendInputParams,
-    PaneSendKeysParams, PaneSendTextParams, PaneSplitParams, PaneSwapParams, PaneTarget,
+    PaneSendKeysParams, PaneSendKeysPathCheckedParams, PaneSendTextParams,
+    PaneSendTextPathCheckedParams, PaneSplitParams, PaneSwapParams, PaneTarget,
     PaneWaitForOutputParams, PaneZoomMode, PaneZoomParams, ReadFormat, ReadSource, Request,
     SplitDirection,
 };
@@ -33,6 +34,7 @@ pub(super) fn run_pane_command(args: &[String]) -> std::io::Result<i32> {
         "swap" => pane_swap(&args[1..]),
         "move" => pane_move(&args[1..]),
         "close" => pane_close(&args[1..]),
+        "clear-input-poison" => pane_clear_input_poison(&args[1..]),
         "send-text" => pane_send_text(&args[1..]),
         "send-keys" => pane_send_keys(&args[1..]),
         "wait-output" => pane_wait_output(&args[1..]),
@@ -1008,16 +1010,56 @@ fn parse_pane_direction(value: &str) -> Result<PaneDirection, String> {
 }
 
 fn pane_close(args: &[String]) -> std::io::Result<i32> {
-    let Some(raw_pane_id) = args.first() else {
-        eprintln!("usage: herdr pane close <pane_id>");
-        return Ok(2);
-    };
-    if args.len() != 1 {
-        eprintln!("usage: herdr pane close <pane_id>");
-        return Ok(2);
+    match parse_pane_close_args(args) {
+        Ok(params) => super::runtime::pane_close(params),
+        Err(err) => {
+            let exit_code = err.exit_code();
+            err.print()?;
+            Ok(exit_code)
+        }
     }
+}
 
-    super::runtime::pane_close(super::normalize_pane_id(raw_pane_id))
+/// The terminal ID is opaque: only the pane ID is normalized.
+fn parse_pane_close_args(args: &[String]) -> Result<PaneCloseParams, clap::Error> {
+    let matches = super::spec::parse_leaf_args(&["pane", "close"], args)?;
+    Ok(PaneCloseParams {
+        pane_id: super::normalize_pane_id(
+            matches
+                .get_one::<String>("pane_id")
+                .expect("Clap requires the pane target"),
+        ),
+        expected_terminal: matches.get_one::<String>("expected-terminal").cloned(),
+    })
+}
+
+fn parse_pane_clear_input_poison_args(args: &[String]) -> Result<PaneTarget, clap::Error> {
+    let matches = super::spec::parse_leaf_args(&["pane", "clear-input-poison"], args)?;
+    Ok(PaneTarget {
+        pane_id: super::normalize_pane_id(
+            matches
+                .get_one::<String>("pane_id")
+                .expect("Clap requires the pane target"),
+        ),
+    })
+}
+
+fn pane_clear_input_poison(args: &[String]) -> std::io::Result<i32> {
+    let target = match parse_pane_clear_input_poison_args(args) {
+        Ok(target) => target,
+        Err(error) => {
+            let exit_code = error.exit_code();
+            error.print()?;
+            return Ok(exit_code);
+        }
+    };
+    // Warn before the operator's explicit request can reach the actor.
+    eprintln!("Warning: {}", crate::api::schema::PANE_INPUT_POISON_NOTICE);
+    eprintln!("{}", crate::api::schema::PANE_INPUT_POISON_CLEAR_WARNING);
+    super::print_response(&super::send_request(&Request {
+        id: "cli:pane:clear-input-poison".into(),
+        method: Method::PaneClearInputPoison(target),
+    })?)
 }
 
 fn parse_pane_content_args(
@@ -1037,48 +1079,105 @@ fn parse_pane_content_args(
             .cloned()
             .collect(),
         matches.get_flag("allow-cross-pane"),
-        if command == "run" {
-            matches.get_one::<String>("expected-terminal").cloned()
-        } else {
-            None
-        },
+        // The guard flag is command-specific; session IDs are opaque, not pane IDs.
+        matches
+            .get_one::<String>(if command == "run" {
+                "expected-terminal"
+            } else {
+                "expected-session"
+            })
+            .cloned(),
     ))
 }
 
-fn pane_send_text(args: &[String]) -> std::io::Result<i32> {
-    let (raw_pane_id, text, allow_cross_pane, _) =
-        match parse_pane_content_args("send-text", "text", args) {
-            Ok(parsed) => parsed,
-            Err(err) => {
-                let exit_code = err.exit_code();
-                err.print()?;
-                return Ok(exit_code);
-            }
-        };
-
-    super::send_ok_request(Method::PaneSendText(PaneSendTextParams {
+fn parse_pane_send_text_args(args: &[String]) -> Result<PaneSendTextParams, clap::Error> {
+    let (raw_pane_id, text, allow_cross_pane, expected_agent_session_id) =
+        parse_pane_content_args("send-text", "text", args)?;
+    Ok(PaneSendTextParams {
         pane_id: super::normalize_pane_id(&raw_pane_id),
         text: text.join(" "),
+        expected_agent_session_id,
         allow_cross_pane,
-    }))
+    })
+}
+
+/// `--refuse-if-exists PATH`, made absolute against this CLI's working
+/// directory: the server checks it from its own.
+fn parse_refuse_if_exists_arg(
+    command: &str,
+    args: &[String],
+) -> Result<Option<String>, clap::Error> {
+    let matches = super::spec::parse_leaf_args(&["pane", command], args)?;
+    let Some(path) = matches.get_one::<String>("refuse-if-exists") else {
+        return Ok(None);
+    };
+    let absolute = std::path::absolute(path).map_err(|err| {
+        clap::Error::raw(
+            clap::error::ErrorKind::ValueValidation,
+            format!("invalid --refuse-if-exists path {path:?}: {err}\n"),
+        )
+    })?;
+    absolute
+        .into_os_string()
+        .into_string()
+        .map(Some)
+        .map_err(|_| {
+            clap::Error::raw(
+                clap::error::ErrorKind::InvalidUtf8,
+                "--refuse-if-exists needs a UTF-8 path\n",
+            )
+        })
+}
+
+fn pane_send_text(args: &[String]) -> std::io::Result<i32> {
+    let parsed = parse_pane_send_text_args(args)
+        .and_then(|params| Ok((params, parse_refuse_if_exists_arg("send-text", args)?)));
+    let (params, refuse_if_exists) = match parsed {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            let exit_code = err.exit_code();
+            err.print()?;
+            return Ok(exit_code);
+        }
+    };
+    super::send_ok_request(match refuse_if_exists {
+        Some(refuse_if_exists) => Method::PaneSendTextPathChecked(PaneSendTextPathCheckedParams {
+            input: params,
+            refuse_if_exists,
+        }),
+        None => Method::PaneSendText(params),
+    })
+}
+
+fn parse_pane_send_keys_args(args: &[String]) -> Result<PaneSendKeysParams, clap::Error> {
+    let (raw_pane_id, keys, allow_cross_pane, expected_agent_session_id) =
+        parse_pane_content_args("send-keys", "key", args)?;
+    Ok(PaneSendKeysParams {
+        pane_id: super::normalize_pane_id(&raw_pane_id),
+        keys,
+        expected_agent_session_id,
+        allow_cross_pane,
+    })
 }
 
 fn pane_send_keys(args: &[String]) -> std::io::Result<i32> {
-    let (raw_pane_id, keys, allow_cross_pane, _) =
-        match parse_pane_content_args("send-keys", "key", args) {
-            Ok(parsed) => parsed,
-            Err(err) => {
-                let exit_code = err.exit_code();
-                err.print()?;
-                return Ok(exit_code);
-            }
-        };
-
-    super::send_ok_request(Method::PaneSendKeys(PaneSendKeysParams {
-        pane_id: super::normalize_pane_id(&raw_pane_id),
-        keys,
-        allow_cross_pane,
-    }))
+    let parsed = parse_pane_send_keys_args(args)
+        .and_then(|params| Ok((params, parse_refuse_if_exists_arg("send-keys", args)?)));
+    let (params, refuse_if_exists) = match parsed {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            let exit_code = err.exit_code();
+            err.print()?;
+            return Ok(exit_code);
+        }
+    };
+    super::send_ok_request(match refuse_if_exists {
+        Some(refuse_if_exists) => Method::PaneSendKeysPathChecked(PaneSendKeysPathCheckedParams {
+            input: params,
+            refuse_if_exists,
+        }),
+        None => Method::PaneSendKeys(params),
+    })
 }
 
 fn pane_run(args: &[String]) -> std::io::Result<i32> {
@@ -1755,8 +1854,9 @@ fn print_pane_help() {
     eprintln!("  herdr pane swap --source-pane ID --target-pane ID");
     eprintln!("  {}", pane_move_usage());
     eprintln!("  herdr pane close <pane_id>");
-    eprintln!("  herdr pane send-text <pane_id> [--allow-cross-pane] <text>");
-    eprintln!("  herdr pane send-keys <pane_id> [--allow-cross-pane] <key> [key ...]");
+    eprintln!("  herdr pane clear-input-poison <pane_id>");
+    eprintln!("  herdr pane send-text <pane_id> [--expected-session ID] [--refuse-if-exists PATH] [--allow-cross-pane] <text>");
+    eprintln!("  herdr pane send-keys <pane_id> [--expected-session ID] [--refuse-if-exists PATH] [--allow-cross-pane] <key> [key ...]");
     eprintln!("  herdr pane wait-output <pane_id> (--match TEXT | --regex PATTERN) [--source visible|recent|recent-unwrapped] [--lines N] [--timeout MS] [--raw]");
     eprintln!("  herdr pane report-agent <pane_id> --source ID --agent LABEL --state idle|working|blocked|unknown [--message TEXT] [--seq N] [--agent-session-id ID] [--agent-session-path PATH]");
     eprintln!("  herdr pane report-agent-session <pane_id> --source ID --agent LABEL [--seq N] [--agent-session-id ID] [--agent-session-path PATH]");
@@ -1767,6 +1867,17 @@ fn print_pane_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clear_input_poison_parser_requires_one_explicit_pane() {
+        let target = parse_pane_clear_input_poison_args(&args(&["w1:p2"])).unwrap();
+        assert_eq!(target.pane_id, "w1:p2");
+        let value = serde_json::to_value(Method::PaneClearInputPoison(target)).unwrap();
+        assert_eq!(value["method"], "pane.clear_input_poison");
+        for values in [&[][..], &["w1:p2", "extra"][..], &["--current"][..]] {
+            assert!(parse_pane_clear_input_poison_args(&args(values)).is_err());
+        }
+    }
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
@@ -2341,6 +2452,90 @@ mod tests {
             assert!(allow_cross_pane);
             assert_eq!(expected_terminal, None);
         }
+    }
+
+    #[test]
+    fn pane_send_session_expectations_round_trip_with_exact_pane_ids() {
+        for values in [
+            &[
+                "--expected-session",
+                "session=a",
+                "w1:p2",
+                "hello",
+                "--allow-cross-pane",
+            ][..],
+            &[
+                "w1:p2",
+                "hello",
+                "--expected-session=session=a",
+                "--allow-cross-pane",
+            ][..],
+        ] {
+            let text = parse_pane_send_text_args(&args(values)).unwrap();
+            assert_eq!(text.pane_id, "w1:p2");
+            assert_eq!(text.text, "hello");
+            assert_eq!(text.expected_agent_session_id.as_deref(), Some("session=a"));
+            assert!(text.allow_cross_pane);
+            let keys = parse_pane_send_keys_args(&args(values)).unwrap();
+            assert_eq!(keys.pane_id, "w1:p2");
+            assert_eq!(keys.keys, ["hello"]);
+            assert_eq!(keys.expected_agent_session_id.as_deref(), Some("session=a"));
+            assert!(keys.allow_cross_pane);
+            for method in [Method::PaneSendText(text), Method::PaneSendKeys(keys)] {
+                let request = Request {
+                    id: "test:send".into(),
+                    method,
+                };
+                let value = serde_json::to_value(&request).unwrap();
+                assert_eq!(value["params"]["expected_agent_session_id"], "session=a");
+                assert_eq!(value["params"]["pane_id"], "w1:p2");
+                assert_eq!(serde_json::from_value::<Request>(value).unwrap(), request);
+            }
+        }
+    }
+
+    #[test]
+    fn pane_send_without_expectations_and_double_dash_remain_unguarded() {
+        let text =
+            parse_pane_send_text_args(&args(&["w1:p2", "--", "--expected-session=session=a"]))
+                .unwrap();
+        assert_eq!(text.text, "--expected-session=session=a");
+        let keys =
+            parse_pane_send_keys_args(&args(&["w1:p2", "--", "--expected-session", "session=a"]))
+                .unwrap();
+        assert_eq!(keys.keys, ["--expected-session", "session=a"]);
+        for method in [Method::PaneSendText(text), Method::PaneSendKeys(keys)] {
+            let value = serde_json::to_value(method).unwrap();
+            assert!(value["params"].get("expected_agent_session_id").is_none());
+        }
+        for command in ["send-text", "send-keys"] {
+            let payload = if command == "send-text" {
+                "text"
+            } else {
+                "key"
+            };
+            for options in [&["--expected-session"][..], &["--expected-pane=w1:p2"][..]] {
+                let mut values = args(&["w1:p2", "hello"]);
+                values.extend(args(options));
+                assert!(parse_pane_content_args(command, payload, &values).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn pane_close_parses_expected_terminal_without_normalizing_it() {
+        for values in [
+            &["--expected-terminal", "term_opaque", "1-2"][..],
+            &["1-2", "--expected-terminal=term_opaque"][..],
+        ] {
+            let params = parse_pane_close_args(&args(values)).unwrap();
+            assert_eq!(params.pane_id, super::super::normalize_pane_id("1-2"));
+            assert_eq!(params.expected_terminal.as_deref(), Some("term_opaque"));
+        }
+        let params = parse_pane_close_args(&args(&["w1:p1"])).unwrap();
+        assert_eq!(params, PaneCloseParams::unguarded("w1:p1"));
+        assert!(parse_pane_close_args(&args(&["w1:p1", "w1:p2"])).is_err());
+        assert!(parse_pane_close_args(&args(&["w1:p1", "--expected-terminal"])).is_err());
     }
 
     #[test]

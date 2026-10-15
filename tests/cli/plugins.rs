@@ -1434,8 +1434,9 @@ EOF
 /// a pane and forks a `herdr pane run` grandchild into the new pane without
 /// --allow-cross-pane. This CLI invocation has no live-attributed invoking
 /// pane, so the grant is global: it admits only the pane it created while the
-/// action child lives, never pre-existing panes (herdr#223); a copied HERDR_PANE_ID without the token, a malformed token,
-/// and a replay after the action child exits are refused. Startup hooks never
+/// action child lives, never pre-existing panes (herdr#223); a malformed token and a replay after the
+/// action child exits are refused; a copied HERDR_PANE_ID without any token is
+/// accepted by the advisory fleet input-origin guard (Paul, 2026-10-13). Startup hooks never
 /// receive a grant.
 #[cfg(target_os = "linux")]
 #[test]
@@ -1460,6 +1461,7 @@ title = "Open"
 command = ["sh", "-c", '''
 e=$(cat target)
 "$HERDR_BIN_PATH" pane run "$e" "echo existing-marker" > existing.out 2>&1; echo $? > existing.rc
+env -u HERDR_PLUGIN_ACTION_TOKEN -u HERDR_ENV -u HERDR_PANE_ID "$HERDR_BIN_PATH" pane run "$e" "echo stripped-marker" > stripped.out 2>&1; echo $? > stripped.rc
 c=$(cat caller)
 "$HERDR_BIN_PATH" pane run "$c" "echo caller-marker" > caller.out 2>&1; echo $? > caller.rc
 "$HERDR_BIN_PATH" pane split "$c" --direction down > split.json 2> split.err
@@ -1469,6 +1471,15 @@ printf %s "$t" > created.tmp; mv created.tmp created
 env -u HERDR_PLUGIN_ACTION_TOKEN "$HERDR_BIN_PATH" pane run "$t" "echo copied-marker" > copied.out 2>&1; echo $? > copied.rc
 HERDR_PLUGIN_ACTION_TOKEN=forged "$HERDR_BIN_PATH" pane run "$t" "echo forged-marker" > forged.out 2>&1; echo $? > forged.rc
 ( while kill -0 $PPID_SH 2>/dev/null; do sleep 0.05; done; "$HERDR_BIN_PATH" pane run "$t" "echo replay-marker" > replay.out 2>&1; echo $? > replay.tmp; mv replay.tmp replay.rc ) </dev/null >/dev/null 2>&1 &
+''']
+
+[[actions]]
+id = "strip-pane"
+title = "Strip pane"
+command = ["sh", "-c", '''
+printf %s "${HERDR_PANE_ID-none}" > pane-invoked.tmp; mv pane-invoked.tmp pane-invoked.id
+e=$(cat target)
+env -u HERDR_PLUGIN_ACTION_TOKEN -u HERDR_ENV -u HERDR_PANE_ID "$HERDR_BIN_PATH" pane run "$e" "echo stripped-pane-marker" > stripped-pane.out 2>&1; echo $? > stripped-pane.tmp; mv stripped-pane.tmp stripped-pane.rc
 ''']
 
 [[startup]]
@@ -1581,7 +1592,36 @@ command = ["sh", "-c", 'printf %s "${HERDR_PLUGIN_ACTION_TOKEN-none}" > hook.tmp
             "pre-existing {case} pane: {output}"
         );
     }
-    for case in ["copied", "forged", "replay"] {
+    // smarty-dev#9452 residual (owner-disposed same-UID limit): an action
+    // can strip its token and launch markers and become an ordinary caller.
+    // Assert this existing behavior, not an isolation guarantee. #9212 only
+    // refuses launch when minting or binding fails; it does not authenticate
+    // hostile same-UID code after a successful grant launch.
+    assert_eq!(
+        read("stripped.rc").trim(),
+        "0",
+        "stripped: {}",
+        out("stripped.out")
+    );
+    assert!(wait_until(
+        Duration::from_secs(10),
+        Duration::from_millis(50),
+        || pane_read_recent_contains(&socket, &target_pane, "\nstripped-marker")
+    ));
+    // Paul, 2026-10-13: a copied HERDR_PANE_ID without any token is no plugin
+    // input; it takes the advisory fleet path and is accepted (and logged).
+    assert_eq!(
+        read("copied.rc").trim(),
+        "0",
+        "copied: {}",
+        out("copied.out")
+    );
+    assert!(wait_until(
+        Duration::from_secs(10),
+        Duration::from_millis(50),
+        || pane_read_recent_contains(&socket, &created_pane, "\ncopied-marker")
+    ));
+    for case in ["forged", "replay"] {
         assert_ne!(read(&format!("{case}.rc")).trim(), "0", "{case}");
         let output = out(&format!("{case}.out"));
         assert!(output.contains("input_origin_unknown"), "{case}: {output}");
@@ -1591,7 +1631,7 @@ command = ["sh", "-c", 'printf %s "${HERDR_PLUGIN_ACTION_TOKEN-none}" > hook.tmp
         Duration::from_millis(50),
         || pane_read_recent_contains(&socket, &created_pane, "granted-marker")
     ));
-    for refused in ["copied-marker", "forged-marker", "replay-marker"] {
+    for refused in ["forged-marker", "replay-marker"] {
         assert!(!pane_read_recent_contains(
             &socket,
             &created_pane,
@@ -1607,6 +1647,56 @@ command = ["sh", "-c", 'printf %s "${HERDR_PLUGIN_ACTION_TOKEN-none}" > hook.tmp
         &socket,
         &caller_pane,
         "\ncaller-marker"
+    ));
+
+    // smarty-dev#9452 same-UID residual also applies to a pane invocation:
+    // the invoker runs from A's live shell and the server derives A through
+    // trusted attribution, but the successfully launched action can still
+    // strip all attribution and write to B as an ordinary caller. This is
+    // deliberately asserted current behavior, outside #9212's launch refusal.
+    let quote = |path: &Path| format!("'{}'", path.display().to_string().replace('\'', "'\\''"));
+    let invoke_out = plugin_dir.join("invoke-pane.out");
+    let invoke_rc = plugin_dir.join("invoke-pane.rc");
+    let invoke_line = format!(
+        "{} --session grant plugin action invoke strip-pane --plugin example.grant > {} 2>&1; echo $? > {}",
+        quote(Path::new(env!("CARGO_BIN_EXE_herdr"))),
+        quote(&invoke_out),
+        quote(&invoke_rc)
+    );
+    let typed = run_named_cli(
+        &config_home,
+        &runtime_dir,
+        &[
+            "--session",
+            "grant",
+            "pane",
+            "run",
+            &caller_pane,
+            &invoke_line,
+        ],
+    );
+    assert!(
+        typed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&typed.stderr)
+    );
+    assert_eq!(
+        read("invoke-pane.rc").trim(),
+        "0",
+        "pane invoke: {}",
+        out("invoke-pane.out")
+    );
+    assert_eq!(read("pane-invoked.id"), caller_pane);
+    assert_eq!(
+        read("stripped-pane.rc").trim(),
+        "0",
+        "stripped pane: {}",
+        out("stripped-pane.out")
+    );
+    assert!(wait_until(
+        Duration::from_secs(10),
+        Duration::from_millis(50),
+        || pane_read_recent_contains(&socket, &target_pane, "\nstripped-pane-marker")
     ));
 
     // Startup hooks never see a grant (restart runs them).

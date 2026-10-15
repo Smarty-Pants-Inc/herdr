@@ -53,6 +53,27 @@ pub(crate) fn local_stream_peer_identity(
     }
 }
 
+/// The pidfs identity of a local transport's peer (`SO_PEERPIDFD`), taken at
+/// accept for the input consumer. Unix sockets on Linux only; otherwise `None`.
+pub(crate) fn local_stream_peer_pidfd(stream: &LocalStream) -> Option<crate::platform::PeerPidfd> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd as _;
+
+        match stream {
+            LocalStream::UdSocket(stream) => {
+                crate::platform::local_socket_peer_pidfd(stream.inner().as_raw_fd())
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = stream;
+        None
+    }
+}
+
 /// Numeric peer lookup retained only for transport tests; production request
 /// attribution uses the instance identity above.
 #[cfg(test)]

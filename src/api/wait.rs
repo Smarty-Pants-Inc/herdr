@@ -175,20 +175,77 @@ pub(super) fn wait_for_agent(
     }
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum AgentPromptKind {
+    Legacy,
+    SessionChecked,
+    StatusChecked,
+}
+
+impl AgentPromptKind {
+    fn validation_error(
+        self,
+        params: &crate::api::schema::AgentPromptParams,
+    ) -> Option<&'static str> {
+        if params.expected_agent_status.is_some() && params.expected_agent_session_id.is_none() {
+            return Some("expected_agent_status requires expected_agent_session_id");
+        }
+        match self {
+            Self::SessionChecked
+                if params.expected_agent_session_id.is_none()
+                    && params.expected_pane_id.is_none() =>
+            {
+                Some("session-checked method requires an identity expectation")
+            }
+            Self::StatusChecked
+                if params.expected_agent_status.is_none()
+                    || params.expected_agent_session_id.is_none() =>
+            {
+                Some("status-checked method requires status and session expectations")
+            }
+            _ => None,
+        }
+    }
+
+    fn method(self, params: crate::api::schema::AgentPromptParams) -> Method {
+        match self {
+            Self::Legacy => Method::AgentPrompt(params),
+            Self::SessionChecked => Method::AgentPromptSessionChecked(params),
+            Self::StatusChecked => Method::AgentPromptStatusChecked(params),
+        }
+    }
+}
+
 pub(super) fn prompt_agent(
     request_id: String,
     mut params: crate::api::schema::AgentPromptParams,
+    kind: AgentPromptKind,
     context: ApiRequestContext,
     stream: &mut LocalStream,
     api_tx: &ApiRequestSender,
     event_hub: &EventHub,
     running: &Arc<AtomicBool>,
 ) -> std::io::Result<Option<String>> {
+    // Validate before either the no-wait dispatch or the pre-wait lookup.
+    if let Some(message) = kind.validation_error(&params) {
+        return Ok(Some(
+            serde_json::to_string(&ErrorResponse {
+                id: request_id,
+                error: ErrorBody {
+                    code: "invalid_request".into(),
+                    message: message.into(),
+                },
+            })
+            .map_err(std::io::Error::other)?,
+        ));
+    }
+    // --wait must preserve the exact fail-closed method, never demote it.
+    let prompt_method = |params| kind.method(params);
     let Some(wait) = params.wait.clone() else {
         return Ok(Some(dispatch_to_app_with_timeout_and_context(
             Request {
                 id: request_id,
-                method: Method::AgentPrompt(params),
+                method: prompt_method(params),
             },
             api_tx,
             None,
@@ -222,7 +279,7 @@ pub(super) fn prompt_agent(
     let last_event_sequence = event_hub.current_sequence();
     let prompt_request = Request {
         id: request_id.clone(),
-        method: Method::AgentPrompt(params),
+        method: prompt_method(params),
     };
     #[cfg(windows)]
     let prompt_response = dispatch_to_app_with_caller_timeout(
@@ -830,6 +887,50 @@ fn wait_matched_response(request_id: &str, event: serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expected_status_guard_wait_preserves_exact_method_and_identity_requirements() {
+        for (kind, method) in [
+            (AgentPromptKind::Legacy, "agent.prompt"),
+            (
+                AgentPromptKind::SessionChecked,
+                "agent.prompt_session_checked",
+            ),
+            (
+                AgentPromptKind::StatusChecked,
+                "agent.prompt_status_checked",
+            ),
+        ] {
+            let mut params: crate::api::schema::AgentPromptParams = serde_json::from_value(serde_json::json!({
+                "target": "reviewer", "text": "hello", "expected_agent_status": "idle",
+                "expected_agent_session_id": "session=a", "wait": {"until": ["done"], "timeout_ms": 1200},
+            })).unwrap();
+            assert!(kind.validation_error(&params).is_none());
+            let request = kind.method(params.clone());
+            assert_eq!(crate::api::api_method_name(&request), method);
+            assert_eq!(
+                serde_json::to_value(request).unwrap()["params"],
+                serde_json::to_value(&params).unwrap()
+            );
+            params.expected_agent_session_id = None;
+            params.expected_pane_id = Some("w1:p1".into());
+            assert!(
+                kind.validation_error(&params).is_some(),
+                "pane expectation cannot authorize status-only delivery"
+            );
+            params.expected_agent_status = None;
+            match kind {
+                AgentPromptKind::Legacy | AgentPromptKind::SessionChecked => {
+                    assert!(kind.validation_error(&params).is_none())
+                }
+                AgentPromptKind::StatusChecked => assert!(kind.validation_error(&params).is_some()),
+            }
+            params.expected_pane_id = None;
+            if !matches!(kind, AgentPromptKind::Legacy) {
+                assert!(kind.validation_error(&params).is_some());
+            }
+        }
+    }
 
     #[test]
     fn agent_wait_probe_only_translates_agent_disappearance() {

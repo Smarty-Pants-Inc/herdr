@@ -126,12 +126,11 @@ impl HeadlessServer {
                 continue;
             };
             let mut handoff_runtime = runtime.handoff_runtime_state(pane_id);
-            handoff_runtime.agent_state = self
-                .app
-                .state
-                .terminals
-                .get(terminal_id)
-                .and_then(|terminal| terminal.handoff_agent_state());
+            let terminal = self.app.state.terminals.get(terminal_id);
+            handoff_runtime.agent_state =
+                terminal.and_then(|terminal| terminal.handoff_agent_state());
+            handoff_runtime.agent_session_binding =
+                terminal.and_then(|terminal| terminal.handoff_agent_session_binding());
             let has_agent_session = self
                 .app
                 .state
@@ -154,6 +153,7 @@ impl HeadlessServer {
             params.expected_protocol,
             params.expected_version,
             self.api_window_title.clone(),
+            self.host_shutdown_intent.get(),
         );
         let mut import_child = if pull {
             info!(socket = %socket_path.display(), "waiting for pulling handoff importer");

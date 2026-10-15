@@ -196,7 +196,7 @@ herdr tab close <tab_id>
 
 タブはワークスペース内の別のターミナルレイアウトです。`--workspace` を省略すると、`tab create` はアクティブなワークスペースを使い、存在しなければ失敗します。JSON レスポンスの `.result.tab.tab_id` と `.result.root_pane.pane_id` から ID を取得できます。ワークスペースの最後のタブを閉じると、そのワークスペースも閉じられます。`ui.confirm_close` が有効で、親ワークツリーの最後のタブを閉じるとワークツリーグループ全体が閉じられる場合、`tab close` は `confirmation_required` エラーを返します。
 
-`ui.confirm_close` が有効な場合、キーバインドやタブメニューからワークスペースの最後のタブを閉じる前に、TUI が確認を求めます。通常の CLI/API によるタブの終了は引き続き即座に実行されます。
+`ui.confirm_close` が有効な場合、キーバインドやタブ／ペインメニューからワークスペースの最後のタブ、または唯一のペインを閉じる前に、TUI が確認を求めます。通常のペイン終了や CLI/API による終了は引き続き即座に実行されます。
 
 ワークスペースとタブの作成、およびペインの分割は、デフォルトではフォーカスを変えません。`--focus` は新しいレイアウトを選択し、`--no-focus` はデフォルトを明示します。`--cwd` がない場合、新しいターミナルは `terminal.new_cwd` の設定に従い、デフォルトでは元のペインまたはワークスペースを引き継ぎます。各 `--env KEY=VALUE` は新しいルートシェルの環境変数を追加または置換します。
 
@@ -220,8 +220,11 @@ herdr pane swap --source-pane ID --target-pane ID
 herdr pane move <pane_id> --tab <tab_id> --split right|down [--target-pane ID] [--ratio FLOAT] [--focus|--no-focus]
 herdr pane move <pane_id> --new-tab [--workspace ID] [--label TEXT] [--focus|--no-focus]
 herdr pane move <pane_id> --new-workspace [--label TEXT] [--tab-label TEXT] [--focus|--no-focus]
-herdr pane close <pane_id>
+herdr pane clear-input-poison <pane>
+herdr pane close <pane_id> [--expected-terminal TERMINAL_ID]
 ```
+
+`pane close --expected-terminal <terminal_id>` は、ペインがまだそのターミナルを保持している場合にだけペインを閉じます。自分で起動したペインを閉じるときに使ってください。`terminal_id` は不透明な値なので、ペインを作成したレスポンスか `pane get` からコピーします。ペインが別のターミナルを保持している場合(たとえばサーバーが置き換わり、新しいターミナルが同じペイン ID を再利用した場合)、サーバーは `terminal_identity_mismatch` で拒否し、何も閉じません。サーバーは識別子の確認とクローズを 1 つのステップで行うため、その間に別のターミナルがペインを引き継ぐことはありません。サーバーが対応を通知していない場合、CLI は `expected_terminal_unsupported` を返し、何も閉じません。フラグなしの `pane close` の動作は変わりません。
 
 `--current` を受け付けるペインコマンドは、Herdr ペイン内から実行した場合、呼び出し元の `HERDR_PANE_ID` を使います。`pane split` では、明示したペイン ID または `--pane ID` がそのペインを分割します。対象を省略すると `HERDR_PANE_ID` があれば呼び出し元ペインを、なければフォーカス中のペインを使います。`--current` は呼び出し元ペインを必須とし、`HERDR_PANE_ID` がない場合はエラーになります。分割レスポンスでは、新しいペイン ID は `.result.pane.pane_id` にあります。
 
@@ -240,8 +243,8 @@ herdr pane read <pane_id> --source recent-unwrapped --lines 120
 入力を送る:
 
 ```bash
-herdr pane send-text <pane_id> <text>
-herdr pane send-keys <pane_id> <key> [key ...]
+herdr pane send-text <pane_id> [--expected-session ID] [--refuse-if-exists PATH] <text>
+herdr pane send-keys <pane_id> [--expected-session ID] [--refuse-if-exists PATH] <key> [key ...]
 herdr pane run <pane_id> <command>
 ```
 
@@ -250,6 +253,24 @@ herdr pane run <pane_id> <command>
 標準表記は `esc` ですが、`escape` も使えます。
 
 `pane run` は現在の bracketed paste モードを尊重し、テキストと Enter をアトミックに送信します。コマンドには `send-text` + `send-keys Enter` よりこちらを使ってください。個別の送信操作は低レベルのままで、コマンドを送信しません。
+
+`agent prompt`、`pane send-text`、`pane send-keys` に `--expected-session ID` を指定すると、報告済みのネイティブエージェントセッションが異なる場合に入力を拒否できます。`pane get` または `agent get` から現在の `agent_session_id` をコピーしてください。これは報告された ID であり、`agent_session.value` ではありません。Pi ではその値が再開用のパスになることがありますが、Herdr は報告された ID を別に保持します。ID が未報告ならガード付き入力は `agent_session_unknown`、異なる ID なら `agent_session_mismatch` を返します。これらの初期拒否は実際の ID を公開せず、入力バイトを一切書き込みません。
+
+`agent prompt` のターゲットにはエイリアスも使えます。`--expected-pane ID` を追加すると、先に確認したペインに引き続き解決されることを要求できます。異なるペインに解決された場合は、入力バイトを一切書き込まずに `expected_pane_mismatch` を返します。どちらの期待値も単独または組み合わせて使え、`--wait` とも併用できます。`pane send-text` と `pane send-keys` はすでに正規化された正確な `pane_id` を指定するため、`--expected-pane` は受け付けません。
+
+`--expected-session` を指定すると、サーバーは受理時にセッション報告元のプロセス ID と開始時刻を固定し、各 `write(2)` の直前に、そのプロセスが生存し、この PTY のフォアグラウンドプロセスグループに属することを最新情報で確認します。部分的な書き込み、再試行、フォーカス用プレフィックス、テキスト、遅延 Enter も対象です。受理後に所有権が失われると `agent_session_lost` を返し、残りの入力と Enter を破棄します。ただし、テキストの一部やプレフィックスはすでに書き込まれている可能性があります。テキスト段階のバイトが書き込まれている場合、Linux はアクターの PTY マスターから対応する正確なスレーブを開き、完了を返す前に `tcflush(slave, TCIFLUSH)` を呼び、蓄積された未読入力を破棄します。このフラッシュは tty 全体に作用するため、すでに蓄積された他の未読入力も破棄する可能性があります。読み取り側がすでに消費したバイトは取り消せず、同じ Pi の下書きが残る場合があります。
+
+`agent_session_lost` の `partial_text_consumed` は真偽値または `null` で、`flush_failed` は正確なスレーブのオープンまたは `TCIFLUSH` の失敗を示します。フラッシュが成功した場合（またはテキスト段階のバイトが未書き込みでフラッシュが不要な場合）、`flush_failed` は `false` です。この場合、テキスト段階のバイトが PTY に到達し、消費された可能性がある場合に限り `partial_text_consumed` は `true`、一切書き込まれていない場合に限り `false` です。読み取り側の受領確認ではありません。正確なスレーブのオープンまたは `TCIFLUSH` が失敗した場合は、`partial_text_consumed: null`（不明）と `flush_failed: true` を返します。ガード付き送信はキューへの追加成功ではなく PTY アクターの完了を返しますが、受信側エージェントからの応答確認ではありません。入力が部分的に届いている可能性があるため、エラー後に自動再試行したり期待値を外したりしないでください。これらのエラーで実際のセッション ID は公開されません。
+
+正確なスレーブのオープンまたは `TCIFLUSH` が失敗しても、Herdr は PTY マスターを閉じず、ユーザーのプロセスを終了しません。残りの要求を破棄して Enter を送らず、その要求を `flush_failed: true` で失敗させ、警告をログに記録します。以降のペイン入力はブロックされません。
+
+`herdr pane clear-input-poison <pane>`（API `pane.clear_input_poison`）は引き続き利用でき、任意の呼び出し元を受け付けます。呼び出し元はログに記録されます。**警告:** 蓄積されたテキストが入力行に残っている可能性があります。解除前に確認して破棄してください。解除しても行が空であるとは限らず、その後の Enter で読み取り側がすでにバッファーに保持しているテキストが送信される可能性があります。自動解除や再試行のための解除は行わないでください。
+
+初期チェックは、受理時の Herdr の報告済みペイン状態に対してアトミックです。エージェントがまだ報告していないセッション変更は検出できません。最後の最新プロセス／フォアグラウンド確認と `write(2)` の間のネイティブ確認／書き込みの隙間、および所有権喪失／フラッシュ／読み取り側の競合は残ります。読み取り側がフラッシュ前に蓄積されたバイトを消費する可能性があります。完了やフラッシュは、書き込まれた、または消費された総バイト数がゼロであることを保証しません。App からアクターへのキューと遅延 Enter の待機はガードされますが、これらのネイティブの競合をなくすものではありません。CLI は `expected_agent_session_guard` を必要とし、対応と能力の通知は Linux のみです。macOS と Windows は安全を確認できないため拒否し、macOS はネイティブな証明の実装待ちです。未対応なら CLI はガード付き操作を送らずに `expected_agent_session_unsupported` を返します。また checked メソッド名を使うため、能力チェック後にサーバーが置き換わっても、安全を確認できなければ操作を拒否します。これらのフラグを省略すると、既存の動作と別途定められたペイン間入力ポリシーは変わりません。
+
+既知の制限: 一時停止後に同じネイティブセッションを再開または再読み込みしても、ガード付き送信は再び許可されません。新しいセッションを開始する（`/new`）か、エージェントを再起動してください。[フォローアップの issue](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/7577) を参照してください。
+
+`pane send-text` または `pane send-keys` に `--refuse-if-exists PATH` を指定すると、リクエストの受理時ではなく、最初のリクエストバイトの書き込みが成功するまで、各書き込み試行の直前に PATH を `lstat` で確認します。最初のバイトを書き込む前に存在する claim はリクエストを防ぎ、書き込み開始後はリクエストを完了します。書き込みが 0 バイトのまま `EAGAIN`（ブロックする）または `EINTR`（中断された）を返した場合、再試行の前に PATH を再確認します。パスが存在する場合は `guard_path_present` と終了コード 1 を返し、リクエストの書き込みは 0 バイト、`partial_text_consumed: false`、`flush_failed: false` となります。パスを確認できない場合（たとえば親ディレクトリを検索できない場合）もフェイルクローズし、`guard_path_unverifiable` と同じ 0 バイトの結果を返します。パスが存在しない場合だけ書き込みを開始します。開始後はパスを再検査せず、部分チャンク、再試行、遅延 Enter を完了します。パスガードは未読入力をフラッシュしないため、無関係なキュー入力は保持されます。独立した `--expected-session` ガードの各書き込み前のチェックとセッション喪失時のフラッシュ動作は変わりません。別々の `lstat` と最初の `write(2)` は同期ではなく、その間に作成された claim を見逃す可能性があります（受容された技術的リスク [smarty-dev#12584](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/12584)）。CLI は相対 PATH を自身の作業ディレクトリを基準に絶対パスにします。サーバー機能 `refuse_if_exists_guard`（Unix のみ）が必要で、この機能がない場合は送信せずに `refuse_if_exists_unsupported` を返します。CLI はチェック付きメソッド `pane.send_text_path_checked` と `pane.send_keys_path_checked` を使うため、古いサーバーはリクエストを拒否し、フラグを無視することはありません。フラグを省略すると動作は変わりません。
 
 カスタムフックからエージェント状態を報告する:
 
@@ -321,7 +342,7 @@ herdr agent list
 herdr agent get <target>
 herdr agent read <target> [--source visible|recent|recent-unwrapped|detection] [--lines N] [--format text|ansi] [--ansi]
 herdr agent send-keys <target> <key> [key ...]
-herdr agent prompt <target> <text> [--if-draft-empty | --wait [--until STATUS]... [--timeout MS]] [--allow-cross-pane]
+herdr agent prompt <target> <text> [--if-draft-empty | [--expected-session ID] [--expected-pane ID] [--expected-status STATUS] [--wait [--until STATUS]... [--timeout MS]]] [--allow-cross-pane]
 herdr agent rename <target> <name>|--clear
 herdr agent focus <target>
 herdr agent wait <target> [--until STATUS]... [--timeout MS]
@@ -338,6 +359,18 @@ herdr agent explain --file PATH --agent LABEL [--json|--verbose]
 成功した start は、期待したエージェントが同じターミナルを所有し、対話入力の準備ができてから返ります。起動中の検出状態が `blocked` の場合、コマンドは直ちに `agent_not_ready` を返します。名前は `agent read` と `agent send-keys` で引き続き使用でき、検出状態が `idle` になるとプロンプトを送信できるようになります。デフォルトの起動タイムアウトは 30000 ミリ秒で、明示する値は 3000 より大きく 300000 以下でなければなりません。
 
 `--if-draft-empty` を付けない `agent prompt` は従来の動作を維持し、現在の bracketed paste モードを尊重し、working 中でもテキストと遅延した Enter を順序付きの 1 回の送信として書き込みます。`--wait` なしの成功は書き込みの完了を示し、ターンの開始を保証しません。Windows の Codex では Enter の前にペースト境界が送られるため、送信はプロンプトのサイズに依存しません。呼び出し側のタイムアウトには送信時間も含まれます。エージェントがすでに `blocked` の場合は、入力を送信せずに `agent_blocked` を返します。`--wait` を使う場合、別の non-working 状態から受け付けたプロンプトでは、送信後の最大 5 秒間に `working` または `blocked` が観測される必要があります。観測できなければ Herdr は `agent_prompt_stalled` を返し、呼び出し側のタイムアウトが先に切れた場合は通常の `timeout` エラーを返します。これにより、無関係な `idle`、`done`、またはセッションの変化によって待機が誤って完了することを防ぎます。活動を観測した後、要求された最初の安定状態を待ちます。個々のターンは追跡しません。すでに working の場合、進行中ターンの完了が待機を満たすことがあります。`--until` は一致状態を絞り込み、`--wait` なしでは拒否されます。単独の `agent wait` は現在の状態が一致すれば即座に返ります。どちらもデフォルトは `idle`、`done`、`blocked` です。
+
+`agent prompt` に `--expected-status idle` を追加すると、受理時に Herdr が**検出した**エージェント状態が idle でない限り送信を拒否します。初期不一致では `expected_status_mismatch` を返し、入力バイトは一切書き込みません。フックとスクリーン検出から得た有効状態を比較し、ペインの既読状態には依存しません。そのため、`done` と表示される idle エージェントも idle の期待値を満たします。フラグを省略すると、working 中のエージェントへの送信を含む既存の動作を維持します。
+
+```bash
+herdr agent prompt reviewer "Review the current diff" --expected-session "$session_id" --expected-status idle
+```
+
+`--expected-status` には **`--expected-session` が必須**です。上の例では、`agent get` で報告された `agent_session_id` を `session_id` にコピーしてください。状態だけのガードは未対応です。このフラグは API の省略可能な `expected_agent_status` フィールドに対応し、`expected_agent_status_guard` のサポートが必要です。未対応なら CLI はプロンプトを送らずに `expected_agent_status_unsupported` を返します。`--expected-status` を指定すると、CLI は常に `agent.prompt_status_checked` を使います。古いサーバーは状態フィールドを黙って無視せず、このメソッドを拒否します。旧メソッドでの再試行はありません。期待値を外して自動再試行しないでください。`--expected-pane` と `--wait` も併用できます。
+
+検出状態の条件は、受理時と PTY 書き込み前に既存のセッション／報告元ガードとともに確認します。受理後に検出状態が不一致となった場合も `expected_status_mismatch` を返し、リクエストの残りのバイトを停止して、それ以降の Enter を送りません。入力の一部がすでに書き込まれている可能性があり、この後段のエラーは総書き込みバイト数がゼロであることを保証しません。idle になるまで待つ操作ではありません。
+
+検出された idle は**最後に観測した状態**であり、実際のエージェントが busy ではないことのトランザクション的な証明ではありません。フックとスクリーン検出には遅延があり、確認後に busy になることもあります。破壊的なコマンドには引き続きエージェント側の busy チェックが必要で、このフラグはそれを提供しません。`--wait` は送信後の活動と安定状態を観測するもので、受理時の確認を強化するものではありません。
 
 `idle` と `done` はどちらも入力可能な状態です。CLI/API はサーバーの既読状態を使い、未確認の idle を `done` とします。明示的な `pane focus` / `agent focus` は対象を既読にしますが、読み取りでは変わりません。各 TUI クライアントは表示済みの完了を独立して管理するため、Done バッジが CLI やほかのクライアントと異なる場合があります。`blocked` は承認または質問 UI を Herdr が認識した状態です。`unknown` はエージェントが存在するものの確実に分類できない状態で、作業の成功を意味しません。
 
@@ -358,7 +391,7 @@ herdr agent prompt-guarded <target> <text> --expected-terminal TERMINAL_ID --exp
 
 これらのコマンドはスクリーン検出を必要とせず、明示的なペイン ID、不透明なターミナル ID、または一意なライブエージェント名を対象にします。`channel-info` は `terminal_id` と `ready` を返し、準備完了時には `registration_epoch` と `session_generation` も含み、判明している場合は boolean の能力 `draft_guard` を返します。`draft_guard` が欠落または `false` ならドラフトガードには未対応です。問い合わせ自体は登録を行いません。同じ `ready: true` レスポンスからターミナルと epoch をコピーし、名前やペイン位置から推測しないでください。
 
-`prompt-guarded` は登録済みソケットチャネルだけを通じてリテラルのテキストを送ります。PTY にテキスト、準備用バイト、Enter を書き込まず、入力フォーカスを変えず、`agent prompt` にフォールバックしません。`--if-draft-empty` を付けない場合、既存の `agent prompt` の動作は変わりません。対象、テキスト、両方の固定識別子、リクエスト ID は空にできません。`--timeout-ms` はターン完了ではなく入力の受け入れ確認を待ちます。既定値は 10000、範囲は 1〜300000 ミリ秒です。`--allow-cross-pane` は既存のペイン間入力ポリシーへの明示的な許可で、チャネルや識別子の検証を回避しません。
+`prompt-guarded` は登録済みソケットチャネルだけを通じてリテラルのテキストを送ります。PTY にテキスト、準備用バイト、Enter を書き込まず、入力フォーカスを変えず、`agent prompt` にフォールバックしません。`--if-draft-empty` を付けない場合、既存の `agent prompt` の動作は変わりません。対象、テキスト、両方の固定識別子、リクエスト ID は空にできません。`--timeout-ms` はターン完了ではなく入力の受け入れ確認を待ちます。既定値は 10000、範囲は 1〜300000 ミリ秒です。`--allow-cross-pane` は互換性のため受け付けられます。ペイン間入力はこれなしでも許可され、ログに記録されます。どちらもチャネルや識別子の検証を回避しません。
 
 `agent prompt --if-draft-empty` は登録済みチャネルへの簡便な経路です。送信前に `draft_guard: true` を確認し、現在のターミナル/epoch をコピーしてリクエスト ID を生成し、`if_draft_empty: true` で `agent.prompt_guarded` を呼びます。タイピングや従来の配信へのフォールバックはありません。従来の `--wait`、`--until`、`--timeout` とは併用できず、送信前に拒否します。受け入れ確認の期限を指定するには `prompt-guarded --timeout-ms` を使ってください。
 
@@ -366,7 +399,7 @@ herdr agent prompt-guarded <target> <text> --expected-terminal TERMINAL_ID --exp
 
 ガード付きフレームは期限を持ちます。Pi は上記の確認と submit 呼び出しの前に、期限切れを同期的に `expired` で拒否し、送信もエディタ変更も行いません。期限の欠落・不正は `unknown` で拒否します。ソケット配信前の型付き失敗は未送信を意味しますが、受け入れの可能性がある後の確認喪失は引き続き `delivery_unknown` であり、再送してはいけません。
 
-`agent draft-state` は登録済みチャネルを使う読み取り専用の観測で、既定の問い合わせタイムアウトは 2 秒です。known の結果はドラフトが空かどうかと UI hold（`null`、`"dialog"`、`"custom"`、`"editor"`）だけを示します。ドラフト本文や文字数は返しません。取得できない場合は `{status: "unknown", reason}` を返し、理由は `unregistered`（チャネルなし）、`unsupported`（能力なし）、`timeout`（期限内の応答なし）、`unknown`（観測不能）です。unknown は空のドラフトを意味しません。エージェント自身のペインへの問い合わせはデフォルトで許可されます。別のペインへの問い合わせには `--allow-cross-pane` が必要です。通常の外部オペレーターには `agent.prompt` と同じポリシーを適用します。認可は予約またはフレーム送信の前に確認されます。この問い合わせは後の送信を許可するものではなく、ガード付きプロンプトは受け入れ時に再確認します。
+`agent draft-state` は登録済みチャネルを使う読み取り専用の観測で、既定の問い合わせタイムアウトは 2 秒です。known の結果はドラフトが空かどうかと UI hold（`null`、`"dialog"`、`"custom"`、`"editor"`）だけを示します。ドラフト本文や文字数は返しません。取得できない場合は `{status: "unknown", reason}` を返し、理由は `unregistered`（チャネルなし）、`unsupported`（能力なし）、`timeout`（期限内の応答なし）、`unknown`（観測不能）です。unknown は空のドラフトを意味しません。入力元チェックは助言的です。別のペインへの問い合わせも許可されてログに記録され、`--allow-cross-pane` は互換性のため受け付けられますが不要です。通常の外部オペレーターには `agent.prompt` と同じポリシーを適用します。認可は予約またはフレーム送信の前に確認されます。この問い合わせは後の送信を許可するものではなく、ガード付きプロンプトは受け入れ時に再確認します。
 
 成功時は、活動中セッションの入力に受け入れられた `status: "accepted"`、またはそのセッションの後続キューに入った `"queued"` と、固定したターミナル、epoch、リクエスト ID、セッション世代を返します。ターンの完了や成功は保証しません。同じ epoch 内の同じ ID、完全に同じテキスト、同じ `if_draft_empty` 値は、再送せずに最初の結果を共有します。テキストまたはガード値の変更は `payload_mismatch` です。新しい ID は新規リクエストであり、安全な再試行ではありません。
 
@@ -455,13 +488,14 @@ herdr integration status [--outdated-only]
 
 ```bash
 herdr plugin install <owner>/<repo>[/subdir...] [--ref REF] [--yes]
+herdr plugin update [<plugin_id|owner/repo[/subdir...]>...] [--yes]
 herdr plugin list [--plugin ID] [--json]
 herdr plugin uninstall <plugin_id|owner/repo[/subdir...]>
 herdr plugin enable <plugin_id>
 herdr plugin disable <plugin_id>
 ```
 
-`plugin install` は `ogulcancelik/herdr-plugin-examples/worktree-bootstrap` のような GitHub 省略記法のみを受け付けます。`git` を使い、対話的なターミナルでは信頼プレビューを表示し、サポートされるマニフェストのビルドコマンドを実行し、GitHub インストールを Herdr 管理のディレクトリに保存します。非対話的なインストールには `--yes` を使ってください。GitHub 管理プラグインの再インストールは、その管理チェックアウトを置き換えます。ローカルにリンクされたプラグインへの上書きインストールは拒否されます。プラグインのマニフェストは `min_herdr_version` を宣言しなければならず、プラグインがより新しい Herdr バイナリを要求する場合、install と link は失敗します。`plugin list` はデフォルトで人間可読です。生の API レスポンスが欲しいときは `--json` を渡してください。
+`plugin install` は `ogulcancelik/herdr-plugin-examples/worktree-bootstrap` のような GitHub 省略記法のみを受け付けます。`git` を使い、対話的なターミナルでは信頼プレビューを表示し、サポートされるマニフェストのビルドコマンドを実行し、GitHub インストールを Herdr 管理のディレクトリに保存します。非対話的なインストールには `--yes` を使ってください。`plugin update` は対象を省略すると GitHub 管理の全プラグインを、指定すると該当する id または GitHub ソースだけを更新します。記録された ref を使い、変更のないコミットと一括更新時のローカルリンクをスキップします。再インストールは新しいディレクトリを作成します。実行中のプラグインは元のファイルを、新しい呼び出しは新しい版を使います。ローカルにリンクされたプラグインへの上書きインストールは拒否されます。プラグインのマニフェストは `min_herdr_version` を宣言しなければならず、プラグインがより新しい Herdr バイナリを要求する場合、install と link は失敗します。`plugin list` はデフォルトで人間可読です。生の API レスポンスが欲しいときは `--json` を渡してください。
 
 ローカル開発:
 
@@ -470,7 +504,7 @@ herdr plugin link <path> [--disabled]
 herdr plugin unlink <plugin_id>
 ```
 
-`plugin link` は `herdr-plugin.toml` を含むプラグインディレクトリ、またはマニフェストへの直接パスを受け付けます。ローカルチェックアウトからプラグインを作成・テストしている間はこれが正しいコマンドです。`plugin unlink` はプラグインの登録を解除し、ファイルには触れません。`plugin uninstall` はプラグインの登録を解除し、Herdr 管理の GitHub チェックアウトファイルも削除します。GitHub インストールの場合、uninstall はプラグイン id と、install で使うのと同じ `owner/repo[/subdir...]` 省略記法の両方を受け付けます。アクション、イベントフック、ペイン、リンクハンドラーはマニフェストで宣言します。ランタイムでのアクション登録は v1 の範囲外です。
+`plugin link` は `herdr-plugin.toml` を含むプラグインディレクトリ、またはマニフェストへの直接パスを受け付けます。ローカルチェックアウトからプラグインを作成・テストしている間はこれが正しいコマンドです。`plugin unlink` と `plugin uninstall` は登録を解除し、実行中のプラグインが完了できるようファイルを残します。更新や再インストールも古い版を保持し、新しい呼び出しは設定の再読み込みなしで新しい版を使います。使用中のサーバーが終了した後、次に成功したインストール／更新、またはサーバー起動時に不要な管理インストールを削除します。設定の再読み込みでは解放されません。プラグインは親コマンドやペインの終了前に、切り離したバックグラウンドプロセスを停止する必要があります。サーバー終了後も残るプロセスは削除から保護されません。削除追跡のない旧インストールとローカルリンクのファイルは保持します。GitHub インストールの場合、uninstall はプラグイン id と、install で使うのと同じ `owner/repo[/subdir...]` 省略記法の両方を受け付けます。アクション、イベントフック、ペイン、リンクハンドラーはマニフェストで宣言します。ランタイムでのアクション登録は v1 の範囲外です。
 
 設定ディレクトリ:
 
@@ -505,7 +539,7 @@ herdr plugin pane close <pane_id>
 
 `plugin pane open` は、プラグインがリンクされ、有効で、現在のプラットフォームと互換であることを要求します。マニフェストで宣言された `[[panes]]` コマンドを Herdr 管理のターミナルペインとして起動します。マニフェストのデフォルトは `overlay` で、アクティブなペインの上に一時的なズームオーバーレイを開きます。分割、新しいタブ、ズームされたペイン、またはタブレイアウトを変更しないセッションモーダルな `popup` として開くこともできます。`--width` と `--height` は、外側のポップアップ寸法をターミナルセル数または `80%` のような割合で指定します。省略した寸法はデフォルトでターミナルの半分になり、小さすぎる値はポップアップの最小サイズに制限されます。ポップアップは Herdr ペインではなく、`HERDR_PANE_ID` を受け取らず、pane API やエージェント API に参加しません。ターミナル以外のネイティブなプラグインペインは今後の対応面です。
 
-新しいペインでは `TERM_PROGRAM=herdr` として識別され、`TERM_PROGRAM_VERSION` には Herdr のバージョンが設定されます。`TERM=xterm-256color` と `COLORTERM=truecolor` は維持されます。Herdr は、明示的な起動環境の値を適用する前に、継承した外側のターミナルのセッションマーカー（iTerm2、WezTerm、Kitty、Windows Terminal、tmux、screen、Zellij）、iTerm2 の `LC_TERMINAL` 識別子、既知の Claude Code、Codex、OMP セッションマーカーを削除します。これにより、新しいペインがサーバーを最初に起動したターミナルやエージェントのセッションを名乗ることを防ぎます。API キーやディスプレイ設定を含む通常の環境変数は、アタッチ中クライアントの環境に置き換えられず、引き続き継承されます。SSH エージェント転送には独自の再接続処理があります。このクリーンアップによって既存ペインのプロセスは変更されません。
+新しいペインでは `TERM_PROGRAM=herdr` として識別され、`TERM_PROGRAM_VERSION` には Herdr のバージョンが設定されます。`TERM=xterm-256color` と `COLORTERM=truecolor` は維持されます。リサイズ時に Herdr がテキストを折り返し直すため、`fish_handle_reflow=0` も設定します。継承した値や明示的な `fish_handle_reflow` の指定は優先されます。Herdr は、明示的な起動環境の値を適用する前に、継承した外側のターミナルのセッションマーカー（iTerm2、WezTerm、Kitty、Windows Terminal、tmux、screen、Zellij）、iTerm2 の `LC_TERMINAL` 識別子、既知の Claude Code、Codex、OMP セッションマーカーを削除します。これにより、新しいペインがサーバーを最初に起動したターミナルやエージェントのセッションを名乗ることを防ぎます。API キーやディスプレイ設定を含む通常の環境変数は、アタッチ中クライアントの環境に置き換えられず、引き続き継承されます。SSH エージェント転送には独自の再接続処理があります。このクリーンアップによって既存ペインのプロセスは変更されません。
 
 `--env KEY=VALUE` はプロセスを起動するコマンドで繰り返し指定できます。新しく起動されるプロセスにのみ適用されます。`HERDR_SOCKET_PATH`、`HERDR_BIN_PATH`、`HERDR_ENV`、`HERDR_WORKSPACE_ID`、`HERDR_TAB_ID`、`HERDR_PANE_ID`、`HERDR_PLUGIN_ID`、`HERDR_PLUGIN_ROOT`、`HERDR_PLUGIN_CONFIG_DIR`、`HERDR_PLUGIN_STATE_DIR`、`HERDR_PLUGIN_ENTRYPOINT_ID`、`HERDR_PLUGIN_CONTEXT_JSON` のような Herdr 管理の変数は、呼び出し側が与えた環境変数と衝突した場合も権威を保ちます。
 

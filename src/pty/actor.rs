@@ -1,3 +1,310 @@
+/// Pinned admission evidence carried to the actual PTY writer. Native session
+/// identifiers are opaque to the actor; the reporter is a process incarnation,
+/// not a PID-only or cached foreground observation.
+#[derive(Debug, Clone)]
+pub(crate) struct SessionInputGuard {
+    pub(crate) reporter: crate::platform::ProcessIdentity,
+    pub(crate) expected_agent_session_id: String,
+    pub(crate) expected_agent_status: Option<crate::api::schema::AgentStatus>,
+    pub(crate) agent_status: std::sync::Weak<std::sync::atomic::AtomicU8>,
+    /// Shared across guard clones so a refused status stays typed even if it changes back.
+    pub(crate) status_mismatch: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The accepted binding owns the strong root. Queued input must neither
+    /// extend that binding's lifetime nor retain a strong root during proof.
+    pub binding_validity: std::sync::Weak<std::sync::atomic::AtomicBool>,
+}
+
+impl SessionInputGuard {
+    #[cfg(unix)]
+    fn binding_is_current(&self) -> bool {
+        self.binding_validity
+            .upgrade()
+            .is_some_and(|validity| validity.load(std::sync::atomic::Ordering::Acquire))
+    }
+
+    fn status_is_current(&self) -> bool {
+        let Some(expected) = self.expected_agent_status else {
+            return true;
+        };
+        if self
+            .status_mismatch
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return false;
+        }
+        let expected = match expected {
+            crate::api::schema::AgentStatus::Idle => Some(crate::detect::AgentState::Idle),
+            crate::api::schema::AgentStatus::Working => Some(crate::detect::AgentState::Working),
+            crate::api::schema::AgentStatus::Blocked => Some(crate::detect::AgentState::Blocked),
+            crate::api::schema::AgentStatus::Unknown => Some(crate::detect::AgentState::Unknown),
+            crate::api::schema::AgentStatus::Done => None,
+        };
+        let current = expected.is_some_and(|expected| {
+            let expected = crate::terminal::state::agent_state_guard_code(expected);
+            self.agent_status
+                .upgrade()
+                .is_some_and(|status| status.load(std::sync::atomic::Ordering::Acquire) == expected)
+        });
+        if !current {
+            self.status_mismatch
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        current
+    }
+}
+
+#[derive(Debug)]
+struct ExpectedStatusMismatch {
+    expected: crate::api::schema::AgentStatus,
+    /// Submission text may have reached the PTY, as for session loss.
+    partial_text_consumed: Option<bool>,
+    flush_failed: bool,
+}
+
+impl std::fmt::Display for ExpectedStatusMismatch {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "the target's detected agent status no longer matches expected {:?}; partial_text_consumed={}; flush_failed={}",
+            self.expected,
+            self.partial_text_consumed
+                .map_or("unknown", |partial| if partial { "true" } else { "false" }),
+            self.flush_failed
+        )
+    }
+}
+
+impl std::error::Error for ExpectedStatusMismatch {}
+
+/// Classify only the guard's typed status refusal, not arbitrary permission errors.
+pub(crate) fn is_expected_status_mismatch(error: &std::io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|cause| cause.is::<ExpectedStatusMismatch>())
+}
+
+#[derive(Debug)]
+struct AgentSessionLost {
+    expected_agent_session_id: String,
+    /// True means submission text reached the PTY and may have been consumed;
+    /// it does not claim that a reader consumed every byte.
+    partial_text_consumed: Option<bool>,
+    flush_failed: bool,
+}
+
+impl std::fmt::Display for AgentSessionLost {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "agent session ownership was lost: {}; partial_text_consumed={}; flush_failed={}",
+            self.expected_agent_session_id,
+            self.partial_text_consumed
+                .map_or("unknown", |partial| if partial { "true" } else { "false" }),
+            self.flush_failed
+        )
+    }
+}
+
+impl std::error::Error for AgentSessionLost {}
+
+/// Only ownership loss has this payload. A detected-status refusal has its own
+/// type. Never classify generic permission or PTY failures as session loss.
+/// Some text may already have reached the PTY.
+pub(crate) fn is_agent_session_lost(error: &std::io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|cause| cause.is::<AgentSessionLost>())
+}
+
+/// Shared cleanup metadata for either typed guard refusal. Classification stays
+/// separate so a status mismatch never becomes an agent-session-loss response.
+pub(crate) fn agent_session_loss_details(error: &std::io::Error) -> Option<(Option<bool>, bool)> {
+    let cause = error.get_ref()?;
+    if let Some(loss) = cause.downcast_ref::<AgentSessionLost>() {
+        return Some((loss.partial_text_consumed, loss.flush_failed));
+    }
+    cause
+        .downcast_ref::<ExpectedStatusMismatch>()
+        .map(|mismatch| (mismatch.partial_text_consumed, mismatch.flush_failed))
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn agent_session_loss_partial_text_consumed(error: &std::io::Error) -> Option<bool> {
+    agent_session_loss_details(error).and_then(|(partial, _)| partial)
+}
+
+/// The submission's `refuse_if_exists` path existed (`lstat` succeeded), or
+/// could not be checked, before a write attempt while no submission byte had
+/// been written. The actor refused the whole submission with zero bytes written
+/// and no flush.
+#[derive(Debug)]
+struct GuardPathPresent {
+    path: std::path::PathBuf,
+    /// The lookup error when `lstat` failed with anything but "absent".
+    unverifiable: Option<String>,
+    /// Always `Some(false)`: path admission refusal precedes all submission bytes.
+    partial_text_consumed: Option<bool>,
+    /// Always false: path admission refusal must not flush unrelated staged input.
+    flush_failed: bool,
+}
+
+impl std::fmt::Display for GuardPathPresent {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.unverifiable {
+            Some(error) => write!(
+                formatter,
+                "guard_path_unverifiable: {} could not be checked at write time ({error}); ",
+                self.path.display()
+            )?,
+            None => write!(
+                formatter,
+                "guard_path_present: {} exists at write time; ",
+                self.path.display()
+            )?,
+        }
+        write!(
+            formatter,
+            "the input was refused; partial_text_consumed={}; flush_failed={}",
+            self.partial_text_consumed
+                .map_or("unknown", |partial| if partial { "true" } else { "false" }),
+            self.flush_failed
+        )
+    }
+}
+
+impl std::error::Error for GuardPathPresent {}
+
+#[cfg(unix)]
+pub(crate) fn guard_path_present(
+    path: &std::path::Path,
+    unverifiable: Option<&str>,
+    partial_text_consumed: Option<bool>,
+    flush_failed: bool,
+) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        GuardPathPresent {
+            path: path.to_path_buf(),
+            unverifiable: unverifiable.map(str::to_owned),
+            partial_text_consumed,
+            flush_failed,
+        },
+    )
+}
+
+/// `(code, partial_text_consumed, flush_failed)` for a path-guard refusal:
+/// `guard_path_present` or `guard_path_unverifiable`.
+pub(crate) fn guard_path_present_details(
+    error: &std::io::Error,
+) -> Option<(&'static str, Option<bool>, bool)> {
+    error
+        .get_ref()?
+        .downcast_ref::<GuardPathPresent>()
+        .map(|refusal| {
+            (
+                if refusal.unverifiable.is_some() {
+                    "guard_path_unverifiable"
+                } else {
+                    "guard_path_present"
+                },
+                refusal.partial_text_consumed,
+                refusal.flush_failed,
+            )
+        })
+}
+
+/// Fresh `lstat(path)` before each submission write attempt until its first
+/// byte is written, including zero-byte retries; never at request time or after
+/// a successful Text/Enter write.
+/// `None`: the path is absent (ENOENT, or ENOTDIR: a component is not a
+/// directory, so it cannot exist), and the write proceeds. `Some(None)`: it
+/// exists. `Some(Some(error))`: it could not be checked (EACCES, ELOOP, EIO,
+/// ...), so the guard fails closed instead of treating it as absent.
+#[cfg(unix)]
+fn guard_path_refusal(path: &std::path::Path) -> Option<Option<String>> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Some(None),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            None
+        }
+        Err(error) => Some(Some(error.to_string())),
+    }
+}
+
+#[derive(Debug)]
+struct PaneInputPoisoned;
+impl std::fmt::Display for PaneInputPoisoned {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("pane_input_poisoned: input blocked after a failed flush; staged text may remain on the line; inspect or discard it before explicitly clearing input poison")
+    }
+}
+impl std::error::Error for PaneInputPoisoned {}
+#[cfg(unix)]
+pub(crate) fn pane_input_poisoned() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::PermissionDenied, PaneInputPoisoned)
+}
+pub(crate) fn is_pane_input_poisoned(error: &std::io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|cause| cause.is::<PaneInputPoisoned>())
+}
+
+/// Keep status refusal distinct, including when it changed back after the check.
+pub(crate) fn agent_session_lost(
+    guard: &SessionInputGuard,
+    partial_text_consumed: bool,
+) -> std::io::Error {
+    if let Some(expected) = guard.expected_agent_status {
+        if !guard.status_is_current() {
+            return std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                ExpectedStatusMismatch {
+                    expected,
+                    partial_text_consumed: Some(partial_text_consumed),
+                    flush_failed: false,
+                },
+            );
+        }
+    }
+    std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        AgentSessionLost {
+            expected_agent_session_id: guard.expected_agent_session_id.clone(),
+            partial_text_consumed: Some(partial_text_consumed),
+            flush_failed: false,
+        },
+    )
+}
+
+#[cfg(unix)]
+pub(crate) fn agent_session_flush_failed(guard: &SessionInputGuard) -> std::io::Error {
+    if let Some(expected) = guard.expected_agent_status {
+        if !guard.status_is_current() {
+            return std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                ExpectedStatusMismatch {
+                    expected,
+                    partial_text_consumed: None,
+                    flush_failed: true,
+                },
+            );
+        }
+    }
+    std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        AgentSessionLost {
+            expected_agent_session_id: guard.expected_agent_session_id.clone(),
+            partial_text_consumed: None,
+            flush_failed: true,
+        },
+    )
+}
+
 #[cfg(unix)]
 mod unix;
 
@@ -84,6 +391,53 @@ mod windows {
     }
 
     impl PtyIoActorHandle {
+        pub(crate) fn input_is_poisoned(&self) -> bool {
+            false
+        }
+        pub(crate) fn clear_input_poison(&self) -> std::io::Result<()> {
+            Ok(())
+        }
+        #[cfg(test)]
+        pub(crate) fn test_set_input_poisoned(&self, _poisoned: bool) {}
+        /// ConPTY has no equivalent native foreground reporter proof. Never
+        /// enqueue guarded input on this unsupported platform.
+        pub(crate) fn queue_guarded_user_input_submission_with_source(
+            &self,
+            _text: Bytes,
+            _enter: Bytes,
+            _delay: Duration,
+            guard: super::SessionInputGuard,
+            _source: crate::pty::input_consumer::InputSource,
+        ) -> std::io::Result<std_mpsc::Receiver<std::io::Result<()>>> {
+            // The pin is carried by the common interface, but cannot be proved
+            // against ConPTY. Do not substitute process existence for ownership.
+            let _ = (guard.reporter, &guard.binding_validity);
+            Err(super::agent_session_lost(&guard, false))
+        }
+
+        /// No write-time path guard on ConPTY yet; the server does not
+        /// advertise `refuse_if_exists_guard` here, so never enqueue.
+        pub(crate) fn queue_checked_user_input_submission_with_source(
+            &self,
+            text: Bytes,
+            enter: Bytes,
+            delay: Duration,
+            guard: Option<super::SessionInputGuard>,
+            refuse_if_exists: Option<std::path::PathBuf>,
+            source: crate::pty::input_consumer::InputSource,
+        ) -> std::io::Result<std_mpsc::Receiver<std::io::Result<()>>> {
+            if let Some(guard) = guard {
+                return self.queue_guarded_user_input_submission_with_source(
+                    text, enter, delay, guard, source,
+                );
+            }
+            let _ = refuse_if_exists;
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "refuse_if_exists is supported only on Unix",
+            ))
+        }
+
         pub(crate) fn input_consumer_epoch_matches(&self, _epoch: &str) -> bool {
             false
         }
@@ -483,6 +837,50 @@ mod windows {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn guarded_submission_fails_closed_without_enqueuing_on_windows() {
+            let (data_tx, mut data_rx) = mpsc::channel(2);
+            let (control_tx, _control_rx) = std_mpsc::channel();
+            let (write_tx, write_rx) = std_mpsc::channel();
+            let handle = PtyIoActorHandle {
+                data_tx,
+                control_tx,
+                write_tx,
+                response_order: Arc::new(Mutex::new(())),
+                accepting: input_acceptance(true),
+            };
+            let guard = super::super::SessionInputGuard {
+                reporter: crate::platform::ProcessIdentity {
+                    pid: std::process::id(),
+                    start_time: 0,
+                },
+                expected_agent_session_id: "unsupported-session".into(),
+                expected_agent_status: None,
+                agent_status: std::sync::Weak::new(),
+                status_mismatch: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                binding_validity: std::sync::Weak::new(),
+            };
+            let error = handle
+                .queue_guarded_user_input_submission_with_source(
+                    Bytes::from_static(b"forbidden"),
+                    Bytes::from_static(b"\r"),
+                    Duration::ZERO,
+                    guard,
+                    crate::pty::input_consumer::InputSource::Api,
+                )
+                .expect_err("ConPTY has no native proof");
+            assert!(super::super::is_agent_session_lost(&error));
+            assert!(data_rx.try_recv().is_err());
+            assert!(write_rx.try_recv().is_err());
+            // Ordinary legacy input still uses the original path.
+            handle
+                .try_write_user_input(Bytes::from_static(b"legacy"))
+                .expect("legacy queues");
+            assert!(
+                matches!(data_rx.try_recv(), Ok(PtyIoDataCommand::WriteUserInput(bytes)) if bytes == b"legacy"[..])
+            );
+        }
 
         fn input_acceptance(accepting: bool) -> Arc<Mutex<InputAcceptance>> {
             Arc::new(Mutex::new(InputAcceptance {

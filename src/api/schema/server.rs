@@ -54,6 +54,21 @@ pub struct ServerCapabilities {
     /// Supports the fail-closed `expected_terminal` guard on `agent.start` and `pane.send_input`.
     #[serde(default)]
     pub expected_terminal_guard: bool,
+    /// Supports the fail-closed `expected_terminal` guard on `pane.close` and `pane.close_guarded`.
+    #[serde(default)]
+    pub pane_close_expected_terminal_guard: bool,
+    /// Supports the local JSON session-checked prompt, text and key methods.
+    #[serde(default)]
+    pub expected_agent_session_guard: bool,
+    /// Supports the detected-agent-status guard on local JSON prompts.
+    #[serde(default)]
+    pub expected_agent_status_guard: bool,
+    /// Supports the before-first-byte `refuse_if_exists` path guard on the
+    /// local JSON `pane.send_text_path_checked` and `pane.send_keys_path_checked`
+    /// methods. Zero-byte retries recheck; a claim after the first written byte
+    /// does not interrupt the request.
+    #[serde(default)]
+    pub refuse_if_exists_guard: bool,
     /// Supports the local `pane.input_consumer.*` methods (Linux servers only).
     #[serde(default)]
     pub input_consumer: bool,

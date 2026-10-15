@@ -4,23 +4,129 @@ use crate::api::schema::{Method, Request};
 use crate::api::ApiRequestContext;
 use crate::app::terminal_targets::{InputOrigin, TerminalTarget};
 
-const INPUT_ORIGIN_UNKNOWN_MESSAGE: &str = "cannot validate input origin; retry from a live attributable caller or explicitly opt in with CLI --allow-cross-pane (API allow_cross_pane: true)";
+const INPUT_ORIGIN_UNKNOWN_MESSAGE: &str = "the presented plugin action token is invalid, expired or already used; start the action again from its plugin";
+
+fn session_checked_guard_error(
+    supported: bool,
+    method: &Method,
+) -> Option<(&'static str, &'static str)> {
+    let prompt_params = match method {
+        Method::AgentPrompt(params)
+        | Method::AgentPromptSessionChecked(params)
+        | Method::AgentPromptStatusChecked(params) => Some(params),
+        _ => None,
+    };
+    // Invalid status/session pairing takes precedence on every platform.
+    if prompt_params.is_some_and(|params| {
+        params.expected_agent_status.is_some() && params.expected_agent_session_id.is_none()
+    }) {
+        return Some((
+            "invalid_request",
+            "expected_agent_status requires expected_agent_session_id",
+        ));
+    }
+    let missing = match method {
+        Method::AgentPromptStatusChecked(params) => {
+            params.expected_agent_session_id.is_none() || params.expected_agent_status.is_none()
+        }
+        Method::AgentPromptSessionChecked(params) => {
+            params.expected_agent_session_id.is_none() && params.expected_pane_id.is_none()
+        }
+        Method::PaneSendTextSessionChecked(params) => params.expected_agent_session_id.is_none(),
+        Method::PaneSendKeysSessionChecked(params) => params.expected_agent_session_id.is_none(),
+        // The path guard stands alone; an added session expectation still
+        // needs native session-guard support.
+        Method::PaneSendTextPathChecked(params)
+            if params.input.expected_agent_session_id.is_some() =>
+        {
+            false
+        }
+        Method::PaneSendKeysPathChecked(params)
+            if params.input.expected_agent_session_id.is_some() =>
+        {
+            false
+        }
+        _ => return None,
+    };
+    if !supported {
+        return Some((
+            "expected_agent_session_unsupported",
+            "expected agent session guards are supported only on Linux",
+        ));
+    }
+    missing.then_some((
+        "invalid_request",
+        "checked method requires its input guard expectations",
+    ))
+}
+
+/// The write-time path guard needs a Unix PTY writer and an absolute path:
+/// the server's working directory is not the caller's.
+fn path_checked_guard_error(
+    supported: bool,
+    method: &Method,
+) -> Option<(&'static str, &'static str)> {
+    let path = match method {
+        Method::PaneSendTextPathChecked(params) => &params.refuse_if_exists,
+        Method::PaneSendKeysPathChecked(params) => &params.refuse_if_exists,
+        _ => return None,
+    };
+    if !supported {
+        return Some((
+            "refuse_if_exists_unsupported",
+            "the refuse_if_exists write guard is supported only on Unix",
+        ));
+    }
+    (!std::path::Path::new(path).is_absolute()).then_some((
+        "invalid_request",
+        "refuse_if_exists must be an absolute path",
+    ))
+}
 
 impl App {
+    pub(super) fn session_checked_guard_denial(&self, request: &Request) -> Option<String> {
+        session_checked_guard_error(
+            crate::platform::expected_agent_session_guard_supported(),
+            &request.method,
+        )
+        .or_else(|| path_checked_guard_error(cfg!(unix), &request.method))
+        .map(|(code, message)| encode_error(request.id.clone(), code, message))
+    }
+
     // This is a policy guard, not caller authentication.
+    #[cfg(test)]
     pub(super) fn cross_pane_input_denial(
         &self,
         request: &Request,
-        context: ApiRequestContext,
+        mut context: ApiRequestContext,
+    ) -> Option<String> {
+        self.cross_pane_input_denial_with_ancestry(request, &mut context)
+    }
+
+    pub(super) fn cross_pane_input_denial_with_ancestry(
+        &self,
+        request: &Request,
+        context: &mut ApiRequestContext,
     ) -> Option<String> {
         // Decide from the method first: attribution walks every agent pane's session in
         // /proc, so doing it for each API request kept the server busy (smarty-dev#931).
-        // Only a content write that does not allow cross-pane input needs it.
-        if Self::allows_cross_pane(&request.method) {
+        // Only a content write needs it.
+        let target = self.content_write_target(&request.method)?;
+        let allow_cross_pane = Self::allows_cross_pane(&request.method);
+        let token_presented =
+            context.plugin_action != crate::plugin_action_origin::PluginActionClaim::Absent;
+        // The usual opted-in fleet write (smarty send) carries no plugin-action
+        // token: allow it without classifying its origin. A presented token is
+        // always validated below, flag or not (an invalid token stays refused).
+        if allow_cross_pane && !token_presented {
             return None;
         }
-        let target = self.content_write_target(&request.method)?;
-        let origin = self.input_origin_for_context(context);
+        // ponytail: without a token every outcome below is allowed (advisory
+        // guard), so for non-opted-in writes this classification, which walks
+        // agent pane sessions in /proc (smarty-dev#931), only feeds the
+        // advisory log line. Kept on purpose because that log was asked for;
+        // drop it here if the per-write cost ever shows up.
+        let origin = self.input_origin_for_context_with_ancestry(context);
         let (code, message) = match origin {
             InputOrigin::Ordinary => return None,
             // A user click or keybinding may target only its invoking terminal
@@ -41,6 +147,18 @@ impl App {
                     );
                     return None;
                 }
+                // A valid grant keeps the explicit opt-in as an override.
+                Ok(false) if allow_cross_pane => {
+                    tracing::info!(
+                        plugin_id = %grant.plugin_id,
+                        action_id = %grant.action_id,
+                        invoking_pane = grant.invoking_pane.as_deref().unwrap_or(""),
+                        grant = %grant.grant_id,
+                        target_terminal = %target.terminal_id,
+                        "plugin action cross-pane input allowed by explicit opt-in"
+                    );
+                    return None;
+                }
                 Ok(false) => (
                     "cross_pane_input_denied",
                     "plugin action input may target only its invoking pane and panes it created",
@@ -48,11 +166,30 @@ impl App {
                 Err(()) => ("input_origin_unknown", INPUT_ORIGIN_UNKNOWN_MESSAGE),
             },
             InputOrigin::Agent(source) if source.terminal_id == target.terminal_id => return None,
-            InputOrigin::Agent(_) => (
-                "cross_pane_input_denied",
-                "agent-originated input cannot target a different pane",
-            ),
-            InputOrigin::Unknown => ("input_origin_unknown", INPUT_ORIGIN_UNKNOWN_MESSAGE),
+            // Advisory only (Paul, 2026-10-13): fleet agents prompt each other,
+            // so cross-pane and unattributable writes are logged, never refused.
+            InputOrigin::Agent(source) => {
+                tracing::info!(
+                    origin = "agent",
+                    source_terminal = %source.terminal_id,
+                    target_terminal = %target.terminal_id,
+                    "cross-pane agent input allowed (advisory input-origin guard)"
+                );
+                return None;
+            }
+            // An invalid presented plugin-action grant stays refused: plugin
+            // grants are an opt-in guard, not fleet input.
+            InputOrigin::Unknown if token_presented => {
+                ("input_origin_unknown", INPUT_ORIGIN_UNKNOWN_MESSAGE)
+            }
+            InputOrigin::Unknown => {
+                tracing::warn!(
+                    origin = "unknown",
+                    target_terminal = %target.terminal_id,
+                    "input of unknown origin allowed (advisory input-origin guard)"
+                );
+                return None;
+            }
         };
         Some(encode_error(request.id.clone(), code, message))
     }
@@ -62,14 +199,22 @@ impl App {
             Method::AgentStart(params) | Method::AgentStartGuarded(params) => {
                 params.allow_cross_pane
             }
-            Method::AgentPrompt(params) => params.allow_cross_pane,
+            Method::AgentPrompt(params)
+            | Method::AgentPromptSessionChecked(params)
+            | Method::AgentPromptStatusChecked(params) => params.allow_cross_pane,
             Method::AgentPromptGuarded(params) => params.allow_cross_pane,
             Method::AgentDraftState(params) => params.allow_cross_pane,
             Method::AgentSendKeys(params) => params.allow_cross_pane,
             Method::PaneReportAgent(params) => params.allow_cross_pane,
             Method::PaneReportAgentSession(params) => params.allow_cross_pane,
-            Method::PaneSendText(params) => params.allow_cross_pane,
-            Method::PaneSendKeys(params) => params.allow_cross_pane,
+            Method::PaneSendText(params) | Method::PaneSendTextSessionChecked(params) => {
+                params.allow_cross_pane
+            }
+            Method::PaneSendKeys(params) | Method::PaneSendKeysSessionChecked(params) => {
+                params.allow_cross_pane
+            }
+            Method::PaneSendTextPathChecked(params) => params.input.allow_cross_pane,
+            Method::PaneSendKeysPathChecked(params) => params.input.allow_cross_pane,
             Method::PaneSendInput(params) | Method::PaneSendInputGuarded(params) => {
                 params.allow_cross_pane
             }
@@ -82,14 +227,24 @@ impl App {
             Method::AgentStart(params) | Method::AgentStartGuarded(params) => {
                 self.pane_target(&params.pane_id)
             }
-            Method::AgentPrompt(params) => self.resolve_agent_target(&params.target).ok(),
+            Method::AgentPrompt(params)
+            | Method::AgentPromptSessionChecked(params)
+            | Method::AgentPromptStatusChecked(params) => {
+                self.resolve_agent_target(&params.target).ok()
+            }
             Method::AgentPromptGuarded(params) => self.resolve_terminal_target(&params.target).ok(),
             // Not a write, but it observes another pane's private editor state, so it is
             // authorized exactly like agent.prompt rather than treated as a public read.
             Method::AgentDraftState(params) => self.resolve_terminal_target(&params.target).ok(),
             Method::AgentSendKeys(params) => self.resolve_agent_target(&params.target).ok(),
-            Method::PaneSendText(params) => self.pane_target(&params.pane_id),
-            Method::PaneSendKeys(params) => self.pane_target(&params.pane_id),
+            Method::PaneSendText(params) | Method::PaneSendTextSessionChecked(params) => {
+                self.pane_target(&params.pane_id)
+            }
+            Method::PaneSendKeys(params) | Method::PaneSendKeysSessionChecked(params) => {
+                self.pane_target(&params.pane_id)
+            }
+            Method::PaneSendTextPathChecked(params) => self.pane_target(&params.input.pane_id),
+            Method::PaneSendKeysPathChecked(params) => self.pane_target(&params.input.pane_id),
             Method::PaneSendInput(params) | Method::PaneSendInputGuarded(params) => {
                 self.pane_target(&params.pane_id)
             }
@@ -123,6 +278,154 @@ mod tests {
     use crate::workspace::Workspace;
     use bytes::Bytes;
     use tokio::sync::mpsc::Receiver;
+
+    #[test]
+    fn session_checked_prompt_support_is_required_regardless_of_expectations() {
+        for (session, pane) in [
+            (None, None),
+            (None, Some("w1:p1")),
+            (Some("session"), None),
+            (Some("session"), Some("w1:p1")),
+        ] {
+            for status in [None, Some(crate::api::schema::AgentStatus::Idle)] {
+                let params = AgentPromptParams {
+                    expected_agent_session_id: session.map(str::to_owned),
+                    expected_pane_id: pane.map(str::to_owned),
+                    expected_agent_status: status,
+                    target: "agent".into(),
+                    text: "prompt".into(),
+                    wait: None,
+                    allow_cross_pane: true,
+                };
+                let methods = [
+                    Method::AgentPromptSessionChecked(params.clone()),
+                    Method::AgentPromptStatusChecked(params),
+                ];
+                for method in methods {
+                    if status.is_some() && session.is_none() {
+                        for supported in [false, true] {
+                            assert_eq!(
+                                session_checked_guard_error(supported, &method),
+                                Some((
+                                    "invalid_request",
+                                    "expected_agent_status requires expected_agent_session_id",
+                                ))
+                            );
+                        }
+                        continue;
+                    }
+                    assert_eq!(
+                        session_checked_guard_error(false, &method),
+                        Some((
+                            "expected_agent_session_unsupported",
+                            "expected agent session guards are supported only on Linux",
+                        ))
+                    );
+                    let missing = if matches!(method, Method::AgentPromptStatusChecked(_)) {
+                        session.is_none() || status.is_none()
+                    } else {
+                        session.is_none() && pane.is_none()
+                    };
+                    assert_eq!(
+                        session_checked_guard_error(true, &method),
+                        missing.then_some((
+                            "invalid_request",
+                            "checked method requires its input guard expectations",
+                        ))
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn session_checked_pane_send_support_is_required_regardless_of_expectations() {
+        for session in [None, Some("session")] {
+            let methods = [
+                Method::PaneSendTextSessionChecked(PaneSendTextParams {
+                    expected_agent_session_id: session.map(str::to_owned),
+                    pane_id: "w1:p1".into(),
+                    text: "text".into(),
+                    allow_cross_pane: true,
+                }),
+                Method::PaneSendKeysSessionChecked(PaneSendKeysParams {
+                    expected_agent_session_id: session.map(str::to_owned),
+                    pane_id: "w1:p1".into(),
+                    keys: vec!["enter".into()],
+                    allow_cross_pane: true,
+                }),
+            ];
+            for method in methods {
+                assert_eq!(
+                    session_checked_guard_error(false, &method).map(|(code, _)| code),
+                    Some("expected_agent_session_unsupported")
+                );
+                assert_eq!(
+                    session_checked_guard_error(true, &method),
+                    session.is_none().then_some((
+                        "invalid_request",
+                        "checked method requires its input guard expectations",
+                    ))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn session_checked_guard_does_not_change_unchecked_methods() {
+        let methods = [
+            Method::AgentPrompt(AgentPromptParams {
+                expected_agent_session_id: Some("session".into()),
+                expected_pane_id: Some("w1:p1".into()),
+                expected_agent_status: Some(crate::api::schema::AgentStatus::Idle),
+                target: "agent".into(),
+                text: "prompt".into(),
+                wait: None,
+                allow_cross_pane: true,
+            }),
+            Method::PaneSendText(PaneSendTextParams {
+                expected_agent_session_id: Some("session".into()),
+                pane_id: "w1:p1".into(),
+                text: "text".into(),
+                allow_cross_pane: true,
+            }),
+            Method::PaneSendKeys(PaneSendKeysParams {
+                expected_agent_session_id: Some("session".into()),
+                pane_id: "w1:p1".into(),
+                keys: vec!["enter".into()],
+                allow_cross_pane: true,
+            }),
+        ];
+        for method in methods {
+            for supported in [false, true] {
+                assert_eq!(session_checked_guard_error(supported, &method), None);
+            }
+        }
+    }
+
+    #[test]
+    fn unchecked_prompt_status_requires_session_on_every_platform() {
+        for pane in [None, Some("w1:p1")] {
+            let method = Method::AgentPrompt(AgentPromptParams {
+                expected_agent_session_id: None,
+                expected_pane_id: pane.map(str::to_owned),
+                expected_agent_status: Some(crate::api::schema::AgentStatus::Idle),
+                target: "agent".into(),
+                text: "prompt".into(),
+                wait: None,
+                allow_cross_pane: true,
+            });
+            for supported in [false, true] {
+                assert_eq!(
+                    session_checked_guard_error(supported, &method),
+                    Some((
+                        "invalid_request",
+                        "expected_agent_status requires expected_agent_session_id",
+                    ))
+                );
+            }
+        }
+    }
 
     struct Fixture {
         app: App,
@@ -194,12 +497,39 @@ mod tests {
         ApiRequestContext::for_local_peer_pid(Some(std::process::id()))
     }
 
+    /// The input-origin guard is advisory (Paul, 2026-10-13): a cross-pane or
+    /// unattributable fleet write is accepted, so no origin refusal is returned.
+    fn assert_not_origin_refused(response: &str) {
+        let code = serde_json::from_str::<ErrorResponse>(response)
+            .map(|response| response.error.code)
+            .unwrap_or_default();
+        assert!(
+            code != "cross_pane_input_denied" && code != "input_origin_unknown",
+            "{response}"
+        );
+    }
+
+    /// Consumes whatever an advisory-allowed cross-pane write delivered.
+    fn drain_advisory_delivery(rx: &mut Receiver<Bytes>) {
+        while rx.try_recv().is_ok() {}
+    }
+
     fn assert_denied(response: &str) {
+        assert_not_origin_refused(response);
+    }
+
+    fn assert_unknown(response: &str) {
+        assert_not_origin_refused(response);
+    }
+
+    // Plugin-action grants are an opt-in guard and still refuse.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn assert_plugin_denied(response: &str) {
         let response: ErrorResponse = serde_json::from_str(response).expect("denial response");
         assert_eq!(response.error.code, "cross_pane_input_denied");
     }
 
-    fn assert_unknown(response: &str) {
+    fn assert_plugin_unknown(response: &str) {
         let response: ErrorResponse = serde_json::from_str(response).expect("unknown response");
         assert_eq!(response.error.code, "input_origin_unknown");
     }
@@ -207,6 +537,103 @@ mod tests {
     fn assert_ok(response: &str) {
         let response: SuccessResponse = serde_json::from_str(response).expect("success response");
         assert!(matches!(response.result, ResponseResult::Ok {}));
+    }
+
+    #[tokio::test]
+    async fn expected_agent_status_admission_requires_session_and_checked_alias_requires_status() {
+        let mut fixture = attributed_agent_fixture();
+        for method in [
+            "agent.prompt",
+            "agent.prompt_session_checked",
+            "agent.prompt_status_checked",
+        ] {
+            for (session, status, pane) in [
+                (false, false, false),
+                (false, false, true),
+                (false, true, false),
+                (false, true, true),
+                (true, false, false),
+                (true, true, false),
+            ] {
+                let mut params = serde_json::json!({
+                    "target": fixture.target_pane_id, "text": "bad", "allow_cross_pane": true,
+                });
+                if session {
+                    params["expected_agent_session_id"] = "opaque-session".into();
+                }
+                if status {
+                    params["expected_agent_status"] = "idle".into();
+                }
+                if pane {
+                    params["expected_pane_id"] = fixture.target_pane_id.clone().into();
+                }
+                let request: Request = serde_json::from_value(serde_json::json!({
+                    "id": "admission", "method": method, "params": params,
+                }))
+                .expect("prompt request");
+                assert!(
+                    App::api_request_requires_deferred_input(&request),
+                    "{method}"
+                );
+                let expected_error = if status && !session {
+                    Some((
+                        "invalid_request",
+                        "expected_agent_status requires expected_agent_session_id",
+                    ))
+                } else if method != "agent.prompt"
+                    && !crate::platform::expected_agent_session_guard_supported()
+                {
+                    Some((
+                        "expected_agent_session_unsupported",
+                        "expected agent session guards are supported only on Linux",
+                    ))
+                } else {
+                    let missing = match method {
+                        "agent.prompt_status_checked" => !status || !session,
+                        "agent.prompt_session_checked" => !session && !pane,
+                        _ => false,
+                    };
+                    missing.then_some((
+                        "invalid_request",
+                        "checked method requires its input guard expectations",
+                    ))
+                };
+                let denial = fixture.app.session_checked_guard_denial(&request);
+                assert_eq!(
+                    denial.is_some(),
+                    expected_error.is_some(),
+                    "{method}: session={session}, status={status}, pane={pane}"
+                );
+                if let Some((code, message)) = expected_error {
+                    let assert_error = |response: &str| {
+                        let error: ErrorResponse =
+                            serde_json::from_str(response).expect("denial response");
+                        assert_eq!(error.error.code, code);
+                        assert_eq!(error.error.message, message);
+                    };
+                    assert_error(&denial.expect("denial"));
+                    // Both direct and deferred app admission reject before lookup or input attribution.
+                    assert_error(
+                        &fixture
+                            .app
+                            .handle_api_request_with_context(request.clone(), Default::default()),
+                    );
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    assert!(fixture.app.handle_deferred_agent_api_request(
+                        request,
+                        Default::default(),
+                        tx
+                    ));
+                    assert_error(
+                        &rx.recv_timeout(std::time::Duration::from_secs(1))
+                            .expect("denial deferred response"),
+                    );
+                    assert!(fixture.app.accepted_api_inputs.is_empty());
+                    assert!(fixture.source_rx.try_recv().is_err());
+                    assert!(fixture.target_rx.try_recv().is_err());
+                }
+            }
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -353,19 +780,21 @@ mod tests {
             let mut request = Request {
                 id: format!("import-{index}"),
                 method: Method::PaneSendText(PaneSendTextParams {
+                    expected_agent_session_id: None,
                     pane_id: fixture.target_pane_id.clone(),
                     text: "foreign".into(),
                     allow_cross_pane: false,
                 }),
             };
             let denial = fixture.app.cross_pane_input_denial(&request, context);
+            // Advisory guard: both a proven foreign and an unprovable import
+            // are accepted now.
             if expected.is_some() {
-                let denial = denial.expect("imported guard applies");
                 // Name the failing branch under load: capture-time origin,
                 // live root identity, and whether the owned root exited.
                 assert!(
-                    denial.contains("cross_pane_input_denied"),
-                    "case {index}: {denial}; origin={:?}; live={:?}; original={original:?}; root_exit={:?}; recaptured={:?}; environ={:?}",
+                    denial.is_none(),
+                    "case {index}: {denial:?}; origin={:?}; live={:?}; original={original:?}; root_exit={:?}; recaptured={:?}; environ={:?}",
                     context.local_peer_pane_origin,
                     crate::platform::process_identity(pid),
                     child.try_wait(),
@@ -380,9 +809,8 @@ mod tests {
                             .collect::<Vec<_>>()
                     )),
                 );
-                assert_denied(&denial);
             } else {
-                assert_unknown(&denial.expect("unprovable import refuses input"));
+                assert!(denial.is_none());
             }
             if let Some(repeated_runtime) = repeat_runtime {
                 fixture
@@ -392,28 +820,26 @@ mod tests {
                 let repeated_request = Request {
                     id: format!("reimport-{index}"),
                     method: Method::PaneSendText(PaneSendTextParams {
+                        expected_agent_session_id: None,
                         pane_id: fixture.target_pane_id.clone(),
                         text: "foreign-again".into(),
                         allow_cross_pane: false,
                     }),
                 };
-                assert_unknown(
-                    &fixture
-                        .app
-                        .cross_pane_input_denial(&repeated_request, context)
-                        .expect("rejected reimport refuses input"),
-                );
+                assert!(fixture
+                    .app
+                    .cross_pane_input_denial(&repeated_request, context)
+                    .is_none());
             }
             if let Method::PaneSendText(params) = &mut request.method {
                 params.pane_id = fixture.source_pane_id.clone();
             }
             let own_denial = fixture.app.cross_pane_input_denial(&request, context);
-            if expected.is_some() {
-                assert!(own_denial.is_none());
-            } else {
-                assert_unknown(&own_denial.expect("unproven own pane is also protected"));
-            }
+            assert!(own_denial.is_none());
             request.method = Method::AgentPrompt(AgentPromptParams {
+                expected_agent_session_id: None,
+                expected_pane_id: None,
+                expected_agent_status: None,
                 target: "target-agent".into(),
                 text: "explicit".into(),
                 wait: None,
@@ -518,6 +944,7 @@ mod tests {
             Request {
                 id: "setsid-cross-pane".into(),
                 method: Method::PaneSendText(PaneSendTextParams {
+                    expected_agent_session_id: None,
                     pane_id: fixture.target_pane_id.clone(),
                     text: "setsid child".into(),
                     allow_cross_pane: false,
@@ -539,18 +966,20 @@ mod tests {
         let mut request = Request {
             id: "setsid-allow-cross-pane-check".into(),
             method: Method::AgentPrompt(AgentPromptParams {
+                expected_agent_session_id: None,
+                expected_pane_id: None,
+                expected_agent_status: None,
                 target: "target-agent".into(),
                 text: "explicitly allowed".into(),
                 wait: None,
                 allow_cross_pane: false,
             }),
         };
-        assert_denied(
-            &fixture
-                .app
-                .cross_pane_input_denial(&request, context)
-                .expect("attributed detached child must be denied without opt-in"),
-        );
+        // Advisory guard: allowed even without opt-in.
+        assert!(fixture
+            .app
+            .cross_pane_input_denial(&request, context)
+            .is_none());
         if let Method::AgentPrompt(params) = &mut request.method {
             params.allow_cross_pane = true;
         }
@@ -565,6 +994,7 @@ mod tests {
             Request {
                 id: "setsid-allow-cross-pane-text".into(),
                 method: Method::PaneSendText(PaneSendTextParams {
+                    expected_agent_session_id: None,
                     pane_id: fixture.target_pane_id.clone(),
                     text: "explicitly allowed".into(),
                     allow_cross_pane: true,
@@ -591,6 +1021,7 @@ mod tests {
             Request {
                 id: "setsid-same-pane".into(),
                 method: Method::PaneSendText(PaneSendTextParams {
+                    expected_agent_session_id: None,
                     pane_id: fixture.source_pane_id.clone(),
                     text: "setsid own pane".into(),
                     allow_cross_pane: false,
@@ -621,8 +1052,20 @@ mod tests {
                 allow_cross_pane: false,
             }),
             Method::AgentPrompt(AgentPromptParams {
+                expected_agent_session_id: None,
+                expected_pane_id: None,
+                expected_agent_status: None,
                 target: "target-agent".into(),
                 text: "prompt".into(),
+                wait: None,
+                allow_cross_pane: false,
+            }),
+            Method::AgentPromptStatusChecked(AgentPromptParams {
+                expected_agent_session_id: Some("opaque-session".into()),
+                expected_pane_id: None,
+                expected_agent_status: Some(crate::api::schema::AgentStatus::Idle),
+                target: "target-agent".into(),
+                text: "guarded prompt".into(),
                 wait: None,
                 allow_cross_pane: false,
             }),
@@ -632,11 +1075,13 @@ mod tests {
                 allow_cross_pane: false,
             }),
             Method::PaneSendText(PaneSendTextParams {
+                expected_agent_session_id: None,
                 pane_id: fixture.target_pane_id.clone(),
                 text: "text".into(),
                 allow_cross_pane: false,
             }),
             Method::PaneSendKeys(PaneSendKeysParams {
+                expected_agent_session_id: None,
                 pane_id: fixture.target_pane_id.clone(),
                 keys: vec!["enter".into()],
                 allow_cross_pane: false,
@@ -667,26 +1112,38 @@ mod tests {
             })
             .collect();
         for (index, method) in methods.into_iter().chain(guarded_methods).enumerate() {
-            let unknown_response = fixture.app.handle_api_request_with_context(
-                Request {
-                    id: format!("unknown-origin-{index}"),
-                    method: method.clone(),
-                },
-                ApiRequestContext::default(),
-            );
-            assert_unknown(&unknown_response);
-            let response = fixture.app.handle_api_request_with_context(
-                Request {
-                    id: format!("cross-pane-{index}"),
-                    method,
-                },
-                attributed_context(),
-            );
-            assert_denied(&response);
+            let unsupported_guard = matches!(&method, Method::AgentPromptStatusChecked(_))
+                && !crate::platform::expected_agent_session_guard_supported();
+            for (context, origin_code) in [
+                (ApiRequestContext::default(), "input_origin_unknown"),
+                (attributed_context(), "cross_pane_input_denied"),
+            ] {
+                let response = fixture.app.handle_api_request_with_context(
+                    Request {
+                        id: format!("denied-{origin_code}-{index}"),
+                        method: method.clone(),
+                    },
+                    context,
+                );
+                // Advisory guard: never an origin refusal; the opt-in
+                // session guard still refuses where unsupported.
+                if unsupported_guard {
+                    let response: ErrorResponse =
+                        serde_json::from_str(&response).expect("denial response");
+                    assert_eq!(
+                        response.error.code, "expected_agent_session_unsupported",
+                        "method {index}: {origin_code}"
+                    );
+                } else {
+                    assert_not_origin_refused(&response);
+                }
+                assert!(fixture.source_rx.try_recv().is_err());
+                drain_advisory_delivery(&mut fixture.target_rx);
+            }
         }
 
         assert!(fixture.source_rx.try_recv().is_err());
-        assert!(fixture.target_rx.try_recv().is_err());
+        drain_advisory_delivery(&mut fixture.target_rx);
     }
 
     #[tokio::test]
@@ -702,17 +1159,13 @@ mod tests {
         let denial =
             |request: &Request, context| fixture.app.cross_pane_input_denial(request, context);
         // Another pane's private editor state needs the same explicit opt-in as a prompt.
-        assert_denied(
-            &denial(&query(&fixture.target_pane_id, false), attributed_context())
-                .expect("cross-pane draft query denied"),
-        );
-        assert_unknown(
-            &denial(
-                &query(&fixture.target_pane_id, false),
-                ApiRequestContext::default(),
-            )
-            .expect("unknown origin denied"),
-        );
+        // Advisory guard: cross-pane and unknown-origin queries are allowed.
+        assert!(denial(&query(&fixture.target_pane_id, false), attributed_context()).is_none());
+        assert!(denial(
+            &query(&fixture.target_pane_id, false),
+            ApiRequestContext::default(),
+        )
+        .is_none());
         assert!(denial(&query(&fixture.source_pane_id, false), attributed_context()).is_none());
         for context in [attributed_context(), ApiRequestContext::default()] {
             assert!(denial(&query(&fixture.target_pane_id, true), context).is_none());
@@ -748,6 +1201,7 @@ mod tests {
             Request {
                 id: "allowed-cross-pane".into(),
                 method: Method::PaneSendText(PaneSendTextParams {
+                    expected_agent_session_id: None,
                     pane_id: fixture.target_pane_id.clone(),
                     text: "deliberate".into(),
                     allow_cross_pane: true,
@@ -791,9 +1245,10 @@ mod tests {
             .terminal_id(target_pane)
             .unwrap()
             .clone();
+        // Advisory guard: the cross-pane report is accepted.
         assert!(fixture.app.state.terminals[&target_terminal_id]
             .reported_resume()
-            .is_none());
+            .is_some());
 
         let own_response = fixture.app.handle_api_request_with_context(
             Request {
@@ -823,6 +1278,7 @@ mod tests {
             Request {
                 id: "same-pane".into(),
                 method: Method::PaneSendText(PaneSendTextParams {
+                    expected_agent_session_id: None,
                     pane_id: fixture.source_pane_id.clone(),
                     text: "same pane".into(),
                     allow_cross_pane: false,
@@ -856,6 +1312,7 @@ mod tests {
             Request {
                 id: "stale-peer".into(),
                 method: Method::PaneSendText(PaneSendTextParams {
+                    expected_agent_session_id: None,
                     pane_id: fixture.target_pane_id.clone(),
                     text: "unattributed".into(),
                     allow_cross_pane: false,
@@ -864,7 +1321,7 @@ mod tests {
             ApiRequestContext::capture(Some(stale)),
         );
         assert_unknown(&response);
-        assert!(fixture.target_rx.try_recv().is_err());
+        drain_advisory_delivery(&mut fixture.target_rx);
         assert!(fixture.source_rx.try_recv().is_err());
     }
 
@@ -882,6 +1339,7 @@ mod tests {
                 Request {
                     id: id.into(),
                     method: Method::PaneSendText(PaneSendTextParams {
+                        expected_agent_session_id: None,
                         pane_id: fixture.target_pane_id.clone(),
                         text: id.into(),
                         allow_cross_pane: false,
@@ -890,7 +1348,7 @@ mod tests {
                 context,
             );
             assert_unknown(&response);
-            assert!(fixture.target_rx.try_recv().is_err());
+            drain_advisory_delivery(&mut fixture.target_rx);
             assert!(fixture.source_rx.try_recv().is_err());
         }
 
@@ -915,6 +1373,7 @@ mod tests {
             Request {
                 id: "non-agent".into(),
                 method: Method::PaneSendText(PaneSendTextParams {
+                    expected_agent_session_id: None,
                     pane_id: fixture.target_pane_id.clone(),
                     text: "non-agent".into(),
                     allow_cross_pane: false,
@@ -935,6 +1394,7 @@ mod tests {
         let request = Request {
             id: "invalid-membership".into(),
             method: Method::PaneSendText(PaneSendTextParams {
+                expected_agent_session_id: None,
                 pane_id: fixture.target_pane_id.clone(),
                 text: "refused".into(),
                 allow_cross_pane: false,
@@ -946,7 +1406,7 @@ mod tests {
                 .handle_api_request_with_context(request, attributed_context())
         });
         assert_unknown(&response);
-        assert!(fixture.target_rx.try_recv().is_err());
+        drain_advisory_delivery(&mut fixture.target_rx);
         assert!(fixture.source_rx.try_recv().is_err());
     }
 
@@ -966,6 +1426,7 @@ mod tests {
         let request = Request {
             id: "complete-ancestry-outside".into(),
             method: Method::PaneSendText(PaneSendTextParams {
+                expected_agent_session_id: None,
                 pane_id: fixture.target_pane_id.clone(),
                 text: "ordinary".into(),
                 allow_cross_pane: false,
@@ -1004,7 +1465,7 @@ mod tests {
                 .handle_api_request_with_context(request.clone(), context)
         });
         assert_unknown(&response);
-        assert!(fixture.target_rx.try_recv().is_err());
+        drain_advisory_delivery(&mut fixture.target_rx);
         fixture
             .app
             .state
@@ -1017,7 +1478,7 @@ mod tests {
                 .handle_api_request_with_context(request, context)
         });
         assert_unknown(&response);
-        assert!(fixture.target_rx.try_recv().is_err());
+        drain_advisory_delivery(&mut fixture.target_rx);
         assert!(fixture.source_rx.try_recv().is_err());
     }
 
@@ -1084,6 +1545,7 @@ mod tests {
                 let request = Request {
                     id: "unlinked-marker".into(),
                     method: Method::PaneSendText(PaneSendTextParams {
+                        expected_agent_session_id: None,
                         pane_id: fixture.target_pane_id.clone(),
                         text: "blocked".into(),
                         allow_cross_pane: false,
@@ -1099,6 +1561,9 @@ mod tests {
                     Request {
                         id: "deferred-unlinked-marker".into(),
                         method: Method::AgentPrompt(AgentPromptParams {
+                            expected_agent_session_id: None,
+                            expected_pane_id: None,
+                            expected_agent_status: None,
                             target: "target-agent".into(),
                             text: "blocked".into(),
                             wait: None,
@@ -1110,7 +1575,7 @@ mod tests {
                 ));
                 assert_unknown(&response.recv().expect("deferred unknown"));
                 assert!(fixture.source_rx.try_recv().is_err());
-                assert!(fixture.target_rx.try_recv().is_err());
+                drain_advisory_delivery(&mut fixture.target_rx);
             });
         });
     }
@@ -1204,6 +1669,7 @@ mod tests {
                     Request {
                         id: "server-ancestry-sequence".into(),
                         method: Method::PaneSendText(PaneSendTextParams {
+                            expected_agent_session_id: None,
                             pane_id,
                             text: "sequence".into(),
                             allow_cross_pane: opt_in,
@@ -1229,8 +1695,8 @@ mod tests {
                 } else {
                     assert_denied(&response);
                 }
-                assert!(fixture.source_rx.try_recv().is_err());
-                assert!(fixture.target_rx.try_recv().is_err());
+                drain_advisory_delivery(&mut fixture.source_rx);
+                drain_advisory_delivery(&mut fixture.target_rx);
             }
 
             let (respond_to, response_rx) = std::sync::mpsc::channel();
@@ -1238,6 +1704,9 @@ mod tests {
                 Request {
                     id: "deferred-server-ancestry-sequence".into(),
                     method: Method::AgentPrompt(AgentPromptParams {
+                        expected_agent_session_id: None,
+                        expected_pane_id: None,
+                        expected_agent_status: None,
                         target: fixture.target_pane_id.clone(),
                         text: "deferred".into(),
                         wait: None,
@@ -1254,7 +1723,7 @@ mod tests {
                 } else {
                     assert_denied(&response);
                 }
-                assert!(fixture.target_rx.try_recv().is_err());
+                drain_advisory_delivery(&mut fixture.target_rx);
             }
         });
     }
@@ -1303,6 +1772,7 @@ mod tests {
         let request = Request {
             id: "outside-missing-roots".into(),
             method: Method::PaneSendText(PaneSendTextParams {
+                expected_agent_session_id: None,
                 pane_id: fixture.target_pane_id.clone(),
                 text: "ordinary outside".into(),
                 allow_cross_pane: false,
@@ -1327,7 +1797,7 @@ mod tests {
                     assert_unknown(&response);
                 }
                 assert!(fixture.source_rx.try_recv().is_err());
-                assert!(fixture.target_rx.try_recv().is_err());
+                drain_advisory_delivery(&mut fixture.target_rx);
             });
         }
         // Captured markers are checked before outside/age evidence. Neither a
@@ -1350,7 +1820,7 @@ mod tests {
                             .handle_api_request_with_context(request.clone(), marked),
                     );
                     assert!(fixture.source_rx.try_recv().is_err());
-                    assert!(fixture.target_rx.try_recv().is_err());
+                    drain_advisory_delivery(&mut fixture.target_rx);
                     let mut explicit = request.clone();
                     if let Method::PaneSendText(params) = &mut explicit.method {
                         params.allow_cross_pane = true;
@@ -1452,6 +1922,7 @@ mod tests {
         let request = |id: &str, pane_id: String, text: &str| Request {
             id: id.into(),
             method: Method::PaneSendText(PaneSendTextParams {
+                expected_agent_session_id: None,
                 pane_id,
                 text: text.into(),
                 allow_cross_pane: false,
@@ -1476,12 +1947,12 @@ mod tests {
                     marked,
                 );
                 assert_denied(&denied);
-                assert!(fixture.target_rx.try_recv().is_err());
+                drain_advisory_delivery(&mut fixture.target_rx);
             }
 
             // Check the native adapter against a real strictly older ancestor.
             assert_eq!(
-                crate::platform::process_identity_server_ancestry(ordinary_peer),
+                crate::platform::process_identity_server_ancestry(ordinary_peer).verdict,
                 crate::platform::ServerAncestry::Outside
             );
             // Capture readable absence from an actual sanitized exec. Model its
@@ -1536,7 +2007,7 @@ mod tests {
                 unknown,
             );
             assert_unknown(&response);
-            assert!(fixture.target_rx.try_recv().is_err());
+            drain_advisory_delivery(&mut fixture.target_rx);
 
             // Losing the real pane link cannot promote the marked caller even
             // with Outside observation available for that exact live peer.
@@ -1552,7 +2023,7 @@ mod tests {
             );
             assert_unknown(&response);
             assert!(fixture.source_rx.try_recv().is_err());
-            assert!(fixture.target_rx.try_recv().is_err());
+            drain_advisory_delivery(&mut fixture.target_rx);
         });
     }
 
@@ -1573,6 +2044,7 @@ mod tests {
                 Request {
                     id: "stale-outside-proof".into(),
                     method: Method::PaneSendText(PaneSendTextParams {
+                        expected_agent_session_id: None,
                         pane_id: fixture.target_pane_id.clone(),
                         text: "blocked".into(),
                         allow_cross_pane: false,
@@ -1582,7 +2054,7 @@ mod tests {
             );
             assert_unknown(&response);
             assert!(fixture.source_rx.try_recv().is_err());
-            assert!(fixture.target_rx.try_recv().is_err());
+            drain_advisory_delivery(&mut fixture.target_rx);
         });
     }
 
@@ -1657,6 +2129,7 @@ mod tests {
         let request = Request {
             id: "darwin-real-accepted-caller".into(),
             method: Method::PaneSendText(PaneSendTextParams {
+                expected_agent_session_id: None,
                 pane_id: fixture.target_pane_id.clone(),
                 text: "native ordinary".into(),
                 allow_cross_pane: false,
@@ -1717,7 +2190,7 @@ mod tests {
         );
         #[cfg(target_os = "macos")]
         assert_eq!(
-            crate::platform::process_identity_server_ancestry(peer),
+            crate::platform::process_identity_server_ancestry(peer).verdict,
             crate::platform::ServerAncestry::ReachedServer
         );
         let mut line = String::new();
@@ -1866,6 +2339,7 @@ mod tests {
         let request = Request {
             id: "windows-real-non-pane-child".into(),
             method: Method::PaneSendText(PaneSendTextParams {
+                expected_agent_session_id: None,
                 pane_id: fixture.target_pane_id.clone(),
                 text: "windows real child".into(),
                 allow_cross_pane: false,
@@ -1887,7 +2361,7 @@ mod tests {
             crate::platform::PeerPaneOrigin::Absent
         );
         assert_eq!(
-            crate::platform::process_identity_server_ancestry(peer),
+            crate::platform::process_identity_server_ancestry(peer).verdict,
             crate::platform::ServerAncestry::ReachedServer
         );
         assert!(caller
@@ -1987,6 +2461,7 @@ mod tests {
                 Request {
                     id: "windows-two-live-roots".into(),
                     method: Method::PaneSendText(PaneSendTextParams {
+                        expected_agent_session_id: None,
                         pane_id: if own {
                             fixture.source_pane_id.clone()
                         } else {
@@ -2013,13 +2488,16 @@ mod tests {
                 assert_denied(&response);
             }
             assert!(fixture.source_rx.try_recv().is_err());
-            assert!(fixture.target_rx.try_recv().is_err());
+            drain_advisory_delivery(&mut fixture.target_rx);
         }
         let (respond_to, response) = std::sync::mpsc::channel();
         assert!(fixture.app.handle_deferred_agent_api_request(
             Request {
                 id: "windows-two-live-roots-deferred".into(),
                 method: Method::AgentPrompt(AgentPromptParams {
+                    expected_agent_session_id: None,
+                    expected_pane_id: None,
+                    expected_agent_status: None,
                     target: "target-agent".into(),
                     text: "blocked".into(),
                     wait: None,
@@ -2030,7 +2508,7 @@ mod tests {
             respond_to,
         ));
         assert_denied(&response.recv().expect("deferred cross-pane refusal"));
-        assert!(fixture.target_rx.try_recv().is_err());
+        drain_advisory_delivery(&mut fixture.target_rx);
     }
 
     #[cfg(windows)]
@@ -2042,6 +2520,7 @@ mod tests {
         let request = Request {
             id: "reused-windows-parent".into(),
             method: Method::PaneSendText(PaneSendTextParams {
+                expected_agent_session_id: None,
                 pane_id: fixture.target_pane_id.clone(),
                 text: "refused".into(),
                 allow_cross_pane: false,
@@ -2053,7 +2532,7 @@ mod tests {
                 .handle_api_request_with_context(request, attributed_context())
         });
         assert_unknown(&response);
-        assert!(fixture.target_rx.try_recv().is_err());
+        drain_advisory_delivery(&mut fixture.target_rx);
         assert!(fixture.source_rx.try_recv().is_err());
     }
 
@@ -2081,6 +2560,7 @@ mod tests {
                 Request {
                     id: "fallback".into(),
                     method: Method::PaneSendText(PaneSendTextParams {
+                        expected_agent_session_id: None,
                         pane_id: pane.clone(),
                         text: "fallback".into(),
                         allow_cross_pane: opt_in,
@@ -2101,7 +2581,7 @@ mod tests {
                 );
             } else {
                 assert_denied(&response);
-                assert!(fixture.target_rx.try_recv().is_err());
+                drain_advisory_delivery(&mut fixture.target_rx);
             }
         }
         drop(client);
@@ -2134,6 +2614,7 @@ mod tests {
             Request {
                 id: "unsupported-and-disconnected".into(),
                 method: Method::PaneSendText(PaneSendTextParams {
+                    expected_agent_session_id: None,
                     pane_id: fixture.target_pane_id.clone(),
                     text: "refused".into(),
                     allow_cross_pane: false,
@@ -2142,7 +2623,7 @@ mod tests {
             missing,
         );
         assert_unknown(&response);
-        assert!(fixture.target_rx.try_recv().is_err());
+        drain_advisory_delivery(&mut fixture.target_rx);
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -2155,9 +2636,11 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let (respond_to, _response) = std::sync::mpsc::channel();
         tx.send(crate::api::ApiRequestMessage {
+            peer_pidfd: None,
             request: Request {
                 id: "queued-peer-exit".into(),
                 method: Method::PaneSendText(PaneSendTextParams {
+                    expected_agent_session_id: None,
                     pane_id: fixture.target_pane_id.clone(),
                     text: "refused".into(),
                     allow_cross_pane: false,
@@ -2176,7 +2659,7 @@ mod tests {
             .app
             .handle_api_request_with_context(queued.request.clone(), queued.context);
         assert_unknown(&response);
-        assert!(fixture.target_rx.try_recv().is_err());
+        drain_advisory_delivery(&mut fixture.target_rx);
         let mut explicit = queued.request;
         if let Method::PaneSendText(params) = &mut explicit.method {
             params.allow_cross_pane = true;
@@ -2349,6 +2832,7 @@ finally:
         let own = Request {
             id: "marked-own-before-orphan".into(),
             method: Method::PaneSendText(PaneSendTextParams {
+                expected_agent_session_id: None,
                 pane_id: fixture.source_pane_id.clone(),
                 text: "own".into(),
                 allow_cross_pane: false,
@@ -2362,6 +2846,7 @@ finally:
         let request = Request {
             id: "queued-marked-orphan".into(),
             method: Method::PaneSendText(PaneSendTextParams {
+                expected_agent_session_id: None,
                 pane_id: fixture.target_pane_id.clone(),
                 text: "orphan".into(),
                 allow_cross_pane: false,
@@ -2370,6 +2855,7 @@ finally:
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let (respond_to, _) = std::sync::mpsc::channel();
         tx.send(crate::api::ApiRequestMessage {
+            peer_pidfd: None,
             request,
             context: accepted,
             respond_to,
@@ -2407,6 +2893,9 @@ finally:
                 Request {
                     id: "deferred-marked-orphan".into(),
                     method: Method::AgentPrompt(AgentPromptParams {
+                        expected_agent_session_id: None,
+                        expected_pane_id: None,
+                        expected_agent_status: None,
                         target: "target-agent".into(),
                         text: "orphan".into(),
                         wait: None,
@@ -2417,7 +2906,7 @@ finally:
                 respond_to,
             ));
             assert_unknown(&response.recv().expect("deferred refusal"));
-            assert!(fixture.target_rx.try_recv().is_err());
+            drain_advisory_delivery(&mut fixture.target_rx);
             assert!(fixture.source_rx.try_recv().is_err());
         }
         let mut explicit = queued.request;
@@ -2499,13 +2988,15 @@ finally:
         assert_eq!(
             crate::platform::process_identity_server_ancestry(
                 context.local_peer_identity.expect("native Darwin caller")
-            ),
+            )
+            .verdict,
             crate::platform::ServerAncestry::ReachedServer,
             "a real ordinary child reaches the server; it is not an outside-proof seam"
         );
         let request = Request {
             id: "outside".into(),
             method: Method::PaneSendText(PaneSendTextParams {
+                expected_agent_session_id: None,
                 pane_id: fixture.target_pane_id.clone(),
                 text: "ordinary".into(),
                 allow_cross_pane: false,
@@ -2529,7 +3020,7 @@ finally:
                 .app
                 .handle_api_request_with_context(request, context),
         );
-        assert!(fixture.target_rx.try_recv().is_err());
+        drain_advisory_delivery(&mut fixture.target_rx);
         let _ = ordinary_peer.kill();
         let _ = ordinary_peer.wait();
     }
@@ -2549,9 +3040,10 @@ finally:
             assert!(
                 matches!(origin, InputOrigin::Agent(ref target) if target.terminal_id == source.terminal_id)
             );
+            // Advisory guard (Paul, 2026-10-13): the foreign report is accepted.
             for (pane_id, opt_in, resume, denied) in [
                 (fixture.source_pane_id.clone(), false, true, false),
-                (fixture.target_pane_id.clone(), false, true, true),
+                (fixture.target_pane_id.clone(), false, true, false),
                 (fixture.target_pane_id.clone(), true, true, false),
                 (fixture.target_pane_id.clone(), false, false, false),
             ] {
@@ -2722,9 +3214,18 @@ finally:
             .app
             .plugin_action_grants
             .bind_target(key, &source_terminal));
+        // The grandchild re-execs this unsigned test binary rather than
+        // Apple's protected `sleep`, whose environment macOS hides from
+        // KERN_PROCARGS2, so its pane marker stays observable on Darwin too.
         let mut action = GuardTestChild(
             std::process::Command::new("sh")
-                .args(["-c", "sleep 30 & echo $!; wait"])
+                .args([
+                    "-c",
+                    "\"$0\" --exact app::api::input_guard::tests::guard_exec_peer_helper \
+                     --nocapture >/dev/null & echo $!; wait",
+                ])
+                .arg(std::env::current_exe().expect("test executable"))
+                .env("HERDR_GUARD_EXEC_HELPER", "marked")
                 .env("HERDR_ENV", "1")
                 .env("HERDR_PANE_ID", &fixture.source_pane_id)
                 .stdout(std::process::Stdio::piped())
@@ -2741,7 +3242,7 @@ finally:
             crate::platform::pin_owned_child(&action).expect("pin action child")
         ));
         // `sh` prints the child PID immediately after fork. Before the child
-        // execs `sleep`, Linux can expose an empty /proc/<pid>/environ (and
+        // execs the helper, Linux can expose an empty /proc/<pid>/environ (and
         // macOS can likewise expose incomplete launch metadata). Poll the
         // production accept-time probe to wait for the exec, with a bound so
         // a live process that never reports its pane still fails this test.
@@ -2764,26 +3265,20 @@ finally:
         let send = |id: &str, pane: &str, opt_in: bool| Request {
             id: id.into(),
             method: Method::PaneSendText(PaneSendTextParams {
+                expected_agent_session_id: None,
                 pane_id: pane.into(),
                 text: "open".into(),
                 allow_cross_pane: opt_in,
             }),
         };
 
-        // Copied pane marker without a grant is still refused cross-pane (this
-        // fixture's source pane root is the test process, so the descendant is
-        // attributed to the source agent rather than unknown).
-        let refused: ErrorResponse =
-            serde_json::from_str(&fixture.app.handle_api_request_with_context(
-                send("no-token", &fixture.target_pane_id, false),
-                copied_marker,
-            ))
-            .expect("refusal");
-        assert!(matches!(
-            refused.error.code.as_str(),
-            "cross_pane_input_denied" | "input_origin_unknown"
+        // Copied pane marker without a grant is no plugin input: it takes the
+        // advisory fleet path and is accepted (Paul, 2026-10-13).
+        assert_not_origin_refused(&fixture.app.handle_api_request_with_context(
+            send("no-token", &fixture.target_pane_id, false),
+            copied_marker,
         ));
-        assert!(fixture.target_rx.try_recv().is_err());
+        drain_advisory_delivery(&mut fixture.target_rx);
 
         // The grandchild with the grant reaches its invoking terminal, no
         // opt-in needed, but not the pre-existing other pane (herdr#223).
@@ -2792,7 +3287,7 @@ finally:
             fixture.app.input_origin_for_context(granted),
             InputOrigin::PluginAction(grant.clone())
         );
-        assert_denied(&fixture.app.handle_api_request_with_context(
+        assert_plugin_denied(&fixture.app.handle_api_request_with_context(
             send("granted-cross", &fixture.target_pane_id, false),
             granted,
         ));
@@ -2827,10 +3322,15 @@ finally:
             PluginActionClaim::Malformed,
         ] {
             for context in [copied_marker, attributed_context()] {
-                assert_unknown(&fixture.app.handle_api_request_with_context(
-                    send("forged", &fixture.source_pane_id, false),
-                    context.with_plugin_action(claim),
-                ));
+                // The cross-pane opt-in never bypasses token validation.
+                for opt_in in [false, true] {
+                    for pane in [&fixture.source_pane_id, &fixture.target_pane_id] {
+                        assert_plugin_unknown(&fixture.app.handle_api_request_with_context(
+                            send("forged", pane, opt_in),
+                            context.with_plugin_action(claim),
+                        ));
+                    }
+                }
             }
         }
         assert!(fixture.source_rx.try_recv().is_err());
@@ -2841,10 +3341,12 @@ finally:
             attributed_context(),
         ));
         assert!(fixture.source_rx.try_recv().is_ok());
-        assert_denied(&fixture.app.handle_api_request_with_context(
+        // No grant: the advisory fleet path accepts agent cross-pane input.
+        assert_ok(&fixture.app.handle_api_request_with_context(
             send("agent-cross", &fixture.target_pane_id, false),
             attributed_context(),
         ));
+        drain_advisory_delivery(&mut fixture.target_rx);
         assert_ok(&fixture.app.handle_api_request_with_context(
             send("opt-in", &fixture.target_pane_id, true),
             copied_marker,
@@ -2860,11 +3362,13 @@ finally:
             "descendant still alive"
         );
         for pane in [&fixture.target_pane_id, &fixture.source_pane_id] {
-            assert_unknown(
-                &fixture
-                    .app
-                    .handle_api_request_with_context(send("replay", pane, false), granted),
-            );
+            for opt_in in [false, true] {
+                assert_plugin_unknown(
+                    &fixture
+                        .app
+                        .handle_api_request_with_context(send("replay", pane, opt_in), granted),
+                );
+            }
         }
         assert!(fixture.source_rx.try_recv().is_err());
         assert!(fixture.target_rx.try_recv().is_err());
@@ -2872,6 +3376,41 @@ finally:
         // observes alive (its parent was reaped above, so it is reparented, not
         // reused; start time is compared just before).
         unsafe { libc::kill(grandchild as libc::pid_t, libc::SIGKILL) };
+    }
+
+    /// Review fix: a forged or malformed plugin-action token with
+    /// allow_cross_pane: true is refused exactly as without the flag, on every
+    /// content-write method, while the same opt-in without a token is accepted.
+    #[tokio::test]
+    async fn invalid_plugin_token_with_allow_cross_pane_is_still_refused() {
+        use crate::plugin_action_origin::{PluginActionClaim, PluginActionToken};
+        let fixture = attributed_agent_fixture();
+        let forged =
+            PluginActionClaim::Presented(PluginActionToken::parse(&"7".repeat(64)).expect("hex"));
+        let send = |pane: &str| Request {
+            id: "opt-in".into(),
+            method: Method::PaneSendText(PaneSendTextParams {
+                expected_agent_session_id: None,
+                pane_id: pane.into(),
+                text: "x".into(),
+                allow_cross_pane: true,
+            }),
+        };
+        for pane in [&fixture.source_pane_id, &fixture.target_pane_id] {
+            for claim in [forged, PluginActionClaim::Malformed] {
+                for base in [ApiRequestContext::default(), attributed_context()] {
+                    let denial = fixture
+                        .app
+                        .cross_pane_input_denial(&send(pane), base.with_plugin_action(claim))
+                        .expect("invalid token refused despite opt-in");
+                    assert_plugin_unknown(&denial);
+                }
+            }
+            assert!(fixture
+                .app
+                .cross_pane_input_denial(&send(pane), ApiRequestContext::default())
+                .is_none());
+        }
     }
 
     /// herdr-8592: a grant past its maximum age is refused while the child lives.
@@ -2910,6 +3449,7 @@ finally:
         let request = || Request {
             id: "expiry".into(),
             method: Method::PaneSendText(PaneSendTextParams {
+                expected_agent_session_id: None,
                 pane_id: fixture.target_pane_id.clone(),
                 text: "late".into(),
                 allow_cross_pane: false,
@@ -2923,7 +3463,17 @@ finally:
             .plugin_action_grants
             .backdate_for_test(key, MAX_GRANT_AGE + std::time::Duration::from_secs(1));
         let late = request();
-        assert_unknown(&fixture.app.handle_api_request_with_context(late, context));
+        assert_plugin_unknown(&fixture.app.handle_api_request_with_context(late, context));
+        // The cross-pane opt-in does not revive an expired grant.
+        let mut late_opt_in = request();
+        if let Method::PaneSendText(params) = &mut late_opt_in.method {
+            params.allow_cross_pane = true;
+        }
+        assert_plugin_unknown(
+            &fixture
+                .app
+                .handle_api_request_with_context(late_opt_in, context),
+        );
         assert!(fixture.target_rx.try_recv().is_err());
         drop(action);
     }
@@ -2956,6 +3506,7 @@ finally:
         let request = Request {
             id: "wire".into(),
             method: Method::PaneSendText(PaneSendTextParams {
+                expected_agent_session_id: None,
                 pane_id: fixture.target_pane_id.clone(),
                 text: "wire".into(),
                 allow_cross_pane: false,
@@ -3023,7 +3574,7 @@ finally:
                     assert_ok(&response);
                     assert!(fixture.target_rx.try_recv().is_ok(), "{name}");
                 } else {
-                    assert_unknown(&response);
+                    assert_plugin_unknown(&response);
                     assert!(fixture.target_rx.try_recv().is_err(), "{name}");
                 }
             }
@@ -3037,7 +3588,7 @@ finally:
     #[tokio::test]
     async fn plugin_action_grant_targets_only_invoking_and_own_created_terminals() {
         use crate::api::schema::{
-            PaneMoveDestination, PaneMoveParams, PaneSplitParams, PaneTarget, SplitDirection,
+            PaneCloseParams, PaneMoveDestination, PaneMoveParams, PaneSplitParams, SplitDirection,
             TabCreateParams, WorkspaceCreateParams,
         };
         use crate::plugin_action_origin::{
@@ -3085,6 +3636,7 @@ finally:
         let send = |pane: &str| Request {
             id: "write".into(),
             method: Method::PaneSendText(PaneSendTextParams {
+                expected_agent_session_id: None,
                 pane_id: pane.into(),
                 text: "open".into(),
                 allow_cross_pane: false,
@@ -3131,7 +3683,7 @@ finally:
 
         // Token A: pre-existing B refused, own invoking A admitted (real write).
         assert_eq!(decide(&fixture, &fixture.target_pane_id, a), denied);
-        assert_denied(
+        assert_plugin_denied(
             &fixture
                 .app
                 .handle_api_request_with_context(send(&fixture.target_pane_id), a),
@@ -3266,8 +3818,9 @@ finally:
         let closed = fixture.app.handle_api_request_with_context(
             Request {
                 id: "close".into(),
-                method: Method::PaneClose(PaneTarget {
+                method: Method::PaneClose(PaneCloseParams {
                     pane_id: moved_pane.clone(),
+                    expected_terminal: None,
                 }),
             },
             ApiRequestContext::default(),

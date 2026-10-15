@@ -2117,7 +2117,7 @@ fn homebrew_cellar_keg_root(path: &Path) -> Option<PathBuf> {
 pub(crate) const SMARTY_INSTALL_REFUSAL: &str = "this herdr is installed by smarty-install (setgid herdr for the server key); update it with smarty-install herdr <sha>";
 
 /// A setgid binary (any group) belongs to smarty-install: replacing it here would drop
-/// the `root:herdr 2755` mode that smarty-install sets (smarty-dev#2636). A plain
+/// `root:herdr 2755`, and the next server could not read its attestation key. A plain
 /// root-owned binary is an ordinary system install and takes the normal update path.
 #[cfg(unix)]
 fn is_smarty_install_managed_exe(exe: &Path) -> bool {
@@ -3112,6 +3112,10 @@ mod tests {
                 ssh_agent_registration: false,
                 guarded_live_handoff: true,
                 expected_terminal_guard: true,
+                pane_close_expected_terminal_guard: true,
+                expected_agent_session_guard: true,
+                expected_agent_status_guard: true,
+                refuse_if_exists_guard: true,
                 input_consumer: false,
             }),
         };
@@ -3181,6 +3185,10 @@ mod tests {
                 protocol: Some(76),
                 capabilities: Some(crate::api::schema::ServerCapabilities {
                     expected_terminal_guard: true,
+                    pane_close_expected_terminal_guard: true,
+                    expected_agent_session_guard: true,
+                    expected_agent_status_guard: true,
+                    refuse_if_exists_guard: true,
                     live_handoff: true,
                     detached_server_daemon: true,
                     endpoint_protocol_generation: Some(
@@ -3435,6 +3443,10 @@ mod tests {
                 protocol: Some(76),
                 capabilities: Some(crate::api::schema::ServerCapabilities {
                     expected_terminal_guard: true,
+                    pane_close_expected_terminal_guard: true,
+                    expected_agent_session_guard: true,
+                    expected_agent_status_guard: true,
+                    refuse_if_exists_guard: true,
                     live_handoff: true,
                     detached_server_daemon: true,
                     endpoint_protocol_generation: Some(

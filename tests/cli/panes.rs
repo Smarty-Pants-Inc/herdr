@@ -780,6 +780,293 @@ fn pane_agent_reports_accept_options_before_pane() {
     drop(agent_process);
 }
 
+/// A real server whose one pane runs a process titled `pi`, already detected as Pi. Shared by
+/// the smarty-dev#10398 report E2Es below.
+struct DetectedPiPane {
+    herdr: SpawnedHerdr,
+    base: PathBuf,
+    socket_path: PathBuf,
+    pane_id: String,
+}
+
+impl DetectedPiPane {
+    fn spawn() -> Self {
+        let base = unique_test_dir();
+        let config_home = base.join("config");
+        let runtime_dir = base.join("runtime");
+        let socket_path = runtime_dir.join("herdr.sock");
+        let bin_dir = base.join("bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        // A process titled `pi`, so the server detects the pane as Pi.
+        let fake_pi = bin_dir.join("pi");
+        fs::copy("/bin/sleep", &fake_pi).unwrap();
+
+        let herdr = spawn_herdr(&config_home, &runtime_dir, &socket_path);
+        wait_for_socket(&socket_path, Duration::from_secs(5));
+
+        let created = run_cli_json(
+            &socket_path,
+            &["workspace", "create", "--cwd", base.to_str().unwrap()],
+        );
+        let pane_id = created["result"]["root_pane"]["pane_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let command = format!("{} 120", fake_pi.display());
+        let started = run_cli(&socket_path, &["pane", "run", &pane_id, &command]);
+        assert!(
+            started.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&started.stderr)
+        );
+        let pi = Self {
+            herdr,
+            base,
+            socket_path,
+            pane_id,
+        };
+        let mut last = serde_json::Value::Null;
+        assert!(
+            wait_until(Duration::from_secs(10), Duration::from_millis(50), || {
+                last = pi.pane_get();
+                last["agent"] == "pi"
+            }),
+            "pi was never detected: {last}"
+        );
+        pi
+    }
+
+    fn pane_get(&self) -> serde_json::Value {
+        run_cli_json(&self.socket_path, &["pane", "get", &self.pane_id])["result"]["pane"].clone()
+    }
+
+    fn cleanup(self) {
+        cleanup_spawned_herdr(self.herdr, self.base);
+    }
+}
+
+/// smarty-dev#10398 end to end: a real server, a real `pi` foreground process and the real
+/// `herdr pane report-agent-session` CLI. A Pi `/reload` anchors an unanchored pane, a
+/// same-path report without an id keeps the id, a reload for another session never replaces
+/// the anchor, and an explicit `new` session still does.
+#[cfg(target_os = "linux")]
+#[test]
+fn pi_reload_cli_reports_anchor_the_pane_and_keep_the_id_end_to_end() {
+    let pi = DetectedPiPane::spawn();
+    let (base, socket_path, pane_id) = (&pi.base, &pi.socket_path, &pi.pane_id);
+    let detected = pi.pane_get();
+    assert_eq!(
+        detected["agent_session"],
+        serde_json::Value::Null,
+        "{detected}"
+    );
+    assert_eq!(
+        detected["agent_session_id"],
+        serde_json::Value::Null,
+        "{detected}"
+    );
+
+    let path_a = base.join("pi-reload-a.jsonl").to_str().unwrap().to_string();
+    let path_b = base.join("pi-reload-b.jsonl").to_str().unwrap().to_string();
+    // Returns `pane get`'s (session path, session id) right after the report: reports are
+    // applied before the reply, so no wait is needed.
+    let report = |seq: u64, start: Option<&str>, path: &str, id: Option<&str>| {
+        let seq = format!("--seq={seq}");
+        let path = format!("--agent-session-path={path}");
+        let start = start.map(|start| format!("--session-start-source={start}"));
+        let id = id.map(|id| format!("--agent-session-id={id}"));
+        let mut args = vec![
+            "pane",
+            "report-agent-session",
+            "--source=herdr:pi",
+            "--agent=pi",
+            seq.as_str(),
+            path.as_str(),
+        ];
+        args.extend(start.as_deref());
+        args.extend(id.as_deref());
+        args.push(pane_id.as_str());
+        let output = run_cli(socket_path, &args);
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let pane = pi.pane_get();
+        assert_eq!(pane["agent"], "pi", "{pane}");
+        (
+            pane["agent_session"]["value"].clone(),
+            pane["agent_session_id"].clone(),
+        )
+    };
+    let anchored_a = (serde_json::json!(path_a), serde_json::json!("pi-id-a"));
+
+    assert_eq!(
+        report(1, Some("reload"), &path_a, Some("pi-id-a")),
+        anchored_a,
+        "a reload anchors the unanchored pane"
+    );
+    assert_eq!(
+        report(2, None, &path_a, None),
+        anchored_a,
+        "an id-less same-path report keeps the id"
+    );
+    assert_eq!(
+        report(3, Some("reload"), &path_b, Some("pi-id-b")),
+        anchored_a,
+        "a reload for another session never replaces the anchor"
+    );
+    assert_eq!(
+        report(4, Some("new"), &path_b, Some("pi-id-b")),
+        (serde_json::json!(path_b), serde_json::json!("pi-id-b")),
+        "an explicit new session still replaces it"
+    );
+
+    pi.cleanup();
+}
+
+/// smarty-dev#10398 end to end: a real server, a real `pi` foreground process,
+/// a real `events.subscribe` stream, and the real `herdr pane report-agent-session`
+/// CLI. The event must carry the actual id `pane get` shows and fire when only it
+/// changes. A pre-v11 Pi extension re-reports its path without an id after `/reload`;
+/// that report keeps the id (the id belongs to the session file), so it emits nothing,
+/// and the id clears only together with the path.
+#[test]
+fn agent_session_changed_cli_reports_carry_the_actual_id_end_to_end() {
+    let pi = DetectedPiPane::spawn();
+    let (base, socket_path, pane_id) = (&pi.base, &pi.socket_path, &pi.pane_id);
+
+    // The same socket path event subscribers use.
+    let mut stream = UnixStream::connect(socket_path).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    writeln!(
+        stream,
+        "{}",
+        serde_json::json!({
+            "id": "session-id-events",
+            "method": "events.subscribe",
+            "params": {"subscriptions": [
+                {"type": "pane.agent_session_changed", "pane_id": pane_id}
+            ]}
+        })
+    )
+    .unwrap();
+    let mut events = BufReader::new(stream);
+    let mut next_event = || {
+        let mut line = String::new();
+        let count = events.read_line(&mut line).unwrap();
+        assert_ne!(count, 0, "event socket closed");
+        serde_json::from_str::<serde_json::Value>(&line).unwrap()
+    };
+    let started = next_event();
+    assert_eq!(
+        started["result"]["type"], "subscription_started",
+        "{started}"
+    );
+
+    let session_path = base.join("pi-a.jsonl");
+    let path = session_path.to_str().unwrap().to_string();
+    let report = |seq: u64, id: Option<&str>, path: &str| {
+        let seq = format!("--seq={seq}");
+        let path = format!("--agent-session-path={path}");
+        let mut args = vec![
+            "pane",
+            "report-agent-session",
+            "--source=herdr:pi",
+            "--agent=pi",
+            seq.as_str(),
+            path.as_str(),
+            "--session-start-source=startup",
+        ];
+        let id = id.map(|id| format!("--agent-session-id={id}"));
+        if let Some(id) = id.as_deref() {
+            args.push(id);
+        }
+        args.push(pane_id.as_str());
+        let output = run_cli(socket_path, &args);
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // Reports are applied before the reply: `pane get` must already agree.
+        pi.pane_get()["agent_session_id"].clone()
+    };
+
+    let null = serde_json::Value::Null;
+    let id_a = serde_json::json!("pi-id-a");
+    assert_eq!(report(1, None, &path), null, "path only");
+    assert_eq!(
+        report(2, Some("pi-id-a"), &path),
+        id_a,
+        "same path with an id"
+    );
+    assert_eq!(report(3, Some("pi-id-a"), &path), id_a, "repeat");
+    // The sticky id (#247): an id-less re-report of the same path keeps the id, so
+    // neither report changes the session and neither emits.
+    assert_eq!(report(4, None, &path), id_a, "path only after /reload");
+    assert_eq!(report(5, None, &path), id_a, "repeat");
+    // A sentinel with a new path: events are ordered, so whatever arrives
+    // before it is everything the five reports emitted. A different path still
+    // clears the id, so the sentinel's own event carries that clear.
+    let sentinel = base.join("pi-sentinel.jsonl");
+    let sentinel = sentinel.to_str().unwrap().to_string();
+    assert_eq!(report(6, None, &sentinel), null, "sentinel");
+
+    let mut received = Vec::new();
+    loop {
+        let event = next_event();
+        assert_eq!(event["event"], "pane.agent_session_changed", "{event}");
+        let data = event["data"].clone();
+        assert_eq!(data["pane_id"], *pane_id, "{event}");
+        assert_eq!(data["agent"], "pi", "{event}");
+        let is_sentinel = data["session_id"] == sentinel;
+        received.push(data);
+        if is_sentinel {
+            break;
+        }
+    }
+    let fields = |data: &serde_json::Value| {
+        (
+            data["session_id"].clone(),
+            data["previous_session_id"].clone(),
+            data["agent_session_id"].clone(),
+            data["previous_agent_session_id"].clone(),
+        )
+    };
+    let path_value = serde_json::json!(path);
+    assert_eq!(
+        received.iter().map(fields).collect::<Vec<_>>(),
+        vec![
+            (path_value.clone(), null.clone(), null.clone(), null.clone()),
+            (
+                path_value.clone(),
+                path_value.clone(),
+                id_a.clone(),
+                null.clone()
+            ),
+            (
+                serde_json::json!(sentinel),
+                path_value.clone(),
+                null.clone(),
+                id_a.clone()
+            ),
+        ],
+        "exactly two events before the sentinel: path only and the id set; the \
+         same-path id-less reports keep the id and emit nothing"
+    );
+    for data in &received {
+        // Present and explicitly null, not merely absent.
+        let object = data.as_object().unwrap();
+        assert!(object.contains_key("agent_session_id"), "{data}");
+        assert!(object.contains_key("previous_agent_session_id"), "{data}");
+    }
+
+    pi.cleanup();
+}
+
 #[test]
 fn pane_read_rejects_invalid_value_with_usage_error() {
     // Invalid option values fail as CLI usage errors before any server
@@ -792,4 +1079,287 @@ fn pane_read_rejects_invalid_value_with_usage_error() {
     let stderr = String::from_utf8_lossy(&read.stderr);
     assert!(stderr.contains("invalid read source: bogus"));
     assert!(!stderr.contains("Error: Custom"));
+}
+
+/// smarty-dev#8152, rolled back by Paul on 2026-10-13: clearing a pane's input
+/// poison accepts any caller. A real `herdr` CLI run inside a pane succeeds for
+/// another pane and for its own pane, from a plain shell pane and from a
+/// reported agent pane. The same CLI run outside every pane also succeeds. Drain-before-clear on a
+/// poisoned pane is proven natively in pty::actor guard_tests, because no CLI
+/// path can poison pane input (it needs a failed TCIFLUSH during guarded loss).
+#[cfg(target_os = "linux")]
+#[test]
+fn clear_input_poison_is_refused_inside_panes_and_accepted_from_an_operator() {
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+    let herdr = spawn_herdr(&config_home, &runtime_dir, &socket_path);
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+
+    let created = run_cli_json(
+        &socket_path,
+        &["workspace", "create", "--cwd", base.to_str().unwrap()],
+    );
+    let source = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let split = run_cli_json(
+        &socket_path,
+        &["pane", "split", &source, "--direction", "right"],
+    );
+    let target = split["result"]["pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Runs the real CLI from the source pane's shell and returns its JSON reply.
+    let mut run = 0;
+    let mut clear_from_source_pane = |pane: &str| -> serde_json::Value {
+        run += 1;
+        let out = base.join(format!("clear-{run}.json"));
+        let done = base.join(format!("clear-{run}.done"));
+        let command = format!(
+            "'{}' pane clear-input-poison {pane} > '{}'; echo $? > '{}'",
+            env!("CARGO_BIN_EXE_herdr"),
+            out.display(),
+            done.display()
+        );
+        assert!(run_cli(&socket_path, &["pane", "run", &source, &command])
+            .status
+            .success());
+        assert!(
+            wait_until(Duration::from_secs(10), Duration::from_millis(25), || {
+                fs::read_to_string(&done).is_ok_and(|rc| rc.ends_with('\n'))
+            }),
+            "in-pane CLI did not finish"
+        );
+        // Paul, 2026-10-13: any caller may clear, so the in-pane CLI succeeds.
+        assert_eq!(fs::read_to_string(&done).unwrap().trim(), "0");
+        let stdout = fs::read_to_string(&out).unwrap();
+        serde_json::from_str(stdout.lines().last().unwrap_or_default()).unwrap()
+    };
+
+    // A plain shell pane is pane-attributed: accepted for another pane and its own.
+    for pane in [target.clone(), source.clone()] {
+        let accepted = clear_from_source_pane(&pane);
+        assert_eq!(accepted["result"]["type"], "ok", "{accepted}");
+    }
+
+    // Once the source pane is an agent, cross-pane and own-pane clears are
+    // still accepted (the origin check is advisory).
+    assert!(run_cli(
+        &socket_path,
+        &[
+            "pane",
+            "report-agent",
+            &source,
+            "--source",
+            "custom:pi",
+            "--agent",
+            "pi",
+            "--state",
+            "idle",
+        ],
+    )
+    .status
+    .success());
+    for pane in [target.clone(), source.clone()] {
+        let accepted = clear_from_source_pane(&pane);
+        assert_eq!(accepted["result"]["type"], "ok", "{accepted}");
+    }
+
+    // The operator: the same CLI outside every pane.
+    // Strip every inherited HERDR_* so the run is outside every pane even when
+    // the suite itself runs inside a Herdr pane.
+    let mut operator = crate::test_command::herdr_command();
+    strip_herdr_env(&mut operator);
+    let cleared = operator
+        .args(["pane", "clear-input-poison", &target])
+        .env("HERDR_SOCKET_PATH", &socket_path)
+        .output()
+        .unwrap();
+    assert!(
+        cleared.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cleared.stderr)
+    );
+    let cleared: serde_json::Value = serde_json::from_slice(&cleared.stdout).unwrap();
+    assert_eq!(cleared["result"]["type"], "ok", "{cleared}");
+    assert!(cleared["result"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("TCIFLUSH"));
+
+    cleanup_spawned_herdr(herdr, base);
+}
+
+#[cfg(target_os = "linux")]
+/// Removes every `HERDR_*` variable inherited from the test runner, so an
+/// operator leg never carries pane markers of an enclosing Herdr session.
+fn strip_herdr_env(command: &mut std::process::Command) {
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("HERDR_") {
+            command.env_remove(key);
+        }
+    }
+}
+
+const CLIENT_CHILD_SOCKET: &str = "CLEAR_POISON_CLIENT_CHILD_SOCKET";
+const CLIENT_CHILD_PANE: &str = "CLEAR_POISON_CLIENT_CHILD_PANE";
+const CLIENT_CHILD_OUT: &str = "CLEAR_POISON_CLIENT_CHILD_OUT";
+
+/// Opens a real client-protocol connection (endpoint hello, boot id from the
+/// snapshot) and sends `pane.clear_input_poison` on the endpoint command lane.
+#[cfg(target_os = "linux")]
+fn clear_input_poison_over_client_protocol(
+    client_socket: &Path,
+    pane: &str,
+) -> Result<serde_json::Value, String> {
+    let mut stream = UnixStream::connect(client_socket).map_err(|err| err.to_string())?;
+    crate::support::client_shell_handshake(
+        &mut stream,
+        crate::support::CURRENT_ENDPOINT_PROTOCOL_GENERATION,
+        80,
+        24,
+    )?;
+    let boot_id =
+        crate::support::wait_for_client_shell_boot_id(&mut stream, Duration::from_secs(10))?;
+    crate::support::client_shell_endpoint_request(
+        &mut stream,
+        &boot_id,
+        &serde_json::json!({
+            "id": "clear",
+            "method": "pane.clear_input_poison",
+            "params": {"pane_id": pane},
+        }),
+        Duration::from_secs(10),
+    )
+}
+
+/// Child half of the test below: re-executed from this test binary inside a
+/// Herdr pane. A no-op unless that test supplied its environment.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "re-executed inside a pane by clear_input_poison_client_lane_is_refused_inside_a_pane"]
+fn clear_input_poison_client_protocol_child() {
+    let Some(out) = std::env::var_os(CLIENT_CHILD_OUT) else {
+        return;
+    };
+    let socket = std::env::var_os(CLIENT_CHILD_SOCKET).expect("client socket");
+    let pane = std::env::var(CLIENT_CHILD_PANE).expect("pane");
+    let result = match clear_input_poison_over_client_protocol(Path::new(&socket), &pane) {
+        Ok(response) => response.to_string(),
+        Err(error) => serde_json::json!({ "child_error": error }).to_string(),
+    };
+    let out = PathBuf::from(out);
+    let partial = out.with_extension("partial");
+    fs::write(&partial, result).unwrap();
+    fs::rename(partial, out).unwrap();
+}
+
+/// smarty-dev#8152 round 2: the client-shell lane is not operator proof by
+/// itself. A same-user process inside a pane can open the owner-readable
+/// client socket, complete a valid endpoint hello, read the boot id from the
+/// snapshot and send the allowlisted `pane.clear_input_poison`; it must be
+/// refused. The CLI has no command that speaks the client protocol (and the
+/// real `herdr` client refuses to start nested in a pane), so this is not a CLI
+/// E2E: it drives the real server through a real client-protocol connection
+/// from a child process (this test binary, re-executed) spawned inside a pane,
+/// and from this test process outside every pane, which is the operator.
+#[cfg(target_os = "linux")]
+#[test]
+fn clear_input_poison_client_lane_is_refused_inside_a_pane() {
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+    let client_socket = runtime_dir.join("herdr-client.sock");
+    let herdr = spawn_herdr(&config_home, &runtime_dir, &socket_path);
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+    wait_for_socket(&client_socket, Duration::from_secs(5));
+
+    let created = run_cli_json(
+        &socket_path,
+        &["workspace", "create", "--cwd", base.to_str().unwrap()],
+    );
+    let source = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let split = run_cli_json(
+        &socket_path,
+        &["pane", "split", &source, "--direction", "right"],
+    );
+    let target = split["result"]["pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // In-pane client: refused for another pane and for its own pane.
+    let exe = std::env::current_exe().unwrap();
+    for (run, pane) in [target.clone(), source.clone()].into_iter().enumerate() {
+        let out = base.join(format!("client-clear-{run}.json"));
+        let log = base.join(format!("client-clear-{run}.log"));
+        let command = format!(
+            "{CLIENT_CHILD_SOCKET}='{}' {CLIENT_CHILD_PANE}='{pane}' {CLIENT_CHILD_OUT}='{}' '{}' --exact cases::panes::clear_input_poison_client_protocol_child --include-ignored --nocapture > '{}' 2>&1",
+            client_socket.display(),
+            out.display(),
+            exe.display(),
+            log.display()
+        );
+        assert!(run_cli(&socket_path, &["pane", "run", &source, &command])
+            .status
+            .success());
+        assert!(
+            wait_until(Duration::from_secs(30), Duration::from_millis(50), || out
+                .exists()),
+            "in-pane client did not finish: {}",
+            fs::read_to_string(&log).unwrap_or_default()
+        );
+        // Paul, 2026-10-13: any caller may clear, in-pane clients too.
+        let accepted: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&out).unwrap()).unwrap();
+        assert_eq!(
+            accepted["result"]["type"], "ok",
+            "in-pane client targeting {pane}: {accepted}"
+        );
+    }
+
+    // The operator: a client run outside every pane still clears it. It runs
+    // in a re-executed child with every inherited HERDR_* removed, so the
+    // result does not depend on whether the runner itself is inside a pane.
+    let out = base.join("client-clear-operator.json");
+    let log = base.join("client-clear-operator.log");
+    let mut operator = std::process::Command::new(&exe);
+    strip_herdr_env(&mut operator);
+    let status = operator
+        .args([
+            "--exact",
+            "cases::panes::clear_input_poison_client_protocol_child",
+            "--include-ignored",
+            "--nocapture",
+        ])
+        .env(CLIENT_CHILD_SOCKET, &client_socket)
+        .env(CLIENT_CHILD_PANE, &target)
+        .env(CLIENT_CHILD_OUT, &out)
+        .stdout(fs::File::create(&log).unwrap())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(
+        status.success() && out.exists(),
+        "operator client failed: {}",
+        fs::read_to_string(&log).unwrap_or_default()
+    );
+    let cleared: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&out).unwrap()).unwrap();
+    assert_eq!(cleared["result"]["type"], "ok", "{cleared}");
+    assert!(cleared["result"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("TCIFLUSH"));
+
+    cleanup_spawned_herdr(herdr, base);
 }

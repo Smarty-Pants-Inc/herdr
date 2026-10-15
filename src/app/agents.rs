@@ -209,6 +209,10 @@ impl App {
             return Err(AgentStartError::InvalidTimeout);
         }
 
+        runtime
+            .validate_input_submission(&bytes)
+            .map_err(|err| AgentStartError::InputFailed(err.to_string()))?;
+
         let now = Instant::now();
         let terminal = self
             .state
@@ -394,6 +398,7 @@ impl App {
             state_labels: pane.state_labels,
             tokens: pane.tokens,
             agent_session: pane.agent_session,
+            agent_session_id: pane.agent_session_id,
             workspace_id: pane.workspace_id,
             tab_id: pane.tab_id,
             pane_id: pane.pane_id,

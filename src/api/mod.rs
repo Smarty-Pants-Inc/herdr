@@ -3,6 +3,8 @@ pub mod client;
 mod event_hub;
 pub mod schema;
 mod server;
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use server::handle_connection as test_handle_connection;
 mod status;
 mod subscriptions;
 mod wait;
@@ -61,6 +63,8 @@ pub(crate) fn request_changes_ui(request: &Request) -> bool {
             | Method::AgentStart(_)
             | Method::AgentStartGuarded(_)
             | Method::AgentPrompt(_)
+            | Method::AgentPromptSessionChecked(_)
+            | Method::AgentPromptStatusChecked(_)
             | Method::AgentSendKeys(_)
             | Method::PaneSplit(_)
             | Method::PaneSwap(_)
@@ -82,6 +86,7 @@ pub(crate) fn request_changes_ui(request: &Request) -> bool {
             | Method::PaneClearAgentAuthority(_)
             | Method::PaneReleaseAgent(_)
             | Method::PaneClose(_)
+            | Method::PaneCloseGuarded(_)
             | Method::PopupClose(_)
             | Method::PluginUnlink(_)
             | Method::PluginDisable(_)
@@ -105,6 +110,9 @@ pub(crate) struct ApiRequestContext {
     /// origin. A captured marker that loses that live relationship is unknown,
     /// not ordinary.
     pub(crate) local_peer_pane_origin: crate::platform::PeerPaneOrigin,
+    /// Filled only while handling one request, never cached at accept time or
+    /// shared between requests. The input log reuses the guard's live proof.
+    pub(crate) server_ancestry: Option<crate::platform::ServerAncestryObservation>,
     /// Optional plugin action grant presented on this request line only
     /// (herdr-8592). Per-request, never sticky to the connection; Debug
     /// redacts the secret.
@@ -120,6 +128,7 @@ impl ApiRequestContext {
         Self {
             local_peer_identity,
             local_peer_pane_origin,
+            server_ancestry: None,
             plugin_action: crate::plugin_action_origin::PluginActionClaim::Absent,
         }
     }
@@ -149,6 +158,10 @@ impl ApiRequestContext {
 pub struct ApiRequestMessage {
     pub request: Request,
     pub(crate) context: ApiRequestContext,
+    /// The connection's `SO_PEERPIDFD`, taken at accept. Kept out of the `Copy`
+    /// context because the input consumer retains the enroll pidfd for its
+    /// epoch; only that route reads it (smarty-dev#2636 E′).
+    pub(crate) peer_pidfd: Option<crate::platform::PeerPidfd>,
 
     pub respond_to: std::sync::mpsc::Sender<String>,
     pub response_write_complete: Option<std::sync::mpsc::Receiver<()>>,
@@ -173,6 +186,7 @@ mod context_tests {
         let captured = ApiRequestContext {
             local_peer_identity: Some(peer),
             local_peer_pane_origin: crate::platform::PeerPaneOrigin::HasPane,
+            server_ancestry: None,
             plugin_action: crate::plugin_action_origin::PluginActionClaim::Malformed,
         };
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
