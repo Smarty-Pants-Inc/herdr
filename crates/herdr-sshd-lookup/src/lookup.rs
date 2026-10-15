@@ -9,6 +9,8 @@ use std::os::unix::fs::MetadataExt;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::bridge_argv::is_bridge_argv;
+
 const SSHD: &str = "/usr/sbin/sshd";
 const JOURNALCTL: &str = "/usr/bin/journalctl";
 /// sshd logs the acceptance within LoginGraceTime (default 120 s) of the fork.
@@ -21,6 +23,10 @@ const OUTPUT_LIMIT: usize = 262_144;
 const JOURNAL_TIMEOUT: Duration = Duration::from_millis(1_200);
 /// The caller passes its accepted connection from the bridge here.
 const CONNECTION_FD: RawFd = 3;
+/// The caller passes its own executable here (`O_PATH` of `/proc/self/exe`). A
+/// non-dumpable caller's `/proc/<pid>/exe` and `/proc/<pid>/fd` are closed to
+/// this process (smarty-dev#13408).
+const EXECUTABLE_FD: RawFd = 4;
 /// The server's chain walk allows at most three parents from the bridge to the priv.
 const MAX_PARENTS: usize = 3;
 /// Every journal field `accepted_record` reads. journald always adds the
@@ -34,9 +40,6 @@ const UNIX_TABLE_LIMIT: usize = 16 << 20;
 const FD_LIMIT: usize = 4_096;
 /// `__SO_ACCEPTCON` in the `Flags` column of `/proc/net/unix`: listening.
 const SO_ACCEPTCON: u32 = 0x0001_0000;
-/// The subcommand the bridge runs as (`herdr remote-client-bridge`), as the
-/// server's own check reads it.
-const BRIDGE_SUBCOMMAND: &str = "remote-client-bridge";
 /// Only root (systemd) places a process in these cgroups.
 const LISTENER_CGROUPS: [&str; 2] = [
     "0::/system.slice/ssh.service",
@@ -80,6 +83,8 @@ pub(crate) trait Host {
     fn exe(&mut self, pid: u32) -> Option<Exe>;
     /// The process that started this helper (`getppid`).
     fn caller(&mut self) -> u32;
+    /// The caller's executable, from the descriptor it passed (fd 4).
+    fn caller_exe(&mut self) -> Option<Exe>;
     fn clock(&mut self) -> Option<Clock>;
     /// Fixed `journalctl` arguments; None on failure, timeout or excess output.
     fn journal(&mut self, args: &[String]) -> Option<Vec<u8>>;
@@ -134,16 +139,23 @@ fn unix_rows(table: &[u8]) -> Vec<UnixRow> {
 }
 
 /// The fd-3 peer is a bridge that this caller accepted: the peer runs the
-/// bridge subcommand and holds no listening socket, and the caller holds
-/// both this accepted socket and the listener it was accepted from.
+/// bridge subcommand and holds no listening socket, and fd 3, which the
+/// caller passed, is the accepted side of a socket listening in the caller's
+/// network namespace. A non-dumpable caller's `/proc/<pid>/fd` is unreadable,
+/// so the descriptor the caller passed stands for what it holds.
 fn accepted_bridge(
     host: &mut impl Host,
     caller: u32,
     peer: &Snapshot,
     connection: Connection,
 ) -> Option<()> {
-    let argv: Vec<_> = peer.cmdline.split(|b| *b == 0).collect();
-    if argv.get(1).copied() != Some(BRIDGE_SUBCOMMAND.as_bytes()) {
+    // The kernel ends every argument with a NUL; a title without one was rewritten.
+    let argv: Vec<_> = peer
+        .cmdline
+        .strip_suffix(b"\0")?
+        .split(|b| *b == 0)
+        .collect();
+    if !is_bridge_argv(argv.get(1..)?) {
         return None;
     }
     let peer_sockets = host.sockets(connection.peer)?;
@@ -154,13 +166,9 @@ fn accepted_bridge(
     {
         return None;
     }
-    let caller_sockets = host.sockets(caller)?;
-    if !caller_sockets.contains(&connection.inode) {
-        return None;
-    }
     let caller_rows = unix_rows(&host.unix_table(caller)?);
     // An accepted socket carries its listener's address; the connecting
-    // side is unnamed.
+    // side is unnamed, or bound to a path no listener holds.
     let path = caller_rows
         .iter()
         .find(|row| row.inode == connection.inode && !row.listening)?
@@ -168,9 +176,7 @@ fn accepted_bridge(
         .as_ref()?;
     caller_rows
         .iter()
-        .any(|row| {
-            row.listening && row.path.as_ref() == Some(path) && caller_sockets.contains(&row.inode)
-        })
+        .any(|row| row.listening && row.path.as_ref() == Some(path))
         .then_some(())
 }
 
@@ -256,6 +262,17 @@ fn socket_inode(fd: RawFd) -> Option<u64> {
 }
 
 fn snapshot(host: &mut impl Host, pid: u32) -> Option<Snapshot> {
+    let exe = host.exe(pid)?;
+    process(host, pid, exe)
+}
+
+/// The caller's executable is the one it passed, never its `/proc/<pid>/exe`.
+fn caller_snapshot(host: &mut impl Host, pid: u32) -> Option<Snapshot> {
+    let exe = host.caller_exe()?;
+    process(host, pid, exe)
+}
+
+fn process(host: &mut impl Host, pid: u32, exe: Exe) -> Option<Snapshot> {
     let stat = String::from_utf8(host.read(pid, "stat")?).ok()?;
     let (head, _) = stat.split_once(" (")?;
     let close = stat.rfind(") ")?;
@@ -281,7 +298,7 @@ fn snapshot(host: &mut impl Host, pid: u32) -> Option<Snapshot> {
         uids: uids.try_into().ok()?,
         cmdline: host.read(pid, "cmdline")?,
         cgroup: String::from_utf8(host.read(pid, "cgroup")?).ok()?,
-        exe: host.exe(pid)?,
+        exe,
     })
 }
 
@@ -419,10 +436,10 @@ pub(crate) fn lookup(host: &mut impl Host, connection: Connection) -> Option<Log
     if host.ptrace_scope()? < 1 {
         return None;
     }
-    let caller = snapshot(host, caller_pid)?;
+    let caller = caller_snapshot(host, caller_pid)?;
     let mut chain = vec![(peer, snapshot(host, peer)?)];
     // The peer runs the caller's executable (both the installed herdr) as a
-    // bridge, and the caller accepted it on its own listener. A bridge never
+    // bridge, and the caller accepted it on a listener. A bridge never
     // listens, so a process holds a socket whose peer is a bridge only when
     // that bridge connected to it. The end re-read repeats the executable and
     // argv checks, since the snapshots hold them.
@@ -482,7 +499,7 @@ pub(crate) fn lookup(host: &mut impl Host, connection: Connection) -> Option<Log
     // Every fact was read by number. A changed process (a reused peer pid
     // included: its start time differs) refuses the answer.
     if host.caller() != caller_pid
-        || snapshot(host, caller_pid)? != caller
+        || caller_snapshot(host, caller_pid)? != caller
         || snapshot(host, listener_pid)? != listener
     {
         return None;
@@ -510,10 +527,37 @@ fn bounded_read(path: &str, limit: usize) -> Option<Vec<u8>> {
     (bytes.len() <= limit).then_some(bytes)
 }
 
+/// An executable by device and inode; `/usr/sbin/sshd` is `Exe::Sshd`.
+fn executable(dev: u64, ino: u64) -> Option<Exe> {
+    let sshd = std::fs::metadata(SSHD).ok()?;
+    Some(if (dev, ino) == (sshd.dev(), sshd.ino()) {
+        Exe::Sshd
+    } else {
+        Exe::Other(dev, ino)
+    })
+}
+
+/// The regular file at `fd` (the caller opens it with `O_PATH`).
+fn passed_executable(fd: RawFd) -> Option<Exe> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    // SAFETY: fstat fills the zeroed structure on success.
+    if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    // SAFETY: fstat succeeded.
+    let stat = unsafe { stat.assume_init() };
+    if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
+        return None;
+    }
+    executable(stat.st_dev, stat.st_ino)
+}
+
 /// The installed helper: real /proc, real journal, and the group switch.
 struct System {
     caller_gid: libc::gid_t,
     journal_gid: libc::gid_t,
+    /// Read from fd 4 before the helper closes it.
+    caller_exe: Option<Exe>,
 }
 
 fn set_gids(real: libc::gid_t, effective: libc::gid_t, saved: libc::gid_t) -> bool {
@@ -530,12 +574,7 @@ impl Host for System {
         match File::open(format!("/proc/{pid}/exe")) {
             Ok(file) => {
                 let exe = file.metadata().ok()?;
-                let sshd = std::fs::metadata(SSHD).ok()?;
-                Some(if (exe.dev(), exe.ino()) == (sshd.dev(), sshd.ino()) {
-                    Exe::Sshd
-                } else {
-                    Exe::Other(exe.dev(), exe.ino())
-                })
+                executable(exe.dev(), exe.ino())
             }
             Err(e) if e.kind() == ErrorKind::PermissionDenied => Some(Exe::Unreadable),
             Err(_) => None,
@@ -545,6 +584,10 @@ impl Host for System {
     fn caller(&mut self) -> u32 {
         // SAFETY: getppid cannot fail.
         unsafe { libc::getppid() as u32 }
+    }
+
+    fn caller_exe(&mut self) -> Option<Exe> {
+        self.caller_exe
     }
 
     fn clock(&mut self) -> Option<Clock> {
@@ -682,9 +725,9 @@ fn bounded_output(child: &mut std::process::Child) -> Option<Vec<u8>> {
 /// Entry point for the installed binary.
 pub(crate) fn run() -> Option<String> {
     // Inherited descriptors must not reach journalctl. Fd 3 is the caller's
-    // connection: read its peer, then close it too.
+    // connection and fd 4 its executable: read them, then close them too.
     // SAFETY: close_range has no pointer arguments.
-    if unsafe { libc::syscall(libc::SYS_close_range, 4u32, u32::MAX, 0u32) } != 0 {
+    if unsafe { libc::syscall(libc::SYS_close_range, 5u32, u32::MAX, 0u32) } != 0 {
         return None;
     }
     let peer = peer_pid(CONNECTION_FD).and_then(|peer| {
@@ -693,8 +736,9 @@ pub(crate) fn run() -> Option<String> {
             inode: socket_inode(CONNECTION_FD)?,
         })
     });
-    // SAFETY: fd 3 is not used again.
-    if unsafe { libc::close(CONNECTION_FD) } != 0 {
+    let caller_exe = passed_executable(EXECUTABLE_FD);
+    // SAFETY: fds 3 and 4 are not used again; close_range has no pointer arguments.
+    if unsafe { libc::syscall(libc::SYS_close_range, 3u32, 4u32, 0u32) } != 0 {
         return None;
     }
     // SAFETY: integer-only prctl.
@@ -713,8 +757,9 @@ pub(crate) fn run() -> Option<String> {
     let mut host = System {
         caller_gid: real,
         journal_gid: effective,
+        caller_exe,
     };
-    // The contract takes no arguments: the peer is the only input.
+    // The contract takes no arguments: the two descriptors are the only input.
     let login = peer
         .filter(|_| std::env::args_os().len() == 1)
         .and_then(|peer| lookup(&mut host, peer));
@@ -810,6 +855,10 @@ mod tests {
         }
         fn caller(&mut self) -> u32 {
             self.caller
+        }
+        /// What the caller passed as fd 4: its executable.
+        fn caller_exe(&mut self) -> Option<Exe> {
+            self.exes.get(&self.caller).copied()
         }
         fn clock(&mut self) -> Option<Clock> {
             Some(Clock {
@@ -1407,11 +1456,25 @@ mod tests {
             f.tables.insert(BRIDGE, table);
             f.sockets.get_mut(&BRIDGE).unwrap().push(600);
         });
+        // The launcher's named-session and idle-timeout forms are bridges
+        // (the full rule is `bridge_argv`, shared with the server).
+        for argv in [
+            &b"herdr\0--session\0b\0remote-client-bridge\0"[..],
+            b"herdr\0--session=b\0remote-client-bridge\0--idle-timeout-v1\0",
+        ] {
+            let mut f = fixture();
+            f.files.insert((BRIDGE, "cmdline"), argv.to_vec());
+            assert_eq!(lookup(&mut f, connection()), Some(paul()));
+        }
         for argv in [
             &b"herdr\0server\0"[..],
             b"herdr\0",
-            b"herdr\0--session\0b\0remote-client-bridge\0",
             b"herdr\0remote-client-bridge-x\0",
+            b"herdr\0--session\0a\0--session\0b\0remote-client-bridge\0",
+            b"herdr\0remote-client-bridge\0--extra\0",
+            b"herdr\0remote-client-bridge\0\0",
+            // A rewritten title: no terminating NUL.
+            b"herdr\0remote-client-bridge",
         ] {
             refused(|f| {
                 f.files.insert((BRIDGE, "cmdline"), argv.to_vec());
@@ -1426,14 +1489,15 @@ mod tests {
         refused(|f| {
             f.tables.remove(&BRIDGE);
         });
-        // The caller did not accept this connection: it does not hold it, it
-        // holds the connecting (unnamed) side, or it holds no listener with
-        // the accepted socket's path.
-        refused(|f| {
-            f.sockets.insert(CALLER, vec![LISTEN_INO]);
-        });
+        // smarty-dev#13408: a non-dumpable caller's descriptors are
+        // unreadable; fd 3, which it passed, stands for what it holds.
         let mut f = fixture();
-        f.sockets.insert(CALLER, vec![LISTEN_INO, CLIENT_INO]);
+        f.sockets.remove(&CALLER);
+        assert_eq!(lookup(&mut f, connection()), Some(paul()));
+        // The caller did not accept this connection: fd 3 is the connecting
+        // (unnamed) side, or the listener, or no socket listens on the
+        // accepted socket's path.
+        let mut f = fixture();
         let client_side = Connection {
             peer: BRIDGE,
             inode: CLIENT_INO,
@@ -1445,9 +1509,6 @@ mod tests {
             inode: LISTEN_INO,
         };
         assert_eq!(lookup(&mut fixture(), listener), None);
-        refused(|f| {
-            f.sockets.insert(CALLER, vec![ACCEPTED_INO]);
-        });
         refused(|f| {
             let table = unix_table(&[
                 unix_row(LISTEN_INO, true, "/run/user/1000/other.sock"),
@@ -1609,11 +1670,318 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// The installed helper's view of a real Herdr server and bridge: every
+    /// fact about the two is read from the real `/proc`; the sshd login above
+    /// the bridge, the clock and the journal are the fixture's (a test cannot
+    /// run a root sshd). The bridge's real parent stands in for the notty.
+    #[cfg(debug_assertions)]
+    struct RealServer {
+        real: System,
+        fake: Fixture,
+        server: u32,
+        bridge: u32,
+        server_exe: Exe,
+    }
+
+    #[cfg(debug_assertions)]
+    impl RealServer {
+        fn is_real(&self, pid: u32) -> bool {
+            pid == self.server || pid == self.bridge
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    impl Host for RealServer {
+        fn read(&mut self, pid: u32, leaf: &str) -> Option<Vec<u8>> {
+            if self.is_real(pid) {
+                self.real.read(pid, leaf)
+            } else {
+                self.fake.read(pid, leaf)
+            }
+        }
+        fn exe(&mut self, pid: u32) -> Option<Exe> {
+            if self.is_real(pid) {
+                self.real.exe(pid)
+            } else {
+                self.fake.exe(pid)
+            }
+        }
+        fn caller(&mut self) -> u32 {
+            self.server
+        }
+        fn caller_exe(&mut self) -> Option<Exe> {
+            Some(self.server_exe)
+        }
+        fn clock(&mut self) -> Option<Clock> {
+            self.fake.clock()
+        }
+        fn journal(&mut self, args: &[String]) -> Option<Vec<u8>> {
+            self.fake.journal(args)
+        }
+        fn sockets(&mut self, pid: u32) -> Option<Vec<u64>> {
+            if self.is_real(pid) {
+                self.real.sockets(pid)
+            } else {
+                self.fake.sockets(pid)
+            }
+        }
+        fn unix_table(&mut self, pid: u32) -> Option<Vec<u8>> {
+            if self.is_real(pid) {
+                self.real.unix_table(pid)
+            } else {
+                self.fake.unix_table(pid)
+            }
+        }
+        fn ptrace_scope(&mut self) -> Option<u32> {
+            self.fake.ptrace_scope
+        }
+    }
+
+    /// Stops and reaps a spawned process on every exit path.
+    /// Whether process `pid` (this test's child) holds a socket whose peer is
+    /// bound to `path`. Reads each socket through a duplicate (`pidfd_getfd`).
+    #[cfg(debug_assertions)]
+    fn connected_to(pid: u32, path: &str) -> bool {
+        // SAFETY: integer-only syscall; a nonnegative result is a new descriptor.
+        let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as RawFd;
+        if pidfd < 0 {
+            return false;
+        }
+        let numbers: Vec<libc::c_int> = std::fs::read_dir(format!("/proc/{pid}/fd"))
+            .map(|entries| {
+                entries
+                    .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse().ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let found = numbers.into_iter().any(|number| {
+            // SAFETY: integer-only syscall; a nonnegative result is a new descriptor.
+            let fd = unsafe { libc::syscall(libc::SYS_pidfd_getfd, pidfd, number, 0) } as RawFd;
+            if fd < 0 {
+                return false;
+            }
+            let mut address = std::mem::MaybeUninit::<libc::sockaddr_un>::zeroed();
+            let mut len = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+            // SAFETY: getpeername writes at most `len` bytes into the zeroed address.
+            let named =
+                unsafe { libc::getpeername(fd, address.as_mut_ptr().cast(), &mut len) } == 0;
+            // SAFETY: closing the duplicate made above.
+            unsafe { libc::close(fd) };
+            // SAFETY: zero-initialized, and getpeername filled it on success.
+            let address = unsafe { address.assume_init() };
+            let peer: Vec<u8> = address
+                .sun_path
+                .iter()
+                .take_while(|c| **c != 0)
+                .map(|c| *c as u8)
+                .collect();
+            named
+                && address.sun_family == libc::AF_UNIX as libc::sa_family_t
+                && peer == path.as_bytes()
+        });
+        // SAFETY: closing the pidfd opened above.
+        unsafe { libc::close(pidfd) };
+        found
+    }
+
+    /// A new private directory (`mkdtemp`), removed on every exit path.
+    #[cfg(debug_assertions)]
+    struct TempDir(std::path::PathBuf);
+
+    #[cfg(debug_assertions)]
+    impl TempDir {
+        fn new(prefix: &str) -> Self {
+            use std::os::unix::ffi::OsStringExt;
+            let template = std::env::temp_dir().join(format!("{prefix}XXXXXX"));
+            let mut bytes = std::ffi::CString::new(template.into_os_string().into_vec())
+                .unwrap()
+                .into_bytes_with_nul();
+            // SAFETY: a writable NUL-terminated template that mkdtemp fills in place.
+            assert!(!unsafe { libc::mkdtemp(bytes.as_mut_ptr().cast()) }.is_null());
+            bytes.pop();
+            Self(std::ffi::OsString::from_vec(bytes).into())
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    struct Reaped(std::process::Child);
+
+    #[cfg(debug_assertions)]
+    impl Drop for Reaped {
+        fn drop(&mut self) {
+            // SAFETY: a signal to this test's own child, which it has not reaped.
+            unsafe { libc::kill(self.0.id() as libc::pid_t, libc::SIGTERM) };
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                if self.0.try_wait().ok().flatten().is_some() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// smarty-dev#13408: a real herdr server of a named session that runs
+    /// non-dumpable, as an attested server does, and a real
+    /// `herdr --session S remote-client-bridge` connected to it. The server's
+    /// `/proc/<pid>/exe` and `/proc/<pid>/fd` are closed to the helper; the
+    /// login still resolves, from the executable and the connection the server
+    /// passes.
+    // The server's non-dumpable test switch exists in debug builds only.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn non_dumpable_real_server_resolves_its_real_bridge() {
+        // target/<profile>/deps/<this test> -> target/<profile>/herdr, built
+        // with this workspace's tests (cargo nextest run builds every bin).
+        let herdr = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .and_then(|deps| deps.parent())
+            .unwrap()
+            .join("herdr");
+        assert!(
+            herdr.is_file(),
+            "{} is missing: build the workspace (cargo build -p herdr)",
+            herdr.display()
+        );
+        // Declared before the processes, so it is removed after they stop.
+        let temp = TempDir::new("hsl-");
+        let dir = temp.0.clone();
+        // A named session, as the launcher runs it for smarty-dev and playful:
+        // `herdr --session smarty-dev remote-client-bridge` (smarty-dev#13408 F2).
+        let session = ["--session", "smarty-dev"];
+        // The debug build's data directory for that session.
+        let client = dir.join("c/herdr-dev/sessions/smarty-dev/herdr-client.sock");
+        let environment = |command: &mut Command| {
+            command
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("HOME", &dir)
+                .env("XDG_CONFIG_HOME", dir.join("c"))
+                .env("XDG_DATA_HOME", dir.join("d"))
+                .env("XDG_STATE_HOME", dir.join("s"))
+                .env("XDG_CACHE_HOME", dir.join("k"))
+                .env("XDG_RUNTIME_DIR", &dir)
+                .args(session)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+        };
+        let mut command = Command::new(&herdr);
+        environment(&mut command);
+        // Debug builds only: the server goes non-dumpable at startup, as one
+        // that loaded /etc/herdr/server.key does.
+        command.arg("server").env("HERDR_TEST_NON_DUMPABLE", "1");
+        let server = Reaped(command.spawn().unwrap());
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let path = client.to_str().unwrap().to_owned();
+        let server_pid = server.0.id();
+        let mut real = System {
+            caller_gid: 0,
+            journal_gid: 0,
+            caller_exe: None,
+        };
+        // Connections on the client path: (listening, accepted inodes).
+        let client_rows = |real: &mut System| {
+            let rows = unix_rows(&real.unix_table(server_pid).unwrap());
+            let on_path = |listening: bool| {
+                rows.iter()
+                    .filter(|row| row.listening == listening && row.path.as_ref() == Some(&path))
+                    .map(|row| row.inode)
+                    .collect::<Vec<_>>()
+            };
+            (!on_path(true).is_empty(), on_path(false))
+        };
+        // Listening, without a probe connection of this test's own.
+        while !client_rows(&mut real).0 {
+            assert!(Instant::now() < deadline, "server did not listen");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let mut command = Command::new(&herdr);
+        environment(&mut command);
+        command.arg(crate::bridge_argv::BRIDGE_SUBCOMMAND);
+        let mut bridge = Reaped(command.spawn().unwrap());
+        let bridge_pid = bridge.0.id();
+        // The server is non-dumpable: the reads the helper used to make refuse.
+        assert_eq!(real.exe(server_pid), Some(Exe::Unreadable));
+        assert_eq!(real.sockets(server_pid), None);
+        // The server's accepted socket from the bridge's persistent
+        // connection. The bridge closes its startup probe before it makes that
+        // connection, so once the bridge holds a socket connected to the client
+        // path, any other row on the path is the probe's server side or a
+        // connection not yet accepted (inode 0). One row with an inode is then
+        // the persistent connection's accepted socket.
+        let accepted = loop {
+            if connected_to(bridge_pid, &path) {
+                if let [inode] = client_rows(&mut real).1[..] {
+                    if inode != 0 {
+                        break inode;
+                    }
+                }
+            }
+            assert!(Instant::now() < deadline, "bridge did not connect");
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        // The executable the server passes: the binary it runs.
+        let binary = std::fs::metadata(&herdr).unwrap();
+        // The login fixture above the bridge: its real parent (this test) is
+        // the notty, under a root priv and the system listener.
+        let notty = std::process::id();
+        let mut fake = fixture();
+        add(
+            &mut fake.files,
+            (notty, "sshd", PRIV, 2, 1000),
+            b"sshd: paul@notty\0",
+            SESSION,
+        );
+        add(
+            &mut fake.files,
+            (PRIV, "sshd", LISTENER, 1, 0),
+            b"sshd: paul [priv]\0",
+            SESSION,
+        );
+        add(
+            &mut fake.files,
+            (LISTENER, "sshd", 1, 0, 0),
+            b"sshd: /usr/sbin/sshd -D [listener] 0 of 10-100 startups\0",
+            "0::/system.slice/ssh.service\n",
+        );
+        fake.exes.insert(notty, Exe::Sshd);
+        let mut host = RealServer {
+            real,
+            fake,
+            server: server_pid,
+            bridge: bridge_pid,
+            server_exe: Exe::Other(binary.dev(), binary.ino()),
+        };
+        let login = lookup(
+            &mut host,
+            Connection {
+                peer: bridge_pid,
+                inode: accepted,
+            },
+        );
+        assert_eq!(client_rows(&mut host.real).1, vec![accepted]);
+        assert!(bridge.0.try_wait().unwrap().is_none(), "bridge exited");
+        drop((bridge, server, temp));
+        assert_eq!(login, Some(paul()));
+    }
+
     #[test]
     fn real_host_refuses_a_peer_that_is_not_an_sshd_login() {
         let mut host = System {
             caller_gid: 0,
             journal_gid: 0,
+            caller_exe: None,
         };
         assert!(host.clock().is_some());
         let own = |peer| Connection {
@@ -1661,6 +2029,21 @@ mod tests {
             host.exe(std::process::id()),
             Some(Exe::Other(own.dev(), own.ino()))
         );
+        // The executable a caller passes as fd 4: an O_PATH descriptor of a
+        // regular file. A socket or a closed descriptor is none.
+        // SAFETY: a NUL-terminated literal path; the descriptor is closed below.
+        let path_fd =
+            unsafe { libc::open(c"/proc/self/exe".as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+        assert!(path_fd >= 0);
+        assert_eq!(
+            passed_executable(path_fd),
+            Some(Exe::Other(own.dev(), own.ino()))
+        );
+        // SAFETY: closing the descriptor opened above.
+        unsafe { libc::close(path_fd) };
+        let (socket, _other) = UnixStream::pair().unwrap();
+        assert_eq!(passed_executable(socket.as_raw_fd()), None);
+        assert_eq!(passed_executable(-1), None);
         // An unprivileged test cannot read a root pid 1's executable (a CI
         // container's pid 1 may run as the test's own user).
         // SAFETY: getuid cannot fail.

@@ -215,6 +215,16 @@ pub(crate) fn acquire(args: &[OsString]) {
             std::process::exit(1);
         }
     }
+    // Debug builds only (never in release): a real-binary test runs the server non-dumpable,
+    // as one that loaded the key is, without a root-installed key (smarty-dev#13408).
+    #[cfg(debug_assertions)]
+    if is_server_invocation(args)
+        && std::env::var_os("HERDR_TEST_NON_DUMPABLE").is_some()
+        && !Kernel.make_non_dumpable()
+    {
+        eprintln!("HERDR_TEST_NON_DUMPABLE: the server could not go non-dumpable");
+        std::process::exit(1);
+    }
 }
 
 fn acquire_with<K>(
