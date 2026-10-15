@@ -58,6 +58,6 @@ fn ensure_remote_server_running() -> io::Result<()> {
         ));
     }
 
-    crate::server::autodetect::spawn_server_daemon()?;
+    crate::server::autodetect::start_server()?;
     crate::server::autodetect::wait_for_server_socket(&socket_path, Duration::from_secs(5))
 }

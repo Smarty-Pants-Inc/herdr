@@ -233,6 +233,19 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # Size of the virtual terminal used when no client is attached.
 # Attached clients always use their own terminal size.
 [server]
+# Linux only: start this user systemd unit when the local TUI or SSH bridge needs a server.
+# Other platforms ignore this setting. Herdr uses /usr/bin/systemctl, or /bin/systemctl
+# if the former is absent; it does not search PATH. Arguments are `--user --no-block start -- UNIT`.
+# The 5-second helper-child bound kills and reaps it on timeout; --no-block only queues the
+# start job. Herdr then waits up to 15 seconds for the client socket; readiness determines
+# success. A failed request or socket timeout is an error, with no unmanaged-server fallback.
+# If config cannot be read or parsed, Linux refuses auto-start rather than using defaults
+# that could start an unmanaged server. Configure the unit to expose the correct session socket.
+# Client environment variables are not promised to be inherited by the unit; configure the
+# socket in the unit itself. Unit names must match ASCII regex [A-Za-z0-9@._-]+\.service
+# and must not start with '-'; a leading '-' is rejected while loading config.
+# systemd_unit = "herdr@default.service"
+
 # Windows only: allow ordinary same-account clients to control an elevated server.
 # Requires a server restart.
 # allow_unelevated_clients = false
