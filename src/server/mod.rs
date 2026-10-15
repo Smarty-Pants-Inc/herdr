@@ -1,5 +1,7 @@
 mod alt_screen_read;
 pub mod autodetect;
+#[cfg(any(target_os = "linux", test))]
+pub(crate) mod bridge_argv;
 #[cfg(unix)]
 pub(crate) mod client_accept;
 pub(crate) mod client_commands;

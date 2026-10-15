@@ -192,32 +192,52 @@ fn bounded_read(path: impl AsRef<Path>, limit: usize) -> Option<Vec<u8>> {
 }
 
 struct LinuxSources<'a> {
+    /// `O_PATH` of `/proc/self/exe`, for the helper's fd 4.
+    executable: OwnedFd,
     server_exe: Metadata,
     connection: BorrowedFd<'a>,
 }
 
+/// This process's executable. A process may always open its own
+/// `/proc/self/exe`, also when it is non-dumpable.
+fn own_executable() -> Option<OwnedFd> {
+    // SAFETY: a NUL-terminated literal path; open returns a new descriptor or -1.
+    let fd = unsafe { libc::open(c"/proc/self/exe".as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+    // SAFETY: a nonnegative fd is a new descriptor that this process owns.
+    (fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
 impl<'a> LinuxSources<'a> {
     fn new(connection: BorrowedFd<'a>) -> Option<Self> {
+        let executable = own_executable()?;
         Some(Self {
-            server_exe: std::fs::metadata("/proc/self/exe").ok()?,
+            server_exe: File::from(executable.try_clone().ok()?).metadata().ok()?,
+            executable,
             connection,
         })
     }
 }
 
 /// Ask the setgid helper about the login behind `connection`, passed as its
-/// fd 3. A missing, failing, hung or malformed helper leaves the connection
-/// unmapped; `resolve` checks the answer names the priv it found.
-fn sshd_login_via(helper: &Path, connection: BorrowedFd<'_>) -> Option<SshdLogin> {
-    sshd_login_from(helper, &[], connection)
+/// fd 3, with this server's `executable` as its fd 4: a non-dumpable server's
+/// `/proc/<pid>/exe` and `/proc/<pid>/fd` are closed to the helper
+/// (smarty-dev#13408). A missing, failing, hung or malformed helper leaves the
+/// connection unmapped; `resolve` checks the answer names the priv it found.
+fn sshd_login_via(
+    helper: &Path,
+    connection: BorrowedFd<'_>,
+    executable: BorrowedFd<'_>,
+) -> Option<SshdLogin> {
+    sshd_login_from(helper, &[], connection, executable)
 }
 
 fn sshd_login_from(
     helper: &Path,
     args: &[String],
     connection: BorrowedFd<'_>,
+    executable: BorrowedFd<'_>,
 ) -> Option<SshdLogin> {
-    let output = trusted_command(helper, args, SSHD_LOOKUP_TIMEOUT, Some(connection))?;
+    let output = trusted_command(helper, args, SSHD_LOOKUP_TIMEOUT, &[connection, executable])?;
     client_identity::parse_sshd_login(&output)
 }
 
@@ -302,7 +322,12 @@ impl Sources for LinuxSources<'_> {
     }
 
     fn sshd_login(&mut self) -> Option<SshdLogin> {
-        sshd_login_via(Path::new(SSHD_LOOKUP), self.connection)
+        use std::os::fd::AsFd as _;
+        sshd_login_via(
+            Path::new(SSHD_LOOKUP),
+            self.connection,
+            self.executable.as_fd(),
+        )
     }
 
     fn whois(&mut self, ip: &str) -> Option<String> {
@@ -313,35 +338,38 @@ impl Sources for LinuxSources<'_> {
             Path::new("/usr/bin/tailscale"),
             &["whois".into(), "--json".into(), ip.into()],
             COMMAND_TIMEOUT,
-            None,
+            &[],
         )?)
         .ok()
     }
 }
 
+/// Above the descriptors `trusted_command` places at 3 and 4.
+const FIRST_FREE_FD: libc::c_int = 5;
+
+/// A close-on-exec duplicate of `fd` at `FIRST_FREE_FD` or above, clear of the
+/// child's fds 3 and 4, which its dup2 replaces.
+fn duplicate_above_inherited(fd: libc::c_int) -> Option<OwnedFd> {
+    // SAFETY: F_DUPFD_CLOEXEC returns a new owned descriptor or -1.
+    let fd = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, FIRST_FREE_FD) };
+    // SAFETY: a descriptor at or above the minimum is the new one.
+    (fd >= FIRST_FREE_FD).then(|| unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
 /// Execute an already-open root-protected binary, with a clean environment, no
 /// shell, bounded output and wall deadline. A hung/unavailable helper gives None.
-/// `connection` becomes the child's fd 3; every other descriptor above 2 is
-/// closed at exec.
+/// `inherited` become the child's fds 3 and 4, in order; every other
+/// descriptor above 2 is closed at exec.
 fn trusted_command(
     path: &Path,
     args: &[String],
     timeout: Duration,
-    connection: Option<BorrowedFd<'_>>,
+    inherited: &[BorrowedFd<'_>],
 ) -> Option<Vec<u8>> {
-    let executable = protected_open(path)?;
-    // Keep the executable clear of fd 3, which the child's dup2 replaces.
-    // SAFETY: F_DUPFD_CLOEXEC returns a new owned descriptor or -1.
-    let executable = unsafe {
-        OwnedFd::from_raw_fd(
-            Some(libc::fcntl(
-                executable.as_raw_fd(),
-                libc::F_DUPFD_CLOEXEC,
-                4,
-            ))
-            .filter(|fd| *fd >= 4)?,
-        )
-    };
+    if inherited.len() > (FIRST_FREE_FD - 3) as usize {
+        return None;
+    }
+    let executable = duplicate_above_inherited(protected_open(path)?.as_raw_fd())?;
     let mut command = Command::new(format!("/proc/self/fd/{}", executable.as_raw_fd()));
     command
         .args(args)
@@ -351,32 +379,41 @@ fn trusted_command(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    if let Some(connection) = connection {
-        let source = connection.as_raw_fd();
-        // The child's stdio setup would replace a source below 3.
-        if source < 3 {
-            return None;
-        }
-        // SAFETY: the closure runs in the forked child before exec and calls
-        // only async-signal-safe syscalls on integers. CLOSE_RANGE_CLOEXEC
-        // (not a close) keeps the executable and std's exec-error pipe valid
-        // until exec, then the kernel closes them.
-        unsafe {
-            command.pre_exec(move || {
-                if libc::dup2(source, 3) != 3
-                    || libc::fcntl(3, libc::F_SETFD, 0) != 0
-                    || libc::syscall(
-                        libc::SYS_close_range,
-                        4u32,
-                        u32::MAX,
-                        libc::CLOSE_RANGE_CLOEXEC,
-                    ) != 0
+    // The child's stdio setup would replace a source below 3.
+    if inherited.iter().any(|fd| fd.as_raw_fd() < 3) {
+        return None;
+    }
+    // Duplicates above 4, so that no dup2 below replaces a later source.
+    let sources = inherited
+        .iter()
+        .map(|fd| duplicate_above_inherited(fd.as_raw_fd()))
+        .collect::<Option<Vec<_>>>()?;
+    let first_closed = 3 + sources.len() as u32;
+    // SAFETY: the closure runs in the forked child before exec and calls
+    // only async-signal-safe syscalls on integers. CLOSE_RANGE_CLOEXEC
+    // (not a close) keeps the executable, the duplicates and std's
+    // exec-error pipe valid until exec, then the kernel closes them. Every
+    // child, also one with nothing inherited, gets no other descriptor.
+    unsafe {
+        command.pre_exec(move || {
+            for (target, source) in (3..).zip(&sources) {
+                if libc::dup2(source.as_raw_fd(), target) != target
+                    || libc::fcntl(target, libc::F_SETFD, 0) != 0
                 {
                     return Err(std::io::Error::last_os_error());
                 }
-                Ok(())
-            });
-        }
+            }
+            if libc::syscall(
+                libc::SYS_close_range,
+                first_closed,
+                u32::MAX,
+                libc::CLOSE_RANGE_CLOEXEC,
+            ) != 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
     }
     let mut child = command.spawn().ok()?;
     let outcome = (|| {
@@ -444,7 +481,9 @@ mod tests {
             r#"{"pid":20,"user":"paul","fingerprint":"SHA256:paul","source_ip":"100.64.0.7"}"#;
         let (connection, _bridge) = UnixStream::pair().unwrap();
         let fd = connection.as_fd();
-        let printf = |text: &str| sshd_login_via_printf(text, fd);
+        let executable = own_executable().unwrap();
+        let exe = executable.as_fd();
+        let printf = |text: &str| sshd_login_via_printf(text, fd, exe);
         // The installed path is absent on test hosts: the production source refuses.
         if !Path::new(SSHD_LOOKUP).exists() {
             assert_eq!(LinuxSources::new(fd).unwrap().sshd_login(), None);
@@ -452,19 +491,21 @@ mod tests {
         assert_eq!(
             sshd_login_via(
                 Path::new("/usr/local/libexec/herdr-sshd-lookup-missing"),
-                fd
+                fd,
+                exe
             ),
             None
         );
         // Untrusted location, failure exit, hang, and the empty fail-closed answer.
         assert_eq!(
-            sshd_login_via(Path::new("/tmp/herdr-sshd-lookup"), fd),
+            sshd_login_via(Path::new("/tmp/herdr-sshd-lookup"), fd, exe),
             None
         );
-        assert_eq!(sshd_login_via(Path::new("/usr/bin/false"), fd), None);
-        assert_eq!(sshd_login_via(Path::new("/usr/bin/true"), fd), None);
+        assert_eq!(sshd_login_via(Path::new("/usr/bin/false"), fd, exe), None);
+        assert_eq!(sshd_login_via(Path::new("/usr/bin/true"), fd, exe), None);
         // A well-formed answer parses; `resolve` checks its priv pid. The
-        // stand-in answers only because it received the connection as fd 3.
+        // stand-in answers only because it received the connection as fd 3
+        // and the executable as fd 4.
         assert_eq!(
             printf(&format!("{line}\n")).map(|login| (login.pid, login.fingerprint)),
             Some((20, "SHA256:paul".into()))
@@ -475,18 +516,102 @@ mod tests {
     }
 
     /// `bash` stands in for a helper that prints `text` only when it got a
-    /// socket as fd 3, as the real helper requires.
-    fn sshd_login_via_printf(text: &str, connection: BorrowedFd<'_>) -> Option<SshdLogin> {
+    /// socket as fd 3 and a file as fd 4, as the real helper requires.
+    fn sshd_login_via_printf(
+        text: &str,
+        connection: BorrowedFd<'_>,
+        executable: BorrowedFd<'_>,
+    ) -> Option<SshdLogin> {
         sshd_login_from(
             Path::new("/usr/bin/bash"),
             &[
                 "-c".into(),
-                r#"test -S /proc/self/fd/3 && printf %s "$1""#.into(),
+                r#"test -S /proc/self/fd/3 && test -f /proc/self/fd/4 && printf %s "$1""#.into(),
                 "helper".into(),
                 text.into(),
             ],
             connection,
+            executable,
         )
+    }
+
+    /// The inherited descriptors become fds 3 and 4 in order, whatever their
+    /// numbers in the server, and nothing else is inherited, not even a
+    /// descriptor without close-on-exec; a third has no place.
+    #[test]
+    fn helper_descriptors_keep_their_order() {
+        let (connection, bridge) = UnixStream::pair().unwrap();
+        // SAFETY: plain dup of a live descriptor; closed below.
+        let leaky = unsafe { libc::dup(connection.as_raw_fd()) };
+        assert!(leaky > 4);
+        let script =
+            format!("readlink /proc/self/fd/3 /proc/self/fd/4 && test ! -e /proc/self/fd/{leaky}");
+        let links = |inherited: &[BorrowedFd<'_>]| {
+            trusted_command(
+                Path::new("/usr/bin/bash"),
+                &["-c".into(), script.clone()],
+                COMMAND_TIMEOUT,
+                inherited,
+            )
+            .map(|out| String::from_utf8(out).unwrap())
+        };
+        let socket = |stream: &UnixStream| {
+            let inode = File::from(stream.as_fd().try_clone_to_owned().unwrap())
+                .metadata()
+                .unwrap()
+                .ino();
+            format!("socket:[{inode}]\n")
+        };
+        let both = format!("{}{}", socket(&bridge), socket(&connection));
+        assert_eq!(links(&[bridge.as_fd(), connection.as_fd()]), Some(both));
+        let swapped = format!("{}{}", socket(&connection), socket(&bridge));
+        assert_eq!(links(&[connection.as_fd(), bridge.as_fd()]), Some(swapped));
+        let three = [connection.as_fd(), bridge.as_fd(), connection.as_fd()];
+        assert_eq!(links(&three), None);
+        // SAFETY: closing the descriptor this test created.
+        unsafe { libc::close(leaky) };
+    }
+
+    /// smarty-dev#13408: a non-dumpable server (one that loaded its key)
+    /// still gives the helper its executable as fd 4, while the helper cannot
+    /// read the server's `/proc/<pid>/exe` or `/proc/<pid>/fd`.
+    #[test]
+    fn non_dumpable_server_passes_its_executable_as_fd_4() {
+        // Going non-dumpable changes the whole process: one test per process only.
+        let own_process =
+            std::env::var_os("NEXTEST_EXECUTION_MODE").is_some_and(|m| m == "process-per-test");
+        if !own_process {
+            return;
+        }
+        let (connection, _bridge) = UnixStream::pair().unwrap();
+        // SAFETY: integer-only prctl calls on this process.
+        assert_eq!(unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) }, 0);
+        let sources = LinuxSources::new(connection.as_fd()).expect("own executable");
+        let report = trusted_command(
+            Path::new("/usr/bin/bash"),
+            &[
+                "-c".into(),
+                "readlink /proc/self/fd/4; readlink /proc/$PPID/exe || echo denied; \
+                 ls /proc/$PPID/fd || echo denied"
+                    .into(),
+            ],
+            COMMAND_TIMEOUT,
+            &[connection.as_fd(), sources.executable.as_fd()],
+        );
+        // SAFETY: as above.
+        unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0) };
+        let own = std::env::current_exe().unwrap();
+        assert_eq!(
+            String::from_utf8(report.unwrap()).unwrap(),
+            format!("{}\ndenied\ndenied\n", own.display())
+        );
+        assert_eq!(
+            (sources.server_exe.dev(), sources.server_exe.ino()),
+            (
+                std::fs::metadata(&own).unwrap().dev(),
+                std::fs::metadata(&own).unwrap().ino()
+            )
+        );
     }
 
     /// The helper gets the client connection as fd 3 and no other inherited
@@ -500,20 +625,20 @@ mod tests {
                 .unwrap()
                 .ino()
         };
-        let readlink = |connection| {
+        let readlink = |inherited: &[BorrowedFd<'_>]| {
             trusted_command(
                 Path::new("/usr/bin/readlink"),
                 &["/proc/self/fd/3".into()],
                 COMMAND_TIMEOUT,
-                connection,
+                inherited,
             )
         };
         let socket =
             |stream: &UnixStream| Some(format!("socket:[{}]\n", inode(stream)).into_bytes());
-        assert_eq!(readlink(Some(connection.as_fd())), socket(&connection));
+        assert_eq!(readlink(&[connection.as_fd()]), socket(&connection));
         // A source above 3 is moved to 3, over whatever the server holds there.
         assert!(bridge.as_raw_fd() > 3);
-        assert_eq!(readlink(Some(bridge.as_fd())), socket(&bridge));
+        assert_eq!(readlink(&[bridge.as_fd()]), socket(&bridge));
         // A source already at 3 (close-on-exec, as std opens it) is still
         // inherited. Rebinding fd 3 is safe only with one test per process.
         let own_process =
@@ -529,7 +654,7 @@ mod tests {
         if connection.as_raw_fd() == 3 || own_process {
             // SAFETY: fd 3 holds the connection or its duplicate.
             let three = unsafe { BorrowedFd::borrow_raw(3) };
-            assert_eq!(readlink(Some(three)), socket(&connection));
+            assert_eq!(readlink(&[three]), socket(&connection));
         }
         // SAFETY: restore fd 3 as it was.
         unsafe {
@@ -548,22 +673,23 @@ mod tests {
         // SAFETY: plain dup of a live descriptor; closed below.
         let leaky = unsafe { libc::dup(connection.as_raw_fd()) };
         assert!(leaky > 3);
+        let executable = own_executable().unwrap();
         let listing = trusted_command(
             Path::new("/usr/bin/ls"),
             &["/proc/self/fd".into()],
             COMMAND_TIMEOUT,
-            Some(connection.as_fd()),
+            &[connection.as_fd(), executable.as_fd()],
         )
         .unwrap();
-        // ls opens the directory as fd 4 itself.
-        assert_eq!(String::from_utf8(listing).unwrap(), "0\n1\n2\n3\n4\n");
+        // ls opens the directory as fd 5 itself.
+        assert_eq!(String::from_utf8(listing).unwrap(), "0\n1\n2\n3\n4\n5\n");
         // SAFETY: closing the descriptor this test created.
         unsafe { libc::close(leaky) };
         // Without a connection the child has no fd 3.
-        assert_eq!(readlink(None), None);
+        assert_eq!(readlink(&[]), None);
         // A source below 3 would be replaced by the child's stdio: refused.
         // SAFETY: 0 is this process's stdin, borrowed only for the call.
-        assert_eq!(readlink(Some(unsafe { BorrowedFd::borrow_raw(0) })), None);
+        assert_eq!(readlink(&[unsafe { BorrowedFd::borrow_raw(0) }]), None);
     }
 
     #[test]
@@ -629,7 +755,7 @@ mod tests {
                 Path::new("/usr/bin/printf"),
                 &["%s".into(), "literal;$(touch nope)".into()],
                 COMMAND_TIMEOUT,
-                None
+                &[]
             ),
             Some(b"literal;$(touch nope)".to_vec())
         );
@@ -637,14 +763,12 @@ mod tests {
             Path::new("/usr/bin/sleep"),
             &["2".into()],
             COMMAND_TIMEOUT,
-            None
+            &[]
         )
         .is_none());
-        assert!(
-            trusted_command(Path::new("/tmp/journalctl"), &[], COMMAND_TIMEOUT, None).is_none()
-        );
+        assert!(trusted_command(Path::new("/tmp/journalctl"), &[], COMMAND_TIMEOUT, &[]).is_none());
         assert_eq!(
-            trusted_command(Path::new("/usr/bin/env"), &[], COMMAND_TIMEOUT, None),
+            trusted_command(Path::new("/usr/bin/env"), &[], COMMAND_TIMEOUT, &[]),
             Some(b"LANG=C\nLC_ALL=C\n".to_vec())
         );
         assert!(trusted_command(
@@ -655,9 +779,9 @@ mod tests {
                 "/dev/zero".into()
             ],
             COMMAND_TIMEOUT,
-            None
+            &[]
         )
         .is_none());
-        assert!(trusted_command(Path::new("/usr/bin/false"), &[], COMMAND_TIMEOUT, None).is_none());
+        assert!(trusted_command(Path::new("/usr/bin/false"), &[], COMMAND_TIMEOUT, &[]).is_none());
     }
 }
