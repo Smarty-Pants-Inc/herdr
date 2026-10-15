@@ -45,6 +45,87 @@ pub(crate) use notifications::{
     show_actionable_desktop_notification, show_desktop_notification,
 };
 
+// This is a hang guard for native control acknowledgments, not a watcher
+// performance target. The normal event path and 60-second safety refresh are
+// unchanged. Creation and each control request get one finite budget.
+const GIT_WATCH_CONTROL_BUDGET: Duration = Duration::from_secs(2);
+static GIT_WATCH_FAILED: LazyLock<Arc<std::sync::atomic::AtomicBool>> =
+    LazyLock::new(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
+
+pub(super) struct NativeGitWatcher {
+    control: super::GitWatchControl,
+}
+
+impl NativeGitWatcher {
+    pub(super) fn new(
+        handler: impl notify::EventHandler,
+        config: notify::Config,
+    ) -> notify::Result<Self> {
+        use notify::Watcher as _;
+
+        let (control, commands) = super::GitWatchControl::channel(
+            Arc::clone(&GIT_WATCH_FAILED),
+            GIT_WATCH_CONTROL_BUDGET,
+        )?;
+        let callbacks_enabled = Arc::clone(&control.callbacks_enabled);
+        let (ready, initialized) = std::sync::mpsc::channel();
+        // One detached owner per watcher, not one thread per operation. Only
+        // this owner calls native creation/watch/unwatch/Drop. notify has its
+        // own backend thread; its unwatch/Drop only enqueue native work.
+        let owner = crate::thread_spawn::spawn_named("herdr-git-watch", move || {
+            let mut watcher = match notify::RecommendedWatcher::new(
+                super::git_watch_event_handler(handler, callbacks_enabled.clone()),
+                config,
+            ) {
+                Ok(watcher) => watcher,
+                Err(err) => {
+                    let _ = ready.send(Err(err));
+                    return;
+                }
+            };
+            if ready.send(Ok(())).is_err() {
+                return;
+            }
+            for request in commands {
+                if !callbacks_enabled.load(AtomicOrdering::Acquire) {
+                    break;
+                }
+                let result = match request.command {
+                    super::GitWatchCommand::Watch(path, mode) => watcher.watch(&path, mode),
+                    super::GitWatchCommand::Unwatch(path) => watcher.unwatch(&path),
+                };
+                // Unwatch success means notify accepted the queued operation,
+                // NOT that native cancellation/handle teardown has completed.
+                if request.reply.send(result).is_err() {
+                    break;
+                }
+            }
+            // Bounded containment, not cancellation: a stalled owner and
+            // notify's native backend/resources may survive until process
+            // exit. Drop on the caller never joins either thread; the failed
+            // latch prevents new attachments from starting replacements.
+        })
+        .map_err(notify::Error::io)?;
+        drop(owner); // Detach: a stuck native call must not delay caller Drop.
+        control.wait(initialized)?;
+        Ok(Self { control })
+    }
+
+    pub(super) fn watch(
+        &mut self,
+        path: &std::path::Path,
+        mode: notify::RecursiveMode,
+    ) -> notify::Result<()> {
+        self.control
+            .request(super::GitWatchCommand::Watch(path.to_path_buf(), mode))
+    }
+
+    pub(super) fn unwatch(&mut self, path: &std::path::Path) -> notify::Result<()> {
+        self.control
+            .request(super::GitWatchCommand::Unwatch(path.to_path_buf()))
+    }
+}
+
 static ALLOW_UNELEVATED_CLIENTS: OnceLock<bool> = OnceLock::new();
 
 pub(crate) fn allow_unelevated_clients() {
