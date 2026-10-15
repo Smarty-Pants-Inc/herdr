@@ -777,11 +777,19 @@ fn agent_rename(args: &[String]) -> std::io::Result<i32> {
 const AGENT_PROMPT_USAGE: &str = "usage: herdr agent prompt <target> <text> [--if-draft-empty | [--expected-session ID] [--expected-pane ID] [--expected-status STATUS] [--wait [--until STATUS]... [--timeout MS]]] [--allow-cross-pane]";
 
 fn parse_agent_prompt_args(args: &[String]) -> Result<AgentPromptParams, String> {
-    let target = args.first().ok_or(AGENT_PROMPT_USAGE)?;
-    let text = args.get(1).ok_or("agent prompt requires text")?;
-    // Keep the fixed positional text literal, including flag-shaped prompts.
+    // Use the same TARGET/TEXT classification as the global extractors, while
+    // retaining all session/status expectations and wait options from master.
+    let argv = channel::classify_prompt_argv(args);
+    let target = argv
+        .target
+        .map(|slot| &args[slot])
+        .ok_or(AGENT_PROMPT_USAGE)?;
+    let text = argv
+        .text
+        .map(|slot| &args[slot])
+        .ok_or("agent prompt requires text")?;
     let options = super::expand_equals_args(
-        &args[2..],
+        &args[argv.options..],
         &[
             "--until",
             "--timeout",
@@ -793,7 +801,7 @@ fn parse_agent_prompt_args(args: &[String]) -> Result<AgentPromptParams, String>
     let mut wait = false;
     let mut until = Vec::new();
     let mut timeout_ms = None;
-    let mut allow_cross_pane = false;
+    let mut allow_cross_pane = argv.cross_pane_opt_in;
     let mut expected_agent_session_id = None;
     let mut expected_pane_id = None;
     let mut expected_agent_status = None;
@@ -868,22 +876,25 @@ fn parse_agent_prompt_args(args: &[String]) -> Result<AgentPromptParams, String>
 }
 
 fn agent_prompt(args: &[String]) -> std::io::Result<i32> {
-    let Some(target) = args.first() else {
+    // TARGET, TEXT and a leading or after-target compatibility flag come from
+    // the same classification that protected them from global extraction.
+    let argv = channel::classify_prompt_argv(args);
+    let Some(target) = argv.target.map(|slot| &args[slot]) else {
         eprintln!("{AGENT_PROMPT_USAGE}");
         return Ok(2);
     };
-    let Some(text) = args.get(1) else {
+    let Some(text) = argv.text.map(|slot| &args[slot]) else {
         eprintln!("agent prompt requires text");
         return Ok(2);
     };
-    // The first two argv remain literal target/text, including flag-shaped text.
+    let options = &args[argv.options..];
     // Select the guarded route before parsing any legacy wait options so it can
     // never accidentally reach the typing path or turn-completion machinery.
     // Session expectations are extra arguments on this route and are refused.
-    if args[2..].iter().any(|arg| arg == "--if-draft-empty") {
+    if options.iter().any(|arg| arg == "--if-draft-empty") {
         let mut if_draft_empty = false;
-        let mut allow_cross_pane = false;
-        for option in &args[2..] {
+        let mut allow_cross_pane = argv.cross_pane_opt_in;
+        for option in options {
             match option.as_str() {
                 "--if-draft-empty" if !if_draft_empty => if_draft_empty = true,
                 "--allow-cross-pane" => allow_cross_pane = true,
@@ -1061,6 +1072,7 @@ mod tests {
     fn send_keys_accepts_option_first_and_trailing_override() {
         for values in [
             &["--allow-cross-pane", "reviewer", "enter"][..],
+            &["reviewer", "--allow-cross-pane", "enter"][..],
             &["reviewer", "enter", "--allow-cross-pane"][..],
         ] {
             let params = parse_agent_send_keys_args(&args(values)).unwrap();
