@@ -379,42 +379,41 @@ fn trusted_command(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    if !inherited.is_empty() {
-        // The child's stdio setup would replace a source below 3.
-        if inherited.iter().any(|fd| fd.as_raw_fd() < 3) {
-            return None;
-        }
-        // Duplicates above 4, so that no dup2 below replaces a later source.
-        let sources = inherited
-            .iter()
-            .map(|fd| duplicate_above_inherited(fd.as_raw_fd()))
-            .collect::<Option<Vec<_>>>()?;
-        let first_closed = 3 + sources.len() as u32;
-        // SAFETY: the closure runs in the forked child before exec and calls
-        // only async-signal-safe syscalls on integers. CLOSE_RANGE_CLOEXEC
-        // (not a close) keeps the executable, the duplicates and std's
-        // exec-error pipe valid until exec, then the kernel closes them.
-        unsafe {
-            command.pre_exec(move || {
-                for (target, source) in (3..).zip(&sources) {
-                    if libc::dup2(source.as_raw_fd(), target) != target
-                        || libc::fcntl(target, libc::F_SETFD, 0) != 0
-                    {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                }
-                if libc::syscall(
-                    libc::SYS_close_range,
-                    first_closed,
-                    u32::MAX,
-                    libc::CLOSE_RANGE_CLOEXEC,
-                ) != 0
+    // The child's stdio setup would replace a source below 3.
+    if inherited.iter().any(|fd| fd.as_raw_fd() < 3) {
+        return None;
+    }
+    // Duplicates above 4, so that no dup2 below replaces a later source.
+    let sources = inherited
+        .iter()
+        .map(|fd| duplicate_above_inherited(fd.as_raw_fd()))
+        .collect::<Option<Vec<_>>>()?;
+    let first_closed = 3 + sources.len() as u32;
+    // SAFETY: the closure runs in the forked child before exec and calls
+    // only async-signal-safe syscalls on integers. CLOSE_RANGE_CLOEXEC
+    // (not a close) keeps the executable, the duplicates and std's
+    // exec-error pipe valid until exec, then the kernel closes them. Every
+    // child, also one with nothing inherited, gets no other descriptor.
+    unsafe {
+        command.pre_exec(move || {
+            for (target, source) in (3..).zip(&sources) {
+                if libc::dup2(source.as_raw_fd(), target) != target
+                    || libc::fcntl(target, libc::F_SETFD, 0) != 0
                 {
                     return Err(std::io::Error::last_os_error());
                 }
-                Ok(())
-            });
-        }
+            }
+            if libc::syscall(
+                libc::SYS_close_range,
+                first_closed,
+                u32::MAX,
+                libc::CLOSE_RANGE_CLOEXEC,
+            ) != 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
     }
     let mut child = command.spawn().ok()?;
     let outcome = (|| {

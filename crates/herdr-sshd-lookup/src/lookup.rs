@@ -1738,6 +1738,32 @@ mod tests {
     }
 
     /// Stops and reaps a spawned process on every exit path.
+    /// A new private directory (`mkdtemp`), removed on every exit path.
+    #[cfg(debug_assertions)]
+    struct TempDir(std::path::PathBuf);
+
+    #[cfg(debug_assertions)]
+    impl TempDir {
+        fn new(prefix: &str) -> Self {
+            use std::os::unix::ffi::OsStringExt;
+            let template = std::env::temp_dir().join(format!("{prefix}XXXXXX"));
+            let mut bytes = std::ffi::CString::new(template.into_os_string().into_vec())
+                .unwrap()
+                .into_bytes_with_nul();
+            // SAFETY: a writable NUL-terminated template that mkdtemp fills in place.
+            assert!(!unsafe { libc::mkdtemp(bytes.as_mut_ptr().cast()) }.is_null());
+            bytes.pop();
+            Self(std::ffi::OsString::from_vec(bytes).into())
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     #[cfg(debug_assertions)]
     struct Reaped(std::process::Child);
 
@@ -1781,9 +1807,9 @@ mod tests {
             "{} is missing: build the workspace (cargo build -p herdr)",
             herdr.display()
         );
-        let dir = std::env::temp_dir().join(format!("hsl-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        // Declared before the processes, so it is removed after they stop.
+        let temp = TempDir::new("hsl-");
+        let dir = temp.0.clone();
         // A named session, as the launcher runs it for smarty-dev and playful:
         // `herdr --session smarty-dev remote-client-bridge` (smarty-dev#13408 F2).
         let session = ["--session", "smarty-dev"];
@@ -1837,14 +1863,16 @@ mod tests {
         let mut command = Command::new(&herdr);
         environment(&mut command);
         command.arg(crate::bridge_argv::BRIDGE_SUBCOMMAND);
-        let bridge = Reaped(command.spawn().unwrap());
+        let mut bridge = Reaped(command.spawn().unwrap());
         let bridge_pid = bridge.0.id();
         // The server is non-dumpable: the reads the helper used to make refuse.
         assert_eq!(real.exe(server_pid), Some(Exe::Unreadable));
         assert_eq!(real.sockets(server_pid), None);
         // The server's accepted socket from the bridge: once the bridge's
-        // startup probe has closed, the one connection on the client path,
-        // the same for 300 ms (well inside the server's 4 s hello deadline).
+        // startup probe has closed (the server closes it at its EOF), the one
+        // connection on the client path, the same for 300 ms, well inside the
+        // server's 4 s hello deadline. After the lookup it must still be there
+        // with the bridge alive: a probe's socket would be gone.
         let (mut last, mut stable) = (None, 0);
         let accepted = loop {
             let now = client_rows(&mut real).1;
@@ -1899,8 +1927,9 @@ mod tests {
                 inode: accepted,
             },
         );
-        drop((bridge, server));
-        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(client_rows(&mut host.real).1, vec![accepted]);
+        assert!(bridge.0.try_wait().unwrap().is_none(), "bridge exited");
+        drop((bridge, server, temp));
         assert_eq!(login, Some(paul()));
     }
 

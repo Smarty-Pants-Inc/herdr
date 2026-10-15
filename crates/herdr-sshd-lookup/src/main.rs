@@ -1,5 +1,6 @@
-//! `herdr-sshd-lookup 3<&CONNECTION`: print the accepted public key of the sshd
-//! login that the connection's peer descends from.
+//! `herdr-sshd-lookup 3<&CONNECTION 4<&EXECUTABLE`: print the accepted public
+//! key of the sshd login that the connection's peer descends from. Fd 4 is the
+//! caller's own executable (`O_PATH` of `/proc/self/exe`).
 //!
 //! Installed `root:systemd-journal` mode 2755 (docs/next/sshd-lookup.md). It
 //! prints one JSON line only after every check passes; otherwise it prints
