@@ -5,6 +5,10 @@
 //! prints one JSON line only after every check passes; otherwise it prints
 //! nothing and exits nonzero.
 
+/// The server's own bridge argv rule, the same file (smarty-dev#13408 F2).
+#[cfg(target_os = "linux")]
+#[path = "../../../src/server/bridge_argv.rs"]
+mod bridge_argv;
 #[cfg(target_os = "linux")]
 mod lookup;
 

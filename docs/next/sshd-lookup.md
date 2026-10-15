@@ -46,13 +46,15 @@ To remove it: `sudo rm /usr/local/libexec/herdr-sshd-lookup`.
 ## Contract
 
 ```text
-herdr-sshd-lookup 3<&CONNECTION
+herdr-sshd-lookup 3<&CONNECTION 4<&EXECUTABLE
 ```
 
-The helper takes no arguments. Its only input is fd 3: the caller's accepted
-connection from `herdr remote-client-bridge`. Any argument, or an fd 3 that is
-not a connected `AF_UNIX` stream socket, refuses. The helper reads no
-environment and no configuration. On success it prints one line and exits 0:
+The helper takes no arguments. Its only inputs are two descriptors. Fd 3 is
+the caller's accepted connection from `herdr remote-client-bridge`. Fd 4 is the
+caller's own executable: the server opens `/proc/self/exe` with `O_PATH`.
+Any argument, an fd 3 that is not a connected `AF_UNIX` stream socket, or an
+fd 4 that is not a regular file, refuses. The helper reads no environment and
+no configuration. On success it prints one line and exits 0:
 
 ```json
 {"pid":1234,"user":"paul","fingerprint":"SHA256:...","source_ip":"100.64.0.7"}
@@ -61,10 +63,16 @@ environment and no configuration. On success it prints one line and exits 0:
 `pid` is the sshd priv process the helper found. In every other case it prints
 nothing and exits nonzero.
 
-The server passes the client connection as fd 3 (`dup2`, then every other
-descriptor above 2 is closed at exec). It keeps its own walk from the bridge to
-the priv and uses the answer only when the answer names the same priv pid and
-user.
+The server passes the client connection as fd 3 and its executable as fd 4
+(`dup2`, then every other descriptor above 2 is closed at exec). It keeps its
+own walk from the bridge to the priv and uses the answer only when the answer
+names the same priv pid and user.
+
+The server passes its executable because the helper cannot read it. A server
+that loaded `/etc/herdr/server.key` is non-dumpable, so the kernel refuses
+another process of the same user both `/proc/<server>/exe` and
+`/proc/<server>/fd` (smarty-dev#13408). Helper and server are one release: a
+server that does not pass fd 4 gets no answer.
 
 ## Checks
 
@@ -74,17 +82,24 @@ these are true:
 - Fd 3 is a connected `AF_UNIX` stream socket (`SO_DOMAIN`, `SO_TYPE`,
   `getpeername`). `SO_PEERCRED` on it gives the peer pid: the process that
   connected, as the kernel recorded it at `connect`.
-- The peer runs the same executable as the caller: the same device and inode
-  of `/proc/<pid>/exe`, normally the installed `herdr` binary that runs both
-  the server and the bridge. An unreadable executable (another user's process)
-  refuses. The helper reads both again at the end; a change refuses.
-- The peer is a bridge: its `argv[1]` is `remote-client-bridge` (the server's
-  own rule), read again at the end, and none of its descriptors is a listening
+- The peer runs the same executable as the caller: the device and inode of
+  the peer's `/proc/<pid>/exe` equal those of fd 4, normally the installed
+  `herdr` binary that runs both the server and the bridge. An unreadable peer
+  executable (another user's process) refuses. The helper reads the peer's
+  again at the end; a change refuses.
+- The peer is a bridge: its arguments after `argv[0]` are exactly what the
+  Herdr launcher writes, `[--session S | --session=S] remote-client-bridge
+  [--idle-timeout-v1]`, with one valid session name. Any other subcommand, an
+  extra or unknown option, or a repeated `--session` refuses. The server and
+  the helper use the same rule (`src/server/bridge_argv.rs`). The helper reads
+  them again at the end, and none of the peer's descriptors is a listening
   socket in its `/proc/<pid>/net/unix`. A Herdr server listens; it refuses.
-- The caller accepted this connection: the caller holds fd 3's socket inode
-  (`/proc/<caller>/fd`), that socket is not listening and carries a bound path
-  (an accepted socket inherits its listener's path; the connecting side is
-  unnamed), and the caller also holds a listening socket with that path.
+- The caller accepted this connection: fd 3's socket, which the helper
+  inherited from the caller, is not listening and carries a bound path in the
+  caller's `/proc/<caller>/net/unix` (an accepted socket inherits its
+  listener's path; the connecting side is unnamed), and a socket listening on
+  that path exists there. The helper does not read `/proc/<caller>/fd`: the
+  kernel refuses it for a non-dumpable server.
 - `kernel.yama.ptrace_scope` is 1 or higher.
 - From the peer, the helper walks at most three parents, like the server, to a
   process whose command line is exactly `sshd: <user> [priv]`, with `comm`
@@ -108,13 +123,14 @@ trusted `_PID`, `_UID=0`, `_COMM=sshd`, `_EXE`, `_TRANSPORT=syslog`, `_BOOT_ID`
 and timestamps after the login started. Exactly one record must start with
 `Accepted `, and it must be
 `Accepted publickey for <user> from <ip> port <port> ssh2: <type> SHA256:<fp>`.
-At last the helper reads the caller, every process of the walk and the listener
-again; a change refuses the answer. A reused peer pid has another start time,
+At last the helper reads the caller's `/proc` state, every process of the walk
+and the listener again; a change refuses the answer. A reused peer pid has another start time,
 so it refuses too.
 
 The helper keeps the journal group only while it starts `journalctl`, then drops
-it for good. It sets `no_new_privs`, closes inherited descriptors above 3 at
-start, and closes fd 3 once it has read the peer, before `journalctl` starts.
+it for good. It sets `no_new_privs`, closes inherited descriptors above 4 at
+start, and closes fds 3 and 4 once it has read the peer and the executable,
+before `journalctl` starts.
 
 Logins whose listener restarted (the priv process is now a child of pid 1),
 bridges more than three parents below the priv, and OpenSSH 9.8 and later
@@ -141,8 +157,13 @@ bridges more than three parents below the priv, and OpenSSH 9.8 and later
   bridge.
 - The caller checks compare an executable inode and `/proc` state; they are
   not a code-integrity check. A user can run the helper from a herdr process
-  they control (for example with `LD_PRELOAD`). The peer checks bind the
-  answer.
+  they control (for example with `LD_PRELOAD`), or from any process that
+  passes the herdr binary as fd 4. The peer checks bind the answer. Such a
+  caller learns only the login behind a bridge that it already holds an
+  accepted connection from, which a herdr process of that user learns the
+  same way. It cannot turn the answer into an attestation: only the server
+  that loaded `/etc/herdr/server.key` signs, and it signs only on its own walk
+  and its own helper call (smarty-dev#13408).
 - `ptrace_scope` 1 or higher stops a process of the same user in another
   session from attaching to a bridge (or writing its memory) to make it
   connect elsewhere. Scope 1 still lets a process trace its own descendants;

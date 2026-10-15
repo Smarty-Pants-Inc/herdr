@@ -214,7 +214,7 @@ pub(crate) fn resolve(
     let first = sources.proc(peer.pid)?;
     if first.start != peer.start
         || first.executable != ExecutableIdentity::Server
-        || first.argv.get(1).map(String::as_str) != Some("remote-client-bridge")
+        || !super::bridge_argv::is_bridge_argv(first.argv.get(1..)?)
     {
         return None;
     }
@@ -663,6 +663,45 @@ mod tests {
             f.processes.get_mut(&40).unwrap().argv = vec!["herdr".into(), "attach".into()];
         }
     );
+    rejected_source!(
+        bridge_with_a_repeated_session_option_is_unmapped,
+        |f: &mut FakeSources, _: &mut AcceptedPeer| {
+            f.processes.get_mut(&40).unwrap().argv = [
+                "herdr",
+                "--session",
+                "a",
+                "--session",
+                "b",
+                "remote-client-bridge",
+            ]
+            .map(String::from)
+            .to_vec();
+        }
+    );
+
+    /// smarty-dev#13408 F2: the launcher runs a named session's bridge as
+    /// `herdr --session S remote-client-bridge [--idle-timeout-v1]`.
+    #[test]
+    fn named_session_bridge_maps() {
+        for argv in [
+            &["herdr", "--session", "smarty-dev", "remote-client-bridge"][..],
+            &[
+                "herdr",
+                "--session=playful",
+                "remote-client-bridge",
+                "--idle-timeout-v1",
+            ],
+        ] {
+            let mut f = sources();
+            f.processes.get_mut(&40).unwrap().argv = argv.iter().map(|a| (*a).into()).collect();
+            assert_eq!(
+                resolve(peer(), &trusted_map(), &mut f),
+                Some(paul()),
+                "{argv:?}"
+            );
+        }
+    }
+
     rejected_source!(
         missing_peer_proc_is_unmapped,
         |f: &mut FakeSources, _: &mut AcceptedPeer| {
