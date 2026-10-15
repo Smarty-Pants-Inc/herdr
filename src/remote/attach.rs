@@ -398,13 +398,19 @@ impl RemoteExecutable {
         self.bridge_command_with_idle_timeout(session_name, false)
     }
 
-    fn bridge_command_with_idle_timeout(&self, session_name: &str, idle_timeout: bool) -> String {
+    /// The bridge's arguments. The server and the sshd lookup helper accept
+    /// exactly these (`server::bridge_argv`).
+    fn bridge_args(session_name: &str, idle_timeout: bool) -> Vec<&str> {
         let command = if idle_timeout {
             &["remote-client-bridge", "--idle-timeout-v1"][..]
         } else {
             &["remote-client-bridge"][..]
         };
-        let args = Self::session_args(session_name, command);
+        Self::session_args(session_name, command)
+    }
+
+    fn bridge_command_with_idle_timeout(&self, session_name: &str, idle_timeout: bool) -> String {
+        let args = Self::bridge_args(session_name, idle_timeout);
         match self {
             Self::PosixShellPath(_) => {
                 posix_remote_output_command(&format!("exec {}", self.command(&args)))
@@ -416,7 +422,7 @@ impl RemoteExecutable {
     }
 
     fn saved_bridge_command(&self, session_name: &str) -> String {
-        let args = Self::session_args(session_name, &["remote-client-bridge"]);
+        let args = Self::bridge_args(session_name, false);
         match self {
             Self::PosixShellPath(_) => format!("exec {} </dev/null", self.command(&args)),
             Self::WindowsPath(path) => {
@@ -3466,6 +3472,26 @@ fn sanitize_path_component(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// smarty-dev#13408 F2: every bridge argv the launcher builds is one the
+    /// server's and the sshd lookup helper's shared check accepts.
+    #[test]
+    fn launcher_bridge_argv_is_accepted_by_the_principal_check() {
+        for session in [
+            crate::session::DEFAULT_SESSION_NAME,
+            "smarty-dev",
+            "playful",
+            "agents",
+        ] {
+            for idle_timeout in [false, true] {
+                let args = RemoteExecutable::bridge_args(session, idle_timeout);
+                assert!(
+                    crate::server::bridge_argv::is_bridge_argv(&args),
+                    "{args:?}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn remote_client_preferences_cross_process_handoff() {
