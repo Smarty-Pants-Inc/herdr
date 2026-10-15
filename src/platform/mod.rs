@@ -2143,6 +2143,44 @@ pub(crate) fn begin_cli_output() {}
 #[cfg(not(unix))]
 pub(crate) fn end_cli_output() {}
 
+/// Nice value applied to new pane children (`server.pane_nice`).
+static PANE_NICE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+pub(crate) fn set_pane_nice(nice: i32) {
+    PANE_NICE.store(nice, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Start every pane at normal CPU priority rather than the server's class.
+/// Report the outcome with [`PaneScheduling::report`] after the spawn.
+pub(crate) fn prepare_pane_spawn_scheduling(
+    command: &mut portable_pty::CommandBuilder,
+) -> PaneScheduling {
+    prepare_pane_scheduling(
+        command,
+        PANE_NICE.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// Only Linux has SCHED_IDLE; other platforms keep the inherited priority.
+#[cfg(not(target_os = "linux"))]
+pub(crate) struct PaneScheduling;
+
+#[cfg(not(target_os = "linux"))]
+impl PaneScheduling {
+    pub(crate) fn report(self, _pane_id: u32, _pid: Option<u32>) {}
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn prepare_pane_scheduling(
+    _command: &mut portable_pty::CommandBuilder,
+    _target_nice: i32,
+) -> PaneScheduling {
+    PaneScheduling
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn check_server_scheduling(_start: &'static str) {}
+
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]

@@ -56,6 +56,12 @@
           "type": "integer",
           "default": "40",
           "description": "Virtual terminal height used for layout and newly created panes when no client is attached. Must be greater than zero."
+        },
+        {
+          "key": "server.pane_nice",
+          "type": "integer",
+          "default": "0",
+          "description": "Linux only: nice value for newly created pane processes, from -20 to 19. Panes also start at the normal SCHED_OTHER scheduling policy, so a server running at idle priority does not pass it on. Lowering a nice value needs RLIMIT_NICE or CAP_SYS_NICE; when the kernel refuses, the pane keeps the server's value and the server log names the pane and the error. Out-of-range values use 0."
         }
       ]
     },

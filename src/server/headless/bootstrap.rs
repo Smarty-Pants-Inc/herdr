@@ -15,6 +15,14 @@ pub fn run_server() -> io::Result<()> {
         }
     }
     crate::platform::raise_server_nofile_limit();
+    // Covers a normal start (and its session restore) and both handoff importers.
+    crate::platform::check_server_scheduling(if handoff_import {
+        "handoff-import"
+    } else if args.iter().any(|arg| arg == "--import-from-running") {
+        "import-from-running"
+    } else {
+        "start"
+    });
 
     if handoff_import {
         let socket_path = args

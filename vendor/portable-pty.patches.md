@@ -168,3 +168,40 @@ cargo test --manifest-path vendor/portable-pty/Cargo.toml iter_full_env_
 The iterator regressions cover base and caller entries, preferred key casing,
 and non-Unicode keys and values on Unix and Windows. Run the vendor unit tests
 on both platforms.
+
+## 0005 run a pre-exec hook in the pty child
+
+status: active
+
+patch: `vendor/patches/portable-pty/0005-pre-exec-hook.patch`
+
+issue: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/11237
+
+upstream discussion: none
+
+upstream pr: none
+
+vendored base: `portable-pty 0.9.0`
+
+local files:
+
+- `vendor/portable-pty/src/cmdbuilder.rs`
+- `vendor/portable-pty/src/unix.rs`
+
+reason: Linux children inherit the forking thread's scheduling policy and nice
+value, so a server running at `SCHED_IDLE` passed idle priority to every pane.
+Herdr must reset the pane child before `exec`, which needs code in the child
+between fork and exec. `portable-pty` owns that `pre_exec` closure and exposes
+no hook. `CommandBuilder::pre_exec_hook` takes an unsafe-constructed,
+async-signal-safe `PreExecHook` that runs after `setsid` and `TIOCSCTTY` and
+before inherited descriptors are closed. It cannot fail the spawn.
+
+remove when: upstream `portable-pty` exposes a Unix pre-exec hook on
+`CommandBuilder`, or Herdr replaces the Unix PTY spawn path.
+
+verification:
+
+```sh
+python3 -m unittest scripts.test_vendor_portable_pty
+cargo nextest run --test pane_cpu_priority
+```
