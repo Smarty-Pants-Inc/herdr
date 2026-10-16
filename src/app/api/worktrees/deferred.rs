@@ -320,27 +320,6 @@ impl App {
             return;
         }
 
-        #[cfg(windows)]
-        {
-            if !params.force
-                && crate::worktree::checkout_has_dirty_files(
-                    &space.checkout_path,
-                    params.trust_repository,
-                )
-                .unwrap_or(false)
-            {
-                Self::send_api_response(
-                    respond_to,
-                    encode_error(
-                        id,
-                        "dirty_worktree_requires_force",
-                        crate::worktree::worktree_dirty_remove_message(&space.checkout_path),
-                    ),
-                );
-                return;
-            }
-        }
-
         let workspace_internal_id = self.state.workspaces[ws_idx].id.clone();
         let checkout_key = crate::worktree::canonical_or_ancestor(&space.checkout_path);
         if self
@@ -370,6 +349,28 @@ impl App {
                 ),
             );
             return;
+        }
+
+        // Busy requests must not inspect a checkout that another operation may be removing.
+        #[cfg(windows)]
+        {
+            if !params.force
+                && crate::worktree::checkout_has_dirty_files(
+                    &space.checkout_path,
+                    params.trust_repository,
+                )
+                .unwrap_or(false)
+            {
+                Self::send_api_response(
+                    respond_to,
+                    encode_error(
+                        id,
+                        "dirty_worktree_requires_force",
+                        crate::worktree::worktree_dirty_remove_message(&space.checkout_path),
+                    ),
+                );
+                return;
+            }
         }
 
         let shutdown_panes =

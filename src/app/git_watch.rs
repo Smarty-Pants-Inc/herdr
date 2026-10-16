@@ -10,10 +10,11 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
-use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{Event, EventKind, RecursiveMode};
 use tokio::sync::mpsc;
 
 use crate::events::AppEvent;
+use crate::platform::GitWatcher;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum WatchTarget {
@@ -144,7 +145,7 @@ fn structural_event(event: &Event, targets: &[WatchTarget]) -> bool {
 }
 
 pub(super) struct GitWatches {
-    watcher: RecommendedWatcher,
+    watcher: GitWatcher,
     roots: HashSet<PathBuf>,
     // Sentinels belong to consumers, not path ancestry: a linked checkout's
     // common .git may live beside (or entirely outside) its workspace CWD.
@@ -173,7 +174,7 @@ impl GitWatches {
         let callback_structural = structural_dirty.clone();
         let discovery_dirty = Arc::new(AtomicBool::new(false));
         let callback_discovery = discovery_dirty.clone();
-        let watcher = RecommendedWatcher::new(
+        let watcher = GitWatcher::new(
             move |result: notify::Result<Event>| {
                 let relevant = match result {
                     Ok(event) => match callback_targets.try_read() {

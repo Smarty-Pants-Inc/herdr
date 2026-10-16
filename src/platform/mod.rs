@@ -13,6 +13,168 @@ pub(crate) use diagnostic_owner::{
 #[cfg(unix)]
 pub(crate) mod ssh_agent;
 
+/// Git metadata watches use the native backend directly except where native
+/// control calls need a bounded ownership boundary. Other notify users are
+/// deliberately unaffected.
+pub(crate) struct GitWatcher {
+    #[cfg(not(windows))]
+    inner: notify::RecommendedWatcher,
+    #[cfg(windows)]
+    inner: windows::NativeGitWatcher,
+}
+
+impl GitWatcher {
+    pub(crate) fn new(
+        handler: impl notify::EventHandler,
+        config: notify::Config,
+    ) -> notify::Result<Self> {
+        #[cfg(not(windows))]
+        let inner = <notify::RecommendedWatcher as notify::Watcher>::new(handler, config)?;
+        #[cfg(windows)]
+        let inner = windows::NativeGitWatcher::new(handler, config)?;
+        Ok(Self { inner })
+    }
+
+    pub(crate) fn watch(
+        &mut self,
+        path: &std::path::Path,
+        mode: notify::RecursiveMode,
+    ) -> notify::Result<()> {
+        #[cfg(not(windows))]
+        return notify::Watcher::watch(&mut self.inner, path, mode);
+        #[cfg(windows)]
+        self.inner.watch(path, mode)
+    }
+
+    pub(crate) fn unwatch(&mut self, path: &std::path::Path) -> notify::Result<()> {
+        #[cfg(not(windows))]
+        return notify::Watcher::unwatch(&mut self.inner, path);
+        #[cfg(windows)]
+        self.inner.unwatch(path)
+    }
+}
+
+// Shared, injectable command/reply contract for the Windows Git watcher. Each
+// request owns its reply channel: a late reply can never acknowledge a later
+// command. No native ownership or platform APIs live in this contract.
+#[cfg(any(windows, test))]
+#[derive(Debug, PartialEq, Eq)]
+enum GitWatchCommand {
+    Watch(std::path::PathBuf, notify::RecursiveMode),
+    Unwatch(std::path::PathBuf),
+}
+
+#[cfg(any(windows, test))]
+struct GitWatchRequest {
+    command: GitWatchCommand,
+    reply: std::sync::mpsc::Sender<notify::Result<()>>,
+}
+
+#[cfg(any(windows, test))]
+struct GitWatchControl {
+    commands: std::sync::mpsc::Sender<GitWatchRequest>,
+    callbacks_enabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    budget: std::time::Duration,
+}
+
+#[cfg(any(windows, test))]
+impl GitWatchControl {
+    fn channel(
+        failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        budget: std::time::Duration,
+    ) -> notify::Result<(Self, std::sync::mpsc::Receiver<GitWatchRequest>)> {
+        if failed.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(Self::unavailable());
+        }
+        let (commands, receiver) = std::sync::mpsc::channel();
+        Ok((
+            Self {
+                commands,
+                callbacks_enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                failed,
+                budget,
+            },
+            receiver,
+        ))
+    }
+
+    fn unavailable() -> notify::Error {
+        notify::Error::generic("git native watcher unavailable; using safety refresh")
+    }
+
+    fn fail(&self) -> notify::Error {
+        self.callbacks_enabled
+            .store(false, std::sync::atomic::Ordering::Release);
+        // Shared across new/clear cycles so a stalled native owner cannot
+        // generate an unbounded succession of replacement threads.
+        self.failed
+            .store(true, std::sync::atomic::Ordering::Release);
+        Self::unavailable()
+    }
+
+    fn wait(&self, reply: std::sync::mpsc::Receiver<notify::Result<()>>) -> notify::Result<()> {
+        if !self
+            .callbacks_enabled
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(Self::unavailable());
+        }
+        match reply.recv_timeout(self.budget) {
+            // Ordinary native errors (including vanished paths) do not poison
+            // a responsive backend or the process-wide recreation latch.
+            Ok(result) => result,
+            Err(error) => {
+                tracing::warn!(
+                    ?error,
+                    budget = ?self.budget,
+                    "native git watcher acknowledgment did not arrive; using 60-second safety refresh"
+                );
+                Err(self.fail())
+            }
+        }
+    }
+
+    fn request(&mut self, command: GitWatchCommand) -> notify::Result<()> {
+        if !self
+            .callbacks_enabled
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(Self::unavailable());
+        }
+        let (reply, receiver) = std::sync::mpsc::channel();
+        if self
+            .commands
+            .send(GitWatchRequest { command, reply })
+            .is_err()
+        {
+            return Err(self.fail());
+        }
+        self.wait(receiver)
+    }
+}
+
+#[cfg(any(windows, test))]
+impl Drop for GitWatchControl {
+    fn drop(&mut self) {
+        self.callbacks_enabled
+            .store(false, std::sync::atomic::Ordering::Release);
+        // Dropping the sender shuts down an unstalled owner. Never join it.
+    }
+}
+
+#[cfg(any(windows, test))]
+fn git_watch_event_handler(
+    mut handler: impl notify::EventHandler,
+    enabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> impl notify::EventHandler {
+    move |event| {
+        if enabled.load(std::sync::atomic::Ordering::Acquire) {
+            handler.handle_event(event);
+        }
+    }
+}
+
 pub(crate) struct HostShutdownMonitor {
     task: Option<tokio::task::JoinHandle<()>>,
 }
@@ -2419,6 +2581,237 @@ fn child_exit_classification_only_checkpoints_interruptions() {
     #[cfg(unix)]
     assert!(ChildExitReason::Handoff.requires_session_checkpoint());
     assert!(!ChildExitReason::WaitFailed.requires_session_checkpoint());
+}
+
+#[cfg(test)]
+mod git_watch_control_tests {
+    use super::*;
+    use notify::{EventHandler as _, RecursiveMode};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{mpsc, Arc};
+    use std::time::Duration;
+
+    // Keep reason: a native cancellation stall is not safely/reliably induced
+    // by a user flow. Real channels exercise the production timeout contract
+    // without filesystem deletion or depending on a particular Windows APC.
+    const HANG_GUARD: Duration = Duration::from_secs(5);
+    const STALL_BUDGET: Duration = Duration::from_millis(25);
+
+    fn watch(path: &str) -> GitWatchCommand {
+        GitWatchCommand::Watch(path.into(), RecursiveMode::Recursive)
+    }
+
+    #[test]
+    fn git_watch_control_healthy_watch_a_unwatch_a_watch_b_ack_success() {
+        let failed = Arc::new(AtomicBool::new(false));
+        let (mut control, commands) =
+            GitWatchControl::channel(failed.clone(), HANG_GUARD).expect("control");
+        let worker = crate::thread_spawn::spawn_named("test-git-watch-healthy", move || {
+            let mut recorded = Vec::new();
+            for _ in 0..3 {
+                let request = commands.recv_timeout(HANG_GUARD).expect("command");
+                recorded.push(request.command);
+                request.reply.send(Ok(())).expect("matching reply");
+            }
+            recorded
+        })
+        .expect("fake owner");
+        control.request(watch("A")).expect("watch A");
+        control
+            .request(GitWatchCommand::Unwatch("A".into()))
+            .expect("unwatch A queued");
+        control.request(watch("B")).expect("watch B");
+        assert_eq!(
+            worker.join().expect("owner exits"),
+            vec![watch("A"), GitWatchCommand::Unwatch("A".into()), watch("B")]
+        );
+        assert!(control.callbacks_enabled.load(Ordering::Acquire));
+        assert!(!failed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn git_watch_control_unwatch_then_stalled_watch_disables_without_retry_or_late_recovery() {
+        let failed = Arc::new(AtomicBool::new(false));
+        let (mut control, commands) =
+            GitWatchControl::channel(failed.clone(), STALL_BUDGET).expect("control");
+        let (events, received_events) = mpsc::channel();
+        let mut callback = git_watch_event_handler(events, control.callbacks_enabled.clone());
+        callback.handle_event(Ok(notify::Event::new(notify::EventKind::Any)));
+        received_events
+            .recv_timeout(HANG_GUARD)
+            .expect("healthy callback")
+            .expect("healthy callback event");
+
+        let (release, wait_release) = mpsc::sync_channel(0);
+        let worker = crate::thread_spawn::spawn_named("test-git-watch-stall", move || {
+            let unwatch = commands.recv_timeout(HANG_GUARD).expect("unwatch A");
+            let first = unwatch.command;
+            // As in notify, this acknowledges queueing, not native teardown.
+            unwatch.reply.send(Ok(())).expect("unwatch accepted");
+            let stalled = commands.recv_timeout(HANG_GUARD).expect("watch B");
+            wait_release
+                .recv_timeout(HANG_GUARD)
+                .expect("release after timeout");
+            let late_reply_rejected = stalled.reply.send(Ok(())).is_err();
+            (first, stalled.command, late_reply_rejected, commands)
+        })
+        .expect("fake owner");
+        // Allow normal setup a generous budget; only the deliberately missing
+        // acknowledgment gets the short injected budget.
+        control.budget = HANG_GUARD;
+        let unwatch = control.request(GitWatchCommand::Unwatch("A".into()));
+        control.budget = STALL_BUDGET;
+        let stalled = control.request(watch("B"));
+        let retry_before_late_reply = control.request(watch("C"));
+        callback.handle_event(Ok(notify::Event::new(notify::EventKind::Any)));
+        let callback_disabled =
+            matches!(received_events.try_recv(), Err(mpsc::TryRecvError::Empty));
+        let recreate_rejected = GitWatchControl::channel(failed.clone(), HANG_GUARD).is_err();
+        // Always release and join before assertions; no fake owner leaks.
+        release
+            .send(())
+            .expect("release owner after observed timeout");
+        let (first, second, late_rejected, commands) = worker.join().expect("owner exits");
+        let retry_after_late_reply = control.request(watch("D"));
+        let no_queued_retry = matches!(commands.try_recv(), Err(mpsc::TryRecvError::Empty));
+
+        assert!(unwatch.is_ok());
+        assert!(
+            stalled.is_err(),
+            "missing acknowledgment returns unavailable"
+        );
+        assert!(retry_before_late_reply.is_err());
+        assert!(retry_after_late_reply.is_err());
+        assert_eq!(first, GitWatchCommand::Unwatch("A".into()));
+        assert_eq!(second, watch("B"));
+        assert!(late_rejected, "timed-out reply channel is never reused");
+        assert!(
+            no_queued_retry,
+            "poisoned frontend never submits another command"
+        );
+        assert!(callback_disabled);
+        assert!(failed.load(Ordering::Acquire));
+        assert!(
+            recreate_rejected,
+            "clear/new cannot start a replacement owner"
+        );
+    }
+
+    #[test]
+    fn git_watch_control_initialization_timeout_and_drop_do_not_wait_for_owner() {
+        let failed = Arc::new(AtomicBool::new(false));
+        let (control, commands) =
+            GitWatchControl::channel(failed.clone(), STALL_BUDGET).expect("control");
+        let enabled = control.callbacks_enabled.clone();
+        let (ready, initialized) = mpsc::channel();
+        let (release, wait_release) = mpsc::sync_channel(0);
+        let worker = crate::thread_spawn::spawn_named("test-git-watch-init", move || {
+            wait_release
+                .recv_timeout(HANG_GUARD)
+                .expect("release after drop");
+            let late_rejected = ready.send(Ok(())).is_err();
+            let disconnected = matches!(commands.try_recv(), Err(mpsc::TryRecvError::Disconnected));
+            (late_rejected, disconnected)
+        })
+        .expect("fake owner");
+        let result = control.wait(initialized);
+        drop(control);
+        // A joining Drop would deadlock against this rendezvous; the fake
+        // worker's guard bounds even the regressed test failure path.
+        release
+            .send(())
+            .expect("drop returned while owner was held");
+        let (late_rejected, disconnected) = worker.join().expect("owner exits");
+        assert!(result.is_err());
+        assert!(late_rejected);
+        assert!(disconnected);
+        assert!(!enabled.load(Ordering::Acquire));
+        assert!(failed.load(Ordering::Acquire));
+        assert!(GitWatchControl::channel(failed, HANG_GUARD).is_err());
+    }
+
+    #[test]
+    fn git_watch_control_disconnected_commands_and_replies_are_sticky() {
+        let failed = Arc::new(AtomicBool::new(false));
+        let (mut control, commands) =
+            GitWatchControl::channel(failed.clone(), HANG_GUARD).expect("control");
+        drop(commands);
+        assert!(control.request(watch("A")).is_err());
+        assert!(control.request(watch("B")).is_err());
+        assert!(failed.load(Ordering::Acquire));
+        assert!(!control.callbacks_enabled.load(Ordering::Acquire));
+
+        let failed = Arc::new(AtomicBool::new(false));
+        let (control, _commands) =
+            GitWatchControl::channel(failed.clone(), HANG_GUARD).expect("control");
+        let (reply, receiver) = mpsc::channel();
+        drop(reply);
+        assert!(control.wait(receiver).is_err());
+        assert!(failed.load(Ordering::Acquire));
+        assert!(!control.callbacks_enabled.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn git_watch_control_responsive_native_errors_do_not_poison_backend() {
+        let failed = Arc::new(AtomicBool::new(false));
+        let (control, commands) =
+            GitWatchControl::channel(failed.clone(), HANG_GUARD).expect("control");
+        let (ready, initialized) = mpsc::channel();
+        ready
+            .send(Err(notify::Error::generic("creation failed")))
+            .expect("ready");
+        assert!(control.wait(initialized).is_err());
+        drop(control);
+        drop(commands);
+        assert!(!failed.load(Ordering::Acquire));
+
+        let (mut control, commands) =
+            GitWatchControl::channel(failed.clone(), HANG_GUARD).expect("recreation allowed");
+        let worker = crate::thread_spawn::spawn_named("test-git-watch-error", move || {
+            let missing = commands.recv_timeout(HANG_GUARD).expect("missing path");
+            missing
+                .reply
+                .send(Err(notify::Error::path_not_found()))
+                .expect("path error");
+            let healthy = commands.recv_timeout(HANG_GUARD).expect("healthy path");
+            healthy.reply.send(Ok(())).expect("healthy reply");
+        })
+        .expect("fake owner");
+        let missing = control.request(watch("missing"));
+        let healthy = control.request(watch("healthy"));
+        worker.join().expect("owner exits");
+        assert!(matches!(
+            missing,
+            Err(notify::Error {
+                kind: notify::ErrorKind::PathNotFound,
+                ..
+            })
+        ));
+        assert!(healthy.is_ok());
+        assert!(!failed.load(Ordering::Acquire));
+        assert!(control.callbacks_enabled.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn git_watch_control_healthy_drop_disables_callbacks_without_poisoning_recreation() {
+        let failed = Arc::new(AtomicBool::new(false));
+        let (control, commands) =
+            GitWatchControl::channel(failed.clone(), HANG_GUARD).expect("control");
+        let (events, received_events) = mpsc::channel();
+        let mut callback = git_watch_event_handler(events, control.callbacks_enabled.clone());
+        drop(control);
+        callback.handle_event(Ok(notify::Event::new(notify::EventKind::Any)));
+        assert!(matches!(
+            received_events.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            commands.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
+        assert!(!failed.load(Ordering::Acquire));
+        assert!(GitWatchControl::channel(failed, HANG_GUARD).is_ok());
+    }
 }
 
 #[cfg(all(test, unix))]

@@ -2332,6 +2332,218 @@ mod tests {
     }
 
     #[test]
+    fn deferred_api_worktree_remove_busy_request_never_dispatches_worker() {
+        // Data safety: no checkout, fixture creation or cleanup; fail every dispatch below.
+        let checkout = unique_temp_path("api-worktree-remove-busy-unused");
+        assert!(!checkout.exists());
+        let checkout_key = crate::worktree::canonical_or_ancestor(&checkout);
+        let mut app = test_app();
+        let mut child = Workspace::test_new("child");
+        child.identity_cwd = checkout.clone();
+        child.worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
+            key: "repo-key".into(),
+            label: "repo".into(),
+            repo_root: checkout.clone(),
+            checkout_path: checkout.clone(),
+            is_linked_worktree: true,
+        });
+        let child_id = child.id.clone();
+        app.state.workspaces = vec![child];
+        app.state.ensure_test_terminals();
+        app.pending_api_worktree_removes.insert(child_id.clone(), 7);
+        let next_operation_id = app.next_api_worktree_operation_id;
+        let (respond_to, response_rx) = response_channel();
+
+        // Existing hook both prevents an accidental removal worker and records its attempt.
+        crate::thread_spawn::test_hook::fail_next_spawns(1);
+        assert!(app.handle_deferred_worktree_api_request(
+            Request {
+                id: "req".into(),
+                method: crate::api::schema::Method::WorktreeRemove(WorktreeRemoveParams {
+                    workspace_id: child_id.clone(),
+                    force: false,
+                    trust_repository: false,
+                }),
+            },
+            respond_to,
+            false,
+        ));
+        // The injected failure must still be unconsumed by deferred dispatch.
+        let probe = crate::thread_spawn::spawn_named("herdr-worktree-busy-probe", || {});
+        assert!(
+            probe.is_err(),
+            "busy request attempted to dispatch a worker"
+        );
+        let response = response_rx
+            .try_recv()
+            .expect("busy request must respond synchronously");
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "worktree_operation_in_progress");
+        assert_eq!(app.pending_api_worktree_removes.get(&child_id), Some(&7));
+        assert_eq!(app.pending_api_worktree_removes.len(), 1);
+        assert!(app.pending_api_worktree_remove_paths.is_empty());
+        assert!(app.pending_api_worktree_creates.is_empty());
+        assert_eq!(app.next_api_worktree_operation_id, next_operation_id);
+        assert!(app.event_rx.try_recv().is_err());
+        assert!(response_rx.try_recv().is_err());
+        assert!(app.pending_worktree_remove_runtime_exits.is_empty());
+        assert!(app.pending_worktree_remove_runtime_restores.is_empty());
+        assert_eq!(app.state.workspaces.len(), 1);
+
+        // Counterexample: no reservation reaches dispatch, but never runs the delete closure.
+        app.pending_api_worktree_removes.remove(&child_id);
+        let (respond_to, response_rx) = response_channel();
+        crate::thread_spawn::test_hook::fail_next_spawns(1);
+        assert!(app.handle_deferred_worktree_api_request(
+            Request {
+                id: "unreserved".into(),
+                method: crate::api::schema::Method::WorktreeRemove(WorktreeRemoveParams {
+                    workspace_id: child_id.clone(),
+                    force: true,
+                    trust_repository: false,
+                }),
+            },
+            respond_to,
+            false,
+        ));
+        assert!(response_rx.try_recv().is_err());
+        assert_eq!(app.next_api_worktree_operation_id, next_operation_id + 1);
+        assert_eq!(
+            app.pending_api_worktree_removes.get(&child_id),
+            Some(&next_operation_id)
+        );
+        assert_eq!(
+            app.pending_api_worktree_remove_paths.get(&checkout_key),
+            Some(&next_operation_id)
+        );
+        let AppEvent::WorktreeRemoveFinished(finished) = app
+            .event_rx
+            .try_recv()
+            .expect("spawn failure must queue completion synchronously")
+        else {
+            panic!("expected worktree remove completion");
+        };
+        assert!(finished.forced);
+        assert_eq!(finished.path, checkout);
+        assert_eq!(finished.workspace_id, child_id);
+        assert!(finished
+            .result
+            .as_ref()
+            .expect_err("injected spawn failure must prevent deletion")
+            .contains("injected thread spawn failure"));
+        assert!(finished
+            .api_request
+            .as_ref()
+            .unwrap()
+            .shutdown_panes
+            .is_empty());
+        assert!(app
+            .handle_api_worktree_remove_finished(*finished)
+            .is_empty());
+        let response = response_rx
+            .try_recv()
+            .expect("handling spawn failure must respond");
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "worktree_remove_failed");
+        assert!(error
+            .error
+            .message
+            .contains("injected thread spawn failure"));
+        assert!(app.pending_api_worktree_removes.is_empty());
+        assert!(app.pending_api_worktree_remove_paths.is_empty());
+        assert!(app.pending_api_worktree_creates.is_empty());
+        assert!(app.pending_worktree_remove_runtime_exits.is_empty());
+        assert!(app.pending_worktree_remove_runtime_restores.is_empty());
+        assert!(app.event_rx.try_recv().is_err());
+        assert_eq!(app.state.workspaces.len(), 1);
+        assert!(!checkout.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn deferred_api_worktree_remove_dirty_checkout_rejects_before_starting_worker() {
+        let repo = create_committed_repo("api-worktree-remove-dirty-guard-repo");
+        let checkout = unique_temp_path("api-worktree-remove-dirty-guard-checkout");
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "worktree/api-remove-dirty-guard",
+                checkout.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        std::fs::write(checkout.join("README.md"), "deliberately dirty\n").unwrap();
+        assert_eq!(
+            crate::worktree::checkout_has_dirty_files(&checkout, false),
+            Ok(true)
+        );
+
+        let mut app = test_app();
+        let mut child = Workspace::test_new("child");
+        child.identity_cwd = checkout.clone();
+        child.worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
+            key: crate::workspace::git_space_metadata(&repo).unwrap().key,
+            label: "api-worktree-remove-dirty-guard-repo".into(),
+            repo_root: repo.clone(),
+            checkout_path: checkout.clone(),
+            is_linked_worktree: true,
+        });
+        let child_id = child.id.clone();
+        app.state.workspaces = vec![child];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        let next_operation_id = app.next_api_worktree_operation_id;
+
+        // Data safety: seed a reservation, never start an actual removal worker.
+        for busy in [true, false] {
+            if busy {
+                app.pending_api_worktree_removes.insert(child_id.clone(), 7);
+            } else {
+                app.pending_api_worktree_removes.remove(&child_id);
+            }
+            let (respond_to, response_rx) = response_channel();
+            assert!(app.handle_deferred_worktree_api_request(
+                Request {
+                    id: "req".into(),
+                    method: crate::api::schema::Method::WorktreeRemove(WorktreeRemoveParams {
+                        workspace_id: child_id.clone(),
+                        force: false,
+                        trust_repository: false,
+                    }),
+                },
+                respond_to,
+                false,
+            ));
+            let response = response_rx
+                .try_recv()
+                .expect("dirty checkout rejection must be synchronous");
+            let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+            let expected_code = if busy {
+                "worktree_operation_in_progress"
+            } else {
+                "dirty_worktree_requires_force"
+            };
+            assert_eq!(error.error.code, expected_code, "busy={busy}: {response}");
+            assert_eq!(app.next_api_worktree_operation_id, next_operation_id);
+            assert!(app.event_rx.try_recv().is_err());
+            assert!(app.pending_worktree_remove_runtime_exits.is_empty());
+            assert_eq!(app.state.workspaces.len(), 1);
+            assert_eq!(
+                std::fs::read_to_string(checkout.join("README.md")).unwrap(),
+                "deliberately dirty\n"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(checkout);
+        let _ = std::fs::remove_dir_all(repo);
+    }
+
+    #[test]
     fn deferred_api_worktree_remove_rejects_duplicate_in_flight_request() {
         let repo = create_committed_repo("api-worktree-remove-duplicate-repo");
         let checkout = unique_temp_path("api-worktree-remove-duplicate-checkout");
@@ -2363,6 +2575,13 @@ mod tests {
         app.state.ensure_test_terminals();
         let (first_tx, _first_rx) = response_channel();
         let (second_tx, second_rx) = response_channel();
+        // Capture before the first request can start a worker and delete the checkout.
+        let initial_status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&checkout)
+            .args(["status", "--porcelain"])
+            .output()
+            .expect("capture checkout status before removal");
 
         assert!(app.handle_deferred_worktree_api_request(
             Request {
@@ -2392,7 +2611,14 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(2))
             .expect("duplicate request should respond immediately");
         let error: ErrorResponse = serde_json::from_str(&response).unwrap();
-        assert_eq!(error.error.code, "worktree_operation_in_progress");
+        assert_eq!(
+            error.error.code,
+            "worktree_operation_in_progress",
+            "git status --porcelain before first request: status={}, stdout={:?}, stderr={:?}; duplicate response={response}",
+            initial_status.status,
+            String::from_utf8_lossy(&initial_status.stdout),
+            String::from_utf8_lossy(&initial_status.stderr),
+        );
 
         let event = wait_for_app_event(&mut app);
         app.handle_internal_event(event);
