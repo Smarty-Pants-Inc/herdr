@@ -2811,6 +2811,26 @@ command = ["sh", "-c", "printf %s ${{HERDR_PANE_ID-unset}} > '{}'; sleep 1"]
 
     #[test]
     fn running_plugin_command_keeps_its_files_after_app_teardown() {
+        const CHILD_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+        if let Ok(event) = std::env::var("HERDR_PLUGIN_EVENT") {
+            if let Some(address) = event.strip_prefix("lease-test:") {
+                let address = address.parse().expect("plugin lease child socket address");
+                let mut stream = std::net::TcpStream::connect_timeout(&address, CHILD_WAIT)
+                    .expect("plugin lease child connect");
+                stream
+                    .set_read_timeout(Some(CHILD_WAIT))
+                    .expect("plugin lease child read timeout");
+                let mut release = [0_u8; 1];
+                std::io::Read::read_exact(&mut stream, &mut release)
+                    .expect("plugin lease child release marker");
+                assert_eq!(release, [1], "plugin lease child release marker");
+                let payload = std::fs::read("payload").expect("plugin lease child payload");
+                std::fs::write("result", payload).expect("plugin lease child result");
+                return;
+            }
+        }
+
         let base = unique_temp_path("plugin-worker-lease");
         let _config = ConfigHomeGuard {
             _dirs: crate::config::test_config_dirs(&base, &base.join("state")),
@@ -2828,54 +2848,99 @@ command = ["sh", "-c", "printf %s ${{HERDR_PANE_ID-unset}} > '{}'; sleep 1"]
         crate::persist::plugin_registry::update(|entries| *entries = vec![plugin.clone()]).unwrap();
         let mut app = test_app();
         crate::plugin_installations::load(&mut app.plugin_installation_leases).unwrap();
-        let command = if cfg!(windows) {
-            vec![
-                "powershell.exe",
-                "-NoProfile",
-                "-Command",
-                "Set-Content ready ready; $deadline = [DateTime]::UtcNow.AddSeconds(10); while (!(Test-Path release) -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 10 }; Get-Content payload | Set-Content result",
-            ]
-        } else {
-            vec![
-                "sh",
-                "-c",
-                "printf ready > ready; i=0; while [ ! -f release ] && [ $i -lt 500 ]; do sleep 0.02; i=$((i+1)); done; cat payload > result",
-            ]
-        }
-        .into_iter()
-        .map(str::to_string)
-        .collect();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build plugin lease test runtime");
+        let std_listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .expect("bind plugin lease child marker");
+        std_listener
+            .set_nonblocking(true)
+            .expect("set plugin lease marker nonblocking");
+        let address = std_listener
+            .local_addr()
+            .expect("plugin lease marker address");
+        let listener = runtime
+            .block_on(async { tokio::net::TcpListener::from_std(std_listener) })
+            .expect("create plugin lease async marker");
+        // Re-exec the same Rust fixture on every platform, not a shell with
+        // polling sleeps. The connection marks ready; one byte releases it.
+        let command = vec![
+            std::env::current_exe()
+                .expect("plugin lease test executable")
+                .to_string_lossy()
+                .into_owned(),
+            "--exact".to_string(),
+            "app::api::plugins::tests::running_plugin_command_keeps_its_files_after_app_teardown"
+                .to_string(),
+            "--nocapture".to_string(),
+            "--test-threads=1".to_string(),
+        ];
         app.start_plugin_command(
             &plugin,
             None,
-            None,
+            Some(format!("lease-test:{address}")),
             command,
             &app.current_plugin_context("lease-test"),
             None,
         )
-        .unwrap();
-        assert_eq!(
-            read_capture_when_ready(&root.join("ready"), || {}).trim(),
-            "ready"
-        );
+        .expect("start plugin lease child");
+        let mut child_stream = runtime.block_on(async {
+            tokio::time::timeout(CHILD_WAIT, listener.accept())
+                .await
+                .expect("plugin lease child readiness timeout")
+                .expect("plugin lease child readiness accept")
+                .0
+        });
         crate::persist::plugin_registry::update(Vec::clear).unwrap();
+        let mut event_rx = std::mem::replace(&mut app.event_rx, tokio::sync::mpsc::channel(1).1);
         drop(app);
         crate::plugin_installations::cleanup().unwrap();
         assert!(root.exists(), "the worker still owns the old installation");
-        std::fs::write(root.join("release"), "").unwrap();
+        runtime.block_on(async {
+            tokio::time::timeout(
+                CHILD_WAIT,
+                tokio::io::AsyncWriteExt::write_all(&mut child_stream, &[1]),
+            )
+            .await
+            .expect("plugin lease child release timeout")
+            .expect("signal plugin worker release");
+        });
+        runtime.block_on(async {
+            let event = tokio::time::timeout(CHILD_WAIT, event_rx.recv())
+                .await
+                .expect("plugin command completion timeout")
+                .expect("plugin event channel closed before completion");
+            assert!(
+                matches!(
+                    event,
+                    crate::events::AppEvent::PluginCommandFinished {
+                        exit_code: Some(0),
+                        error: None,
+                        ..
+                    }
+                ),
+                "plugin command did not finish successfully: {event:?}"
+            );
+            // The finish event is sent just before the worker's lease drops.
+            // Channel closure proves that scope ended before final cleanup.
+            let closed = tokio::time::timeout(CHILD_WAIT, event_rx.recv())
+                .await
+                .expect("plugin worker event channel closure timeout");
+            assert!(
+                closed.is_none(),
+                "plugin worker event sender remained after completion: {closed:?}"
+            );
+        });
         assert_eq!(
-            read_capture_when_ready(&root.join("result"), || {}).trim(),
+            std::fs::read_to_string(root.join("result")).expect("plugin lease child result"),
             "original"
         );
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while installation.exists() {
-            crate::plugin_installations::cleanup().unwrap();
-            assert!(
-                std::time::Instant::now() < deadline,
-                "finished worker must release its installation"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        crate::plugin_installations::cleanup().unwrap();
+        assert!(
+            !installation.exists(),
+            "finished worker must release its installation"
+        );
         std::fs::remove_dir_all(base).unwrap();
     }
 

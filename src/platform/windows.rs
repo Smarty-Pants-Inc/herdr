@@ -45,6 +45,87 @@ pub(crate) use notifications::{
     show_actionable_desktop_notification, show_desktop_notification,
 };
 
+// This is a hang guard for native control acknowledgments, not a watcher
+// performance target. The normal event path and 60-second safety refresh are
+// unchanged. Creation and each control request get one finite budget.
+const GIT_WATCH_CONTROL_BUDGET: Duration = Duration::from_secs(2);
+static GIT_WATCH_FAILED: LazyLock<Arc<std::sync::atomic::AtomicBool>> =
+    LazyLock::new(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
+
+pub(super) struct NativeGitWatcher {
+    control: super::GitWatchControl,
+}
+
+impl NativeGitWatcher {
+    pub(super) fn new(
+        handler: impl notify::EventHandler,
+        config: notify::Config,
+    ) -> notify::Result<Self> {
+        use notify::Watcher as _;
+
+        let (control, commands) = super::GitWatchControl::channel(
+            Arc::clone(&GIT_WATCH_FAILED),
+            GIT_WATCH_CONTROL_BUDGET,
+        )?;
+        let callbacks_enabled = Arc::clone(&control.callbacks_enabled);
+        let (ready, initialized) = std::sync::mpsc::channel();
+        // One detached owner per watcher, not one thread per operation. Only
+        // this owner calls native creation/watch/unwatch/Drop. notify has its
+        // own backend thread; its unwatch/Drop only enqueue native work.
+        let owner = crate::thread_spawn::spawn_named("herdr-git-watch", move || {
+            let mut watcher = match notify::RecommendedWatcher::new(
+                super::git_watch_event_handler(handler, callbacks_enabled.clone()),
+                config,
+            ) {
+                Ok(watcher) => watcher,
+                Err(err) => {
+                    let _ = ready.send(Err(err));
+                    return;
+                }
+            };
+            if ready.send(Ok(())).is_err() {
+                return;
+            }
+            for request in commands {
+                if !callbacks_enabled.load(AtomicOrdering::Acquire) {
+                    break;
+                }
+                let result = match request.command {
+                    super::GitWatchCommand::Watch(path, mode) => watcher.watch(&path, mode),
+                    super::GitWatchCommand::Unwatch(path) => watcher.unwatch(&path),
+                };
+                // Unwatch success means notify accepted the queued operation,
+                // NOT that native cancellation/handle teardown has completed.
+                if request.reply.send(result).is_err() {
+                    break;
+                }
+            }
+            // Bounded containment, not cancellation: a stalled owner and
+            // notify's native backend/resources may survive until process
+            // exit. Drop on the caller never joins either thread; the failed
+            // latch prevents new attachments from starting replacements.
+        })
+        .map_err(notify::Error::io)?;
+        drop(owner); // Detach: a stuck native call must not delay caller Drop.
+        control.wait(initialized)?;
+        Ok(Self { control })
+    }
+
+    pub(super) fn watch(
+        &mut self,
+        path: &std::path::Path,
+        mode: notify::RecursiveMode,
+    ) -> notify::Result<()> {
+        self.control
+            .request(super::GitWatchCommand::Watch(path.to_path_buf(), mode))
+    }
+
+    pub(super) fn unwatch(&mut self, path: &std::path::Path) -> notify::Result<()> {
+        self.control
+            .request(super::GitWatchCommand::Unwatch(path.to_path_buf()))
+    }
+}
+
 static ALLOW_UNELEVATED_CLIENTS: OnceLock<bool> = OnceLock::new();
 
 pub(crate) fn allow_unelevated_clients() {
@@ -5008,7 +5089,45 @@ mod tests {
 
     #[test]
     fn windows_process_cwd_reads_normalized_child_launch_directory() {
-        use std::path::PathBuf;
+        use std::io::{BufRead as _, BufReader, Write as _};
+        use std::path::{Path, PathBuf};
+        use std::process::Child;
+        use std::sync::mpsc;
+
+        // ponytail: cmd's stdout marker proves the command ran before the short cwd
+        // repoll starts; 60s is only a hang guard, not a shell scheduling deadline.
+        fn wait_for_marker(lines: &mpsc::Receiver<Vec<u8>>, marker: &str) -> bool {
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let prompted = format!(">{marker}");
+            loop {
+                let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                    return false;
+                };
+                match lines.recv_timeout(remaining) {
+                    Ok(line) => {
+                        let line = line.trim_ascii_end();
+                        if line == marker.as_bytes() || line.ends_with(prompted.as_bytes()) {
+                            return true;
+                        }
+                    }
+                    Err(_) => return false,
+                }
+            }
+        }
+        fn abort_marker_wait(
+            mut child: Child,
+            reader: thread::JoinHandle<()>,
+            fixture: &Path,
+            shell: &Path,
+            marker: &str,
+        ) -> ! {
+            let _ = child.kill();
+            let _ = child.wait();
+            drop(child);
+            let _ = reader.join();
+            let _ = fs::remove_dir_all(fixture);
+            panic!("{} never printed {marker} within 60s", shell.display());
+        }
 
         let name = format!("Herdr-Cwd-Case-{}", std::process::id());
         let cwd = std::env::temp_dir().join(&name);
@@ -5024,37 +5143,71 @@ mod tests {
             windows.join("SysWOW64").join("cmd.exe"),
         ];
         let mut observations = Vec::new();
-        for shell in shells {
+        for (shell_index, shell) in shells.into_iter().enumerate() {
             let mut child = Command::new(&shell)
                 .args(["/D", "/Q", "/K"])
                 .current_dir(super::normalize_cwd_for_launch_platform(&launch_cwd))
                 .stdin(Stdio::piped())
-                .stdout(Stdio::null())
+                .stdout(Stdio::piped())
                 .stderr(Stdio::null())
                 .spawn()
                 .expect("spawn cmd");
-            let observe = |expected: &PathBuf| {
+            let stdout = child.stdout.take().expect("cmd stdout");
+            let (lines_tx, lines_rx) = mpsc::channel();
+            let reader = thread::spawn(move || {
+                // cmd's prompt uses the active code page; only the marker is ASCII.
+                let mut stdout = BufReader::new(stdout);
+                loop {
+                    let mut line = Vec::new();
+                    match stdout.read_until(b'\n', &mut line) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {
+                            if lines_tx.send(line).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+            let marker = |stage: &str| {
+                format!(
+                    "HERDR_CWD_DONE_{}_{shell_index}_{stage}",
+                    std::process::id()
+                )
+            };
+            let pid = child.id();
+            let observe = move |expected: &PathBuf| {
                 let deadline = Instant::now() + Duration::from_secs(5);
                 loop {
-                    let observed = super::process_cwd(child.id());
+                    let observed = super::process_cwd(pid);
                     if observed.as_ref() == Some(expected) || Instant::now() >= deadline {
                         break observed;
                     }
                     thread::sleep(Duration::from_millis(20));
                 }
             };
+            let launch_marker = marker("launch");
+            writeln!(child.stdin.as_ref().unwrap(), "echo {launch_marker}\r")
+                .expect("request cmd launch marker");
+            if !wait_for_marker(&lines_rx, &launch_marker) {
+                abort_marker_wait(child, reader, &cwd, &shell, &launch_marker);
+            }
             let initial = observe(&cwd);
-            use std::io::Write;
+            let cd_marker = marker("cd");
             writeln!(
                 child.stdin.as_ref().unwrap(),
-                "cd /d \"{}\"\r",
+                "cd /d \"{}\" & echo {cd_marker}\r",
                 changed.display()
             )
             .expect("change cmd cwd");
+            if !wait_for_marker(&lines_rx, &cd_marker) {
+                abort_marker_wait(child, reader, &cwd, &shell, &cd_marker);
+            }
             let after_cd = observe(&changed);
-            let pane_cwd = super::pane_process_cwd(child.id());
+            let pane_cwd = super::pane_process_cwd(pid);
             let _ = child.kill();
             let _ = child.wait();
+            let _ = reader.join();
             observations.push((shell, initial, after_cd, pane_cwd));
         }
         let _ = fs::remove_dir_all(&cwd);
