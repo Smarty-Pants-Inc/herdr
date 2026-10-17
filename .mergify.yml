@@ -19,6 +19,7 @@ queue_rules:
       title: pr-title
       body: empty
     queue_conditions:
+      - -check-failure = review/security  # a failed security verdict refuses admission, label or not
       - base ~= ^(master|smarty-preview-source)$
       - -draft
       - -label = hold
@@ -35,6 +36,7 @@ queue_rules:
       - check-success = smarty-ci
       - -check-failure = smarty-ci
     merge_conditions:
+      - -check-failure = review/security  # a failed security verdict refuses admission, label or not
       - check-success = smarty-ci
       - -check-failure = smarty-ci
 
