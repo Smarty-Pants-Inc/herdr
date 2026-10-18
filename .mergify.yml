@@ -25,8 +25,10 @@ queue_rules:
       - -label = hold
       - -title ~= (?i)do not land
       - check-success = review/astra
+      # fork-sync labels every upstream sync needs-security-pass, so sync/upstream-* heads are exempt here (R-no-security-slips).
       - or:
           - -label = needs-security-pass
+          - head ~= ^sync/upstream-
           - check-success = review/security
       # Upstream syncs (sync/upstream-*) queue like any PR; review/security runs after merge within 24 h (R-no-security-slips, smarty-dev#2264).
       - check-success = smarty-ci
