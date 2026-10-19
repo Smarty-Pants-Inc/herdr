@@ -7,12 +7,14 @@
 
 use std::sync::Arc;
 
-use crate::protocol::media::MediaPeerState;
+use crate::protocol::media::{
+    MediaApplied, MediaControlFailed, MediaDeviceControl, MediaInfo, MediaLevels, MediaPeerState,
+};
 
 /// Asynchronous results from a peer. The peer calls the sink from its own threads.
 // Only the native peer constructs these; builds without it have none outside tests.
 #[cfg_attr(not(feature = "native-media"), allow(dead_code))]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum PeerEvent {
     /// The complete local SDP offer (ICE gathering finished or timed out).
     Offer { session_id: String, sdp: String },
@@ -23,6 +25,19 @@ pub(crate) enum PeerEvent {
         muted: bool,
         detail: Option<String>,
     },
+    /// A device control reached both capture/encoder and speaker callbacks.
+    Applied(MediaApplied),
+    /// A command failed without rolling back requested privacy policy.
+    ControlFailed(MediaControlFailed),
+    /// Controller-local callback attribution; never part of the wire protocol.
+    Scoped {
+        generation: u64,
+        event: Box<PeerEvent>,
+    },
+    /// Opted-in, throttled peaks measured by the capture and speaker paths.
+    Levels(MediaLevels),
+    /// Build, process and device information for the connected peer.
+    Info(MediaInfo),
     /// The peer ended on its own (device loss, ICE or DTLS failure). It has already released
     /// the microphone and speaker. `code` is one of `protocol::media::close_code`.
     Closed {
@@ -32,22 +47,64 @@ pub(crate) enum PeerEvent {
     },
 }
 
-pub(crate) type PeerEventSink = Arc<dyn Fn(PeerEvent) + Send + Sync>;
+impl PeerEvent {
+    /// Only meter samples may be discarded under client-loop backpressure. A nested scope
+    /// is malformed, not a way to exempt a critical event from reliable admission.
+    pub(crate) fn is_best_effort(&self) -> bool {
+        match self {
+            Self::Levels(_) => true,
+            Self::Scoped { event, .. } => matches!(event.as_ref(), Self::Levels(_)),
+            _ => false,
+        }
+    }
+}
 
-/// One live media session. Every method returns promptly; failures arrive as events.
+pub(crate) type PeerEventFuture = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<(), PeerEventSinkError>> + Send + 'static>,
+>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PeerEventSinkError {
+    ConsumerClosed,
+}
+
+/// A critical event succeeds only once admitted to the client-loop queue. Levels may drop.
+pub(crate) type PeerEventSink = Arc<dyn Fn(PeerEvent) -> PeerEventFuture + Send + Sync>;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct PeerInitialState {
+    pub(crate) input_muted: bool,
+    pub(crate) output_suppressed: bool,
+}
+
+// Only the optional native peer rejects admission in production; default builds still
+// implement and handle this same seam so unsupported builds cannot silently lose commands.
+#[cfg_attr(not(feature = "native-media"), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PeerCommandError {
+    Full,
+    Closed,
+}
+
+/// One live media session. Methods return promptly with an admission receipt, not an audio
+/// acknowledgement; admitted operations report their observed outcomes asynchronously.
 pub(crate) trait MediaPeer: Send {
     /// Apply the remote SDP answer.
-    fn apply_answer(&mut self, sdp: String);
+    fn apply_answer(&mut self, sdp: String) -> Result<(), PeerCommandError>;
     /// Mute or unmute the local microphone. The peer confirms with a `State` event.
-    fn set_muted(&mut self, muted: bool);
+    fn set_muted(&mut self, muted: bool) -> Result<(), PeerCommandError>;
+    /// Queue device changes in arrival order. Confirm each with `Applied` only after the
+    /// audio paths observe it; a later control must not overwrite an unconfirmed one.
+    fn apply_control(&mut self, control: MediaDeviceControl) -> Result<(), PeerCommandError>;
     /// Stop media and release the microphone and speaker. Idempotent. Dropping a peer
     /// must have the same effect.
     fn close(&mut self);
 }
 
 /// Starts a peer for one session. It returns at once; the offer arrives as `PeerEvent::Offer`.
-pub(crate) type PeerFactory =
-    Box<dyn Fn(String, PeerEventSink) -> Result<Box<dyn MediaPeer>, String> + Send>;
+pub(crate) type PeerFactory = Box<
+    dyn Fn(String, PeerInitialState, PeerEventSink) -> Result<Box<dyn MediaPeer>, String> + Send,
+>;
 
 /// Whether this build contains a real media peer.
 /// Only macOS has a native audio backend; other feature builds compile the peer for tests
@@ -68,13 +125,14 @@ pub(crate) fn advertised_capabilities() -> Vec<String> {
 pub(crate) fn native_peer_factory() -> PeerFactory {
     #[cfg(feature = "native-media")]
     {
-        Box::new(|session_id, sink| {
-            super::native::start(session_id, sink).map(|peer| Box::new(peer) as Box<dyn MediaPeer>)
+        Box::new(|session_id, initial, sink| {
+            super::native::start(session_id, initial, sink)
+                .map(|peer| Box::new(peer) as Box<dyn MediaPeer>)
         })
     }
     #[cfg(not(feature = "native-media"))]
     {
-        Box::new(|_, _| Err("this Herdr client was built without native media".to_owned()))
+        Box::new(|_, _, _| Err("this Herdr client was built without native media".to_owned()))
     }
 }
 
