@@ -5,7 +5,7 @@
 //! headless server feeds it client, input and API events and performs the returned actions.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
 use crate::api::schema::{
@@ -20,6 +20,8 @@ use crate::protocol::media::{
 /// How long `pane.media_open` waits for the client's offer. It covers the one-time consent
 /// prompt (30 s on the client) plus ICE gathering.
 pub(crate) const MEDIA_OPEN_TIMEOUT: Duration = Duration::from_secs(45);
+/// How long an offered session waits for the remote SDP answer.
+pub(crate) const MEDIA_ANSWER_TIMEOUT: Duration = Duration::from_secs(20);
 /// How long a closed session's final state stays readable through `media.state`.
 const CLOSED_SESSION_RETENTION: Duration = Duration::from_secs(5 * 60);
 const MAX_CLOSED_SESSIONS: usize = 32;
@@ -44,6 +46,8 @@ pub(crate) enum MediaAction {
     Respond {
         respond_to: Sender<String>,
         response: String,
+        /// The live session whose API response is being delivered, if any.
+        session_id: Option<String>,
     },
 }
 
@@ -78,6 +82,8 @@ struct PendingOpen {
 struct MediaSession {
     client_id: u64,
     pane: PaneId,
+    open_id: Option<String>,
+    epoch: u64,
     /// The pane id as its client knows it, so a renewal can reopen for that client (smarty-voice#133).
     pane_ref: String,
     /// A handover (smarty-voice#133): the sessions this one replaces once its client accepts it (its offer). Until
@@ -88,12 +94,15 @@ struct MediaSession {
     wants_muted: bool,
     state: MediaSessionState,
     muted: bool,
+    offered_deadline: Option<Instant>,
+    response_write_complete: Option<Receiver<()>>,
     pending: Option<PendingOpen>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MediaSessionView {
     pub(crate) session_id: String,
+    pub(crate) epoch: u64,
     pub(crate) state: MediaSessionState,
     pub(crate) muted: bool,
     pub(crate) code: Option<String>,
@@ -126,6 +135,7 @@ pub(crate) struct MediaBroker {
     /// this owner, so it cannot reroute a pane's microphone to an older client.
     pane_owners: HashMap<PaneId, PaneOwner>,
     next_owner_cleanup: Option<Instant>,
+    pane_epochs: HashMap<PaneId, u64>,
     sessions: HashMap<String, MediaSession>,
     closed: VecDeque<ClosedSession>,
     id_prefix: String,
@@ -164,6 +174,12 @@ fn sanitize_user(user: &str) -> Option<String> {
     (!name.is_empty()).then(|| name.to_owned())
 }
 
+fn valid_open_id(open_id: &str) -> bool {
+    !open_id.is_empty()
+        && open_id.len() <= 128
+        && open_id.bytes().all(|byte| (0x20..=0x7e).contains(&byte))
+}
+
 impl MediaBroker {
     pub(crate) fn new() -> Self {
         // Session ids only need to be unique for this server's lifetime; the boot stamp keeps
@@ -176,6 +192,7 @@ impl MediaBroker {
             clients: HashMap::new(),
             pane_owners: HashMap::new(),
             next_owner_cleanup: None,
+            pane_epochs: HashMap::new(),
             sessions: HashMap::new(),
             closed: VecDeque::new(),
             id_prefix: format!("media_{boot:x}_"),
@@ -299,10 +316,42 @@ impl MediaBroker {
         request_id: String,
         respond_to: Sender<String>,
         pane: PaneId,
+        open_id: Option<String>,
+        response_write_complete: Option<Receiver<()>>,
         views: impl Fn(u64) -> bool,
         now: Instant,
     ) -> Vec<MediaAction> {
         let mut actions = Vec::new();
+        if let Some(open_id) = open_id.as_deref() {
+            if !valid_open_id(open_id) {
+                actions.push(MediaAction::Respond {
+                    respond_to,
+                    response: error_response(
+                        request_id,
+                        "invalid_params",
+                        "open_id must be non-empty printable ASCII of at most 128 bytes",
+                    ),
+                    session_id: None,
+                });
+                return actions;
+            }
+            if self
+                .sessions
+                .values()
+                .any(|session| session.open_id.as_deref() == Some(open_id))
+            {
+                actions.push(MediaAction::Respond {
+                    respond_to,
+                    response: error_response(
+                        request_id,
+                        "invalid_params",
+                        "open_id is already in use by a live media session",
+                    ),
+                    session_id: None,
+                });
+                return actions;
+            }
+        }
         let fresh = self
             .pane_owners
             .get(&pane)
@@ -345,6 +394,7 @@ impl MediaBroker {
                     error_code::NO_CLIENT,
                     "no attached Herdr client typed into this pane in the last 10 seconds",
                 ),
+                session_id: None,
             });
             return actions;
         };
@@ -358,6 +408,7 @@ impl MediaBroker {
                     error_code::UNSUPPORTED_CLIENT,
                     "the Herdr client that typed into this pane has no native media support",
                 ),
+                session_id: None,
             });
             return actions;
         }
@@ -372,6 +423,7 @@ impl MediaBroker {
                         close_code::NOT_VIEWED
                     ),
                 ),
+                session_id: None,
             });
             return actions;
         }
@@ -408,16 +460,23 @@ impl MediaBroker {
         });
         let session_id = format!("{}{}", self.id_prefix, self.next_id);
         self.next_id += 1;
+        let epoch = self.pane_epochs.entry(pane).or_default();
+        *epoch = epoch.saturating_add(1);
+        let epoch = *epoch;
         self.sessions.insert(
             session_id.clone(),
             MediaSession {
                 client_id,
                 pane,
+                open_id,
+                epoch,
                 pane_ref: input.pane_ref.clone(),
                 replaces,
                 wants_muted: inherited_mute,
                 state: MediaSessionState::Opening,
                 muted: inherited_mute,
+                offered_deadline: None,
+                response_write_complete,
                 pending: Some(PendingOpen {
                     request_id,
                     respond_to,
@@ -466,8 +525,11 @@ impl MediaBroker {
                     return actions;
                 };
                 session.state = MediaSessionState::Offered;
+                session.offered_deadline = Some(now + MEDIA_ANSWER_TIMEOUT);
+                let epoch = session.epoch;
+                let replaces = std::mem::take(&mut session.replaces);
                 // The client accepted a handover: only now is the call it renews replaced.
-                for id in std::mem::take(&mut session.replaces) {
+                for id in replaces {
                     self.finish(
                         &id,
                         close_code::REPLACED,
@@ -481,8 +543,13 @@ impl MediaBroker {
                     respond_to: pending.respond_to,
                     response: success_response(
                         pending.request_id,
-                        ResponseResult::MediaOffer { session_id, sdp },
+                        ResponseResult::MediaOffer {
+                            session_id: session_id.clone(),
+                            sdp,
+                            epoch,
+                        },
                     ),
+                    session_id: Some(session_id.clone()),
                 });
             }
             MediaControl::State(update) => {
@@ -521,6 +588,7 @@ impl MediaBroker {
         }
         if session.state == MediaSessionState::Offered {
             session.state = MediaSessionState::Connecting;
+            session.offered_deadline = None;
         }
         Ok(vec![MediaAction::Send {
             client_id: session.client_id,
@@ -572,6 +640,7 @@ impl MediaBroker {
         if let Some(session) = self.sessions.get(session_id) {
             return Some(MediaSessionView {
                 session_id: session_id.to_owned(),
+                epoch: session.epoch,
                 state: session.state,
                 muted: session.muted,
                 code: None,
@@ -614,6 +683,44 @@ impl MediaBroker {
         actions
     }
 
+    pub(crate) fn close_by_open_id(
+        &mut self,
+        open_id: &str,
+        now: Instant,
+    ) -> Result<Vec<MediaAction>, (&'static str, String)> {
+        if !valid_open_id(open_id) {
+            return Err((
+                "invalid_params",
+                "open_id must be non-empty printable ASCII of at most 128 bytes".to_owned(),
+            ));
+        }
+        let Some(session_id) = self.sessions.iter().find_map(|(session_id, session)| {
+            (session.open_id.as_deref() == Some(open_id)).then(|| session_id.clone())
+        }) else {
+            return Ok(Vec::new());
+        };
+        Ok(self.close(&session_id, now))
+    }
+
+    /// The API response could not be delivered to the caller. Retire the session immediately
+    /// and tell the client to release any microphone it opened for the offer.
+    pub(crate) fn response_delivery_failed(
+        &mut self,
+        session_id: &str,
+        now: Instant,
+    ) -> Vec<MediaAction> {
+        let mut actions = Vec::new();
+        self.finish(
+            session_id,
+            close_code::ABANDONED,
+            "the API caller disconnected before the media offer was delivered",
+            true,
+            now,
+            &mut actions,
+        );
+        actions
+    }
+
     /// Time out slow offers, end sessions whose pane closed and drop old closed sessions.
     pub(crate) fn expire(
         &mut self,
@@ -624,6 +731,33 @@ impl MediaBroker {
         if self.sessions.is_empty() && self.closed.is_empty() {
             return actions;
         }
+        let abandoned = self
+            .sessions
+            .iter_mut()
+            .filter_map(|(id, session)| {
+                let Some(delivery) = session.response_write_complete.as_ref() else {
+                    return None;
+                };
+                match delivery.try_recv() {
+                    Ok(()) => Some(id.clone()),
+                    Err(TryRecvError::Disconnected) => {
+                        session.response_write_complete = None;
+                        None
+                    }
+                    Err(TryRecvError::Empty) => None,
+                }
+            })
+            .collect::<Vec<_>>();
+        for id in abandoned {
+            self.finish(
+                &id,
+                close_code::ABANDONED,
+                "the API caller disconnected before the media offer was delivered",
+                true,
+                now,
+                &mut actions,
+            );
+        }
         let timed_out = self
             .sessions
             .iter()
@@ -632,18 +766,26 @@ impl MediaBroker {
                     .pending
                     .as_ref()
                     .is_some_and(|pending| now >= pending.deadline)
+                    || session
+                        .offered_deadline
+                        .is_some_and(|deadline| now >= deadline)
             })
             .map(|(id, _)| id.clone())
             .collect::<Vec<_>>();
         for id in timed_out {
-            self.finish(
-                &id,
-                close_code::TIMEOUT,
-                "the client did not send an offer in time",
-                true,
-                now,
-                &mut actions,
-            );
+            let code = self
+                .sessions
+                .get(&id)
+                .and_then(|session| session.offered_deadline)
+                .filter(|deadline| now >= *deadline)
+                .map(|_| close_code::UNANSWERED)
+                .unwrap_or(close_code::TIMEOUT);
+            let message = if code == close_code::UNANSWERED {
+                "the remote peer did not answer the media offer in time"
+            } else {
+                "the client did not send an offer in time"
+            };
+            self.finish(&id, code, message, true, now, &mut actions);
         }
         let orphaned = self
             .sessions
@@ -740,12 +882,14 @@ impl MediaBroker {
             actions.push(MediaAction::Respond {
                 respond_to: pending.respond_to,
                 response: error_response(pending.request_id, error, text),
+                session_id: Some(session_id.to_owned()),
             });
         }
         self.closed.push_back(ClosedSession {
             closed_at: now,
             view: MediaSessionView {
                 session_id: session_id.to_owned(),
+                epoch: session.epoch,
                 state: MediaSessionState::Closed,
                 muted: session.muted,
                 code: Some(code.to_owned()),
@@ -781,6 +925,7 @@ mod tests {
                 MediaAction::Respond {
                     respond_to,
                     response,
+                    ..
                 } => {
                     let _ = respond_to.send(response);
                     None
@@ -789,14 +934,31 @@ mod tests {
             .collect()
     }
 
+    fn open_with_id(
+        broker: &mut MediaBroker,
+        pane_id: PaneId,
+        open_id: Option<&str>,
+        now: Instant,
+    ) -> (Vec<(u64, MediaControl)>, mpsc::Receiver<String>) {
+        let (tx, rx) = mpsc::channel();
+        let sent = run(broker.open(
+            "req".into(),
+            tx,
+            pane_id,
+            open_id.map(str::to_owned),
+            None,
+            |_| true,
+            now,
+        ));
+        (sent, rx)
+    }
+
     fn open(
         broker: &mut MediaBroker,
         pane_id: PaneId,
         now: Instant,
     ) -> (Vec<(u64, MediaControl)>, mpsc::Receiver<String>) {
-        let (tx, rx) = mpsc::channel();
-        let sent = run(broker.open("req".into(), tx, pane_id, |_| true, now));
-        (sent, rx)
+        open_with_id(broker, pane_id, None, now)
     }
 
     fn opened_session(sent: &[(u64, MediaControl)]) -> (u64, String, String) {
@@ -1025,7 +1187,15 @@ mod tests {
         broker.client_connected(1, true);
         broker.note_pane_input(1, pane(7), "w1:p7", now);
         let (tx, rx) = mpsc::channel();
-        let sent = run(broker.open("req".into(), tx, pane(7), |_| false, now));
+        let sent = run(broker.open(
+            "req".into(),
+            tx,
+            pane(7),
+            None,
+            None,
+            |_| false,
+            now,
+        ));
         assert!(sent.is_empty());
         let body = response(&rx);
         assert_eq!(body["error"]["code"], error_code::REFUSED);
@@ -1112,6 +1282,206 @@ mod tests {
         ));
         // Closing again is a no-op.
         assert!(run(broker.close(&session_id, now)).is_empty());
+    }
+
+    #[test]
+    fn open_id_cancels_a_pending_session_and_answers_the_caller() {
+        let now = Instant::now();
+        let mut broker = MediaBroker::new();
+        broker.client_connected(1, true);
+        broker.note_pane_input(1, pane(7), "p_7", now);
+        let (sent, rx) = open_with_id(&mut broker, pane(7), Some("voice-1"), now);
+        let (_, session_id, _) = opened_session(&sent);
+
+        let sent = run(broker.close_by_open_id("voice-1", now).unwrap());
+        assert!(matches!(&sent[..], [(1, MediaControl::Close(close))]
+            if close.session_id == session_id && close.code.as_deref() == Some(close_code::CLOSED)));
+        let refused = response(&rx);
+        assert_eq!(refused["error"]["code"], error_code::REFUSED);
+        assert!(refused["error"]["message"].as_str().unwrap().starts_with("closed:"));
+        assert_eq!(broker.state(&session_id).unwrap().code.as_deref(), Some(close_code::CLOSED));
+    }
+
+    #[test]
+    fn duplicate_live_open_id_is_rejected_without_replacing_the_first_session() {
+        let now = Instant::now();
+        let mut broker = MediaBroker::new();
+        broker.client_connected(1, true);
+        broker.note_pane_input(1, pane(7), "p_7", now);
+        let (sent, _first_rx) = open_with_id(&mut broker, pane(7), Some("voice-1"), now);
+        let (_, first, _) = opened_session(&sent);
+
+        let (sent, second_rx) = open_with_id(&mut broker, pane(7), Some("voice-1"), now);
+        assert!(sent.is_empty());
+        assert_eq!(response(&second_rx)["error"]["code"], "invalid_params");
+        assert!(broker.state(&first).is_some(), "the original live session remains");
+    }
+
+    #[test]
+    fn open_id_can_close_after_offer_and_while_connected() {
+        let now = Instant::now();
+        let mut broker = MediaBroker::new();
+        broker.client_connected(1, true);
+        broker.note_pane_input(1, pane(7), "p_7", now);
+        let (sent, rx) = open_with_id(&mut broker, pane(7), Some("offered"), now);
+        let (_, offered, _) = opened_session(&sent);
+        run(broker.client_control(
+            1,
+            MediaControl::Offer(MediaSdp {
+                session_id: offered.clone(),
+                sdp: "v=0 offer".into(),
+            }),
+            now,
+        ));
+        assert_eq!(response(&rx)["result"]["epoch"], 1);
+        let sent = run(broker.close_by_open_id("offered", now).unwrap());
+        assert!(matches!(&sent[..], [(1, MediaControl::Close(close))]
+            if close.session_id == offered && close.code.as_deref() == Some(close_code::CLOSED)));
+
+        let connected = open_with_id(&mut broker, pane(7), Some("connected"), now);
+        let (sent, _rx) = connected;
+        let (_, connected, _) = opened_session(&sent);
+        run(broker.client_control(
+            1,
+            MediaControl::Offer(MediaSdp {
+                session_id: connected.clone(),
+                sdp: "v=0 offer".into(),
+            }),
+            now,
+        ));
+        run(broker.answer(&connected, "v=0 answer".into()).unwrap());
+        run(broker.client_control(
+            1,
+            MediaControl::State(MediaStateUpdate {
+                session_id: connected.clone(),
+                state: MediaPeerState::Connected,
+                muted: false,
+                detail: None,
+            }),
+            now,
+        ));
+        let sent = run(broker.close_by_open_id("connected", now).unwrap());
+        assert!(matches!(&sent[..], [(1, MediaControl::Close(close))]
+            if close.session_id == connected && close.code.as_deref() == Some(close_code::CLOSED)));
+    }
+
+    #[test]
+    fn abandoned_offer_closes_the_client_session() {
+        let now = Instant::now();
+        let mut broker = MediaBroker::new();
+        broker.client_connected(1, true);
+        broker.note_pane_input(1, pane(7), "p_7", now);
+        let (delivery_tx, delivery_rx) = mpsc::channel();
+        let (tx, rx) = mpsc::channel();
+        let sent = run(broker.open(
+            "req".into(),
+            tx,
+            pane(7),
+            Some("abandoned".into()),
+            Some(delivery_rx),
+            |_| true,
+            now,
+        ));
+        let (_, session_id, _) = opened_session(&sent);
+        // This mirrors the API socket detecting that its waiting caller disconnected.
+        drop(rx);
+        delivery_tx.send(()).unwrap();
+        let sent = run(broker.expire(now, |_| true));
+        assert!(sent.iter().any(|(client, control)| *client == 1
+            && matches!(control, MediaControl::Close(close)
+                if close.session_id == session_id && close.code.as_deref() == Some(close_code::ABANDONED))));
+        assert_eq!(broker.state(&session_id).unwrap().code.as_deref(), Some(close_code::ABANDONED));
+    }
+
+    #[test]
+    fn failed_offer_response_sender_abandons_the_offered_session() {
+        let now = Instant::now();
+        let mut broker = MediaBroker::new();
+        broker.client_connected(1, true);
+        broker.note_pane_input(1, pane(7), "p_7", now);
+        let (sent, rx) = open_with_id(&mut broker, pane(7), Some("sender-failed"), now);
+        let (_, session_id, _) = opened_session(&sent);
+        drop(rx);
+        let actions = broker.client_control(
+            1,
+            MediaControl::Offer(MediaSdp {
+                session_id: session_id.clone(),
+                sdp: "v=0 offer".into(),
+            }),
+            now,
+        );
+        assert!(actions.iter().any(|action| matches!(action, MediaAction::Respond { .. })));
+        let sent = run(broker.response_delivery_failed(&session_id, now));
+        assert!(matches!(&sent[..], [(1, MediaControl::Close(close))]
+            if close.session_id == session_id && close.code.as_deref() == Some(close_code::ABANDONED)));
+        assert_eq!(broker.state(&session_id).unwrap().code.as_deref(), Some(close_code::ABANDONED));
+    }
+
+    #[test]
+    fn unanswered_offer_expires_with_a_distinct_close_code() {
+        let now = Instant::now();
+        let mut broker = MediaBroker::new();
+        broker.client_connected(1, true);
+        broker.note_pane_input(1, pane(7), "p_7", now);
+        let (sent, rx) = open_with_id(&mut broker, pane(7), Some("unanswered"), now);
+        let (_, session_id, _) = opened_session(&sent);
+        run(broker.client_control(
+            1,
+            MediaControl::Offer(MediaSdp {
+                session_id: session_id.clone(),
+                sdp: "v=0 offer".into(),
+            }),
+            now,
+        ));
+        let _ = response(&rx);
+        let sent = run(broker.expire(now + MEDIA_ANSWER_TIMEOUT, |_| true));
+        assert!(matches!(&sent[..], [(1, MediaControl::Close(close))]
+            if close.session_id == session_id && close.code.as_deref() == Some(close_code::UNANSWERED)));
+        assert_eq!(broker.state(&session_id).unwrap().code.as_deref(), Some(close_code::UNANSWERED));
+    }
+
+    #[test]
+    fn cancelling_a_renewal_source_cancels_its_pending_successor() {
+        let now = Instant::now();
+        let mut broker = MediaBroker::new();
+        broker.client_connected(1, true);
+        let old = {
+            broker.note_pane_input(1, pane(7), "p_7", now);
+            let (sent, _rx) = open_with_id(&mut broker, pane(7), Some("old"), now);
+            let (_, old, _) = opened_session(&sent);
+            run(broker.client_control(
+                1,
+                MediaControl::Offer(MediaSdp {
+                    session_id: old.clone(),
+                    sdp: "v=0 old".into(),
+                }),
+                now,
+            ));
+            run(broker.answer(&old, "v=0 answer".into()).unwrap());
+            run(broker.client_control(
+                1,
+                MediaControl::State(MediaStateUpdate {
+                    session_id: old.clone(),
+                    state: MediaPeerState::Connected,
+                    muted: false,
+                    detail: None,
+                }),
+                now,
+            ));
+            old
+        };
+        let later = now + MEDIA_INPUT_WINDOW + Duration::from_secs(60);
+        let (sent, _rx) = open_with_id(&mut broker, pane(7), Some("successor"), later);
+        let (_, successor, _) = opened_session(&sent);
+        assert_eq!(broker.state(&old).unwrap().state, MediaSessionState::Connected);
+        let sent = run(broker.close_by_open_id("old", later).unwrap());
+        assert!(sent.iter().any(|(client, control)| *client == 1
+            && matches!(control, MediaControl::Close(close)
+                if close.session_id == old && close.code.as_deref() == Some(close_code::CLOSED))));
+        assert!(sent.iter().any(|(client, control)| *client == 1
+            && matches!(control, MediaControl::Close(close)
+                if close.session_id == successor && close.code.as_deref() == Some(close_code::CLOSED))));
+        assert_eq!(broker.state(&successor).unwrap().code.as_deref(), Some(close_code::CLOSED));
     }
 
     #[test]
@@ -1335,7 +1705,15 @@ mod tests {
         let old = live_call(&mut broker, 1, pane(7), now);
         let later = now + MEDIA_INPUT_WINDOW + Duration::from_secs(60);
         let (tx, rx) = mpsc::channel();
-        let sent = run(broker.open("req".into(), tx, pane(7), |_| false, later));
+        let sent = run(broker.open(
+            "req".into(),
+            tx,
+            pane(7),
+            None,
+            None,
+            |_| false,
+            later,
+        ));
         assert!(sent
             .iter()
             .all(|(_, control)| !matches!(control, MediaControl::Open(_))));

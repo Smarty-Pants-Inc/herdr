@@ -1,11 +1,26 @@
 use serde::{Deserialize, Serialize};
 
-// Client-local media sessions (see `crate::protocol::media`). `pane.media_open` takes a
-// `PaneTarget`; the other methods address one session.
+// Client-local media sessions (see `crate::protocol::media`). `pane.media_open` accepts
+// an optional caller handle; the other methods address one session.
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct MediaOpenParams {
+    pub pane_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_id: Option<String>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MediaSessionTarget {
     pub session_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct MediaCloseParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

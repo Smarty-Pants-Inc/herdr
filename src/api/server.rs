@@ -748,6 +748,67 @@ fn handle_connection_with_stop(
             }
             result
         }
+        Method::PaneMediaOpen(params) => {
+            let changes_ui = request_changes_ui(&Request {
+                id: request_id.clone(),
+                method: Method::PaneMediaOpen(params.clone()),
+            });
+            let (response_write_tx, response_write_rx) = std::sync::mpsc::channel();
+            let response = if server_stop.is_some_and(ServerStop::is_requested) {
+                Some(error_response_json(
+                    request_id.clone(),
+                    "server_unavailable",
+                    "server is shutting down".to_owned(),
+                ))
+            } else {
+                dispatch_media_open(
+                    Request {
+                        id: request_id.clone(),
+                        method: Method::PaneMediaOpen(params),
+                    },
+                    context,
+                    api_tx,
+                    response_write_rx,
+                    &mut stream,
+                    &response_write_tx,
+                )?
+            };
+            let Some(response) = response else {
+                return Ok(());
+            };
+            let result = write_text_line(&mut stream, &response);
+            if result.is_err() {
+                let _ = response_write_tx.send(());
+            }
+            drop(response_write_tx);
+            match &result {
+                Ok(()) => crate::logging::api_request_completed(
+                    &request_id,
+                    method,
+                    api_response_outcome(&response),
+                    changes_ui,
+                ),
+                Err(err) if is_connection_closed_error(err) => {
+                    crate::logging::api_request_completed(
+                        &request_id,
+                        method,
+                        "client_disconnected",
+                        changes_ui,
+                    );
+                }
+                Err(err) => {
+                    crate::logging::api_request_failed(&request_id, method, &err.to_string())
+                }
+            }
+            if result
+                .as_ref()
+                .is_err_and(|err| is_connection_closed_error(err))
+            {
+                Ok(())
+            } else {
+                result
+            }
+        }
         method_body => {
             let (response_write_tx, response_write_rx) = std::sync::mpsc::channel();
             let stop_caller = matches!(method_body, Method::ServerStop(_))
@@ -1484,6 +1545,50 @@ pub(super) fn should_stop_connection(
     }
 
     local_stream_peer_closed(stream)
+}
+
+fn dispatch_media_open(
+    request: Request,
+    context: ApiRequestContext,
+    api_tx: &ApiRequestSender,
+    response_write_complete: std::sync::mpsc::Receiver<()>,
+    stream: &mut LocalStream,
+    response_write_tx: &std::sync::mpsc::Sender<()>,
+) -> io::Result<Option<String>> {
+    let request_id = request.id.clone();
+    let (respond_to, response_rx) = std::sync::mpsc::channel();
+    if let Err(err) = api_tx.send(ApiRequestMessage {
+        request,
+        context,
+        peer_pidfd: None,
+        respond_to,
+        response_write_complete: Some(response_write_complete),
+    }) {
+        return Ok(Some(error_response_json(
+            request_id,
+            "server_unavailable",
+            format!("failed to dispatch request: {err}"),
+        )));
+    }
+
+    loop {
+        match response_rx.recv_timeout(CONNECTION_POLL_INTERVAL) {
+            Ok(response) => return Ok(Some(response)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if local_stream_peer_closed(stream)? {
+                    let _ = response_write_tx.send(());
+                    return Ok(None);
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Ok(Some(error_response_json(
+                    request_id,
+                    "server_unavailable",
+                    "app response channel closed".to_owned(),
+                )));
+            }
+        }
+    }
 }
 
 pub(super) fn dispatch_to_app_with_timeout(

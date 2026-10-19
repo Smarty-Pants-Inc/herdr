@@ -47,6 +47,20 @@ fn media_open_sent(
     None
 }
 
+fn media_close_sent(
+    control: &std::sync::mpsc::Receiver<Vec<u8>>,
+    wait: Duration,
+) -> Option<crate::protocol::media::MediaClose> {
+    while let Ok(bytes) = control.recv_timeout(wait) {
+        if let ServerMessage::EndpointControl { kind, data } = read_server_message(bytes) {
+            if let Some(Ok(MediaControl::Close(close))) = MediaControl::decode(&kind, &data) {
+                return Some(close);
+            }
+        }
+    }
+    None
+}
+
 fn media_api(
     server: &mut HeadlessServer,
     method: api::schema::Method,
@@ -96,8 +110,9 @@ async fn pane_media_open_binds_to_the_client_that_typed_last() {
     let capable = connect_media_shell(&mut server, 31, true);
     let legacy = connect_media_shell(&mut server, 32, false);
     let pane_open = |pane_id: &str| {
-        api::schema::Method::PaneMediaOpen(api::schema::PaneTarget {
+        api::schema::Method::PaneMediaOpen(api::schema::MediaOpenParams {
             pane_id: pane_id.to_owned(),
+            open_id: None,
         })
     };
 
@@ -146,5 +161,55 @@ async fn pane_media_open_binds_to_the_client_that_typed_last() {
 
     let rx = media_api(&mut server, pane_open("w_missing:p9"));
     assert_eq!(json(&rx)["error"]["code"], "pane_not_found");
+    shutdown_test_runtimes(&mut server);
+}
+
+#[tokio::test]
+async fn media_open_can_be_cancelled_by_open_id_before_the_offer() {
+    let mut server = test_headless_server();
+    let mut workspace = crate::workspace::Workspace::test_new("media-cancel");
+    let pane = workspace.tabs[0].root_pane;
+    let (runtime, _input) =
+        crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(80, 24, 0, b"", 4);
+    workspace.insert_test_runtime(pane, runtime);
+    server.app.state.workspaces = vec![workspace];
+    server.app.state.active = Some(0);
+    server.app.state.selected = 0;
+    server.app.state.mode = crate::app::Mode::Terminal;
+    let pane_id = server.app.public_pane_id(0, pane).unwrap();
+
+    let capable = connect_media_shell(&mut server, 41, true);
+    type_into(&mut server, 41, &pane_id);
+    let (open_response_tx, open_response_rx) = std::sync::mpsc::channel();
+    server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+        peer_pidfd: None,
+        context: crate::api::ApiRequestContext::default(),
+        request: api::schema::Request {
+            id: "open".into(),
+            method: api::schema::Method::PaneMediaOpen(api::schema::MediaOpenParams {
+                pane_id: pane_id.clone(),
+                open_id: Some("voice-cancel".into()),
+            }),
+        },
+        respond_to: open_response_tx,
+        response_write_complete: None,
+    });
+    let open = media_open_sent(&capable, Duration::from_secs(5)).expect("media.open sent");
+    assert!(open_response_rx.try_recv().is_err());
+
+    let close = media_api(
+        &mut server,
+        api::schema::Method::MediaClose(api::schema::MediaCloseParams {
+            session_id: None,
+            open_id: Some("voice-cancel".into()),
+        }),
+    );
+    assert_eq!(json(&close)["result"]["type"], "ok");
+    let refused = json(&open_response_rx);
+    assert_eq!(refused["error"]["code"], "media_refused");
+    assert_eq!(refused["error"]["message"], "closed: the caller ended the session");
+    let closed = media_close_sent(&capable, Duration::from_secs(5)).expect("media.close sent");
+    assert_eq!(closed.session_id, open.session_id);
+    assert_eq!(closed.code.as_deref(), Some("closed"));
     shutdown_test_runtimes(&mut server);
 }

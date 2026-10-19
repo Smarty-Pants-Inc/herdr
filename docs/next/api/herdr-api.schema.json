@@ -2594,6 +2594,23 @@
           ],
           "type": "object"
         },
+        "MediaCloseParams": {
+          "properties": {
+            "open_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "session_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "type": "object"
+        },
         "MediaMuteParams": {
           "properties": {
             "muted": {
@@ -2606,6 +2623,23 @@
           "required": [
             "session_id",
             "muted"
+          ],
+          "type": "object"
+        },
+        "MediaOpenParams": {
+          "properties": {
+            "open_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "pane_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pane_id"
           ],
           "type": "object"
         },
@@ -7442,7 +7476,7 @@
               "type": "string"
             },
             "params": {
-              "$ref": "#/schemas/request/$defs/PaneTarget"
+              "$ref": "#/schemas/request/$defs/MediaOpenParams"
             }
           },
           "required": [
@@ -7506,7 +7540,7 @@
               "type": "string"
             },
             "params": {
-              "$ref": "#/schemas/request/$defs/MediaSessionTarget"
+              "$ref": "#/schemas/request/$defs/MediaCloseParams"
             }
           },
           "required": [
@@ -11800,6 +11834,11 @@
             },
             {
               "properties": {
+                "epoch": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
                 "sdp": {
                   "type": "string"
                 },
@@ -11814,7 +11853,8 @@
               "required": [
                 "type",
                 "session_id",
-                "sdp"
+                "sdp",
+                "epoch"
               ],
               "type": "object"
             },

@@ -286,6 +286,7 @@ pub enum ResponseResult {
     MediaOffer {
         session_id: String,
         sdp: String,
+        epoch: u64,
     },
     MediaSession {
         session_id: String,
