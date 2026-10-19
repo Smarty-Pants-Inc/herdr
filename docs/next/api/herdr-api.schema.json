@@ -2594,6 +2594,49 @@
           ],
           "type": "object"
         },
+        "MediaCloseParams": {
+          "description": "Select exactly one `session_id` or caller-selected `open_id` to close.\n\nClosing an unknown `open_id` is idempotent and records a cancellation tombstone for up to\n120 seconds. At most 256 unknown-id tombstones are retained; the media `expire` pass prunes\nelapsed ones. A later open with that id is refused rather than creating a client session.",
+          "oneOf": [
+            {
+              "properties": {
+                "session_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "session_id"
+              ]
+            },
+            {
+              "properties": {
+                "open_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "open_id"
+              ]
+            }
+          ],
+          "properties": {
+            "open_id": {
+              "maxLength": 128,
+              "minLength": 1,
+              "pattern": "^[\\x20-\\x7E]+(?![\\s\\S])",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "session_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "type": "object"
+        },
         "MediaMuteParams": {
           "properties": {
             "muted": {
@@ -2606,6 +2649,26 @@
           "required": [
             "session_id",
             "muted"
+          ],
+          "type": "object"
+        },
+        "MediaOpenParams": {
+          "properties": {
+            "open_id": {
+              "maxLength": 128,
+              "minLength": 1,
+              "pattern": "^[\\x20-\\x7E]+(?![\\s\\S])",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "pane_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pane_id"
           ],
           "type": "object"
         },
@@ -7442,7 +7505,7 @@
               "type": "string"
             },
             "params": {
-              "$ref": "#/schemas/request/$defs/PaneTarget"
+              "$ref": "#/schemas/request/$defs/MediaOpenParams"
             }
           },
           "required": [
@@ -7506,7 +7569,7 @@
               "type": "string"
             },
             "params": {
-              "$ref": "#/schemas/request/$defs/MediaSessionTarget"
+              "$ref": "#/schemas/request/$defs/MediaCloseParams"
             }
           },
           "required": [
@@ -11800,6 +11863,12 @@
             },
             {
               "properties": {
+                "epoch": {
+                  "default": 0,
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
                 "sdp": {
                   "type": "string"
                 },
@@ -11902,6 +11971,11 @@
               "type": "boolean"
             },
             "live_handoff": {
+              "type": "boolean"
+            },
+            "media_open_cancel": {
+              "default": false,
+              "description": "Supports caller-selected `open_id` on `pane.media_open` and cancellation\nvia `media.close` by `open_id`. Closing an unknown id is idempotent and\nleaves a tombstone for up to 120 seconds; at most 256 unknown-id tombstones\nare retained and the media `expire` pass prunes elapsed ones. For a pending\nopen, the cancellation step enqueues its refusal before the close success on\nthe app response channel; replies on separate connections may arrive either order.\nEach `media_offer` includes a per-pane `epoch`; sessions close as\n`abandoned` when the waiting caller disconnects and as `unanswered` when\nthe offer is not answered in time.",
               "type": "boolean"
             },
             "pane_close_expected_terminal_guard": {

@@ -26,8 +26,16 @@ impl HeadlessServer {
                 MediaAction::Respond {
                     respond_to,
                     response,
+                    session_id,
                 } => {
-                    let _ = respond_to.send(response);
+                    if respond_to.send(response).is_err() {
+                        if let Some(session_id) = session_id {
+                            let follow_up = self
+                                .media
+                                .response_delivery_failed(&session_id, Instant::now());
+                            self.perform_media_actions(follow_up);
+                        }
+                    }
                 }
             }
         }
@@ -107,6 +115,7 @@ impl HeadlessServer {
         let api::ApiRequestMessage {
             request,
             respond_to,
+            response_write_complete,
             ..
         } = msg;
         let id = request.id;
@@ -130,6 +139,8 @@ impl HeadlessServer {
                     id,
                     respond_to,
                     pane_id,
+                    target.open_id,
+                    response_write_complete,
                     |client_id| viewers.contains(&client_id),
                     now,
                 );
@@ -145,7 +156,7 @@ impl HeadlessServer {
                         "sdp must be a non-empty SDP answer of at most 64 KiB".to_owned(),
                     ))
                 } else {
-                    self.media.answer(&params.session_id, params.sdp)
+                    self.media.answer(&params.session_id, params.sdp, now)
                 }
             }
             Method::MediaMute(params) => self.media.mute(&params.session_id, params.muted),
@@ -161,7 +172,14 @@ impl HeadlessServer {
                 let _ = respond_to.send(response);
                 return;
             }
-            Method::MediaClose(params) => Ok(self.media.close(&params.session_id, now)),
+            Method::MediaClose(params) => match (params.session_id, params.open_id) {
+                (Some(session_id), None) => Ok(self.media.close(&session_id, now)),
+                (None, Some(open_id)) => self.media.close_by_open_id(&open_id, now),
+                (Some(_), Some(_)) | (None, None) => Err((
+                    "invalid_params",
+                    "media.close requires exactly one of session_id or open_id".to_owned(),
+                )),
+            },
             _ => Err(("invalid_params", "not a media method".to_owned())),
         };
         let response = match immediate {

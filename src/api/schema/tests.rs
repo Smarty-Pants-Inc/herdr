@@ -1260,6 +1260,155 @@ fn agent_status_request_values_remain_strict() {
 }
 
 #[test]
+fn media_open_and_close_schema_match_open_id_validation() {
+    const OPEN_ID_PATTERN: &str = r"^[\x20-\x7E]+(?![\s\S])";
+    let boundary_id = "x".repeat(128);
+    let oversized_id = "x".repeat(129);
+    let cases = [
+        ("valid", true),
+        (" ", true),
+        ("~", true),
+        (boundary_id.as_str(), true),
+        ("", false),
+        (oversized_id.as_str(), false),
+        ("line\n", false),
+        ("line\r\n", false),
+        ("\0", false),
+        ("\x1f", false),
+        ("\x7f", false),
+        ("é", false),
+        ("界", false),
+    ];
+    let now = std::time::Instant::now();
+    let mut broker = crate::server::media::MediaBroker::new();
+    let open_schema = serde_json::to_value(schemars::schema_for!(MediaOpenParams)).unwrap();
+    let close_schema = serde_json::to_value(schemars::schema_for!(MediaCloseParams)).unwrap();
+    for open_id_schema in [
+        &open_schema["properties"]["open_id"],
+        &close_schema["properties"]["open_id"],
+    ] {
+        assert_eq!(
+            open_id_schema["type"],
+            serde_json::json!(["string", "null"])
+        );
+        assert_eq!(open_id_schema["minLength"], 1);
+        assert_eq!(open_id_schema["maxLength"], 128);
+        assert_eq!(open_id_schema["pattern"], OPEN_ID_PATTERN);
+        // Rust regex handles the ASCII prefix; full consumption models this
+        // JSON Schema pattern's absolute-end lookahead, including final newlines.
+        let prefix = open_id_schema["pattern"]
+            .as_str()
+            .unwrap()
+            .strip_suffix(r"(?![\s\S])")
+            .unwrap();
+        let pattern = regex::Regex::new(prefix).unwrap();
+        for (id, expected) in cases {
+            let length = id.chars().count() as u64;
+            let schema_accepts = length >= open_id_schema["minLength"].as_u64().unwrap()
+                && length <= open_id_schema["maxLength"].as_u64().unwrap()
+                && pattern
+                    .find(id)
+                    .is_some_and(|found| found.end() == id.len());
+            assert_eq!(schema_accepts, expected, "schema: {id:?}");
+            assert_eq!(
+                broker.close_by_open_id(id, now).is_ok(),
+                expected,
+                "runtime: {id:?}"
+            );
+        }
+    }
+
+    assert_eq!(
+        close_schema["oneOf"],
+        serde_json::json!([
+            {
+                "properties": { "session_id": { "type": "string" } },
+                "required": ["session_id"]
+            },
+            {
+                "properties": { "open_id": { "type": "string" } },
+                "required": ["open_id"]
+            }
+        ])
+    );
+    assert!(close_schema["properties"]["session_id"]
+        .get("minLength")
+        .is_none());
+    assert!(close_schema["properties"]["session_id"]
+        .get("maxLength")
+        .is_none());
+
+    // `oneOf` must match exactly one non-null selector. The schema shape above
+    // fixes each branch to a required string, so zero and two matches are invalid.
+    let branches = close_schema["oneOf"].as_array().unwrap();
+    let matching_branches = |params: &serde_json::Value| {
+        branches
+            .iter()
+            .filter(|branch| {
+                branch["required"].as_array().unwrap().iter().all(|field| {
+                    params
+                        .get(field.as_str().unwrap())
+                        .is_some_and(serde_json::Value::is_string)
+                })
+            })
+            .count()
+    };
+    for (params, expected_matches) in [
+        (serde_json::json!({}), 0),
+        (serde_json::json!({"session_id":null,"open_id":null}), 0),
+        (serde_json::json!({"session_id":"s","open_id":"o"}), 2),
+        (serde_json::json!({"session_id":"s","open_id":null}), 1),
+        (serde_json::json!({"session_id":null,"open_id":"o"}), 1),
+        (serde_json::json!({"session_id":"s"}), 1),
+        (serde_json::json!({"open_id":"o"}), 1),
+    ] {
+        assert_eq!(matching_branches(&params), expected_matches, "{params}");
+    }
+
+    // Preserve serde's existing omission semantics: null open_id is an omitted
+    // caller handle, and a null unused close selector is harmless.
+    let open: MediaOpenParams = serde_json::from_value(serde_json::json!({
+        "pane_id": "p1", "open_id": null
+    }))
+    .unwrap();
+    assert_eq!(open.open_id, None);
+    assert_eq!(
+        serde_json::to_value(open).unwrap(),
+        serde_json::json!({"pane_id":"p1"})
+    );
+    let close: MediaCloseParams = serde_json::from_value(serde_json::json!({
+        "session_id": "s", "open_id": null
+    }))
+    .unwrap();
+    assert_eq!(close.open_id, None);
+    assert_eq!(close.session_id.as_deref(), Some("s"));
+}
+
+#[test]
+fn media_offer_decodes_legacy_epoch_absence_and_preserves_current_epochs() {
+    for epoch in [None, Some(7)] {
+        let mut value = serde_json::json!({
+            "type": "media_offer", "session_id": "session", "sdp": "v=0 offer"
+        });
+        if let Some(epoch) = epoch {
+            value["epoch"] = epoch.into();
+        }
+        let result: ResponseResult = serde_json::from_value(value).unwrap();
+        assert!(
+            matches!(result, ResponseResult::MediaOffer { epoch: actual, .. }
+            if actual == epoch.unwrap_or_default())
+        );
+    }
+}
+
+#[test]
+fn media_open_cancel_capability_defaults_false_for_legacy_server_json() {
+    let capabilities: ServerCapabilities =
+        serde_json::from_value(serde_json::json!({"live_handoff": true})).unwrap();
+    assert!(!capabilities.media_open_cancel);
+}
+
+#[test]
 fn success_response_round_trips() {
     let response = SuccessResponse {
         id: "req_1".into(),
@@ -1280,6 +1429,7 @@ fn success_response_round_trips() {
                 expected_agent_status_guard: true,
                 refuse_if_exists_guard: true,
                 input_consumer: false,
+                media_open_cancel: true,
             }),
         },
     };

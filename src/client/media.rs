@@ -933,6 +933,7 @@ mod tests {
                 crate::server::media::MediaAction::Respond {
                     respond_to,
                     response,
+                    ..
                 } => {
                     responses.push(serde_json::from_str(&response).unwrap());
                     let _ = respond_to.send(response); // The caller waiting on pane.media_open.
@@ -970,8 +971,15 @@ mod tests {
         broker.note_pane_input(1, PaneId::from_raw(7), "pane_1", now);
         client.note_pane_input(&local(), "pane_1", now);
         let (tx, _rx) = std::sync::mpsc::channel();
-        let (controls, _) =
-            to_client(broker.open("r1".into(), tx, PaneId::from_raw(7), |_| true, now));
+        let (controls, _) = to_client(broker.open(
+            "r1".into(),
+            tx,
+            PaneId::from_raw(7),
+            None,
+            None,
+            |_| true,
+            now,
+        ));
         for control in controls {
             client.handle_server_control(&local(), control, true, |_| Some("label".into()), now);
         }
@@ -995,7 +1003,7 @@ mod tests {
         for control in to_broker(&mut client) {
             to_client(broker.client_control(1, control, now));
         }
-        broker.answer(&old, "v=0 answer".into()).unwrap();
+        broker.answer(&old, "v=0 answer".into(), now).unwrap();
         broker.client_control(
             1,
             MediaControl::State(MediaStateUpdate {
@@ -1017,8 +1025,15 @@ mod tests {
         let (mut broker, mut client, calls, old) = live_call_through_broker(now);
         let later = now + MEDIA_INPUT_WINDOW + Duration::from_secs(60);
         let (tx, rx) = std::sync::mpsc::channel();
-        let (controls, _) =
-            to_client(broker.open("r2".into(), tx, PaneId::from_raw(7), |_| true, later));
+        let (controls, _) = to_client(broker.open(
+            "r2".into(),
+            tx,
+            PaneId::from_raw(7),
+            None,
+            None,
+            |_| true,
+            later,
+        ));
         // 1. Only the new Open: the live call is not closed yet.
         let new = match controls.as_slice() {
             [MediaControl::Open(open)] => open.session_id.clone(),
@@ -1086,7 +1101,15 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
         deliver(
             &mut client,
-            broker.open("r2".into(), tx, PaneId::from_raw(7), |_| true, later),
+            broker.open(
+                "r2".into(),
+                tx,
+                PaneId::from_raw(7),
+                None,
+                None,
+                |_| true,
+                later,
+            ),
             later,
         );
         let calls = calls.lock().unwrap().clone();
@@ -1114,7 +1137,15 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
         deliver(
             &mut client,
-            broker.open("r2".into(), tx, PaneId::from_raw(7), |_| true, later),
+            broker.open(
+                "r2".into(),
+                tx,
+                PaneId::from_raw(7),
+                None,
+                None,
+                |_| true,
+                later,
+            ),
             later,
         );
         for control in to_broker(&mut client) {
@@ -1146,7 +1177,15 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         deliver(
             &mut client,
-            broker.open("r2".into(), tx, PaneId::from_raw(7), |_| true, later),
+            broker.open(
+                "r2".into(),
+                tx,
+                PaneId::from_raw(7),
+                None,
+                None,
+                |_| true,
+                later,
+            ),
             later,
         );
         let new = calls
@@ -1190,8 +1229,15 @@ mod tests {
         let (mut broker, mut client, calls, old) = live_call_through_broker(now);
         let later = now + MEDIA_INPUT_WINDOW + Duration::from_secs(60);
         let (tx, rx) = std::sync::mpsc::channel();
-        let (controls, _) =
-            to_client(broker.open("r2".into(), tx, PaneId::from_raw(7), |_| true, later));
+        let (controls, _) = to_client(broker.open(
+            "r2".into(),
+            tx,
+            PaneId::from_raw(7),
+            None,
+            None,
+            |_| true,
+            later,
+        ));
         // The client no longer shows the pane: it refuses the new session.
         for control in controls {
             client.handle_server_control(&local(), control, true, |_| None, later);
