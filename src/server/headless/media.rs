@@ -18,15 +18,52 @@ pub(super) fn is_media_method(method: &api::schema::Method) -> bool {
 
 impl HeadlessServer {
     pub(super) fn perform_media_actions(&mut self, actions: Vec<MediaAction>) {
-        for action in actions {
+        // Terminal follow-ups run before remaining fanout actions. In particular,
+        // a failed source can legitimately retire its pending successor.
+        let mut pending = std::collections::VecDeque::from(actions);
+        while let Some(action) = pending.pop_front() {
             match action {
                 MediaAction::Publish { event } => self.app.event_hub.push_media(event),
-                MediaAction::Send { client_id, control } => match control.server_message() {
-                    Ok(message) => {
-                        self.send_to_client(client_id, message);
+                MediaAction::Send { client_id, control } => {
+                    // Keep the actual dispatch target, not an API alias or another
+                    // member of the fanout, across both encoding steps.
+                    let target = match &control {
+                        crate::protocol::media::MediaControl::Control(control) => {
+                            let live = self.media.state(&control.session_id).is_some_and(|view| {
+                                !matches!(
+                                    view.state,
+                                    api::schema::MediaSessionState::Closed
+                                        | api::schema::MediaSessionState::Failed
+                                )
+                            });
+                            if !live {
+                                continue;
+                            }
+                            Some(control.session_id.clone())
+                        }
+                        _ => None,
+                    };
+                    let delivered = match control.server_message() {
+                        Ok(message) => self.send_media_to_client(client_id, message),
+                        Err(err) => {
+                            warn!(client_id, err = %err, "failed to encode media control");
+                            false
+                        }
+                    };
+                    if !delivered {
+                        if let Some(session_id) = target {
+                            let follow_up = self.media.control_delivery_failed(
+                                client_id,
+                                &session_id,
+                                Instant::now(),
+                            );
+                            for action in follow_up.into_iter().rev() {
+                                pending.push_front(action);
+                            }
+                        }
                     }
-                    Err(err) => warn!(client_id, err = %err, "failed to encode media control"),
-                },
+                    // A successful local write is not a device acknowledgement.
+                }
                 MediaAction::Respond {
                     respond_to,
                     response,
@@ -37,12 +74,36 @@ impl HeadlessServer {
                             let follow_up = self
                                 .media
                                 .response_delivery_failed(&session_id, Instant::now());
-                            self.perform_media_actions(follow_up);
+                            for action in follow_up.into_iter().rev() {
+                                pending.push_front(action);
+                            }
                         }
                     }
                 }
             }
         }
+    }
+
+    /// A media delivery failure is target-local. The generic targeted sender
+    /// removes a client on failure, recursively executing its media closes before
+    /// removing the writer. Do not enter that path (or pretend a missing writer
+    /// is success); authenticated transport teardown owns client removal.
+    fn send_media_to_client(&self, client_id: u64, message: ServerMessage) -> bool {
+        let Some(writer) = self
+            .clients
+            .get(&client_id)
+            .and_then(|client| client.writer.as_ref())
+        else {
+            return false;
+        };
+        let framed = match Self::frame_server_message(&message) {
+            Ok(framed) => framed,
+            Err(err) => {
+                warn!(client_id, err = %err, "failed to serialize media control for client");
+                return false;
+            }
+        };
+        writer.control.send(framed).is_ok()
     }
 
     pub(super) fn drain_media_interest_transitions(&mut self) {
@@ -54,8 +115,9 @@ impl HeadlessServer {
                     .parse_current_public_pane_id(canonical)
                     .map(|(_, pane)| pane)
             });
+        let now = Instant::now();
         for (pane, enabled) in transitions {
-            let actions = self.media.set_levels(pane, enabled);
+            let actions = self.media.set_levels(pane, enabled, now);
             self.perform_media_actions(actions);
         }
     }

@@ -12,7 +12,7 @@
 #![cfg_attr(not(target_os = "macos"), allow(dead_code))]
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc as std_mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 mod controls;
 mod speaker;
 
-use controls::{enabled, AudioState, Controls};
+use controls::{enabled, AudioState, ControlOutcome, Controls};
 #[cfg(any(target_os = "macos", test))]
 use speaker::Speaker;
 
@@ -42,10 +42,13 @@ use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSampl
 use webrtc::track::track_local::TrackLocal;
 use webrtc::track::track_remote::TrackRemote;
 
-use super::peer::{MediaPeer, PeerEvent, PeerEventSink};
+use super::peer::{
+    MediaPeer, PeerCommandError, PeerEvent, PeerEventSink, PeerEventSinkError, PeerInitialState,
+};
 use crate::protocol::media::{
-    close_code, MediaApplied, MediaDeviceControl, MediaInfo, MediaLevels, MediaPeerState,
-    MAX_MEDIA_TEXT_BYTES,
+    close_code, MediaApplied, MediaControlFailed, MediaDeviceControl, MediaInfo, MediaLevels,
+    MediaPeerState, MAX_MEDIA_TEXT_BYTES, MEDIA_ANSWER_CAPACITY, MEDIA_DEVICE_CONTROL_CAPACITY,
+    MEDIA_LEGACY_MUTE_CAPACITY,
 };
 
 /// The Opus and pipeline sample rate.
@@ -60,7 +63,10 @@ const PLAYBACK_CAPACITY: usize = SAMPLE_RATE as usize / 2;
 /// Captured frames waiting for the encoder (320 ms). Newer frames are dropped when full.
 const CAPTURE_QUEUE_FRAMES: usize = 16;
 /// Controls wait in this bounded FIFO while one command awaits the audio workers.
-const COMMAND_CAPACITY: usize = 32;
+const COMMAND_CAPACITY: usize =
+    MEDIA_DEVICE_CONTROL_CAPACITY + MEDIA_LEGACY_MUTE_CAPACITY + MEDIA_ANSWER_CAPACITY;
+/// Bound waiting while audio is live; final notification retention is audio-off.
+const CRITICAL_EVENT_DELIVERY_TIMEOUT: Duration = Duration::from_secs(1);
 /// Observe atomic encoder/callback confirmations off the realtime threads.
 const CONTROL_OBSERVE_INTERVAL: Duration = Duration::from_millis(10);
 const DEVICE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
@@ -144,7 +150,127 @@ enum Command {
     Answer(String),
     Mute(bool),
     Control(MediaDeviceControl),
-    Close,
+}
+
+#[derive(Clone, Copy)]
+enum CommandClass {
+    Answer,
+    LegacyMute,
+    DeviceControl,
+}
+
+impl Command {
+    fn class(&self) -> CommandClass {
+        match self {
+            Self::Answer(_) => CommandClass::Answer,
+            Self::Mute(_) => CommandClass::LegacyMute,
+            Self::Control(_) => CommandClass::DeviceControl,
+        }
+    }
+}
+
+#[derive(Default)]
+struct CommandCredits {
+    answer: AtomicUsize,
+    legacy_mute: AtomicUsize,
+    device_control: AtomicUsize,
+}
+
+impl CommandCredits {
+    fn counter(&self, class: CommandClass) -> (&AtomicUsize, usize) {
+        match class {
+            CommandClass::Answer => (&self.answer, MEDIA_ANSWER_CAPACITY),
+            CommandClass::LegacyMute => (&self.legacy_mute, MEDIA_LEGACY_MUTE_CAPACITY),
+            CommandClass::DeviceControl => (&self.device_control, MEDIA_DEVICE_CONTROL_CAPACITY),
+        }
+    }
+
+    fn reserve(self: &Arc<Self>, class: CommandClass) -> Result<CommandPermit, PeerCommandError> {
+        let (counter, capacity) = self.counter(class);
+        counter
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                (used < capacity).then_some(used + 1)
+            })
+            .map_err(|_| PeerCommandError::Full)?;
+        Ok(CommandPermit {
+            credits: Arc::clone(self),
+            class,
+        })
+    }
+}
+
+struct CommandPermit {
+    credits: Arc<CommandCredits>,
+    class: CommandClass,
+}
+
+impl Drop for CommandPermit {
+    fn drop(&mut self) {
+        self.credits
+            .counter(self.class)
+            .0
+            .fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+struct QueuedCommand {
+    command: Command,
+    permit: CommandPermit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EventDeliveryError {
+    TimedOut,
+    ConsumerClosed,
+}
+
+enum SessionError {
+    Device(String),
+    Delivery(EventDeliveryError),
+}
+
+impl From<String> for SessionError {
+    fn from(message: String) -> Self {
+        Self::Device(message)
+    }
+}
+
+impl From<EventDeliveryError> for SessionError {
+    fn from(error: EventDeliveryError) -> Self {
+        Self::Delivery(error)
+    }
+}
+
+/// Own the already-existing media tasks so notification-only retention cannot leave
+/// an encoder, remote playback producer or RTCP reader running after audio teardown.
+#[derive(Clone, Default)]
+struct MediaTasks(Arc<Mutex<(bool, Vec<tokio::task::JoinHandle<()>>)>>);
+
+impl MediaTasks {
+    fn retain(&self, task: tokio::task::JoinHandle<()>) {
+        match self.0.lock() {
+            Ok(mut tasks) if !tasks.0 => tasks.1.push(task),
+            Ok(_) => task.abort(),
+            Err(_) => task.abort(),
+        }
+    }
+
+    async fn stop(&self) {
+        let tasks = {
+            let mut tasks = match self.0.lock() {
+                Ok(tasks) => tasks,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            tasks.0 = true;
+            std::mem::take(&mut tasks.1)
+        };
+        for task in &tasks {
+            task.abort();
+        }
+        for task in tasks {
+            let _ = task.await;
+        }
+    }
 }
 
 /// Events from WebRTC and audio callbacks to the peer's control loop.
@@ -158,14 +284,14 @@ enum Internal {
 }
 
 /// How a session ended when it was not cancelled by the controller.
-type SessionEnd = Result<Option<(&'static str, String)>, String>;
+type SessionEnd = Result<Option<(&'static str, String)>, SessionError>;
 
 type Playback = Arc<Mutex<VecDeque<f32>>>;
 
 /// A running native media peer. Dropping it closes the session.
 pub(crate) struct NativePeer {
-    commands: mpsc::Sender<Command>,
-    overloaded: Arc<AtomicBool>,
+    commands: mpsc::Sender<QueuedCommand>,
+    credits: Arc<CommandCredits>,
     /// Cancels setup and negotiation at their next await, so close never waits for them.
     cancel: watch::Sender<bool>,
     closed: Arc<AtomicBool>,
@@ -179,13 +305,21 @@ pub(crate) struct NativePeer {
 
 /// Start a peer with the default microphone and speaker.
 #[cfg(target_os = "macos")]
-pub(crate) fn start(session_id: String, sink: PeerEventSink) -> Result<NativePeer, String> {
-    start_with_audio(session_id, sink, Box::new(cpal_audio::CpalAudio))
+pub(crate) fn start(
+    session_id: String,
+    initial: PeerInitialState,
+    sink: PeerEventSink,
+) -> Result<NativePeer, String> {
+    start_with_audio(session_id, initial, sink, Box::new(cpal_audio::CpalAudio))
 }
 
 /// Start a peer with the default microphone and speaker.
 #[cfg(not(target_os = "macos"))]
-pub(crate) fn start(_session_id: String, _sink: PeerEventSink) -> Result<NativePeer, String> {
+pub(crate) fn start(
+    _session_id: String,
+    _initial: PeerInitialState,
+    _sink: PeerEventSink,
+) -> Result<NativePeer, String> {
     Err("native media audio is only supported on macOS".to_owned())
 }
 
@@ -193,6 +327,7 @@ pub(crate) fn start(_session_id: String, _sink: PeerEventSink) -> Result<NativeP
 /// `PeerEvent::Offer`.
 pub(crate) fn start_with_audio(
     session_id: String,
+    initial: PeerInitialState,
     sink: PeerEventSink,
     audio: Box<dyn AudioBackend>,
 ) -> Result<NativePeer, String> {
@@ -205,51 +340,50 @@ pub(crate) fn start_with_audio(
         .build()
         .map_err(|error| format!("could not start the media runtime: {error}"))?;
     let (commands, command_rx) = mpsc::channel(COMMAND_CAPACITY);
-    let overloaded = Arc::new(AtomicBool::new(false));
-    let thread_overloaded = Arc::clone(&overloaded);
+    let credits = Arc::new(CommandCredits::default());
     let (cancel, cancel_rx) = watch::channel(false);
     let (done_tx, done) = std_mpsc::channel();
     let closed = Arc::new(AtomicBool::new(false));
     let stopped = Arc::new(AtomicBool::new(false));
     let thread_stopped = Arc::clone(&stopped);
-    let emitter = Emitter {
-        session_id,
-        sink,
-        closed: Arc::clone(&closed),
-    };
+    let emitter = Emitter { session_id, sink };
     let thread = std::thread::Builder::new()
         .name("herdr-media-peer".to_owned())
         .spawn(move || {
-            let result = runtime.block_on(session(&emitter, audio, command_rx, cancel_rx));
-            runtime.shutdown_timeout(Duration::from_millis(500));
-            let result = if thread_overloaded.load(Ordering::Acquire) {
-                Err("too many pending media commands".to_owned())
-            } else {
-                result
-            };
-            match result {
-                Ok(None) => {}
-                Ok(Some((code, message))) => emitter.emit(PeerEvent::Closed {
-                    session_id: emitter.session_id.clone(),
-                    code,
-                    message,
-                }),
-                Err(message) => {
-                    tracing::warn!(session_id = %emitter.session_id, %message, "media peer failed");
-                    emitter.emit(PeerEvent::Closed {
-                        session_id: emitter.session_id.clone(),
-                        code: close_code::DEVICE_ERROR,
-                        message,
-                    });
+            runtime.block_on(async {
+                let result = session(&emitter, initial, audio, command_rx, cancel_rx).await;
+                let terminal = match result {
+                    Ok(None) => None, // Controller close/disconnect owns settlement.
+                    Ok(Some(terminal)) => Some(terminal),
+                    Err(SessionError::Device(message)) => {
+                        tracing::warn!(session_id = %emitter.session_id, %message, "media peer failed");
+                        Some((close_code::DEVICE_ERROR, message))
+                    }
+                    Err(SessionError::Delivery(error)) => {
+                        let message = match error {
+                            EventDeliveryError::TimedOut => "media event delivery timed out",
+                            EventDeliveryError::ConsumerClosed => "media event consumer closed",
+                        };
+                        tracing::warn!(session_id = %emitter.session_id, ?error, "media event delivery failed; audio stopped");
+                        Some((close_code::DISCONNECTED, message.to_owned()))
+                    }
+                };
+                if let Some((code, message)) = terminal {
+                    // Once selected, a later owner cancel cannot erase this terminal.
+                    // session has already forced gates and released audio/media tasks.
+                    if let Err(error) = emitter.emit_closed(code, message).await {
+                        tracing::debug!(?error, "media terminal receiver gone; transport teardown owns remote settlement");
+                    }
                 }
-            }
+            });
+            runtime.shutdown_timeout(Duration::from_millis(500));
             thread_stopped.store(true, Ordering::SeqCst);
             let _ = done_tx.send(());
         })
         .map_err(|error| format!("could not start the media thread: {error}"))?;
     Ok(NativePeer {
         commands,
-        overloaded,
+        credits,
         cancel,
         closed,
         stopped,
@@ -259,26 +393,32 @@ pub(crate) fn start_with_audio(
 }
 
 impl NativePeer {
-    fn enqueue(&self, command: Command) {
-        if let Err(mpsc::error::TrySendError::Full(_)) = self.commands.try_send(command) {
-            self.overloaded.store(true, Ordering::Release);
-            // Cancellation releases devices before the thread reports the overload.
-            let _ = self.cancel.send(true);
+    fn enqueue(&self, command: Command) -> Result<(), PeerCommandError> {
+        if self.closed.load(Ordering::Acquire) || self.commands.is_closed() {
+            return Err(PeerCommandError::Closed);
         }
+        let permit = self.credits.reserve(command.class())?;
+        self.commands
+            .try_send(QueuedCommand { command, permit })
+            .map_err(|error| match error {
+                // Dropping either rejected envelope rolls its reserved credit back.
+                mpsc::error::TrySendError::Full(_) => PeerCommandError::Full,
+                mpsc::error::TrySendError::Closed(_) => PeerCommandError::Closed,
+            })
     }
 }
 
 impl MediaPeer for NativePeer {
-    fn apply_answer(&mut self, sdp: String) {
-        self.enqueue(Command::Answer(sdp));
+    fn apply_answer(&mut self, sdp: String) -> Result<(), PeerCommandError> {
+        self.enqueue(Command::Answer(sdp))
     }
 
-    fn set_muted(&mut self, muted: bool) {
-        self.enqueue(Command::Mute(muted));
+    fn set_muted(&mut self, muted: bool) -> Result<(), PeerCommandError> {
+        self.enqueue(Command::Mute(muted))
     }
 
-    fn apply_control(&mut self, control: MediaDeviceControl) {
-        self.enqueue(Command::Control(control));
+    fn apply_control(&mut self, control: MediaDeviceControl) -> Result<(), PeerCommandError> {
+        self.enqueue(Command::Control(control))
     }
 
     fn close(&mut self) {
@@ -287,7 +427,6 @@ impl MediaPeer for NativePeer {
         };
         self.closed.store(true, Ordering::SeqCst);
         let _ = self.cancel.send(true);
-        let _ = self.commands.try_send(Command::Close);
         // Cancellation makes the peer thread drop the devices at its next await. Closing the
         // WebRTC connection can still take up to a second, so join off the client loop.
         let thread = self.thread.take();
@@ -315,27 +454,52 @@ impl Drop for NativePeer {
     }
 }
 
-/// Sends events to the controller until the controller closes the peer.
+/// Critical queue admission runs only on the native worker. Owner cancellation
+/// interrupts live delivery in session; selected final delivery is retained audio-off.
 struct Emitter {
     session_id: String,
     sink: PeerEventSink,
-    closed: Arc<AtomicBool>,
 }
 
 impl Emitter {
-    fn emit(&self, event: PeerEvent) {
-        if !self.closed.load(Ordering::SeqCst) {
-            (self.sink)(event);
+    async fn emit(&self, event: PeerEvent) -> Result<(), EventDeliveryError> {
+        match tokio::time::timeout(CRITICAL_EVENT_DELIVERY_TIMEOUT, (self.sink)(event)).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(PeerEventSinkError::ConsumerClosed)) => Err(EventDeliveryError::ConsumerClosed),
+            Err(_) => Err(EventDeliveryError::TimedOut),
         }
     }
 
-    fn state(&self, state: MediaPeerState, muted: bool) {
+    async fn state(&self, state: MediaPeerState, muted: bool) -> Result<(), EventDeliveryError> {
         self.emit(PeerEvent::State {
             session_id: self.session_id.clone(),
             state,
             muted,
             detail: None,
+        })
+        .await
+    }
+
+    async fn emit_closed(
+        &self,
+        code: &'static str,
+        message: String,
+    ) -> Result<(), PeerEventSinkError> {
+        let delivery = (self.sink)(PeerEvent::Closed {
+            session_id: self.session_id.clone(),
+            code,
+            message,
         });
+        tokio::pin!(delivery);
+        match tokio::time::timeout(CRITICAL_EVENT_DELIVERY_TIMEOUT, delivery.as_mut()).await {
+            Ok(result) => result,
+            Err(_) => {
+                tracing::debug!(session_id = %self.session_id, "audio off; retaining final media notification");
+                // Keep exactly this send future and its FIFO waiter position. No
+                // retry, extra worker, live stream or late-cancel suppression.
+                delivery.await
+            }
+        }
     }
 }
 
@@ -344,58 +508,74 @@ impl Emitter {
 /// connection closed before it returns.
 async fn session(
     emitter: &Emitter,
+    initial: PeerInitialState,
     audio: Box<dyn AudioBackend>,
-    commands: mpsc::Receiver<Command>,
+    mut commands: mpsc::Receiver<QueuedCommand>,
     mut cancel: watch::Receiver<bool>,
 ) -> SessionEnd {
-    if *cancel.borrow() {
-        return Ok(None);
-    }
-    let (internal_tx, internal) = mpsc::unbounded_channel();
-    let playback: Playback = Arc::new(Mutex::new(VecDeque::with_capacity(PLAYBACK_CAPACITY)));
-    let (frames_tx, frames) = mpsc::channel(CAPTURE_QUEUE_FRAMES);
-    let audio_state = Arc::new(AudioState::default());
-
-    let mut audio_guard = audio.open(audio_io(
-        frames_tx,
-        Arc::clone(&playback),
-        Arc::clone(&audio_state),
-        &internal_tx,
-    ))?;
-    // A close that arrived while the device opened releases it here, before any WebRTC work.
-    if *cancel.borrow() {
-        return Ok(None);
-    }
-    let peer = tokio::select! {
-        biased;
-        () = cancelled(&mut cancel) => return Ok(None),
-        peer = new_peer_connection() => match peer {
-            Ok(peer) => Arc::new(peer),
-            Err(error) => return Err(format!("could not create the WebRTC peer: {error}")),
-        },
-    };
+    let audio_state = Arc::new(AudioState::with_initial(initial));
+    let mut audio_guard = None;
+    let mut peer = None;
+    let tasks = MediaTasks::default();
+    // Owned outside the cancelled drive future: cancellation cannot recycle its
+    // active class credit until admission is closed and both gates are protective.
+    let mut active_permit = None;
+    let setup_cancel = cancel.clone();
     let result = tokio::select! {
         biased;
         () = cancelled(&mut cancel) => Ok(None),
-        result = drive(
-            emitter,
-            &peer,
-            Channels {
-                commands,
-                internal,
-                internal_tx,
-                frames,
-                playback,
-                audio: audio_state,
-            },
-            &mut audio_guard,
-        ) => result,
+        result = async {
+            let (internal_tx, internal) = mpsc::unbounded_channel();
+            let playback: Playback = Arc::new(Mutex::new(VecDeque::with_capacity(PLAYBACK_CAPACITY)));
+            let (frames_tx, frames) = mpsc::channel(CAPTURE_QUEUE_FRAMES);
+            audio_guard = Some(audio.open(audio_io(
+                frames_tx,
+                Arc::clone(&playback),
+                Arc::clone(&audio_state),
+                &internal_tx,
+            ))?);
+            // Synchronous OS open may finish after owner cancellation. Do not
+            // negotiate or construct any more live media in that case.
+            if *setup_cancel.borrow() {
+                return Ok(None);
+            }
+            let connection = Arc::new(new_peer_connection().await
+                .map_err(|error| format!("could not create the WebRTC peer: {error}"))?);
+            peer = Some(Arc::clone(&connection));
+            if let Some(devices) = audio_guard.as_mut() {
+                drive(
+                    emitter,
+                    &connection,
+                    Channels {
+                        internal,
+                        internal_tx,
+                        frames,
+                        playback,
+                        audio: Arc::clone(&audio_state),
+                    },
+                    devices,
+                    &mut commands,
+                    &mut active_permit,
+                    &tasks,
+                ).await
+            } else {
+                Err(SessionError::Device("audio device ownership was lost".to_owned()))
+            }
+        } => result,
     };
-    drop(audio_guard);
-    match tokio::time::timeout(PEER_CLOSE_TIMEOUT, peer.close()).await {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => tracing::debug!(%error, "media peer close failed"),
-        Err(_) => tracing::debug!("media peer close timed out"),
+    commands.close();
+    audio_state.force_protective_gates();
+    drop(audio_guard.take());
+    tasks.stop().await;
+    drop(active_permit.take());
+    // Queued credits are released only after admission closes and teardown gates.
+    while commands.try_recv().is_ok() {}
+    if let Some(peer) = peer {
+        match tokio::time::timeout(PEER_CLOSE_TIMEOUT, peer.close()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => tracing::debug!(%error, "media peer close failed"),
+            Err(_) => tracing::debug!("media peer close timed out"),
+        }
     }
     result
 }
@@ -410,7 +590,6 @@ async fn cancelled(cancel: &mut watch::Receiver<bool>) {
 }
 
 struct Channels {
-    commands: mpsc::Receiver<Command>,
     internal: mpsc::UnboundedReceiver<Internal>,
     internal_tx: mpsc::UnboundedSender<Internal>,
     frames: mpsc::Receiver<CapturedFrame>,
@@ -470,9 +649,11 @@ async fn drive(
     peer: &Arc<RTCPeerConnection>,
     channels: Channels,
     devices: &mut OpenedAudio,
+    commands: &mut mpsc::Receiver<QueuedCommand>,
+    active_permit: &mut Option<CommandPermit>,
+    tasks: &MediaTasks,
 ) -> SessionEnd {
     let Channels {
-        mut commands,
         mut internal,
         internal_tx,
         frames,
@@ -498,16 +679,16 @@ async fn drive(
         .await
         .map_err(|error| webrtc_error("could not add the microphone track", error))?;
     // Interceptors (NACK, reports) need RTCP to be read.
-    tokio::spawn(async move {
+    tasks.retain(tokio::spawn(async move {
         let mut buffer = vec![0_u8; 1500];
         while sender.read(&mut buffer).await.is_ok() {}
-    });
-    tokio::spawn(encode_microphone(
+    }));
+    tasks.retain(tokio::spawn(encode_microphone(
         frames,
         track,
         Arc::clone(&audio),
         internal_tx.clone(),
-    ));
+    )));
 
     let channel = peer
         .create_data_channel(EVENTS_CHANNEL_LABEL, None)
@@ -541,14 +722,15 @@ async fn drive(
 
     let track_tx = internal_tx;
     let playback_audio = Arc::clone(&audio);
+    let playback_tasks = tasks.clone();
     peer.on_track(Box::new(move |remote, _, _| {
         // The handler future runs under a lock; keep it short and play in a task.
-        tokio::spawn(play_remote(
+        playback_tasks.retain(tokio::spawn(play_remote(
             remote,
             Arc::clone(&playback),
             Arc::clone(&playback_audio),
             track_tx.clone(),
-        ));
+        )));
         Box::pin(async {})
     }));
 
@@ -568,10 +750,12 @@ async fn drive(
         .await
         .ok_or_else(|| "the peer has no local description".to_owned())?
         .sdp;
-    emitter.emit(PeerEvent::Offer {
-        session_id: emitter.session_id.clone(),
-        sdp,
-    });
+    emitter
+        .emit(PeerEvent::Offer {
+            session_id: emitter.session_id.clone(),
+            sdp,
+        })
+        .await?;
 
     let mut connected = false;
     let mut channel_open = false;
@@ -582,30 +766,36 @@ async fn drive(
     device_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
-            command = commands.recv(), if controls.idle() => match command {
-                Some(Command::Answer(sdp)) => {
-                    let answer = RTCSessionDescription::answer(sdp)
-                        .map_err(|error| webrtc_error("invalid answer", error))?;
-                    peer.set_remote_description(answer)
-                        .await
-                        .map_err(|error| webrtc_error("could not apply the answer", error))?;
-                    if !reported_connected {
-                        emitter.state(MediaPeerState::Connecting, controls.muted);
+            command = commands.recv(), if controls.idle() && active_permit.is_none() => {
+                let Some(QueuedCommand { command, permit }) = command else {
+                    return Ok(None);
+                };
+                *active_permit = Some(permit);
+                match command {
+                    Command::Answer(sdp) => {
+                        let answer = RTCSessionDescription::answer(sdp)
+                            .map_err(|error| webrtc_error("invalid answer", error))?;
+                        peer.set_remote_description(answer)
+                            .await
+                            .map_err(|error| webrtc_error("could not apply the answer", error))?;
+                        if !reported_connected {
+                            emitter.state(MediaPeerState::Connecting, controls.muted).await?;
+                        }
+                        drop(active_permit.take());
+                    }
+                    Command::Mute(mute) => {
+                        controls.begin(None, Some(mute), None, None, Instant::now())?;
+                    }
+                    Command::Control(control) => {
+                        controls.begin(
+                            Some(control.control_id),
+                            control.input_muted,
+                            control.output_suppressed,
+                            control.levels,
+                            Instant::now(),
+                        )?;
                     }
                 }
-                Some(Command::Mute(mute)) => {
-                    controls.begin(None, Some(mute), None, None, Instant::now())?;
-                }
-                Some(Command::Control(control)) => {
-                    controls.begin(
-                        Some(control.control_id),
-                        control.input_muted,
-                        control.output_suppressed,
-                        control.levels,
-                        Instant::now(),
-                    )?;
-                }
-                Some(Command::Close) | None => return Ok(None),
             },
             _ = observe.tick(), if controls.observing() => {},
             _ = device_check.tick() => {
@@ -618,7 +808,7 @@ async fn drive(
             event = internal.recv() => match event {
                 Some(Internal::PeerState(RTCPeerConnectionState::Connected)) => connected = true,
                 Some(Internal::PeerState(RTCPeerConnectionState::Failed)) => {
-                    return Err("the WebRTC connection failed".to_owned());
+                    return Err(SessionError::Device("the WebRTC connection failed".to_owned()));
                 }
                 // Disconnected may recover; it turns into Failed when it does not.
                 Some(Internal::PeerState(_)) => {}
@@ -629,40 +819,74 @@ async fn drive(
                 Some(Internal::DeviceChanged) => {
                     return Ok(Some((close_code::DEVICE_CHANGED, "the default audio device changed".to_owned())));
                 }
-                Some(Internal::Fatal(message)) => return Err(message),
+                Some(Internal::Fatal(message)) => return Err(SessionError::Device(message)),
                 None => return Ok(None),
             },
         }
-        if let Some(confirmation) = controls.confirmed() {
-            if let Some(control_id) = confirmation.control_id {
-                emitter.emit(PeerEvent::Applied(MediaApplied {
-                    session_id: emitter.session_id.clone(),
-                    control_id,
-                    input_muted: confirmation.muted,
-                    output_suppressed: confirmation.suppressed,
-                }));
-            } else {
-                emitter.state(
-                    if reported_connected {
-                        MediaPeerState::Connected
+        if let Some(outcome) = controls.poll(Instant::now()) {
+            let legacy_state = match outcome {
+                ControlOutcome::Applied(confirmation) => {
+                    if let Some(control_id) = confirmation.control_id {
+                        emitter
+                            .emit(PeerEvent::Applied(MediaApplied {
+                                session_id: emitter.session_id.clone(),
+                                control_id,
+                                input_muted: confirmation.muted,
+                                output_suppressed: confirmation.suppressed,
+                            }))
+                            .await?;
+                        false
                     } else {
-                        MediaPeerState::Connecting
-                    },
-                    confirmation.muted,
-                );
+                        true
+                    }
+                }
+                ControlOutcome::Failed { control_id } => {
+                    emitter
+                        .emit(PeerEvent::ControlFailed(MediaControlFailed {
+                            session_id: emitter.session_id.clone(),
+                            control_id,
+                            code: "control_timeout".to_owned(),
+                            message: Some(
+                                "the audio devices did not observe the control within five seconds"
+                                    .to_owned(),
+                            ),
+                        }))
+                        .await?;
+                    control_id.is_none()
+                }
+            };
+            if legacy_state {
+                emitter
+                    .state(
+                        if reported_connected {
+                            MediaPeerState::Connected
+                        } else {
+                            MediaPeerState::Connecting
+                        },
+                        controls.muted,
+                    )
+                    .await?;
             }
+            // Includes the entire legacy failure + truthful State sequence.
+            drop(active_permit.take());
         }
         if connected && channel_open && !reported_connected {
             reported_connected = true;
-            emitter.state(MediaPeerState::Connected, controls.muted);
-            emitter.emit(PeerEvent::Info(devices.info(&emitter.session_id)));
+            emitter
+                .state(MediaPeerState::Connected, controls.muted)
+                .await?;
+            emitter
+                .emit(PeerEvent::Info(devices.info(&emitter.session_id)))
+                .await?;
         }
         if let Some((input_peak, output_peak)) = controls.take_levels(Instant::now()) {
-            emitter.emit(PeerEvent::Levels(MediaLevels {
-                session_id: emitter.session_id.clone(),
-                input_peak,
-                output_peak,
-            }));
+            emitter
+                .emit(PeerEvent::Levels(MediaLevels {
+                    session_id: emitter.session_id.clone(),
+                    input_peak,
+                    output_peak,
+                }))
+                .await?;
         }
     }
 }
@@ -1133,6 +1357,8 @@ mod tests {
         default_changed: AtomicBool,
         callbacks: Mutex<Option<FakeCallbacks>>,
         audio: Mutex<Option<Arc<AudioState>>>,
+        initial_tokens: Mutex<Option<(u64, u64)>>,
+        protected_before_drop: AtomicBool,
     }
 
     struct FakeCallbacks {
@@ -1151,7 +1377,11 @@ mod tests {
         }
 
         fn render(&self) -> Vec<f32> {
-            let mut out = vec![1.0; 127];
+            self.render_samples(127)
+        }
+
+        fn render_samples(&self, samples: usize) -> Vec<f32> {
+            let mut out = vec![1.0; samples];
             self.callbacks
                 .lock()
                 .unwrap()
@@ -1168,6 +1398,9 @@ mod tests {
 
         fn wait_request(&self, input: bool, previous: u64) -> u64 {
             let audio = self.state();
+            // Original false/false fixtures used zero requests. Production now
+            // starts at generation one; preserve their exact bounded wait policy.
+            let previous = if previous == 0 { 2 } else { previous };
             let deadline = Instant::now() + Duration::from_secs(3);
             loop {
                 let token = if input {
@@ -1193,6 +1426,14 @@ mod tests {
 
     impl Drop for FakeGuard {
         fn drop(&mut self) {
+            if let Some(audio) = self.0.audio.lock().unwrap().as_ref() {
+                self.0.protected_before_drop.store(
+                    enabled(audio.input_token())
+                        && enabled(audio.output_token())
+                        && !audio.levels_enabled(),
+                    Ordering::Release,
+                );
+            }
             self.0.callbacks.lock().unwrap().take();
             self.0.audio.lock().unwrap().take();
             self.0.released.store(true, Ordering::SeqCst);
@@ -1203,6 +1444,8 @@ mod tests {
         fn open(self: Box<Self>, mut io: AudioIo) -> Result<OpenedAudio, String> {
             // Exercise the real frame packer and outer renderer, then retain the
             // callbacks so tests can withhold actual capture/output confirmations.
+            *self.0.initial_tokens.lock().unwrap() =
+                Some((io.audio.input_token(), io.audio.output_token()));
             (io.capture)(io.audio.input_token(), &vec![0.1; FRAME_SAMPLES * 2]);
             let mut speaker = Speaker::new(44_100, io.playback, Arc::clone(&io.audio));
             speaker.render(&mut [1.0; 480], 1, |sample| (sample, sample));
@@ -1231,12 +1474,18 @@ mod tests {
         let (events_tx, events) = std_mpsc::channel();
         let events_tx = Mutex::new(events_tx);
         let sink: PeerEventSink = Arc::new(move |event| {
-            if let Ok(events_tx) = events_tx.lock() {
-                let _ = events_tx.send(event);
-            }
+            let result = events_tx
+                .lock()
+                .map_err(|_| PeerEventSinkError::ConsumerClosed)
+                .and_then(|tx| {
+                    tx.send(event)
+                        .map_err(|_| PeerEventSinkError::ConsumerClosed)
+                });
+            Box::pin(async move { result })
         });
         let peer = start_with_audio(
             "media_test".to_owned(),
+            PeerInitialState::default(),
             sink,
             Box::new(FakeAudio(Arc::clone(&devices))),
         )
@@ -1326,12 +1575,18 @@ mod tests {
         let (events_tx, events) = std_mpsc::channel();
         let events_tx = Mutex::new(events_tx);
         let sink: PeerEventSink = Arc::new(move |event| {
-            if let Ok(events_tx) = events_tx.lock() {
-                let _ = events_tx.send(event);
-            }
+            let result = events_tx
+                .lock()
+                .map_err(|_| PeerEventSinkError::ConsumerClosed)
+                .and_then(|tx| {
+                    tx.send(event)
+                        .map_err(|_| PeerEventSinkError::ConsumerClosed)
+                });
+            Box::pin(async move { result })
         });
         let mut peer = start_with_audio(
             "media_test".to_owned(),
+            PeerInitialState::default(),
             sink,
             Box::new(SlowAudio(Arc::clone(&devices))),
         )
@@ -1442,7 +1697,7 @@ mod tests {
         let _ = tokio::time::timeout(ICE_GATHER_TIMEOUT, gathered.recv()).await;
         let answer = remote.local_description().await.expect("local answer").sdp;
         assert_loopback_candidates(&answer, "remote answer");
-        peer.apply_answer(answer);
+        peer.apply_answer(answer).expect("answer admitted");
 
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
         loop {
@@ -1503,7 +1758,7 @@ mod tests {
 
                 // A positive round trip through both audio workers proves the healthy
                 // open channel did not end the session or release its audio devices.
-                peer.apply_control(device_control(1, Some(false), Some(false), None));
+                peer.apply_control(device_control(1, Some(false), Some(false), None)).expect("control admitted");
                 devices.wait_request(true, 0);
                 devices.wait_request(false, 0);
                 devices.capture(&[0.3; FRAME_SAMPLES]);
@@ -1613,12 +1868,18 @@ mod tests {
         let (events_tx, events) = std_mpsc::channel();
         let events_tx = Mutex::new(events_tx);
         let sink: PeerEventSink = Arc::new(move |event| {
-            if let Ok(events_tx) = events_tx.lock() {
-                let _ = events_tx.send(event);
-            }
+            let result = events_tx
+                .lock()
+                .map_err(|_| PeerEventSinkError::ConsumerClosed)
+                .and_then(|tx| {
+                    tx.send(event)
+                        .map_err(|_| PeerEventSinkError::ConsumerClosed)
+                });
+            Box::pin(async move { result })
         });
         let mut peer = start_with_audio(
             "media_test".to_owned(),
+            PeerInitialState::default(),
             sink,
             Box::new(TrackingCpalAudio(Arc::clone(&released))),
         )
@@ -1707,7 +1968,7 @@ mod tests {
     fn native_peer_confirms_mute_before_connect() {
         let (mut peer, devices, events) = start_fake();
         wait_offer(&events);
-        peer.set_muted(true);
+        peer.set_muted(true).expect("legacy mute admitted");
         devices.wait_request(true, 0);
         assert!(events.recv_timeout(Duration::from_millis(60)).is_err());
         devices.capture(&[0.2; FRAME_SAMPLES]);
@@ -1732,12 +1993,22 @@ mod tests {
         let (events_tx, events) = std_mpsc::channel();
         let events_tx = Mutex::new(events_tx);
         let sink: PeerEventSink = Arc::new(move |event| {
-            if let Ok(events_tx) = events_tx.lock() {
-                let _ = events_tx.send(event);
-            }
+            let result = events_tx
+                .lock()
+                .map_err(|_| PeerEventSinkError::ConsumerClosed)
+                .and_then(|tx| {
+                    tx.send(event)
+                        .map_err(|_| PeerEventSinkError::ConsumerClosed)
+                });
+            Box::pin(async move { result })
         });
-        let _peer = start_with_audio("media_test".to_owned(), sink, Box::new(BrokenAudio))
-            .expect("peer starts");
+        let _peer = start_with_audio(
+            "media_test".to_owned(),
+            PeerInitialState::default(),
+            sink,
+            Box::new(BrokenAudio),
+        )
+        .expect("peer starts");
         match events.recv_timeout(Duration::from_secs(5)) {
             Ok(PeerEvent::Closed { code, message, .. }) => {
                 assert_eq!(code, close_code::DEVICE_ERROR);
@@ -1779,14 +2050,16 @@ mod tests {
         let (mut peer, devices, events) = start_fake();
         wait_offer(&events);
         let audio = devices.state();
-        peer.apply_control(device_control(10, Some(true), Some(true), None));
-        peer.apply_control(device_control(11, Some(false), Some(false), None));
+        peer.apply_control(device_control(10, Some(true), Some(true), None))
+            .expect("first control admitted");
+        peer.apply_control(device_control(11, Some(false), Some(false), None))
+            .expect("second control admitted");
         let input = devices.wait_request(true, 0);
         let output = devices.wait_request(false, 0);
         assert!(enabled(input) && enabled(output));
         assert!(events.recv_timeout(Duration::from_millis(60)).is_err());
-        assert_eq!(audio.input_applied.load(Ordering::Acquire), 0);
-        assert_eq!(audio.output_applied.load(Ordering::Acquire), 0);
+        assert_ne!(audio.input_applied.load(Ordering::Acquire), input);
+        assert_ne!(audio.output_applied.load(Ordering::Acquire), output);
 
         // A partial frame is not a capture/encoder confirmation. Even actual speaker
         // silence cannot acknowledge the combined control until that frame completes.
@@ -2026,7 +2299,8 @@ mod tests {
         devices.capture(&[0.9; FRAME_SAMPLES]);
         devices.render();
         assert!(events.recv_timeout(Duration::from_millis(120)).is_err());
-        peer.apply_control(device_control(1, None, None, Some(true)));
+        peer.apply_control(device_control(1, None, None, Some(true)))
+            .expect("levels admitted");
         applied(&events, 1, false, false);
         devices.capture(&[0.75; FRAME_SAMPLES]);
         devices.render();
@@ -2038,7 +2312,8 @@ mod tests {
             }
             other => panic!("expected levels after opt-in, got {other:?}"),
         }
-        peer.apply_control(device_control(2, None, None, Some(false)));
+        peer.apply_control(device_control(2, None, None, Some(false)))
+            .expect("disable admitted");
         applied(&events, 2, false, false);
         devices.capture(&[1.0; FRAME_SAMPLES]);
         assert!(events.recv_timeout(Duration::from_millis(240)).is_err());
@@ -2088,12 +2363,14 @@ mod tests {
         wait_offer(&events);
         let audio = devices.state();
         // Enable levels and mute together, with actual nonzero FakeAudio input.
-        peer.apply_control(device_control(1, Some(true), None, Some(true)));
+        peer.apply_control(device_control(1, Some(true), None, Some(true)))
+            .expect("mute admitted");
         let muted_token = devices.wait_request(true, 0);
         devices.capture(&[0.9; FRAME_SAMPLES]);
         confirmation_and_levels(&events, Some(1), true, 0.0);
 
-        peer.apply_control(device_control(2, Some(false), None, None));
+        peer.apply_control(device_control(2, Some(false), None, None))
+            .expect("unmute admitted");
         let unmuted_token = devices.wait_request(true, muted_token);
         // Model a CPAL callback whose conversion began under the old muted token.
         devices.capture_with_token(muted_token, &[0.9; FRAME_SAMPLES]);
@@ -2105,7 +2382,7 @@ mod tests {
         devices.capture(&[0.75; FRAME_SAMPLES]);
         confirmation_and_levels(&events, Some(2), false, 0.75);
 
-        peer.set_muted(true);
+        peer.set_muted(true).expect("legacy mute admitted");
         devices.wait_request(true, unmuted_token);
         devices.capture(&[0.8; FRAME_SAMPLES]);
         confirmation_and_levels(&events, None, true, 0.0);
@@ -2133,23 +2410,1292 @@ mod tests {
     }
 
     #[test]
-    fn native_command_overload_closes_instead_of_growing_an_unbounded_control_queue() {
+    fn native_command_class_capacity_includes_active_and_rolls_back_rejected_sends() {
         let (mut peer, devices, events) = start_fake();
         wait_offer(&events);
-        peer.apply_control(device_control(1, Some(true), None, None));
-        devices.wait_request(true, 0);
-        for id in 2..=(COMMAND_CAPACITY as u64 + 2) {
-            peer.apply_control(device_control(id, Some(false), None, None));
+        let initial = devices.state().input_token();
+        peer.apply_control(device_control(1, Some(true), None, None))
+            .unwrap();
+        devices.wait_request(true, initial);
+        for id in 2..=MEDIA_DEVICE_CONTROL_CAPACITY as u64 {
+            peer.apply_control(device_control(id, Some(false), None, None))
+                .unwrap();
         }
-        match events.recv_timeout(Duration::from_secs(4)) {
-            Ok(PeerEvent::Closed { code, message, .. }) => {
-                assert_eq!(code, close_code::DEVICE_ERROR);
-                assert!(message.contains("too many pending"));
-            }
-            other => panic!("expected an overload close, got {other:?}"),
+        assert_eq!(
+            peer.apply_control(device_control(33, None, None, None)),
+            Err(PeerCommandError::Full)
+        );
+        for _ in 0..MEDIA_LEGACY_MUTE_CAPACITY {
+            peer.set_muted(true).unwrap();
         }
-        assert!(devices.released.load(Ordering::SeqCst));
+        peer.apply_answer("queued, not interpreted before the pending control".to_owned())
+            .unwrap();
+        assert_eq!(peer.set_muted(false), Err(PeerCommandError::Full));
+        assert_eq!(
+            peer.apply_answer("overflow".to_owned()),
+            Err(PeerCommandError::Full)
+        );
+        assert_eq!(COMMAND_CAPACITY, 65);
+        assert_eq!(peer.credits.device_control.load(Ordering::Acquire), 32);
+        assert_eq!(peer.credits.legacy_mute.load(Ordering::Acquire), 32);
+        assert_eq!(peer.credits.answer.load(Ordering::Acquire), 1);
+        assert!(!devices.released.load(Ordering::Acquire));
+        let credits = Arc::clone(&peer.credits);
         peer.close();
+        assert!(wait_until(&peer.stopped, Duration::from_secs(3)));
+        assert_eq!(credits.device_control.load(Ordering::Acquire), 0);
+        assert_eq!(credits.legacy_mute.load(Ordering::Acquire), 0);
+        assert_eq!(credits.answer.load(Ordering::Acquire), 0);
+    }
+
+    // Keep: #316 privacy, callback provenance and bounded terminal delivery cross
+    // broker/controller/native trust boundaries. Only devices and event observation
+    // are injected; control IDs, scoping, codecs, queue and acknowledgements are real.
+    struct RoutedFixture {
+        broker: crate::server::media::MediaBroker,
+        media: super::super::ClientMedia,
+        tx: mpsc::Sender<crate::client::ClientLoopEvent>,
+        rx: Option<mpsc::Receiver<crate::client::ClientLoopEvent>>,
+        devices: Arc<Mutex<Vec<Arc<FakeDevices>>>>,
+        stopped: Arc<Mutex<Vec<Arc<AtomicBool>>>>,
+        credits: Arc<Mutex<Vec<Arc<CommandCredits>>>>,
+        delivery: Arc<Mutex<Vec<(bool, PeerEvent)>>>,
+        mode: Arc<Mutex<(bool, bool)>>, // eager callbacks, fail after eager callbacks
+        controls: Vec<crate::protocol::media::MediaControl>,
+        session: String,
+    }
+
+    struct RoutedAudio {
+        devices: Arc<FakeDevices>,
+        eager: bool,
+        fail: bool,
+    }
+
+    impl AudioBackend for RoutedAudio {
+        fn open(self: Box<Self>, mut io: AudioIo) -> Result<OpenedAudio, String> {
+            *self.devices.initial_tokens.lock().unwrap() =
+                Some((io.audio.input_token(), io.audio.output_token()));
+            if self.fail {
+                // A backend is allowed to call back before reporting open failure.
+                // Constructor protection, not a later setter, must cover this case.
+                (io.capture)(io.audio.input_token(), &[0.7; FRAME_SAMPLES]);
+                let mut speaker = Speaker::new(44_100, io.playback, Arc::clone(&io.audio));
+                let mut out = [1.0; 127];
+                speaker.render(&mut out, 1, |sample| (sample, sample));
+                assert!(out.iter().all(|sample| *sample == 0.0));
+                self.devices.opened.store(true, Ordering::Release);
+                self.devices.released.store(true, Ordering::Release);
+                return Err("injected open failure after callbacks".to_owned());
+            }
+            if self.eager {
+                return Box::new(FakeAudio(Arc::clone(&self.devices))).open(io);
+            }
+            let speaker = Speaker::new(44_100, io.playback, Arc::clone(&io.audio));
+            *self.devices.audio.lock().unwrap() = Some(io.audio);
+            *self.devices.callbacks.lock().unwrap() = Some(FakeCallbacks {
+                capture: io.capture,
+                speaker,
+                changed: io.changed,
+            });
+            self.devices.opened.store(true, Ordering::Release);
+            Ok(OpenedAudio::new(
+                Box::new(FakeGuard(Arc::clone(&self.devices))),
+                "test microphone".to_owned(),
+                "test speaker".to_owned(),
+            ))
+        }
+    }
+
+    impl RoutedFixture {
+        fn new(eager: bool) -> Self {
+            use super::super::peer::PeerFactory;
+            let (tx, rx) = mpsc::channel(256);
+            let root = crate::client::media_peer_event_sink(tx.clone());
+            let delivery = Arc::new(Mutex::new(Vec::new()));
+            let log = Arc::clone(&delivery);
+            let sink: PeerEventSink = Arc::new(move |event| {
+                log.lock().unwrap().push((false, event.clone()));
+                let future = root(event.clone());
+                let log = Arc::clone(&log);
+                Box::pin(async move {
+                    future.await?;
+                    log.lock().unwrap().push((true, event));
+                    Ok(())
+                })
+            });
+            let devices = Arc::new(Mutex::new(Vec::new()));
+            let stopped = Arc::new(Mutex::new(Vec::new()));
+            let credits = Arc::new(Mutex::new(Vec::new()));
+            let mode = Arc::new(Mutex::new((eager, false)));
+            let (all_devices, all_stopped, all_credits, open_mode) = (
+                Arc::clone(&devices),
+                Arc::clone(&stopped),
+                Arc::clone(&credits),
+                Arc::clone(&mode),
+            );
+            let factory: PeerFactory = Box::new(move |session, initial, sink| {
+                let devices = Arc::new(FakeDevices::default());
+                let (eager, fail) = *open_mode.lock().unwrap();
+                all_devices.lock().unwrap().push(Arc::clone(&devices));
+                let peer = start_with_audio(
+                    session,
+                    initial,
+                    sink,
+                    Box::new(RoutedAudio {
+                        devices,
+                        eager,
+                        fail,
+                    }),
+                )?;
+                all_stopped.lock().unwrap().push(Arc::clone(&peer.stopped));
+                all_credits.lock().unwrap().push(Arc::clone(&peer.credits));
+                Ok(Box::new(peer))
+            });
+            let mut media =
+                super::super::ClientMedia::new(crate::config::MediaMode::Auto, factory, sink);
+            // Linux intentionally does not advertise native hardware. This fixture
+            // supplies its own device backend, but uses the actual NativePeer.
+            media.peer_available = true;
+            let mut broker = crate::server::media::MediaBroker::new();
+            broker.client_connected(7, true);
+            Self {
+                broker,
+                media,
+                tx,
+                rx: Some(rx),
+                devices,
+                stopped,
+                credits,
+                delivery,
+                mode,
+                controls: Vec::new(),
+                session: String::new(),
+            }
+        }
+
+        fn latest_devices(&self) -> Arc<FakeDevices> {
+            Arc::clone(self.devices.lock().unwrap().last().unwrap())
+        }
+
+        fn wire_server(&mut self, control: crate::protocol::media::MediaControl) {
+            use crate::protocol::{media::MediaControl, ServerMessage};
+            let json = serde_json::to_string(&control.server_message().unwrap()).unwrap();
+            let ServerMessage::EndpointControl { kind, data } =
+                serde_json::from_str(&json).unwrap()
+            else {
+                panic!("named endpoint envelope required");
+            };
+            let control = MediaControl::decode(&kind, &data).unwrap().unwrap();
+            self.media.handle_server_control(
+                &crate::client::endpoint::ClientEndpointId::Local,
+                control,
+                true,
+                |_| Some("fixture pane".to_owned()),
+                Instant::now(),
+            );
+            self.effects();
+        }
+
+        fn actions(&mut self, actions: Vec<crate::server::media::MediaAction>) {
+            use crate::server::media::MediaAction;
+            for action in actions {
+                match action {
+                    MediaAction::Send { client_id, control } => {
+                        assert_eq!(client_id, 7, "actual broker target");
+                        self.wire_server(control);
+                    }
+                    MediaAction::Respond {
+                        session_id: _,
+                        respond_to,
+                        response,
+                    } => {
+                        let _ = respond_to.send(response);
+                    }
+                    MediaAction::Publish { .. } => {}
+                }
+            }
+        }
+
+        fn effects(&mut self) {
+            use crate::protocol::{media::MediaControl, ClientMessage};
+            for effect in self.media.take_effects() {
+                if let super::super::MediaEffect::Send(endpoint, control) = effect {
+                    assert_eq!(endpoint, crate::client::endpoint::ClientEndpointId::Local);
+                    let json = serde_json::to_string(&control.client_message().unwrap()).unwrap();
+                    let ClientMessage::EndpointControl { kind, data } =
+                        serde_json::from_str(&json).unwrap()
+                    else {
+                        panic!("named client envelope required");
+                    };
+                    let decoded = MediaControl::decode(&kind, &data).unwrap().unwrap();
+                    self.controls.push(decoded.clone());
+                    let actions = self.broker.client_control(7, decoded, Instant::now());
+                    self.actions(actions);
+                }
+            }
+        }
+
+        fn open(&mut self, fresh: bool) -> String {
+            let now = Instant::now();
+            if fresh {
+                self.broker.note_pane_input(
+                    7,
+                    crate::layout::PaneId::from_raw(316),
+                    "fixture:p316",
+                    now,
+                );
+                self.media.note_pane_input(
+                    &crate::client::endpoint::ClientEndpointId::Local,
+                    "fixture:p316",
+                    now,
+                );
+            }
+            let (tx, _rx) = std_mpsc::channel();
+            let actions = self.broker.open(
+                "fixture-open".to_owned(),
+                tx,
+                crate::layout::PaneId::from_raw(316),
+                None,
+                None,
+                |_| true,
+                now,
+            );
+            let session = actions
+                .iter()
+                .find_map(|action| match action {
+                    crate::server::media::MediaAction::Send {
+                        control: crate::protocol::media::MediaControl::OpenInitial(open),
+                        ..
+                    } => Some(open.session_id.clone()),
+                    _ => None,
+                })
+                .expect("authorized broker open");
+            self.session = session.clone();
+            self.actions(actions);
+            session
+        }
+
+        fn pump(&mut self, timeout: Duration) {
+            let deadline = Instant::now() + timeout;
+            loop {
+                let event = self.rx.as_mut().expect("live queue").try_recv();
+                match event {
+                    Ok(crate::client::ClientLoopEvent::Media(event)) => {
+                        assert!(
+                            matches!(&event, PeerEvent::Scoped { event, .. } if !matches!(event.as_ref(), PeerEvent::Scoped { .. }))
+                        );
+                        self.media.handle_peer_event(event);
+                        self.effects();
+                        return;
+                    }
+                    Ok(_) => return,
+                    Err(mpsc::error::TryRecvError::Disconnected) => {
+                        panic!("client queue unexpectedly disconnected")
+                    }
+                    Err(mpsc::error::TryRecvError::Empty) => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "bounded client queue receipt timed out"
+                        );
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                }
+            }
+        }
+
+        fn until(&mut self, timeout: Duration, predicate: impl Fn(&Self) -> bool) {
+            let deadline = Instant::now() + timeout;
+            while !predicate(self) {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                assert!(
+                    !remaining.is_zero(),
+                    "bounded real-path condition timed out"
+                );
+                self.pump(remaining);
+            }
+        }
+
+        fn offer(&mut self, session: &str) -> String {
+            self.until(Duration::from_secs(10), |fixture| fixture.controls.iter().any(|control| matches!(control, crate::protocol::media::MediaControl::Offer(offer) if offer.session_id == session)));
+            self.controls
+                .iter()
+                .find_map(|control| match control {
+                    crate::protocol::media::MediaControl::Offer(offer)
+                        if offer.session_id == session =>
+                    {
+                        Some(offer.sdp.clone())
+                    }
+                    _ => None,
+                })
+                .unwrap()
+        }
+
+        fn dispatch(
+            &mut self,
+            input: Option<bool>,
+            output: Option<bool>,
+            levels: Option<bool>,
+        ) -> u64 {
+            let dispatch = self
+                .broker
+                .dispatch_control(&self.session, input, output, levels, Instant::now())
+                .unwrap();
+            assert_eq!(dispatch.session_ids, vec![self.session.clone()]);
+            let id = dispatch.control_id;
+            self.actions(dispatch.actions);
+            id
+        }
+
+        fn fill_queue(&self) {
+            assert_eq!(
+                self.tx.capacity(),
+                256,
+                "start with the actual empty root queue"
+            );
+            for _ in 0..256 {
+                assert!(self
+                    .tx
+                    .try_send(crate::client::ClientLoopEvent::Timer)
+                    .is_ok());
+            }
+        }
+
+        fn wait_delivery(&self, admitted: bool, predicate: impl Fn(&PeerEvent) -> bool) {
+            let deadline = Instant::now() + Duration::from_secs(8);
+            loop {
+                if self
+                    .delivery
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|(receipt, event)| {
+                        *receipt == admitted
+                            && match event {
+                                PeerEvent::Scoped { event, .. } => predicate(event),
+                                _ => false,
+                            }
+                    })
+                {
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "bounded actual sink receipt timed out"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+
+        fn await_applied(&mut self, id: u64) {
+            self.until(Duration::from_secs(3), |fixture| {
+                fixture
+                    .broker
+                    .applied(&fixture.session)
+                    .is_some_and(|update| update.control_id == id)
+            });
+        }
+
+        fn replay_actual_applied(&mut self, id: u64) {
+            use crate::protocol::{media::MediaControl, ClientMessage};
+            let applied = self
+                .delivery
+                .lock()
+                .unwrap()
+                .iter()
+                .find_map(|(_, event)| match event {
+                    PeerEvent::Scoped { event, .. } => match event.as_ref() {
+                        PeerEvent::Applied(update) if update.control_id == id => {
+                            Some(update.clone())
+                        }
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .expect("replay only a real encoder/outer-render outcome, never a fake ACK");
+            let wire =
+                serde_json::to_string(&MediaControl::Applied(applied).client_message().unwrap())
+                    .unwrap();
+            let ClientMessage::EndpointControl { kind, data } =
+                serde_json::from_str(&wire).unwrap()
+            else {
+                panic!("named stale outcome");
+            };
+            let stale = MediaControl::decode(&kind, &data).unwrap().unwrap();
+            let actions = self.broker.client_control(7, stale, Instant::now());
+            self.actions(actions);
+        }
+    }
+
+    impl Drop for RoutedFixture {
+        fn drop(&mut self) {
+            // Queue closure releases notification-only retention even on assertion
+            // unwind. Never leave a native worker waiting for a dropped test driver.
+            self.media.set_mode(crate::config::MediaMode::Off);
+            self.rx.take();
+            for stopped in self.stopped.lock().unwrap().iter() {
+                let done = wait_until(stopped, Duration::from_secs(4));
+                if !std::thread::panicking() {
+                    assert!(done, "native test worker completed");
+                }
+            }
+        }
+    }
+
+    struct RoutedRemote {
+        peer: Arc<RTCPeerConnection>,
+        channel: Arc<webrtc::data_channel::RTCDataChannel>,
+        track: Arc<TrackLocalStaticSample>,
+        decoded: mpsc::UnboundedReceiver<f32>,
+    }
+
+    impl RoutedRemote {
+        async fn connect(fixture: &mut RoutedFixture) -> Self {
+            let session = fixture.session.clone();
+            let offer = fixture.offer(&session);
+            assert_loopback_candidates(&offer, "routed native offer");
+            let mut media = MediaEngine::default();
+            media.register_default_codecs().unwrap();
+            let registry = register_default_interceptors(Registry::new(), &mut media).unwrap();
+            let api = APIBuilder::new()
+                .with_media_engine(media)
+                .with_interceptor_registry(registry)
+                .with_setting_engine(loopback_setting_engine())
+                .build();
+            let peer = Arc::new(
+                api.new_peer_connection(RTCConfiguration::default())
+                    .await
+                    .unwrap(),
+            );
+            let track = Arc::new(TrackLocalStaticSample::new(
+                opus_codec().capability,
+                "fixture-audio".to_owned(),
+                "fixture".to_owned(),
+            ));
+            let sender = peer
+                .add_track(Arc::clone(&track) as Arc<dyn TrackLocal + Send + Sync>)
+                .await
+                .unwrap();
+            tokio::spawn(async move {
+                let mut buffer = [0; 1500];
+                while sender.read(&mut buffer).await.is_ok() {}
+            });
+            let (decoded_tx, decoded) = mpsc::unbounded_channel();
+            peer.on_track(Box::new(move |remote, _, _| {
+                let tx = decoded_tx.clone();
+                tokio::spawn(async move {
+                    let mut decoder =
+                        opus::Decoder::new(SAMPLE_RATE, opus::Channels::Mono).unwrap();
+                    let mut pcm = [0.0; MAX_DECODED_SAMPLES];
+                    while let Ok((packet, _)) = remote.read_rtp().await {
+                        if packet.payload.is_empty() {
+                            continue;
+                        }
+                        if let Ok(count) = decoder.decode_float(&packet.payload, &mut pcm, false) {
+                            let peak = pcm[..count]
+                                .iter()
+                                .fold(0.0_f32, |peak, sample| peak.max(sample.abs()));
+                            if tx.send(peak).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                });
+                Box::pin(async {})
+            }));
+            let (channel_tx, mut channel_rx) = mpsc::unbounded_channel();
+            peer.on_data_channel(Box::new(move |channel| {
+                let tx = channel_tx.clone();
+                let opened = Arc::clone(&channel);
+                channel.on_open(Box::new(move || {
+                    let _ = tx.send(opened);
+                    Box::pin(async {})
+                }));
+                Box::pin(async {})
+            }));
+            peer.set_remote_description(RTCSessionDescription::offer(offer).unwrap())
+                .await
+                .unwrap();
+            let answer = peer.create_answer(None).await.unwrap();
+            let mut gathered = peer.gathering_complete_promise().await;
+            peer.set_local_description(answer).await.unwrap();
+            let _ = tokio::time::timeout(ICE_GATHER_TIMEOUT, gathered.recv()).await;
+            let answer = peer.local_description().await.unwrap().sdp;
+            assert_loopback_candidates(&answer, "routed remote answer");
+            let actions = fixture
+                .broker
+                .answer(&session, answer, Instant::now())
+                .unwrap();
+            fixture.actions(actions);
+            fixture.until(Duration::from_secs(20), |fixture| {
+                fixture.broker.info(&session).is_some()
+            });
+            let channel = tokio::time::timeout(Duration::from_secs(5), channel_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(channel.label(), EVENTS_CHANNEL_LABEL);
+            assert_eq!(
+                channel.ready_state(),
+                webrtc::data_channel::data_channel_state::RTCDataChannelState::Open
+            );
+            Self {
+                peer,
+                channel,
+                track,
+                decoded,
+            }
+        }
+
+        async fn capture_peak(&mut self, devices: &FakeDevices) -> f32 {
+            let tone: Vec<f32> = (0..FRAME_SAMPLES)
+                .map(|index| {
+                    (index as f32 * 440.0 * std::f32::consts::TAU / SAMPLE_RATE as f32).sin() * 0.7
+                })
+                .collect();
+            // Drain any eager startup frame; subsequent packets originate in this
+            // actual post-request callback, encoder, awaited write and RTP receiver.
+            while self.decoded.try_recv().is_ok() {}
+            let mut peak = 0.0_f32;
+            for _ in 0..5 {
+                devices.capture(&tone);
+                peak = peak.max(
+                    tokio::time::timeout(Duration::from_secs(3), self.decoded.recv())
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                );
+            }
+            peak
+        }
+
+        async fn output_peak(&self, devices: &FakeDevices) -> f32 {
+            let mut encoder =
+                opus::Encoder::new(SAMPLE_RATE, opus::Channels::Mono, opus::Application::Voip)
+                    .unwrap();
+            let tone: Vec<f32> = (0..FRAME_SAMPLES)
+                .map(|index| {
+                    (index as f32 * 660.0 * std::f32::consts::TAU / SAMPLE_RATE as f32).sin() * 0.6
+                })
+                .collect();
+            let mut peak = 0.0_f32;
+            for _ in 0..5 {
+                let mut packet = [0; 1500];
+                let count = encoder.encode_float(&tone, &mut packet).unwrap();
+                self.track
+                    .write_sample(&Sample {
+                        data: Bytes::copy_from_slice(&packet[..count]),
+                        duration: FRAME_DURATION,
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap();
+                // Existing device callback cadence, bounded to the five-frame Opus
+                // positive control, not an ACK or injected playback ring.
+                tokio::time::sleep(FRAME_DURATION).await;
+                // Consume one actual 20 ms device interval at the fixture's 44.1 kHz.
+                // A single 127-sample callback per interval would leave prefetched
+                // startup silence ahead of the fresh Opus positive control.
+                peak = devices
+                    .render_samples(44_100 / 50)
+                    .iter()
+                    .fold(peak, |peak, sample| peak.max(sample.abs()));
+            }
+            peak
+        }
+    }
+
+    impl Drop for RoutedRemote {
+        fn drop(&mut self) {
+            let peer = Arc::clone(&self.peer);
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(async move {
+                    let _ = peer.close().await;
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn native_retained_intent_reopens_preprotected_and_explicit_false_is_audible() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            for (muted, suppressed) in [(true, false), (false, true), (true, true)] {
+                let mut fixture = RoutedFixture::new(true);
+                fixture.open(true);
+                let remote = RoutedRemote::connect(&mut fixture).await;
+                assert_eq!(
+                    remote.channel.ready_state(),
+                    webrtc::data_channel::data_channel_state::RTCDataChannelState::Open
+                );
+                let devices = fixture.latest_devices();
+                let audio = devices.state();
+                let input = audio.input_token();
+                let output = audio.output_token();
+                let id = fixture.dispatch(Some(muted), Some(suppressed), None);
+                devices.wait_request(true, input);
+                devices.wait_request(false, output);
+                devices.capture(&[0.7; FRAME_SAMPLES]);
+                devices.render();
+                fixture.await_applied(id);
+                assert_eq!(
+                    fixture
+                        .broker
+                        .intent(crate::layout::PaneId::from_raw(316))
+                        .input_muted,
+                    muted
+                );
+                (devices.callbacks.lock().unwrap().as_ref().unwrap().changed)();
+                let old = fixture.session.clone();
+                fixture.until(Duration::from_secs(4), |fixture| {
+                    fixture.broker.state(&old).is_some_and(|state| {
+                        state.code.as_deref() == Some(close_code::DEVICE_CHANGED)
+                    })
+                });
+                assert!(devices.released.load(Ordering::Acquire));
+                assert!(devices.protected_before_drop.load(Ordering::Acquire));
+                let stale = Instant::now()
+                    - crate::protocol::media::MEDIA_INPUT_WINDOW
+                    - Duration::from_secs(1);
+                fixture.broker.note_pane_input(
+                    7,
+                    crate::layout::PaneId::from_raw(316),
+                    "fixture:p316",
+                    stale,
+                );
+                fixture.media.note_pane_input(
+                    &crate::client::endpoint::ClientEndpointId::Local,
+                    "fixture:p316",
+                    stale,
+                );
+                let (reply, replies) = std_mpsc::channel();
+                let refused = fixture.broker.open(
+                    "stale-input-negative".to_owned(),
+                    reply,
+                    crate::layout::PaneId::from_raw(316),
+                    None,
+                    None,
+                    |_| true,
+                    Instant::now(),
+                );
+                assert!(
+                    !refused.iter().any(|action| matches!(
+                        action,
+                        crate::server::media::MediaAction::Send { .. }
+                    )),
+                    "retained intent is not renewed microphone authority"
+                );
+                fixture.actions(refused);
+                let response: serde_json::Value =
+                    serde_json::from_str(&replies.try_recv().unwrap()).unwrap();
+                assert!(response.get("error").is_some());
+                drop(remote);
+                // A newly constructed client has no v1 safety memory. Retained
+                // server policy itself must cross the serialized Initial envelope.
+                let mut fresh_client = RoutedFixture::new(true);
+                std::mem::swap(&mut fresh_client.broker, &mut fixture.broker);
+                fixture = fresh_client;
+                fixture.open(true);
+                let mut remote = RoutedRemote::connect(&mut fixture).await;
+                let devices = fixture.latest_devices();
+                assert_eq!(
+                    *devices.initial_tokens.lock().unwrap(),
+                    Some((2 | u64::from(muted), 2 | u64::from(suppressed)))
+                );
+                let capture = remote.capture_peak(&devices).await;
+                if muted {
+                    assert!(
+                        capture < 0.001,
+                        "new protected peer must decode silence, peak={capture}"
+                    );
+                } else {
+                    assert!(capture > 0.1, "input is independent of output suppression");
+                }
+                let output = remote.output_peak(&devices).await;
+                if suppressed {
+                    assert_eq!(output, 0.0);
+                } else {
+                    assert!(
+                        output > 0.1,
+                        "output is independent of input mute, peak={output}"
+                    );
+                }
+                let audio = devices.state();
+                let previous = audio.input_token();
+                let id = fixture.dispatch(Some(false), Some(false), None);
+                devices.wait_request(true, previous);
+                devices.capture(&[0.7; FRAME_SAMPLES]);
+                devices.render();
+                fixture.await_applied(id);
+                assert!(
+                    remote.capture_peak(&devices).await > 0.1,
+                    "explicit false must resume fresh audible microphone audio"
+                );
+                assert!(
+                    remote.output_peak(&devices).await > 0.1,
+                    "explicit false must resume real outer output"
+                );
+                assert!(
+                    !fixture
+                        .broker
+                        .intent(crate::layout::PaneId::from_raw(316))
+                        .input_muted
+                );
+                assert!(
+                    !fixture
+                        .broker
+                        .intent(crate::layout::PaneId::from_raw(316))
+                        .output_suppressed
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn legacy_mute_input_only_state_without_outer_render() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let mut fixture = RoutedFixture::new(false);
+            fixture.open(true);
+            let _remote = RoutedRemote::connect(&mut fixture).await;
+            let devices = fixture.latest_devices();
+            let audio = devices.state();
+            assert_eq!(audio.input_applied.load(Ordering::Acquire), 0);
+            assert_eq!(audio.output_applied.load(Ordering::Acquire), 0);
+            assert!(!fixture.controls.iter().any(|control| matches!(control, crate::protocol::media::MediaControl::Applied(_))));
+            let actions = fixture.broker.mute(&fixture.session, true).unwrap();
+            fixture.actions(actions);
+            devices.wait_request(true, 2);
+            devices.capture(&[0.8; FRAME_SAMPLES]);
+            fixture.until(Duration::from_secs(3), |fixture| fixture.controls.iter().any(|control| matches!(control, crate::protocol::media::MediaControl::State(state) if state.muted)));
+            assert_eq!(audio.output_applied.load(Ordering::Acquire), 0);
+            let id = fixture.dispatch(None, None, Some(true));
+            fixture.wait_delivery(false, |event| matches!(event, PeerEvent::ControlFailed(failure) if failure.control_id == Some(id)));
+            fixture.until(Duration::from_secs(2), |fixture| fixture.broker.control_failed(&fixture.session).is_some_and(|failure| failure.control_id == Some(id)));
+            let id2 = fixture.dispatch(None, None, Some(false));
+            assert!(fixture.broker.applied(&fixture.session).is_none());
+            devices.render();
+            fixture.await_applied(id2);
+            let applied = fixture.broker.applied(&fixture.session).unwrap();
+            assert!(applied.input_muted);
+            assert!(!applied.output_suppressed);
+        });
+    }
+
+    #[test]
+    fn paired_control_after_partial_timeout_waits_for_outer_silence() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let mut fixture = RoutedFixture::new(false);
+            fixture.open(true);
+            let _remote = RoutedRemote::connect(&mut fixture).await;
+            let devices = fixture.latest_devices();
+            let audio = devices.state();
+            let id = fixture.dispatch(Some(true), Some(true), None);
+            let input = devices.wait_request(true, 2);
+            let output = devices.wait_request(false, 2);
+            devices.capture(&[0.7; FRAME_SAMPLES]);
+            fixture.until(Duration::from_secs(7), |fixture| {
+                fixture
+                    .broker
+                    .control_failed(&fixture.session)
+                    .is_some_and(|failure| failure.control_id == Some(id))
+            });
+            assert_eq!(audio.input_applied.load(Ordering::Acquire), input);
+            assert_ne!(audio.output_applied.load(Ordering::Acquire), output);
+            let id2 = fixture.dispatch(None, None, Some(true));
+            // The omitted output is still the current unobserved true request;
+            // neither legacy input nor a levels-only request manufactures a pair.
+            assert!(fixture.broker.applied(&fixture.session).is_none());
+            assert!(devices.render().iter().all(|sample| *sample == 0.0));
+            fixture.await_applied(id2);
+            let applied = fixture.broker.applied(&fixture.session).unwrap();
+            assert!(applied.input_muted && applied.output_suppressed);
+            assert_eq!(applied.control_id, id2);
+            assert_eq!(audio.output_drained.load(Ordering::Acquire), output);
+            assert_eq!(audio.output_applied.load(Ordering::Acquire), output);
+        });
+    }
+
+    #[test]
+    fn native_critical_outcome_backpressure_settles_broker() {
+        for timeout in [false, true] {
+            let mut fixture = RoutedFixture::new(true);
+            let session = fixture.open(true);
+            fixture.offer(&session);
+            let devices = fixture.latest_devices();
+            let old = devices.state().input_token();
+            let id = fixture.dispatch(Some(true), None, None);
+            let token = devices.wait_request(true, old);
+            let id2 = fixture.dispatch(Some(false), None, None);
+            fixture.fill_queue();
+            if !timeout {
+                devices.capture(&[0.7; FRAME_SAMPLES]);
+            }
+            fixture.wait_delivery(false, |event| match event {
+                PeerEvent::Applied(update) => !timeout && update.control_id == id,
+                PeerEvent::ControlFailed(failure) => timeout && failure.control_id == Some(id),
+                _ => false,
+            });
+            assert_eq!(
+                devices.state().input_token(),
+                token,
+                "ID2 cannot publish during terminal delivery"
+            );
+            assert_eq!(
+                fixture.credits.lock().unwrap()[0]
+                    .device_control
+                    .load(Ordering::Acquire),
+                2
+            );
+            assert!(fixture.broker.applied(&session).is_none());
+            fixture.until(Duration::from_secs(2), |fixture| {
+                if timeout {
+                    fixture
+                        .broker
+                        .control_failed(&session)
+                        .is_some_and(|failure| failure.control_id == Some(id))
+                } else {
+                    fixture
+                        .broker
+                        .applied(&session)
+                        .is_some_and(|applied| applied.control_id == id)
+                }
+            });
+            let fresh = devices.wait_request(true, token);
+            devices.capture_with_token(token, &[0.8; FRAME_SAMPLES]);
+            assert_ne!(devices.state().input_applied.load(Ordering::Acquire), fresh);
+            devices.capture(&[0.7; FRAME_SAMPLES]);
+            fixture.await_applied(id2);
+            assert!(!fixture.broker.applied(&session).unwrap().input_muted);
+            // Settlement freed the real per-target broker allowance, not just a
+            // local permit/counter or fabricated Applied invocation.
+            assert!(fixture
+                .broker
+                .dispatch_control(&session, None, None, None, Instant::now())
+                .is_ok());
+        }
+    }
+
+    #[test]
+    fn native_delivery_timeout_gates_before_device_drop_and_retains_closed() {
+        let mut fixture = RoutedFixture::new(true);
+        let session = fixture.open(true);
+        fixture.offer(&session);
+        let devices = fixture.latest_devices();
+        let audio = devices.state();
+        let old = audio.input_token();
+        let id = fixture.dispatch(Some(true), None, Some(true));
+        let token = devices.wait_request(true, old);
+        fixture.dispatch(Some(false), Some(false), None);
+        fixture.fill_queue();
+        devices.capture(&[0.7; FRAME_SAMPLES]);
+        fixture.wait_delivery(
+            false,
+            |event| matches!(event, PeerEvent::Applied(update) if update.control_id == id),
+        );
+        assert!(wait_until(&devices.released, Duration::from_secs(3)));
+        assert!(devices.protected_before_drop.load(Ordering::Acquire));
+        assert!(enabled(audio.input_token()) && enabled(audio.output_token()));
+        assert!(!audio.levels_enabled());
+        assert_eq!(audio.input_token(), token, "ID2 never published");
+        fixture.wait_delivery(false, |event| {
+            matches!(
+                event,
+                PeerEvent::Closed {
+                    code: close_code::DISCONNECTED,
+                    ..
+                }
+            )
+        });
+        assert!(!wait_until(
+            &fixture.stopped.lock().unwrap()[0],
+            CRITICAL_EVENT_DELIVERY_TIMEOUT + CONTROL_OBSERVE_INTERVAL,
+        ), "a full queue beyond the final delivery bound must retain the same waiter, not stop the runtime");
+        assert!(
+            fixture.broker.state(&session).unwrap().code.is_none(),
+            "queue admission is not broker receipt"
+        );
+        // Owner cancellation after native terminal selection must not erase Closed.
+        fixture.media.session.as_mut().unwrap().peer.close();
+        fixture.until(Duration::from_secs(3), |fixture| {
+            fixture
+                .broker
+                .state(&session)
+                .is_some_and(|state| state.code.as_deref() == Some(close_code::DISCONNECTED))
+        });
+        fixture.wait_delivery(true, |event| matches!(event, PeerEvent::Closed { .. }));
+        assert!(wait_until(
+            &fixture.stopped.lock().unwrap()[0],
+            Duration::from_secs(3)
+        ));
+        {
+            let log = fixture.delivery.lock().unwrap();
+            assert_eq!(log.iter().filter(|(admitted, event)| !admitted && matches!(event, PeerEvent::Scoped { event, .. } if matches!(event.as_ref(), PeerEvent::Closed { .. }))).count(), 1, "one final future, no retry/re-enqueue");
+        }
+        fixture.replay_actual_applied(id);
+        assert!(fixture.broker.applied(&session).is_none());
+        assert_eq!(
+            fixture.broker.state(&session).unwrap().code.as_deref(),
+            Some(close_code::DISCONNECTED)
+        );
+    }
+
+    #[test]
+    fn native_callback_failure_backpressure_timeout_is_gate_first_terminal() {
+        let mut fixture = RoutedFixture::new(true);
+        let session = fixture.open(true);
+        fixture.offer(&session);
+        let devices = fixture.latest_devices();
+        let old = devices.state().input_token();
+        let id = fixture.dispatch(Some(true), Some(true), None);
+        let input = devices.wait_request(true, old);
+        let audio = devices.state();
+        fixture.dispatch(Some(false), Some(false), None);
+        fixture.fill_queue();
+        // Both device observations are withheld for the real five-second worker
+        // deadline; the actual failure then waits on the saturated root queue.
+        fixture.wait_delivery(false, |event| matches!(event, PeerEvent::ControlFailed(failure) if failure.control_id == Some(id)));
+        assert!(wait_until(&devices.released, Duration::from_secs(3)));
+        assert!(devices.protected_before_drop.load(Ordering::Acquire));
+        fixture.wait_delivery(false, |event| matches!(event, PeerEvent::Closed { .. }));
+        assert!(!fixture.stopped.lock().unwrap()[0].load(Ordering::Acquire));
+        fixture.until(Duration::from_secs(3), |fixture| {
+            fixture
+                .broker
+                .state(&session)
+                .is_some_and(|state| state.code.as_deref() == Some(close_code::DISCONNECTED))
+        });
+        assert!(fixture.broker.applied(&session).is_none());
+        assert_eq!(
+            audio.input_token(),
+            input,
+            "ID2 was not published before terminal teardown"
+        );
+    }
+
+    #[test]
+    fn native_closed_consumer_fail_stops_and_disconnect_settles() {
+        let mut fixture = RoutedFixture::new(true);
+        let session = fixture.open(true);
+        fixture.offer(&session);
+        let devices = fixture.latest_devices();
+        let old = devices.state().input_token();
+        let id = fixture.dispatch(Some(true), None, None);
+        devices.wait_request(true, old);
+        fixture.fill_queue();
+        devices.capture(&[0.8; FRAME_SAMPLES]);
+        fixture.wait_delivery(
+            false,
+            |event| matches!(event, PeerEvent::Applied(update) if update.control_id == id),
+        );
+        fixture.rx.take();
+        assert!(wait_until(&devices.released, Duration::from_secs(2)));
+        assert!(devices.protected_before_drop.load(Ordering::Acquire));
+        assert!(wait_until(
+            &fixture.stopped.lock().unwrap()[0],
+            Duration::from_secs(3)
+        ));
+        assert!(
+            fixture.broker.state(&session).unwrap().code.is_none(),
+            "receiver loss alone is not broker-observed disconnect"
+        );
+        let actions = fixture.broker.client_removed(7, Instant::now());
+        fixture.actions(actions);
+        assert_eq!(
+            fixture.broker.state(&session).unwrap().code.as_deref(),
+            Some(close_code::DISCONNECTED)
+        );
+        fixture.replay_actual_applied(id);
+        assert!(fixture.broker.applied(&session).is_none());
+    }
+
+    #[test]
+    fn native_cancel_while_backpressured_releases_audio() {
+        let mut fixture = RoutedFixture::new(true);
+        let session = fixture.open(true);
+        fixture.offer(&session);
+        let devices = fixture.latest_devices();
+        let old = devices.state().input_token();
+        let id = fixture.dispatch(Some(true), None, None);
+        devices.wait_request(true, old);
+        fixture.fill_queue();
+        devices.capture(&[0.8; FRAME_SAMPLES]);
+        fixture.wait_delivery(
+            false,
+            |event| matches!(event, PeerEvent::Applied(update) if update.control_id == id),
+        );
+        let cancelled = Instant::now();
+        fixture.media.set_mode(crate::config::MediaMode::Off);
+        fixture.effects();
+        assert!(wait_until(&devices.released, Duration::from_millis(500)));
+        assert!(cancelled.elapsed() < CRITICAL_EVENT_DELIVERY_TIMEOUT);
+        assert!(devices.protected_before_drop.load(Ordering::Acquire));
+        assert_eq!(
+            fixture.broker.state(&session).unwrap().code.as_deref(),
+            Some(close_code::DISABLED)
+        );
+        assert!(wait_until(
+            &fixture.stopped.lock().unwrap()[0],
+            Duration::from_secs(3)
+        ));
+        assert!(!fixture.delivery.lock().unwrap().iter().any(|(_, event)| matches!(event, PeerEvent::Scoped { event, .. } if matches!(event.as_ref(), PeerEvent::Closed { .. }))));
+    }
+
+    #[test]
+    fn legacy_mute_timeout_reports_observed_state() {
+        let mut fixture = RoutedFixture::new(false);
+        let session = fixture.open(true);
+        fixture.offer(&session);
+        let devices = fixture.latest_devices();
+        let actions = fixture.broker.mute(&session, true).unwrap();
+        fixture.actions(actions);
+        devices.wait_request(true, 2);
+        fixture.until(Duration::from_secs(7), |fixture| fixture.controls.iter().any(|control| matches!(control, crate::protocol::media::MediaControl::ControlFailed(failure) if failure.control_id.is_none())));
+        fixture.until(Duration::from_secs(2), |fixture| fixture.controls.iter().any(|control| matches!(control, crate::protocol::media::MediaControl::State(state) if state.session_id == session && !state.muted)));
+        assert!(!fixture.broker.state(&session).unwrap().muted);
+        assert!(
+            fixture
+                .broker
+                .intent(crate::layout::PaneId::from_raw(316))
+                .input_muted
+        );
+        assert!(enabled(devices.state().input_token()));
+    }
+
+    #[test]
+    fn native_successor_open_failure_keeps_option_b_and_next_open_protection() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let mut fixture = RoutedFixture::new(true);
+            let source = fixture.open(true);
+            let _remote = RoutedRemote::connect(&mut fixture).await;
+            let old_devices = fixture.latest_devices();
+            let old = old_devices.state().input_token();
+            let id = fixture.dispatch(Some(true), Some(true), None);
+            old_devices.wait_request(true, old);
+            old_devices.capture(&[0.6; FRAME_SAMPLES]);
+            old_devices.render();
+            fixture.await_applied(id);
+            let stale = Instant::now()
+                - crate::protocol::media::MEDIA_INPUT_WINDOW
+                - Duration::from_secs(1);
+            fixture.broker.note_pane_input(
+                7,
+                crate::layout::PaneId::from_raw(316),
+                "fixture:p316",
+                stale,
+            );
+            fixture.media.note_pane_input(
+                &crate::client::endpoint::ClientEndpointId::Local,
+                "fixture:p316",
+                stale,
+            );
+            fixture.mode.lock().unwrap().1 = true;
+            let failed = fixture.open(false); // Connected source authorizes idle renewal.
+            fixture.until(Duration::from_secs(4), |fixture| {
+                fixture
+                    .broker
+                    .state(&failed)
+                    .is_some_and(|state| state.code.as_deref() == Some(close_code::DEVICE_ERROR))
+            });
+            assert!(
+                wait_until(&old_devices.released, Duration::from_secs(2)),
+                "Option B closes the physical source first"
+            );
+            let failing_devices = fixture.latest_devices();
+            assert_eq!(
+                *failing_devices.initial_tokens.lock().unwrap(),
+                Some((3, 3))
+            );
+            assert!(failing_devices.released.load(Ordering::Acquire));
+            assert!(
+                fixture.media.session.is_none(),
+                "no physical failed-handover preservation promise"
+            );
+            assert!(fixture.broker.state(&source).unwrap().code.is_some());
+            fixture.mode.lock().unwrap().1 = false;
+            let next = fixture.open(true);
+            fixture.offer(&next);
+            assert_eq!(
+                *fixture.latest_devices().initial_tokens.lock().unwrap(),
+                Some((3, 3))
+            );
+        });
+    }
+
+    #[test]
+    fn native_broker_33rd_control_rejects_without_changing_intent_or_native_admission() {
+        let mut fixture = RoutedFixture::new(true);
+        let session = fixture.open(true);
+        fixture.offer(&session);
+        for _ in 0..32 {
+            fixture.dispatch(Some(true), Some(true), None);
+        }
+        let devices = fixture.latest_devices();
+        let input = devices.wait_request(true, 2);
+        let before = fixture.broker.intent(crate::layout::PaneId::from_raw(316));
+        assert!(fixture
+            .broker
+            .dispatch_control(
+                &session,
+                Some(false),
+                Some(false),
+                Some(true),
+                Instant::now()
+            )
+            .is_err());
+        assert_eq!(
+            fixture.broker.intent(crate::layout::PaneId::from_raw(316)),
+            before
+        );
+        assert_eq!(
+            fixture.credits.lock().unwrap()[0]
+                .device_control
+                .load(Ordering::Acquire),
+            32
+        );
+        assert_eq!(devices.state().input_token(), input);
+        assert!(!devices.state().levels_enabled());
+        let actions = fixture.broker.close(&session, Instant::now());
+        fixture.actions(actions);
+        assert!(wait_until(&devices.released, Duration::from_secs(2)));
+        assert!(wait_until(
+            &fixture.stopped.lock().unwrap()[0],
+            Duration::from_secs(3)
+        ));
+        assert_eq!(
+            fixture.credits.lock().unwrap()[0]
+                .device_control
+                .load(Ordering::Acquire),
+            0
+        );
+        assert!(fixture.broker.applied(&session).is_none());
+    }
+
+    #[test]
+    fn native_setup_reserves_all_65_fifo_credits_without_accepted_bound_overload() {
+        struct GateAudio {
+            devices: Arc<FakeDevices>,
+            begun: Arc<AtomicBool>,
+            gate: std_mpsc::Receiver<()>,
+        }
+        impl AudioBackend for GateAudio {
+            fn open(self: Box<Self>, io: AudioIo) -> Result<OpenedAudio, String> {
+                self.begun.store(true, Ordering::Release);
+                self.gate
+                    .recv_timeout(Duration::from_secs(5))
+                    .map_err(|_| "setup gate not released".to_owned())?;
+                Box::new(FakeAudio(Arc::clone(&self.devices))).open(io)
+            }
+        }
+        let devices = Arc::new(FakeDevices::default());
+        let begun = Arc::new(AtomicBool::new(false));
+        let (release, gate) = std_mpsc::channel();
+        let sink: PeerEventSink = Arc::new(|_| Box::pin(async { Ok(()) }));
+        let mut peer = start_with_audio(
+            "setup-budget".to_owned(),
+            PeerInitialState::default(),
+            sink,
+            Box::new(GateAudio {
+                devices: Arc::clone(&devices),
+                begun: Arc::clone(&begun),
+                gate,
+            }),
+        )
+        .unwrap();
+        assert!(wait_until(&begun, Duration::from_secs(2)));
+        peer.apply_answer("queued until teardown".to_owned())
+            .unwrap();
+        for id in 1..=32 {
+            peer.set_muted(id % 2 == 0).unwrap();
+            peer.apply_control(device_control(id, Some(id % 2 == 0), None, None))
+                .unwrap();
+        }
+        assert_eq!(peer.commands.capacity(), 0);
+        assert_eq!(
+            peer.apply_control(device_control(33, None, None, None)),
+            Err(PeerCommandError::Full)
+        );
+        assert_eq!(peer.set_muted(false), Err(PeerCommandError::Full));
+        assert_eq!(
+            peer.apply_answer(String::new()),
+            Err(PeerCommandError::Full)
+        );
+        assert!(!peer.closed.load(Ordering::Acquire));
+        let credits = Arc::clone(&peer.credits);
+        peer.close();
+        release.send(()).unwrap();
+        assert!(wait_until(&peer.stopped, Duration::from_secs(3)));
+        assert!(devices.protected_before_drop.load(Ordering::Acquire));
+        assert_eq!(credits.answer.load(Ordering::Acquire), 0);
+        assert_eq!(credits.legacy_mute.load(Ordering::Acquire), 0);
+        assert_eq!(credits.device_control.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn native_enqueue_failed_send_rolls_back_permit_and_fifo_does_not_sort_ids() {
+        let (commands, mut rx) = mpsc::channel(2);
+        let credits = Arc::new(CommandCredits::default());
+        let (cancel, _) = watch::channel(false);
+        let peer = NativePeer {
+            commands,
+            credits: Arc::clone(&credits),
+            cancel,
+            closed: Arc::new(AtomicBool::new(false)),
+            stopped: Arc::new(AtomicBool::new(false)),
+            done: None,
+            thread: None,
+        };
+        peer.enqueue(Command::Control(device_control(99, None, None, None)))
+            .unwrap();
+        peer.enqueue(Command::Mute(true)).unwrap();
+        assert_eq!(
+            peer.enqueue(Command::Answer("not admitted".to_owned())),
+            Err(PeerCommandError::Full)
+        );
+        assert_eq!(
+            credits.answer.load(Ordering::Acquire),
+            0,
+            "failed send releases its reserved credit"
+        );
+        let first = rx.try_recv().unwrap();
+        assert!(matches!(
+            first.command,
+            Command::Control(MediaDeviceControl { control_id: 99, .. })
+        ));
+        assert_eq!(
+            credits.device_control.load(Ordering::Acquire),
+            1,
+            "dequeue alone retains active credit"
+        );
+        let second = rx.try_recv().unwrap();
+        assert!(matches!(second.command, Command::Mute(true)));
+        drop(first.permit);
+        drop(second.permit);
+        assert_eq!(credits.device_control.load(Ordering::Acquire), 0);
+        assert_eq!(credits.legacy_mute.load(Ordering::Acquire), 0);
+        rx.close();
+        assert_eq!(
+            peer.enqueue(Command::Answer(String::new())),
+            Err(PeerCommandError::Closed)
+        );
+        assert_eq!(credits.answer.load(Ordering::Acquire), 0);
     }
 
     #[test]

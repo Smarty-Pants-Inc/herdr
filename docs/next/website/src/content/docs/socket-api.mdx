@@ -135,21 +135,39 @@ API request's `id`, both applied boolean fields, and the current `epoch`:
 {"id":"control-1","result":{"type":"media_controls_applied","session_id":"session","request_id":"control-1","input_muted":true,"output_suppressed":false,"epoch":7}}
 ```
 
-An unknown session returns `media_session_not_found`; a session ending before the
-acknowledgement returns `media_control_failed`. The acknowledgement deadline is
-**5 seconds**. `media_timeout` means application is uncertain: the client may
-already have applied the control, or may apply it later. It is not proof of
+Before a session reaches `offered` (while opening/pending), and for unknown,
+stale, or epoch-mismatched targets, `media.control` returns
+`media_session_not_found`.
+
+If the 32 unresolved target-device control slots are full, it returns
+`media_control_failed` with a clear message and no `close_code`; the session
+remains live. Only the matching acknowledgement from the session named in the
+request settles its response. A successor's acknowledgement cannot settle a
+source request. If the named session ends before its acknowledgement, the
+response is `media_control_failed`; a known causal reason is its `close_code`. In
+particular, if the session is retired or replaced first, the response carries
+that session's `close_code`. The successor's own application is reported as a
+`media.controls_applied` event under its own `session_id`, never as the old
+response. The acknowledgement deadline is **5 seconds**. `media_timeout` means
+application is uncertain: the client may already have applied the control, or
+may apply it later. It is not proof of
 non-application and does not close the session. Do not treat it as an automatic
 retry instruction. Disconnecting only the control caller does not end the media
 session. `media.mute` remains the legacy dispatch-only method: its `ok` response
 is not an applied acknowledgement.
 
-Desired mute and output-suppression intent is recorded on dispatch, separately
-from acknowledged state. Both fields are inherited by in-flight renewal and
-survive `device_changed`, session close, and subsequent renewal on that pane.
-When input mute intent is true, renewed capture starts **pre-muted**, not with an
-unmuted interval before a later acknowledgement. Applied acknowledgements do not
-overwrite newer desired intent.
+Desired input-mute and output-suppression intent is recorded separately from
+applied state. It survives `device_changed` and session close until explicitly
+changed or the pane is removed from the live pane topology; it is not persisted
+across server restart.
+
+A new or renewed client session installs both desired input-mute and
+output-suppression gates before invoking `audio.open`, rather than opening audio
+and applying those gates afterward. Applied acknowledgements do not overwrite
+newer desired intent. Renewal has limited availability: the client closes the
+old peer before opening its successor. If the successor's `audio.open` fails,
+the call ends without audio and the voice caller must renew; audio is not
+preserved across that failed handover.
 
 `media.answer` returns immediately after dispatch; it does not wait for a
 connection. After an answer, the client has **15 seconds** to reach `connected`
@@ -196,7 +214,7 @@ Media subscription events use the dotted `event` names below and **untagged
 | `media.stopped` | `epoch`, `code`, `message` | One terminal close with its epoch and reason, including unanswered, abandoned, device-change, and negotiation-timeout closes. |
 | `media.error` | `code`, `message` | A runtime failure; unlike stopped, this shape has no epoch. |
 | `media.controls_applied` | `request_id`, `input_muted`, `output_suppressed`, `epoch` | Applied control acknowledgement; API controls use the outer API request ID. |
-| `media.levels` | `input_peak`, `output_peak` | Numeric audio peak telemetry, at most 10 events per second per session. |
+| `media.levels` | `input_peak`, `output_peak` | Numeric audio peak telemetry, at most 10 events per second per pane. |
 
 ```json
 {"event":"media.started","data":{"pane_id":"w1:p1","session_id":"session","epoch":7,"helper":{"version":"1","commit":"abc","pid":123},"input_device":"microphone","output_device":"speakers"}}
@@ -206,10 +224,16 @@ Media subscription events use the dotted `event` names below and **untagged
 {"event":"media.levels","data":{"pane_id":"w1:p1","session_id":"session","input_peak":0.25,"output_peak":0.5}}
 ```
 
-The first media subscriber for a pane enables client level reporting; the last
-subscriber leaving disables it, including socket disconnect and failed
+The first media subscriber for a pane requests client level reporting; the last
+subscriber leaving requests levels off, including socket disconnect and failed
 subscription setup. Subscribing before a session opens also applies to future
-sessions on that pane. No subscriber means no level reporting. Lifecycle and
+sessions on that pane. A new or renewed session starts with levels off unless a
+subscriber exists. The server drops each incoming levels message immediately
+when its pane has no subscribers. If the levels-off control fails or is
+rejected, desired levels-off remains and is reconciled at the next existing
+dispatch, session-state update, or renewal event for that session; there is no
+frame polling or timer. A last-subscriber transition is a request, not a
+guarantee that the client has already stopped sending levels. Lifecycle and
 control events are not throttled by the level limit. `media.device_changed` is
 reserved and is **never emitted**; device changes are close reasons, not a sixth
 event kind. Reconnect and resubscribe after socket loss; events are live notices,

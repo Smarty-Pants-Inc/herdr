@@ -198,10 +198,16 @@ fn successful_offer(write_half_closed: bool, extra_input: bool) {
         media.broker.state(&id).unwrap().state,
         crate::api::schema::MediaSessionState::Offered
     );
-    assert_eq!(
-        media.controls.len(),
-        1,
-        "successful response teardown must not send media.close"
+    media.assert_unprotected_open_pair(&id);
+    assert!(
+        matches!(
+            media.controls.as_slice(),
+            [
+                crate::protocol::media::MediaControl::OpenInitial(_),
+                crate::protocol::media::MediaControl::Open(_)
+            ]
+        ),
+        "successful response teardown retains only the compatibility open pair, not media.close"
     );
 }
 

@@ -16,8 +16,9 @@ use crate::api::schema::{
 };
 use crate::layout::PaneId;
 use crate::protocol::media::{
-    close_code, MediaApplied, MediaClose, MediaControl, MediaDeviceControl, MediaInfo, MediaLevels,
-    MediaMute, MediaOpen, MediaPeerState, MediaSdp, MEDIA_INPUT_WINDOW,
+    close_code, MediaApplied, MediaClose, MediaControl, MediaControlFailed, MediaDeviceControl,
+    MediaInfo, MediaLevels, MediaMute, MediaOpen, MediaOpenInitial, MediaPeerState, MediaSdp,
+    MEDIA_DEVICE_CONTROL_CAPACITY, MEDIA_INPUT_WINDOW,
 };
 
 /// How long `pane.media_open` waits for the client's offer. It covers the one-time consent
@@ -96,6 +97,7 @@ struct PendingOpen {
     deadline: Instant,
 }
 
+/// Public response waiting only; device admission belongs exclusively to outstanding.
 #[derive(Debug)]
 struct PendingControl {
     control_id: u64,
@@ -104,18 +106,40 @@ struct PendingControl {
     deadline: Instant,
 }
 
-/// Explicit per-pane intent outlives a peer, including device-change retirement. `None`
-/// permits the legacy fail-closed inheritance; an explicit false must not become true
-/// again merely because an older acknowledgement or state update arrived late.
-#[derive(Debug, Default)]
-struct MediaIntent {
-    input_muted: Option<bool>,
-    output_suppressed: Option<bool>,
+/// Event-only correlation for another actual target of the same admitted dispatch.
+/// It never owns a response, allocates an ID, or reserves device capacity. Bounded
+/// by that target's outstanding records, it survives the named response's end.
+#[derive(Debug)]
+struct ControlEventContext {
+    request_id: String,
+}
+
+/// Runtime pane policy, retained until pane death or an explicit request changes an axis.
+/// Session outcomes (including caller close) never clear this policy or renew consent.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct MediaIntent {
+    pub(crate) input_muted: bool,
+    pub(crate) output_suppressed: bool,
+}
+
+/// Broker intent acceptance only: actions are not native admission or delivery receipts.
+#[derive(Debug)]
+pub(crate) struct MediaControlDispatch {
+    pub(crate) control_id: u64,
+    pub(crate) session_ids: Vec<String>,
+    pub(crate) actions: Vec<MediaAction>,
+}
+
+struct ControlTargets {
+    actual: String,
+    targets: Vec<(String, u64)>,
 }
 
 #[derive(Debug, Default)]
 struct MediaTelemetry {
     applied: Option<MediaApplied>,
+    control_failed: Option<MediaControlFailed>,
+    legacy_control_failed: Option<MediaControlFailed>,
     levels: Option<MediaLevels>,
     info: Option<MediaInfo>,
 }
@@ -126,6 +150,9 @@ struct ReplacedSession {
     // Another pending attempt is superseded on acceptance, but is not the connected
     // source that authorizes this renewal. Cancelling it must not cancel this one.
     authorizes_renewal: bool,
+    // Capture authority independently of bounded closed-history retention.
+    pane: PaneId,
+    client_id: u64,
     // Keep the caller's handle while a renewal is pending, even if the client already
     // retired the old peer as replaced before sending the successor's offer.
     open_id: Option<String>,
@@ -149,12 +176,20 @@ struct MediaSession {
     wants_muted: bool,
     wants_output_suppressed: bool,
     state: MediaSessionState,
+    /// Observations, never pane-policy authority. Startup requests are not observations.
     muted: bool,
+    output_suppressed: bool,
+    /// Expected complete pairs for accepted device controls, independent of desired state.
+    outstanding: HashMap<u64, MediaIntent>,
+    terminal_watermark: u64,
     offered_deadline: Option<Instant>,
     connect_deadline: Option<Instant>,
     started: bool,
-    next_control_id: u64,
     pending_controls: VecDeque<PendingControl>,
+    control_events: HashMap<u64, ControlEventContext>,
+    /// Last admitted levels request, not observed application. None needs reconciliation.
+    levels_requested: Option<bool>,
+    levels_control_id: Option<u64>,
     response_write_complete: Option<Receiver<()>>,
     abandoned: bool,
     pending: Option<PendingOpen>,
@@ -287,6 +322,10 @@ impl MediaSessionView {
 #[derive(Debug)]
 struct ClosedSession {
     closed_at: Instant,
+    client_id: u64,
+    pane: PaneId,
+    /// Only a connected source retired by replacement can authorize a pending alias.
+    authorizes_renewal: bool,
     view: MediaSessionView,
 }
 
@@ -297,9 +336,9 @@ pub(crate) struct MediaBroker {
     /// Per pane, the client whose input reached it last. Input to another pane never moves
     /// this owner, so it cannot reroute a pane's microphone to an older client.
     pane_owners: HashMap<PaneId, PaneOwner>,
+    pane_intents: HashMap<PaneId, MediaIntent>,
     next_owner_cleanup: Option<Instant>,
     pane_epochs: HashMap<PaneId, u64>,
-    pane_intent: HashMap<PaneId, MediaIntent>,
     pane_event_ids: HashMap<PaneId, String>,
     levels_interest: HashSet<PaneId>,
     levels_last_published: HashMap<PaneId, Instant>,
@@ -309,6 +348,7 @@ pub(crate) struct MediaBroker {
     cancelled_opens: VecDeque<(Instant, String)>,
     id_prefix: String,
     next_id: u64,
+    next_control_id: u64,
 }
 
 pub(crate) fn success_response(id: String, result: ResponseResult) -> String {
@@ -381,9 +421,9 @@ impl MediaBroker {
         Self {
             clients: HashMap::new(),
             pane_owners: HashMap::new(),
+            pane_intents: HashMap::new(),
             next_owner_cleanup: None,
             pane_epochs: HashMap::new(),
-            pane_intent: HashMap::new(),
             pane_event_ids: HashMap::new(),
             levels_interest: HashSet::new(),
             levels_last_published: HashMap::new(),
@@ -392,6 +432,7 @@ impl MediaBroker {
             cancelled_opens: VecDeque::new(),
             id_prefix: format!("media_{boot:032x}_"),
             next_id: 1,
+            next_control_id: 1,
         }
     }
 
@@ -468,7 +509,7 @@ impl MediaBroker {
         (!self.pane_owners.is_empty()
             || !self.pane_epochs.is_empty()
             || !self.pane_event_ids.is_empty()
-            || !self.pane_intent.is_empty()
+            || !self.pane_intents.is_empty()
             || !self.levels_interest.is_empty())
             && self
                 .next_owner_cleanup
@@ -477,9 +518,9 @@ impl MediaBroker {
 
     pub(crate) fn retain_live_panes(&mut self, now: Instant, pane_exists: impl Fn(PaneId) -> bool) {
         self.pane_owners.retain(|pane, _| pane_exists(*pane));
-        // Epochs belong to the pane's lifetime, not its input owner's connection.
+        // Epochs and intent belong to the pane's lifetime, not its input connection.
         self.pane_epochs.retain(|pane, _| pane_exists(*pane));
-        self.pane_intent.retain(|pane, _| pane_exists(*pane));
+        self.pane_intents.retain(|pane, _| pane_exists(*pane));
         self.pane_event_ids.retain(|pane, _| pane_exists(*pane));
         self.levels_interest.retain(|pane| pane_exists(*pane));
         self.levels_last_published
@@ -693,6 +734,8 @@ impl MediaBroker {
             });
             return actions;
         };
+        // Startup gates use retained policy, never an older observed acknowledgement.
+        let initial = self.intent(pane);
         let replaced = self
             .sessions
             .iter()
@@ -700,6 +743,8 @@ impl MediaBroker {
             .map(|(id, session)| ReplacedSession {
                 session_id: id.clone(),
                 authorizes_renewal: session.state == MediaSessionState::Connected,
+                pane: session.pane,
+                client_id: session.client_id,
                 open_id: session.open_id.clone(),
             })
             .collect::<Vec<_>>();
@@ -721,29 +766,6 @@ impl MediaBroker {
             Vec::new()
         };
 
-        // A renewal keeps the call's mute: muted if the caller asked for it or the client reported it (fail closed).
-        let inherited_mute = self
-            .pane_intent
-            .get(&pane)
-            .and_then(|intent| intent.input_muted)
-            .unwrap_or_else(|| {
-                replaces.iter().any(|old| {
-                    self.sessions
-                        .get(&old.session_id)
-                        .is_some_and(|old| old.wants_muted || old.muted)
-                })
-            });
-        let inherited_suppression = self
-            .pane_intent
-            .get(&pane)
-            .and_then(|intent| intent.output_suppressed)
-            .unwrap_or_else(|| {
-                replaces.iter().any(|old| {
-                    self.sessions
-                        .get(&old.session_id)
-                        .is_some_and(|old| old.wants_output_suppressed)
-                })
-            });
         let session_id = format!("{}{}", self.id_prefix, self.next_id);
         self.next_id += 1;
         self.pane_epochs.insert(pane, epoch);
@@ -761,15 +783,20 @@ impl MediaBroker {
                 epoch,
                 pane_ref: input.pane_ref.clone(),
                 replaces,
-                wants_muted: inherited_mute,
-                wants_output_suppressed: inherited_suppression,
+                wants_muted: initial.input_muted,
+                wants_output_suppressed: initial.output_suppressed,
                 state: MediaSessionState::Opening,
-                muted: inherited_mute,
+                muted: false,
+                output_suppressed: false,
+                outstanding: HashMap::new(),
+                terminal_watermark: 0,
                 offered_deadline: None,
                 connect_deadline: None,
                 started: false,
-                next_control_id: 1,
                 pending_controls: VecDeque::new(),
+                control_events: HashMap::new(),
+                levels_requested: Some(false),
+                levels_control_id: None,
                 response_write_complete,
                 abandoned: false,
                 pending: Some(PendingOpen {
@@ -782,38 +809,27 @@ impl MediaBroker {
         );
         actions.push(MediaAction::Send {
             client_id,
-            control: MediaControl::Open(MediaOpen {
+            control: MediaControl::OpenInitial(MediaOpenInitial {
                 session_id: session_id.clone(),
-                pane_id: input.pane_ref,
+                pane_id: input.pane_ref.clone(),
+                input_muted: initial.input_muted,
+                output_suppressed: initial.output_suppressed,
             }),
         });
-        if inherited_mute {
-            // Right after the Open it follows: the new peer is muted before it can send any microphone audio.
+        if !initial.input_muted && !initial.output_suppressed {
+            // Contiguous, same-ID v1 alternate only for the complete non-protective pair.
+            // Protected opens never downgrade or depend on an after-open Mute.
             actions.push(MediaAction::Send {
                 client_id,
-                control: MediaControl::Mute(MediaMute {
+                control: MediaControl::Open(MediaOpen {
                     session_id: session_id.clone(),
-                    muted: true,
+                    pane_id: input.pane_ref,
                 }),
             });
         }
-        let intent = self.pane_intent.get(&pane);
-        let input_muted = intent
-            .and_then(|intent| intent.input_muted)
-            .or(inherited_mute.then_some(true));
-        let output_suppressed = intent
-            .and_then(|intent| intent.output_suppressed)
-            .or(inherited_suppression.then_some(true));
-        let levels = self.levels_interest.contains(&pane).then_some(true);
-        if input_muted.is_some() || output_suppressed.is_some() || levels.is_some() {
-            self.dispatch_control(
-                &session_id,
-                input_muted,
-                output_suppressed,
-                levels,
-                &mut actions,
-            );
-        }
+        // Privacy is installed before audio.open by OpenInitial, never a later control.
+        // Levels default off; opt in only through the same admitted dispatch seam.
+        self.reconcile_levels(&session_id, now, &mut actions);
         actions
     }
 
@@ -842,73 +858,125 @@ impl MediaBroker {
         // Callback deadlines have the same authority as maintenance. In particular an
         // acknowledgement at 5s cannot win a race against the broker's timeout.
         session.expire_controls(now, &mut actions);
+        let reconcile_levels = matches!(&control, MediaControl::State(_) | MediaControl::Offer(_));
         match control {
             MediaControl::Applied(applied) => {
-                // All dispatched ids, internal and API, share one ordered sequence.
-                // Unsolicited, duplicate and out-of-order acks cannot roll back actual
-                // state, and no ack ever overwrites the caller's newer desired intent.
-                if applied.control_id == 0
-                    || applied.control_id >= session.next_control_id
-                    || session
-                        .telemetry
-                        .applied
-                        .as_ref()
-                        .is_some_and(|old| old.control_id >= applied.control_id)
+                let Some(expected) = session.outstanding.get(&applied.control_id) else {
+                    return actions;
+                };
+                if expected.input_muted != applied.input_muted
+                    || expected.output_suppressed != applied.output_suppressed
                 {
                     return actions;
                 }
-                session.muted = applied.input_muted;
-                if let Some(index) = session
+                // Terminal accounting and public settlement are lossless even for an
+                // older recognized CID. Only the latest telemetry obeys the watermark.
+                session.outstanding.remove(&applied.control_id);
+                if session.levels_control_id == Some(applied.control_id) {
+                    session.levels_control_id = None;
+                }
+                if applied.control_id > session.terminal_watermark {
+                    session.terminal_watermark = applied.control_id;
+                    session.muted = applied.input_muted;
+                    session.output_suppressed = applied.output_suppressed;
+                    session.telemetry.applied = Some(applied.clone());
+                }
+                let context = session.control_events.remove(&applied.control_id);
+                let pending = session
                     .pending_controls
                     .iter()
                     .position(|pending| pending.control_id == applied.control_id)
-                {
-                    if let Some(pending) = session.pending_controls.remove(index) {
-                        actions.push(MediaAction::Respond {
-                            respond_to: pending.respond_to,
-                            response: success_response(
-                                pending.request_id.clone(),
-                                ResponseResult::MediaControlsApplied {
+                    .and_then(|index| session.pending_controls.remove(index));
+                let request_id = if let Some(pending) = pending {
+                    actions.push(MediaAction::Respond {
+                        respond_to: pending.respond_to,
+                        response: success_response(
+                            pending.request_id.clone(),
+                            ResponseResult::MediaControlsApplied {
+                                session_id: session_id.clone(),
+                                request_id: pending.request_id.clone(),
+                                input_muted: applied.input_muted,
+                                output_suppressed: applied.output_suppressed,
+                                epoch: session.epoch,
+                            },
+                        ),
+                        session_id: None,
+                    });
+                    Some(pending.request_id)
+                } else {
+                    context.map(|context| context.request_id)
+                };
+                if let Some(request_id) = request_id {
+                    actions.push(MediaAction::Publish {
+                        event: SubscriptionEventEnvelope {
+                            event: SubscriptionEventKind::MediaControlsApplied,
+                            data: SubscriptionEventData::MediaControlsApplied(
+                                MediaControlsAppliedEvent {
+                                    pane_id: session.event_pane_id.clone(),
                                     session_id: session_id.clone(),
-                                    request_id: pending.request_id.clone(),
+                                    request_id,
                                     input_muted: applied.input_muted,
                                     output_suppressed: applied.output_suppressed,
                                     epoch: session.epoch,
                                 },
                             ),
-                            session_id: None,
-                        });
-                        actions.push(MediaAction::Publish {
-                            event: SubscriptionEventEnvelope {
-                                event: SubscriptionEventKind::MediaControlsApplied,
-                                data: SubscriptionEventData::MediaControlsApplied(
-                                    MediaControlsAppliedEvent {
-                                        pane_id: session.event_pane_id.clone(),
-                                        session_id: session_id.clone(),
-                                        request_id: pending.request_id,
-                                        input_muted: applied.input_muted,
-                                        output_suppressed: applied.output_suppressed,
-                                        epoch: session.epoch,
-                                    },
-                                ),
-                            },
-                        });
-                    }
+                        },
+                    });
                 }
-                session.telemetry.applied = Some(applied);
+            }
+            MediaControl::ControlFailed(failed) => {
+                let Some(control_id) = failed.control_id else {
+                    // A legacy failure is telemetry only, never a correlated outcome.
+                    session.telemetry.legacy_control_failed = Some(failed);
+                    return actions;
+                };
+                if session.outstanding.remove(&control_id).is_none() {
+                    return actions;
+                }
+                session.control_events.remove(&control_id);
+                if session.levels_control_id == Some(control_id) {
+                    session.levels_requested = None;
+                    session.levels_control_id = None;
+                }
+                if let Some(pending) = session
+                    .pending_controls
+                    .iter()
+                    .position(|pending| pending.control_id == control_id)
+                    .and_then(|index| session.pending_controls.remove(index))
+                {
+                    let message = failed
+                        .message
+                        .as_deref()
+                        .unwrap_or("the client could not apply the media control");
+                    actions.push(MediaAction::Respond {
+                        respond_to: pending.respond_to,
+                        response: error_response(
+                            pending.request_id,
+                            error_code::CONTROL_FAILED,
+                            format!("{}: {message}", failed.code),
+                        ),
+                        session_id: None,
+                    });
+                }
+                if control_id > session.terminal_watermark {
+                    session.terminal_watermark = control_id;
+                    session.telemetry.control_failed = Some(failed);
+                }
             }
             MediaControl::Info(info) => {
                 session.telemetry.info = Some(info);
                 session.publish_started(&session_id, &mut actions);
             }
             MediaControl::Levels(levels) => {
-                if self.levels_interest.contains(&session.pane)
-                    && self
-                        .levels_last_published
-                        .get(&session.pane)
-                        .is_none_or(|last| {
-                            now.saturating_duration_since(*last) >= MEDIA_LEVELS_INTERVAL
-                        })
+                if !self.levels_interest.contains(&session.pane) {
+                    return actions;
+                }
+                if self
+                    .levels_last_published
+                    .get(&session.pane)
+                    .is_none_or(|last| {
+                        now.saturating_duration_since(*last) >= MEDIA_LEVELS_INTERVAL
+                    })
                 {
                     self.levels_last_published.insert(session.pane, now);
                     actions.push(MediaAction::Publish {
@@ -958,39 +1026,38 @@ impl MediaBroker {
                 });
             }
             MediaControl::State(update) => {
-                if session.pending.is_some() {
-                    return actions;
+                // State is not an answer or authority to renew. Still use this existing
+                // lifecycle event to reconcile desired levels, including pre-answer.
+                if session.pending.is_none() {
+                    session.muted = update.muted;
                 }
-                session.muted = update.muted;
-                // Peer notifications are not proof that the API caller supplied an
-                // answer. Keep the deadline and do not grant renewal authority early.
-                if session.offered_deadline.is_some() {
-                    return actions;
-                }
-                match update.state {
-                    MediaPeerState::Connecting => {
-                        // A delayed connecting notification must not undo connection.
-                        if session.state != MediaSessionState::Connected {
-                            session.state = MediaSessionState::Connecting;
+                if session.pending.is_none() && session.offered_deadline.is_none() {
+                    match update.state {
+                        MediaPeerState::Connecting => {
+                            // A delayed connecting notification must not undo connection.
+                            if session.state != MediaSessionState::Connected {
+                                session.state = MediaSessionState::Connecting;
+                            }
                         }
+                        MediaPeerState::Connected => {
+                            session.state = MediaSessionState::Connected;
+                            session.connect_deadline = None;
+                            session.publish_started(&session_id, &mut actions);
+                        }
+                        MediaPeerState::Failed => {
+                            let message =
+                                update.detail.as_deref().unwrap_or("the media peer failed");
+                            self.finish(
+                                &session_id,
+                                close_code::DEVICE_ERROR,
+                                message,
+                                true,
+                                now,
+                                &mut actions,
+                            );
+                        }
+                        MediaPeerState::Unknown => {}
                     }
-                    MediaPeerState::Connected => {
-                        session.state = MediaSessionState::Connected;
-                        session.connect_deadline = None;
-                        session.publish_started(&session_id, &mut actions);
-                    }
-                    MediaPeerState::Failed => {
-                        let message = update.detail.as_deref().unwrap_or("the media peer failed");
-                        self.finish(
-                            &session_id,
-                            close_code::DEVICE_ERROR,
-                            message,
-                            true,
-                            now,
-                            &mut actions,
-                        );
-                    }
-                    MediaPeerState::Unknown => {}
                 }
             }
             MediaControl::Close(MediaClose { code, message, .. }) => {
@@ -999,9 +1066,13 @@ impl MediaBroker {
                 self.finish(&session_id, &code, &message, false, now, &mut actions);
             }
             MediaControl::Open(_)
+            | MediaControl::OpenInitial(_)
             | MediaControl::Answer(_)
             | MediaControl::Mute(_)
             | MediaControl::Control(_) => {}
+        }
+        if reconcile_levels {
+            self.reconcile_levels(&session_id, now, &mut actions);
         }
         actions
     }
@@ -1042,40 +1113,168 @@ impl MediaBroker {
         session_id: &str,
         muted: bool,
     ) -> Result<Vec<MediaAction>, (&'static str, String)> {
+        MediaControl::Mute(MediaMute {
+            session_id: session_id.to_owned(),
+            muted,
+        })
+        .validate()
+        .map_err(|message| (error_code::NOT_READY, message))?;
+        let ControlTargets { actual, targets } =
+            self.control_targets(session_id, true, None, Instant::now())?;
+        let intent = self.record_control_intent(&actual, Some(muted), None)?;
+        for (id, _) in &targets {
+            if let Some(session) = self.sessions.get_mut(id) {
+                session.wants_muted = intent.input_muted;
+                session.wants_output_suppressed = intent.output_suppressed;
+            }
+        }
+        Ok(targets
+            .into_iter()
+            .map(|(session_id, client_id)| MediaAction::Send {
+                client_id,
+                control: MediaControl::Mute(MediaMute { session_id, muted }),
+            })
+            .collect())
+    }
+
+    /// Atomically accept intent and correlation records for every authorized actual target.
+    /// C executes these actions; acceptance is not a queued/delivered/applied receipt.
+    pub(crate) fn dispatch_control(
+        &mut self,
+        session_id: &str,
+        input_muted: Option<bool>,
+        output_suppressed: Option<bool>,
+        levels: Option<bool>,
+        now: Instant,
+    ) -> Result<MediaControlDispatch, (&'static str, String)> {
+        MediaControl::Control(MediaDeviceControl {
+            session_id: session_id.to_owned(),
+            control_id: 0,
+            input_muted,
+            output_suppressed,
+            levels,
+        })
+        .validate()
+        .map_err(|message| (error_code::NOT_READY, message))?;
+        let privacy = input_muted.is_some() || output_suppressed.is_some();
+        let ControlTargets { actual, targets } =
+            self.control_targets(session_id, privacy, levels, now)?;
+        for (id, _) in &targets {
+            if self
+                .sessions
+                .get(id)
+                .is_none_or(|session| session.outstanding.len() >= MEDIA_DEVICE_CONTROL_CAPACITY)
+            {
+                return Err((
+                    error_code::CONTROL_FAILED,
+                    "a media target has no device-control allowance (32 outstanding controls)"
+                        .to_owned(),
+                ));
+            }
+        }
+        let control_id = self.next_control_id;
+        let next_control_id = control_id.checked_add(1).ok_or_else(|| {
+            (
+                error_code::CONTROL_FAILED,
+                "media control identifiers are exhausted".to_owned(),
+            )
+        })?;
+        // All fallible target/capacity/ID checks precede this single commit helper.
+        let intent = self.record_control_intent(&actual, input_muted, output_suppressed)?;
+        self.next_control_id = next_control_id;
+        let session_ids = targets.iter().map(|(id, _)| id.clone()).collect();
+        let mut actions = Vec::with_capacity(targets.len());
+        for (id, client_id) in targets {
+            if let Some(session) = self.sessions.get_mut(&id) {
+                let desired_levels = self.levels_interest.contains(&session.pane);
+                let target_levels = if id == session_id { levels } else { None };
+                let target_levels = target_levels
+                    .or((session.levels_requested != Some(desired_levels))
+                        .then_some(desired_levels));
+                session.wants_muted = intent.input_muted;
+                session.wants_output_suppressed = intent.output_suppressed;
+                session.outstanding.insert(control_id, intent);
+                if let Some(enabled) = target_levels {
+                    session.levels_requested = Some(enabled);
+                    session.levels_control_id = Some(control_id);
+                }
+                actions.push(MediaAction::Send {
+                    client_id,
+                    control: MediaControl::Control(MediaDeviceControl {
+                        session_id: id,
+                        control_id,
+                        input_muted,
+                        output_suppressed,
+                        levels: target_levels,
+                    }),
+                });
+            }
+        }
+        // Every expected pair is published before any returned action can execute.
+        Ok(MediaControlDispatch {
+            control_id,
+            session_ids,
+            actions,
+        })
+    }
+
+    /// Commit only the actual preflight-resolved live target's pane policy. No sends or
+    /// alias coordination here; callers must finish their entire preflight before calling.
+    fn record_control_intent(
+        &mut self,
+        session_id: &str,
+        input_muted: Option<bool>,
+        output_suppressed: Option<bool>,
+    ) -> Result<MediaIntent, (&'static str, String)> {
+        let pane = self
+            .sessions
+            .get(session_id)
+            .map(|session| session.pane)
+            .ok_or_else(|| {
+                (
+                    error_code::SESSION_NOT_FOUND,
+                    "no live media session with this id".to_owned(),
+                )
+            })?;
+        let intent = self.pane_intents.entry(pane).or_default();
+        if let Some(value) = input_muted {
+            intent.input_muted = value;
+        }
+        if let Some(value) = output_suppressed {
+            intent.output_suppressed = value;
+        }
+        Ok(*intent)
+    }
+
+    pub(crate) fn intent(&self, pane: PaneId) -> MediaIntent {
+        self.pane_intents.get(&pane).copied().unwrap_or_default()
+    }
+
+    /// A known failed targeted send ends that owned session; stale/repeated failures do
+    /// nothing. Existing finish cancellation of its dependent renewals remains intact.
+    // Called after writer-availability, encoding and targeted-send checks.
+    pub(crate) fn control_delivery_failed(
+        &mut self,
+        client_id: u64,
+        session_id: &str,
+        now: Instant,
+    ) -> Vec<MediaAction> {
         let mut actions = Vec::new();
-        // Legacy mute remains dispatch-only, but shares the persistent desired-intent
-        // path with acknowledged controls and handover propagation.
-        self.record_control_intent(session_id, Some(muted), None);
-        if let Some(session) = self.sessions.get_mut(session_id) {
-            session.wants_muted = muted;
-            actions.push(MediaAction::Send {
-                client_id: session.client_id,
-                control: MediaControl::Mute(MediaMute {
-                    session_id: session_id.to_owned(),
-                    muted,
-                }),
-            });
-        } else if !self.has_successor(session_id) {
-            // Neither live nor being handed over: the error it always was.
-            self.live_session(session_id)?;
+        if self
+            .sessions
+            .get(session_id)
+            .is_some_and(|session| session.client_id == client_id)
+        {
+            self.finish(
+                session_id,
+                close_code::DISCONNECTED,
+                "media control delivery failed",
+                false,
+                now,
+                &mut actions,
+            );
         }
-        // A renewal of this call still being handed over gets the same mute (it replaces this session once accepted).
-        for (id, successor) in self.sessions.iter_mut().filter(|(_, other)| {
-            other
-                .replaces
-                .iter()
-                .any(|old| old.authorizes_renewal && old.session_id == session_id)
-        }) {
-            successor.wants_muted = muted;
-            actions.push(MediaAction::Send {
-                client_id: successor.client_id,
-                control: MediaControl::Mute(MediaMute {
-                    session_id: id.clone(),
-                    muted,
-                }),
-            });
-        }
-        Ok(actions)
+        actions
     }
 
     /// Guard an optional API epoch without changing legacy callers or mutating any
@@ -1130,18 +1329,16 @@ impl MediaBroker {
         {
             self.finish(session_id, code, message, true, now, &mut actions);
         }
+        // Public requests name a live, offered session, never a retired alias. Internal
+        // lineage propagation still goes through the combined dispatch below.
         let failure = match self.sessions.get(session_id) {
             None => Some((
                 error_code::SESSION_NOT_FOUND,
                 "no live media session with this id",
             )),
             Some(session) if session.pending.is_some() => Some((
-                error_code::NOT_READY,
+                error_code::SESSION_NOT_FOUND,
                 "the client has not sent its offer yet",
-            )),
-            Some(session) if session.next_control_id == u64::MAX => Some((
-                error_code::NOT_READY,
-                "the media control sequence is exhausted",
             )),
             Some(_) => None,
         };
@@ -1159,86 +1356,54 @@ impl MediaBroker {
             });
             return actions;
         }
-        self.record_control_intent(session_id, input_muted, output_suppressed);
-        if let Some(control_id) = self.dispatch_control(
-            session_id,
-            input_muted,
-            output_suppressed,
-            None,
-            &mut actions,
-        ) {
-            if let Some(session) = self.sessions.get_mut(session_id) {
-                session.expire_controls(now, &mut actions);
-                session.pending_controls.push_back(PendingControl {
-                    control_id,
-                    request_id,
-                    respond_to,
-                    deadline: now + MEDIA_CONTROL_TIMEOUT,
-                });
+        let dispatch =
+            match self.dispatch_control(session_id, input_muted, output_suppressed, None, now) {
+                Ok(dispatch) => dispatch,
+                Err((code, message)) => {
+                    let code = if code == error_code::NOT_READY {
+                        error_code::SESSION_NOT_FOUND
+                    } else {
+                        code
+                    };
+                    let close_code = self.close_cause(session_id, now);
+                    actions.push(MediaAction::Respond {
+                        respond_to,
+                        response: error_response_with_close_code(
+                            request_id,
+                            code,
+                            message,
+                            close_code.as_deref(),
+                        ),
+                        session_id: None,
+                    });
+                    return actions;
+                }
+            };
+        let deadline = now + MEDIA_CONTROL_TIMEOUT;
+        for target in &dispatch.session_ids {
+            if target != session_id {
+                if let Some(session) = self.sessions.get_mut(target) {
+                    session.control_events.insert(
+                        dispatch.control_id,
+                        ControlEventContext {
+                            request_id: request_id.clone(),
+                        },
+                    );
+                }
             }
         }
-        // A pending handover gets the same intent immediately, but its internal ack
-        // has no API waiter and can never settle the source request.
-        for successor in self.successors(session_id) {
-            self.dispatch_control(
-                &successor,
-                input_muted,
-                output_suppressed,
-                None,
-                &mut actions,
-            );
+        if let Some(session) = self.sessions.get_mut(session_id) {
+            session.expire_controls(now, &mut actions);
+            session.pending_controls.push_back(PendingControl {
+                control_id: dispatch.control_id,
+                request_id,
+                respond_to,
+                deadline,
+            });
         }
+        // Waiters/correlation exist before synchronous delivery failures can execute.
+        actions.extend(dispatch.actions);
         actions
-    }
-
-    /// Shared intent path for legacy mute and acknowledged device controls. Never
-    /// infer desired intent from an ack: it can describe an older in-flight change.
-    fn record_control_intent(
-        &mut self,
-        session_id: &str,
-        input_muted: Option<bool>,
-        output_suppressed: Option<bool>,
-    ) {
-        let targets = std::iter::once(session_id.to_owned()).chain(self.successors(session_id));
-        for id in targets {
-            if let Some(session) = self.sessions.get_mut(&id) {
-                let intent = self.pane_intent.entry(session.pane).or_default();
-                if let Some(muted) = input_muted {
-                    session.wants_muted = muted;
-                    intent.input_muted = Some(muted);
-                }
-                if let Some(suppressed) = output_suppressed {
-                    session.wants_output_suppressed = suppressed;
-                    intent.output_suppressed = Some(suppressed);
-                }
-            }
-        }
-    }
-
-    /// All device controls (API, inherited intent, levels) share this id allocator.
-    /// Internal controls intentionally never insert an API pending response.
-    fn dispatch_control(
-        &mut self,
-        session_id: &str,
-        input_muted: Option<bool>,
-        output_suppressed: Option<bool>,
-        levels: Option<bool>,
-        actions: &mut Vec<MediaAction>,
-    ) -> Option<u64> {
-        let session = self.sessions.get_mut(session_id)?;
-        let control_id = session.next_control_id;
-        session.next_control_id = control_id.checked_add(1)?;
-        actions.push(MediaAction::Send {
-            client_id: session.client_id,
-            control: MediaControl::Control(MediaDeviceControl {
-                session_id: session_id.to_owned(),
-                control_id,
-                input_muted,
-                output_suppressed,
-                levels,
-            }),
-        });
-        Some(control_id)
     }
 
     /// Capture the runtime's canonical public pane id, not the client's legacy alias.
@@ -1254,7 +1419,12 @@ impl MediaBroker {
         self.pane_event_ids.insert(pane, pane_id);
     }
 
-    pub(crate) fn set_levels(&mut self, pane: PaneId, enabled: bool) -> Vec<MediaAction> {
+    pub(crate) fn set_levels(
+        &mut self,
+        pane: PaneId,
+        enabled: bool,
+        now: Instant,
+    ) -> Vec<MediaAction> {
         let changed = if enabled {
             self.levels_interest.insert(pane)
         } else {
@@ -1271,9 +1441,24 @@ impl MediaBroker {
             .map(|(id, _)| id.clone())
             .collect::<Vec<_>>();
         for session_id in sessions {
-            self.dispatch_control(&session_id, None, None, Some(enabled), &mut actions);
+            self.reconcile_levels(&session_id, now, &mut actions);
         }
         actions
+    }
+
+    /// Event-driven only: a rejected transition stays desired in levels_interest.
+    /// Reuse the next dispatch/state/renewal, never a timer or a second coordinator.
+    fn reconcile_levels(&mut self, session_id: &str, now: Instant, actions: &mut Vec<MediaAction>) {
+        let Some(session) = self.sessions.get(session_id) else {
+            return;
+        };
+        let enabled = self.levels_interest.contains(&session.pane);
+        if session.levels_requested == Some(enabled) {
+            return;
+        }
+        if let Ok(dispatch) = self.dispatch_control(session_id, None, None, Some(enabled), now) {
+            actions.extend(dispatch.actions);
+        }
     }
 
     /// Read the causal close code for an API rejection even when its event precedes
@@ -1311,6 +1496,19 @@ impl MediaBroker {
         self.sessions
             .get(session_id)
             .and_then(|session| session.telemetry.applied.as_ref())
+    }
+
+    // This broker seam is consumed by the optional media API/event integration.
+    // Correlated and legacy failures are stored separately; None never settles an ID.
+    #[allow(dead_code)]
+    pub(crate) fn control_failed(&self, session_id: &str) -> Option<&MediaControlFailed> {
+        self.sessions.get(session_id).and_then(|session| {
+            session
+                .telemetry
+                .control_failed
+                .as_ref()
+                .or(session.telemetry.legacy_control_failed.as_ref())
+        })
     }
 
     // This broker seam is consumed by the optional media API/event integration.
@@ -1461,6 +1659,9 @@ impl MediaBroker {
     ) -> Vec<MediaAction> {
         let mut actions = Vec::new();
         self.expire_cancelled_opens(now);
+        // Topology, not session retention or stale input, bounds runtime pane policy.
+        // This must run even when no live or retained session remains.
+        self.pane_intents.retain(|pane, _| pane_exists(*pane));
         if self.sessions.is_empty() && self.closed.is_empty() {
             return actions;
         }
@@ -1521,17 +1722,189 @@ impl MediaBroker {
         self.sessions
             .iter()
             .filter(|(_, other)| {
-                other
-                    .replaces
-                    .iter()
-                    .any(|old| old.authorizes_renewal && old.session_id == session_id)
+                other.replaces.iter().any(|old| {
+                    old.authorizes_renewal
+                        && old.session_id == session_id
+                        && old.pane == other.pane
+                        && old.client_id == other.client_id
+                })
             })
             .map(|(id, _)| id.clone())
             .collect()
     }
 
-    fn has_successor(&self, session_id: &str) -> bool {
-        !self.successors(session_id).is_empty()
+    /// A replacement string alone is not authority: constrain lineage to a connected
+    /// source (or its retained replacement receipt), the same runtime pane and owner.
+    fn control_alias_authorized(&self, id: &str, pane: PaneId, client_id: u64) -> bool {
+        if let Some(source) = self.sessions.get(id) {
+            return source.pane == pane
+                && source.client_id == client_id
+                && source.state == MediaSessionState::Connected;
+        }
+        if let Some(source) = self
+            .closed
+            .iter()
+            .find(|source| source.view.session_id == id)
+        {
+            return source.pane == pane
+                && source.client_id == client_id
+                && source.authorizes_renewal;
+        }
+        // A's acceptance-time receipt outlives bounded closed history, but only on
+        // an unconsumed pending successor with the captured pane and owner.
+        self.sessions.values().any(|candidate| {
+            candidate.pending.is_some()
+                && candidate.pane == pane
+                && candidate.client_id == client_id
+                && candidate.replaces.iter().any(|old| {
+                    old.session_id == id
+                        && old.authorizes_renewal
+                        && old.pane == pane
+                        && old.client_id == client_id
+                })
+        })
+    }
+
+    /// Shared authority preflight, including A's retirement and consumed-alias guards.
+    /// Only retirement evidence may change here; policy, credits and IDs remain untouched.
+    fn control_targets(
+        &mut self,
+        session_id: &str,
+        privacy: bool,
+        levels: Option<bool>,
+        now: Instant,
+    ) -> Result<ControlTargets, (&'static str, String)> {
+        let actual = if self.sessions.contains_key(session_id) {
+            session_id.to_owned()
+        } else {
+            let mut aliases = self
+                .sessions
+                .iter()
+                .filter(|(_, session)| {
+                    session.pending.is_some()
+                        && session.replaces.iter().any(|old| {
+                            old.session_id == session_id
+                                && old.authorizes_renewal
+                                && old.pane == session.pane
+                                && old.client_id == session.client_id
+                        })
+                        && self.control_alias_authorized(
+                            session_id,
+                            session.pane,
+                            session.client_id,
+                        )
+                })
+                .map(|(id, _)| id.clone())
+                .collect::<Vec<_>>();
+            aliases.sort();
+            aliases.into_iter().next().ok_or_else(|| {
+                (
+                    error_code::SESSION_NOT_FOUND,
+                    "no live media session with this id".to_owned(),
+                )
+            })?
+        };
+        if actual != session_id && levels.is_some() {
+            return Err((
+                error_code::NOT_READY,
+                "levels require a named live media session".to_owned(),
+            ));
+        }
+        let Some(named) = self.sessions.get(&actual) else {
+            return Err((
+                error_code::SESSION_NOT_FOUND,
+                "no live media target".to_owned(),
+            ));
+        };
+        let pane = named.pane;
+        let client_id = named.client_id;
+        if named.pending.is_some()
+            && named.replaces.iter().any(|old| old.authorizes_renewal)
+            && !named.replaces.iter().any(|old| {
+                old.authorizes_renewal
+                    && old.pane == pane
+                    && old.client_id == client_id
+                    && self.control_alias_authorized(&old.session_id, pane, client_id)
+            })
+        {
+            return Err((
+                error_code::SESSION_NOT_FOUND,
+                "the pending renewal no longer has its source authority".to_owned(),
+            ));
+        }
+        let mut roots = vec![session_id.to_owned()];
+        roots.extend(
+            named
+                .replaces
+                .iter()
+                .filter(|old| {
+                    old.authorizes_renewal
+                        && old.pane == pane
+                        && old.client_id == client_id
+                        && self.control_alias_authorized(&old.session_id, pane, client_id)
+                })
+                .map(|old| old.session_id.clone()),
+        );
+        let mut targets = vec![(actual.clone(), client_id)];
+        if privacy {
+            for (id, candidate) in &self.sessions {
+                if id == &actual || candidate.pane != pane || candidate.client_id != client_id {
+                    continue;
+                }
+                let source = roots.iter().any(|root| root == id)
+                    && self.control_alias_authorized(id, pane, client_id);
+                let successor = candidate.pending.is_some()
+                    && candidate.replaces.iter().any(|old| {
+                        old.authorizes_renewal
+                            && old.pane == pane
+                            && old.client_id == client_id
+                            && roots.contains(&old.session_id)
+                            && self.control_alias_authorized(&old.session_id, pane, client_id)
+                    });
+                if source || successor {
+                    targets.push((id.clone(), client_id));
+                }
+            }
+        }
+        targets[1..].sort_by(|left, right| left.0.cmp(&right.0));
+        // A levels-only dispatch still cannot borrow a retired source's authority.
+        // Check authorizing live sources even when they are not device-send targets.
+        for root in &roots {
+            if !targets.iter().any(|(id, _)| id == root)
+                && self
+                    .sessions
+                    .get_mut(root)
+                    .is_some_and(|source| source.retirement_reason(now).is_some())
+            {
+                return Err((
+                    error_code::SESSION_NOT_FOUND,
+                    "the renewal source is no longer available".to_owned(),
+                ));
+            }
+        }
+        for (id, target_client) in &targets {
+            let available = self.sessions.get(id).is_some_and(|session| {
+                session.pane == pane
+                    && session.client_id == *target_client
+                    && session.state != MediaSessionState::Failed
+                    && session.state != MediaSessionState::Closed
+            }) && self
+                .clients
+                .get(target_client)
+                .is_some_and(|client| client.capable);
+            if !available
+                || self
+                    .sessions
+                    .get_mut(id)
+                    .is_none_or(|session| session.retirement_reason(now).is_some())
+            {
+                return Err((
+                    error_code::SESSION_NOT_FOUND,
+                    "a media target is no longer available".to_owned(),
+                ));
+            }
+        }
+        Ok(ControlTargets { actual, targets })
     }
 
     fn live_session(
@@ -1555,9 +1928,11 @@ impl MediaBroker {
         now: Instant,
         actions: &mut Vec<MediaAction>,
     ) {
-        let Some(session) = self.sessions.remove(session_id) else {
+        let Some(mut session) = self.sessions.remove(session_id) else {
             return;
         };
+        // The public deadline is independent of device credits and session retirement.
+        session.expire_controls(now, actions);
         // Ending a call (not its own replacement) also cancels a renewal of it still being handed over: the successor
         // inherited its authorization from this session (herdr#102 security pass).
         if code != close_code::REPLACED {
@@ -1640,6 +2015,10 @@ impl MediaBroker {
         });
         self.closed.push_back(ClosedSession {
             closed_at: now,
+            client_id: session.client_id,
+            pane: session.pane,
+            authorizes_renewal: code == close_code::REPLACED
+                && session.state == MediaSessionState::Connected,
             view: MediaSessionView {
                 session_id: session_id.to_owned(),
                 epoch: session.epoch,
@@ -1659,6 +2038,7 @@ impl MediaBroker {
 mod tests {
     use super::*;
     use crate::protocol::media::MediaStateUpdate;
+    use crate::protocol::ServerMessage;
     use std::sync::mpsc;
 
     type SentControls = Vec<(u64, MediaControl)>;
@@ -1721,6 +2101,9 @@ mod tests {
     fn opened_session(sent: &[(u64, MediaControl)]) -> (u64, String, String) {
         sent.iter()
             .find_map(|(client_id, control)| match control {
+                MediaControl::OpenInitial(open) => {
+                    Some((*client_id, open.session_id.clone(), open.pane_id.clone()))
+                }
                 MediaControl::Open(open) => {
                     Some((*client_id, open.session_id.clone(), open.pane_id.clone()))
                 }
@@ -2618,26 +3001,29 @@ mod tests {
         ))
         .is_empty());
         assert!(broker.applied(&session_id).is_none());
-        let mut internal = Vec::new();
-        broker.dispatch_control(&session_id, Some(true), None, None, &mut internal);
-        broker.dispatch_control(&session_id, Some(false), Some(true), None, &mut internal);
-        run(internal);
-
+        let first = broker
+            .dispatch_control(&session_id, Some(true), None, None, now)
+            .unwrap();
+        run(first.actions);
         run(broker.client_control(
             1,
             MediaControl::Applied(MediaApplied {
                 session_id: session_id.clone(),
-                control_id: 1,
+                control_id: first.control_id,
                 input_muted: true,
                 output_suppressed: false,
             }),
             now,
         ));
+        let second = broker
+            .dispatch_control(&session_id, Some(false), Some(true), None, now)
+            .unwrap();
+        run(second.actions);
         run(broker.client_control(
             1,
             MediaControl::Applied(MediaApplied {
                 session_id: session_id.clone(),
-                control_id: 2,
+                control_id: second.control_id,
                 input_muted: false,
                 output_suppressed: true,
             }),
@@ -2647,6 +3033,7 @@ mod tests {
         assert!(!broker.applied(&session_id).unwrap().input_muted);
         assert!(broker.applied(&session_id).unwrap().output_suppressed);
 
+        run(broker.set_levels(pane(7), true, now));
         run(broker.client_control(
             1,
             MediaControl::Levels(MediaLevels {
@@ -2723,9 +3110,11 @@ mod tests {
                 let later = now + MEDIA_INPUT_WINDOW + Duration::from_secs(1);
                 let (sent, rx, delivery) = tracked_open(&mut broker, "renewal", later);
                 let (_, session_id, _) = opened_session(&sent);
-                let mut internal = Vec::new();
-                broker.dispatch_control(&session_id, None, None, Some(true), &mut internal);
-                run(internal);
+                run(broker
+                    .dispatch_control(&session_id, Some(true), None, Some(true), later)
+                    .unwrap()
+                    .actions);
+                run(broker.set_levels(pane(7), true, later));
                 for control in telemetry(&session_id) {
                     assert!(run(broker.client_control(1, control, later)).is_empty());
                 }
@@ -2891,6 +3280,713 @@ mod tests {
             now,
         ));
         session_id
+    }
+
+    fn initial_control(sent: &[(u64, MediaControl)]) -> &MediaOpenInitial {
+        sent.iter()
+            .find_map(|(_, control)| match control {
+                MediaControl::OpenInitial(initial) => Some(initial),
+                _ => None,
+            })
+            .expect("a complete startup policy")
+    }
+
+    fn acknowledge(
+        broker: &mut MediaBroker,
+        client: u64,
+        session: &str,
+        id: u64,
+        pair: MediaIntent,
+    ) {
+        run(broker.client_control(
+            client,
+            MediaControl::Applied(MediaApplied {
+                session_id: session.to_owned(),
+                control_id: id,
+                input_muted: pair.input_muted,
+                output_suppressed: pair.output_suppressed,
+            }),
+            Instant::now(),
+        ));
+    }
+
+    // Keep: #316 privacy regression and the named-JSON/client startup trust boundary.
+    #[test]
+    fn media_intent_survives_device_changed_and_requires_fresh_authorized_open() {
+        for pair in [
+            MediaIntent {
+                input_muted: true,
+                output_suppressed: false,
+            },
+            MediaIntent {
+                input_muted: false,
+                output_suppressed: true,
+            },
+            MediaIntent {
+                input_muted: true,
+                output_suppressed: true,
+            },
+        ] {
+            let now = Instant::now();
+            let mut broker = MediaBroker::new();
+            broker.client_connected(1, true);
+            broker.client_connected(2, true);
+            let old = live_call(&mut broker, 1, pane(7), now);
+            let dispatch = broker
+                .dispatch_control(
+                    &old,
+                    Some(pair.input_muted),
+                    Some(pair.output_suppressed),
+                    None,
+                    now,
+                )
+                .unwrap();
+            run(dispatch.actions);
+            acknowledge(&mut broker, 1, &old, dispatch.control_id, pair);
+            assert_eq!(broker.state(&old).unwrap().muted, pair.input_muted);
+            assert_eq!(
+                broker.sessions[&old].output_suppressed,
+                pair.output_suppressed
+            );
+            run(broker.client_control(
+                1,
+                MediaControl::Close(MediaClose::new(&old, close_code::DEVICE_CHANGED, "renew")),
+                now,
+            ));
+            assert_eq!(broker.intent(pane(7)), pair);
+            let later = now + MEDIA_INPUT_WINDOW + Duration::from_secs(1);
+            let (sent, rx) = open(&mut broker, pane(7), later);
+            assert!(
+                sent.is_empty(),
+                "retained policy is not input authorization"
+            );
+            assert_eq!(response(&rx)["error"]["code"], error_code::NO_CLIENT);
+            broker.note_pane_input(2, pane(7), "p_7", later);
+            let (sent, _rx) = open(&mut broker, pane(7), later);
+            let initial = initial_control(&sent);
+            assert_eq!(
+                (initial.input_muted, initial.output_suppressed),
+                (pair.input_muted, pair.output_suppressed)
+            );
+            assert_eq!(
+                sent.len(),
+                1,
+                "protected startup has no v1 or Mute downgrade"
+            );
+            assert_eq!(sent[0].0, 2, "pane policy survives owner changes");
+            let ServerMessage::EndpointControl { kind, data } = sent[0].1.server_message().unwrap()
+            else {
+                panic!("startup must use the existing endpoint envelope");
+            };
+            assert_eq!(
+                MediaControl::decode(&kind, &data),
+                Some(Ok(MediaControl::OpenInitial(initial.clone())))
+            );
+            let current = &broker.sessions[&initial.session_id];
+            assert_eq!((current.muted, current.output_suppressed), (false, false));
+            assert!(
+                broker.applied(&initial.session_id).is_none(),
+                "request is not evidence"
+            );
+            assert_eq!(broker.intent(pane(8)), MediaIntent::default());
+        }
+    }
+
+    #[test]
+    fn media_open_initial_compatibility_alternate_is_exact_and_only_unprotected() {
+        for (input_muted, output_suppressed) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let now = Instant::now();
+            let mut broker = MediaBroker::new();
+            broker.client_connected(1, true);
+            let old = live_call(&mut broker, 1, pane(7), now);
+            run(broker
+                .dispatch_control(&old, Some(input_muted), Some(output_suppressed), None, now)
+                .unwrap()
+                .actions);
+            let (sent, _rx) = open(&mut broker, pane(7), now);
+            let position = sent
+                .iter()
+                .position(|(_, control)| matches!(control, MediaControl::OpenInitial(_)))
+                .unwrap();
+            let initial = initial_control(&sent);
+            assert_eq!(
+                (initial.input_muted, initial.output_suppressed),
+                (input_muted, output_suppressed)
+            );
+            assert!(sent
+                .iter()
+                .all(|(_, control)| !matches!(control, MediaControl::Mute(_))));
+            if !input_muted && !output_suppressed {
+                assert!(
+                    matches!(&sent[position + 1..], [(1, MediaControl::Open(open))]
+                    if open.session_id == initial.session_id && open.pane_id == initial.pane_id)
+                );
+            } else {
+                assert_eq!(position + 1, sent.len());
+            }
+        }
+    }
+
+    #[test]
+    fn media_explicit_false_survives_stale_applied_and_legacy_state() {
+        let now = Instant::now();
+        let mut broker = MediaBroker::new();
+        broker.client_connected(1, true);
+        let id = live_call(&mut broker, 1, pane(7), now);
+        let protected = MediaIntent {
+            input_muted: true,
+            output_suppressed: true,
+        };
+        let first = broker
+            .dispatch_control(&id, Some(true), Some(true), None, now)
+            .unwrap();
+        run(first.actions);
+        let second = broker
+            .dispatch_control(&id, Some(false), None, None, now)
+            .unwrap();
+        run(second.actions);
+        let output_only = MediaIntent {
+            input_muted: false,
+            output_suppressed: true,
+        };
+        acknowledge(&mut broker, 1, &id, second.control_id, output_only);
+        acknowledge(&mut broker, 1, &id, first.control_id, protected);
+        assert_eq!(broker.intent(pane(7)), output_only);
+        assert!(!broker.sessions[&id].muted);
+        assert!(broker.sessions[&id].output_suppressed);
+        assert!(
+            broker.sessions[&id].outstanding.is_empty(),
+            "old recognized terminal still releases capacity"
+        );
+        assert_eq!(broker.applied(&id).unwrap().control_id, second.control_id);
+        run(broker.mute(&id, true).unwrap());
+        assert_eq!(
+            broker.intent(pane(7)),
+            protected,
+            "legacy Mute shares the recorder"
+        );
+        run(broker.mute(&id, false).unwrap());
+        assert_eq!(
+            broker.intent(pane(7)),
+            output_only,
+            "legacy explicit false is authoritative"
+        );
+        run(broker
+            .dispatch_control(&id, None, Some(false), None, now)
+            .unwrap()
+            .actions);
+        run(broker.client_control(
+            1,
+            MediaControl::State(MediaStateUpdate {
+                session_id: id.clone(),
+                state: MediaPeerState::Connected,
+                muted: true,
+                detail: None,
+            }),
+            now,
+        ));
+        assert_eq!(
+            broker.intent(pane(7)),
+            MediaIntent::default(),
+            "legacy observation never relatches intent"
+        );
+        run(broker.close(&id, now));
+        let (sent, _rx) = open(&mut broker, pane(7), now);
+        let initial = initial_control(&sent);
+        assert!(!initial.input_muted && !initial.output_suppressed);
+        assert!(matches!(
+            &sent[..],
+            [
+                (1, MediaControl::OpenInitial(_)),
+                (1, MediaControl::Open(_))
+            ]
+        ));
+    }
+
+    #[test]
+    fn media_all_finish_reasons_retain_intent_but_dead_panes_prune_without_sessions() {
+        let reasons = [
+            close_code::CLOSED,
+            close_code::DEVICE_CHANGED,
+            close_code::DEVICE_ERROR,
+            close_code::DISCONNECTED,
+            close_code::DECLINED,
+            close_code::TIMEOUT,
+            close_code::REPLACED,
+            close_code::DISABLED,
+            close_code::UNSUPPORTED,
+        ];
+        for reason in reasons {
+            let now = Instant::now();
+            let mut broker = MediaBroker::new();
+            broker.client_connected(1, true);
+            let id = live_call(&mut broker, 1, pane(7), now);
+            run(broker
+                .dispatch_control(&id, Some(true), Some(true), None, now)
+                .unwrap()
+                .actions);
+            if reason == close_code::CLOSED {
+                run(broker.close(&id, now));
+            } else if reason == close_code::DISCONNECTED {
+                run(broker.client_removed(1, now));
+            } else {
+                run(broker.client_control(
+                    1,
+                    MediaControl::Close(MediaClose::new(&id, reason, "ended")),
+                    now,
+                ));
+            }
+            assert!(!broker.sessions.contains_key(&id));
+            assert!(broker.intent(pane(7)).input_muted && broker.intent(pane(7)).output_suppressed);
+            run(broker.expire(now + CLOSED_SESSION_RETENTION, |_| true));
+            assert!(broker.closed.is_empty());
+            broker.pane_owners.clear();
+            assert!(broker.owner_cleanup_due(now + CLOSED_SESSION_RETENTION));
+            assert!(
+                broker.intent(pane(7)).input_muted,
+                "session retention is not policy expiry"
+            );
+            run(broker.expire(now + CLOSED_SESSION_RETENTION, |_| false));
+            assert_eq!(
+                broker.intent(pane(7)),
+                MediaIntent::default(),
+                "prune before empty-session return"
+            );
+        }
+        let now = Instant::now();
+        let mut broker = MediaBroker::new();
+        broker.client_connected(1, true);
+        let id = live_call(&mut broker, 1, pane(7), now);
+        run(broker.mute(&id, true).unwrap());
+        run(broker.close(&id, now));
+        broker.pane_owners.clear();
+        broker.retain_live_panes(now, |_| false);
+        assert_eq!(broker.intent(pane(7)), MediaIntent::default());
+    }
+
+    // Keep: bounded admission and atomic fanout are a privacy/data-safety failure path.
+    #[test]
+    fn media_control_dispatch_records_intent_atomically() {
+        let now = Instant::now();
+        let mut broker = MediaBroker::new();
+        broker.client_connected(1, true);
+        broker.client_connected(2, true);
+        let old = live_call(&mut broker, 1, pane(7), now);
+        let other = live_call(&mut broker, 2, pane(8), now);
+        let later = now + MEDIA_INPUT_WINDOW + Duration::from_secs(1);
+        let (sent, _rx) = open(&mut broker, pane(7), later);
+        let (_, successor, _) = opened_session(&sent);
+        // Even a captured source receipt on a foreign owner/pane grants no fanout.
+        broker
+            .sessions
+            .get_mut(&other)
+            .unwrap()
+            .replaces
+            .push(ReplacedSession {
+                session_id: old.clone(),
+                authorizes_renewal: true,
+                pane: pane(7),
+                client_id: 1,
+                open_id: None,
+            });
+        let mut ids = Vec::new();
+        for _ in 0..MEDIA_DEVICE_CONTROL_CAPACITY {
+            let dispatch = broker
+                .dispatch_control(&successor, None, None, Some(false), later)
+                .unwrap();
+            assert_eq!(dispatch.session_ids, vec![successor.clone()]);
+            ids.push(dispatch.control_id);
+            run(dispatch.actions);
+        }
+        let next = broker.next_control_id;
+        let before_intents = broker.pane_intents.clone();
+        let before_old = broker.sessions[&old].outstanding.clone();
+        let before_successor = broker.sessions[&successor].outstanding.clone();
+        assert!(matches!(
+            broker.dispatch_control(&old, Some(true), Some(true), Some(true), later),
+            Err((error_code::CONTROL_FAILED, _))
+        ));
+        assert_eq!(broker.next_control_id, next);
+        assert_eq!(broker.pane_intents, before_intents);
+        assert_eq!(broker.sessions[&old].outstanding, before_old);
+        assert_eq!(broker.sessions[&successor].outstanding, before_successor);
+        for session in broker.sessions.values() {
+            assert!(!session.wants_muted && !session.wants_output_suppressed);
+        }
+        acknowledge(&mut broker, 1, &successor, ids[0], MediaIntent::default());
+        let dispatch = broker
+            .dispatch_control(&old, Some(true), Some(true), Some(true), later)
+            .unwrap();
+        assert_eq!(dispatch.control_id, next, "rejection did not consume an ID");
+        assert_eq!(dispatch.session_ids.len(), 2);
+        let sent = run(dispatch.actions);
+        assert_eq!(sent.len(), 2);
+        for (client, control) in sent {
+            assert_eq!(client, 1);
+            let MediaControl::Control(control) = control else {
+                panic!("only device controls")
+            };
+            assert!(control.session_id == old || control.session_id == successor);
+            assert_eq!(
+                control.levels,
+                if control.session_id == old {
+                    Some(true)
+                } else {
+                    None
+                }
+            );
+            assert!(broker.sessions[&control.session_id]
+                .outstanding
+                .contains_key(&control.control_id));
+        }
+        assert_eq!(broker.intent(pane(8)), MediaIntent::default());
+        assert!(broker.sessions[&other].outstanding.is_empty());
+    }
+
+    #[test]
+    fn media_control_fanout_never_crosses_pane_or_owner_independently() {
+        for same_pane in [false, true] {
+            let now = Instant::now();
+            let mut broker = MediaBroker::new();
+            broker.client_connected(1, true);
+            broker.client_connected(2, true);
+            let source = live_call(&mut broker, 1, pane(7), now);
+            let unrelated = live_call(&mut broker, 2, pane(8), now);
+            // Minimal adversarial lineage: one dimension matches, the other must still
+            // independently deny fanout. A raw replaces string is not authority.
+            let session = broker.sessions.get_mut(&unrelated).unwrap();
+            session.replaces.push(ReplacedSession {
+                session_id: source.clone(),
+                authorizes_renewal: true,
+                pane: pane(7),
+                client_id: 1,
+                open_id: None,
+            });
+            session.state = MediaSessionState::Opening;
+            let (tx, _rx) = mpsc::channel();
+            session.pending = Some(PendingOpen {
+                request_id: "unrelated".into(),
+                respond_to: tx,
+                deadline: now + MEDIA_OPEN_TIMEOUT,
+            });
+            if same_pane {
+                session.pane = pane(7);
+            } else {
+                session.client_id = 1;
+            }
+            let dispatch = broker
+                .dispatch_control(&source, Some(true), Some(true), Some(true), now)
+                .unwrap();
+            assert_eq!(dispatch.session_ids, vec![source.clone()]);
+            let sent = run(dispatch.actions);
+            assert_eq!(sent.len(), 1);
+            assert!(!broker.sessions[&unrelated].wants_muted);
+            assert!(!broker.sessions[&unrelated].wants_output_suppressed);
+            assert!(broker.sessions[&unrelated].outstanding.is_empty());
+        }
+    }
+
+    #[test]
+    fn media_intent_survives_actual_pending_timeout_and_fresh_replacement() {
+        let now = Instant::now();
+        let mut broker = MediaBroker::new();
+        broker.client_connected(1, true);
+        broker.note_pane_input(1, pane(7), "p_7", now);
+        let (sent, rx) = open(&mut broker, pane(7), now);
+        let (_, id, _) = opened_session(&sent);
+        run(broker
+            .dispatch_control(&id, Some(true), Some(true), None, now)
+            .unwrap()
+            .actions);
+        run(broker.expire(now + MEDIA_OPEN_TIMEOUT, |_| true));
+        assert_eq!(response(&rx)["error"]["code"], error_code::TIMEOUT);
+        assert!(broker.intent(pane(7)).input_muted && broker.intent(pane(7)).output_suppressed);
+        broker.note_pane_input(1, pane(7), "p_7", now + MEDIA_OPEN_TIMEOUT);
+        let (sent, _rx) = open(&mut broker, pane(7), now + MEDIA_OPEN_TIMEOUT);
+        let first = initial_control(&sent).session_id.clone();
+        let (sent, _rx) = open(&mut broker, pane(7), now + MEDIA_OPEN_TIMEOUT);
+        assert_eq!(
+            broker.state(&first).unwrap().code.as_deref(),
+            Some(close_code::REPLACED)
+        );
+        assert!(initial_control(&sent).input_muted && initial_control(&sent).output_suppressed);
+        let successor = initial_control(&sent).session_id.clone();
+        let before = broker.next_control_id;
+        assert!(matches!(
+            broker.dispatch_control(
+                &successor,
+                Some(false),
+                Some(false),
+                None,
+                now + MEDIA_OPEN_TIMEOUT * 2
+            ),
+            Err((error_code::SESSION_NOT_FOUND, _))
+        ));
+        assert_eq!(broker.next_control_id, before);
+        assert!(broker.intent(pane(7)).input_muted && broker.intent(pane(7)).output_suppressed);
+    }
+
+    #[test]
+    fn media_control_identifier_exhaustion_and_missing_target_do_not_mutate_intent() {
+        let now = Instant::now();
+        let mut broker = MediaBroker::new();
+        broker.client_connected(1, true);
+        let id = live_call(&mut broker, 1, pane(7), now);
+        broker.next_control_id = u64::MAX;
+        assert!(matches!(
+            broker.dispatch_control(&id, Some(true), Some(true), None, now),
+            Err((error_code::CONTROL_FAILED, _))
+        ));
+        assert_eq!(broker.next_control_id, u64::MAX);
+        assert!(broker.pane_intents.is_empty());
+        let session = &broker.sessions[&id];
+        assert!(!session.wants_muted && !session.wants_output_suppressed);
+        assert!(session.outstanding.is_empty());
+        assert!(broker
+            .record_control_intent("missing", Some(true), Some(true))
+            .is_err());
+        assert!(broker.pane_intents.is_empty());
+        assert!(broker
+            .dispatch_control("missing", Some(true), None, None, now)
+            .is_err());
+        assert!(broker.mute("missing", true).is_err());
+        assert!(broker.pane_intents.is_empty());
+    }
+
+    #[test]
+    fn media_applied_requires_known_pair_and_terminal_failures_cannot_revive() {
+        let now = Instant::now();
+        let mut broker = MediaBroker::new();
+        broker.client_connected(1, true);
+        broker.client_connected(2, true);
+        let id = live_call(&mut broker, 1, pane(7), now);
+        let pair = MediaIntent {
+            input_muted: true,
+            output_suppressed: false,
+        };
+        acknowledge(&mut broker, 1, &id, 999, pair);
+        assert!(broker.applied(&id).is_none(), "unknown ACK is not evidence");
+        let first = broker
+            .dispatch_control(&id, Some(true), None, None, now)
+            .unwrap();
+        run(first.actions);
+        acknowledge(
+            &mut broker,
+            1,
+            &id,
+            first.control_id,
+            MediaIntent::default(),
+        );
+        acknowledge(&mut broker, 2, &id, first.control_id, pair);
+        assert!(broker.applied(&id).is_none());
+        assert!(broker.sessions[&id]
+            .outstanding
+            .contains_key(&first.control_id));
+        acknowledge(&mut broker, 1, &id, first.control_id, pair);
+        assert!(broker.sessions[&id].muted);
+        assert!(broker.sessions[&id].outstanding.is_empty());
+        let second = broker
+            .dispatch_control(&id, Some(false), Some(true), None, now)
+            .unwrap();
+        run(second.actions);
+        let failure = MediaControlFailed {
+            session_id: id.clone(),
+            control_id: Some(second.control_id),
+            code: "control_timeout".into(),
+            message: None,
+        };
+        run(broker.client_control(1, MediaControl::ControlFailed(failure.clone()), now));
+        assert_eq!(broker.control_failed(&id), Some(&failure));
+        acknowledge(
+            &mut broker,
+            1,
+            &id,
+            second.control_id,
+            MediaIntent {
+                input_muted: false,
+                output_suppressed: true,
+            },
+        );
+        assert_eq!(broker.applied(&id).unwrap().control_id, first.control_id);
+        assert!(
+            broker.sessions[&id].muted,
+            "failure cannot fabricate observation"
+        );
+        assert_eq!(
+            broker.intent(pane(7)),
+            MediaIntent {
+                input_muted: false,
+                output_suppressed: true
+            }
+        );
+        let third = broker.dispatch_control(&id, None, None, None, now).unwrap();
+        run(third.actions);
+        let mut legacy = failure.clone();
+        legacy.control_id = None;
+        run(broker.client_control(1, MediaControl::ControlFailed(legacy), now));
+        assert!(broker.sessions[&id]
+            .outstanding
+            .contains_key(&third.control_id));
+        let mut unknown = failure.clone();
+        unknown.control_id = Some(999);
+        unknown.code = "awaiting_consent".into();
+        run(broker.client_control(1, MediaControl::ControlFailed(unknown), now));
+        let mut duplicate = failure.clone();
+        duplicate.code = "awaiting_consent".into();
+        run(broker.client_control(1, MediaControl::ControlFailed(duplicate), now));
+        assert_eq!(broker.control_failed(&id), Some(&failure));
+        run(broker.close(&id, now));
+        acknowledge(
+            &mut broker,
+            1,
+            &id,
+            third.control_id,
+            MediaIntent {
+                input_muted: false,
+                output_suppressed: true,
+            },
+        );
+        assert!(broker.applied(&id).is_none());
+        assert_eq!(broker.state(&id).unwrap().state, MediaSessionState::Closed);
+    }
+
+    #[test]
+    fn media_older_failure_settles_record_without_overwriting_newer_terminal_snapshot() {
+        let now = Instant::now();
+        let mut broker = MediaBroker::new();
+        broker.client_connected(1, true);
+        let id = live_call(&mut broker, 1, pane(7), now);
+        let first = broker
+            .dispatch_control(&id, Some(true), None, None, now)
+            .unwrap();
+        run(first.actions);
+        let second = broker
+            .dispatch_control(&id, Some(false), None, None, now)
+            .unwrap();
+        run(second.actions);
+        acknowledge(
+            &mut broker,
+            1,
+            &id,
+            second.control_id,
+            MediaIntent::default(),
+        );
+        run(broker.client_control(
+            1,
+            MediaControl::ControlFailed(MediaControlFailed {
+                session_id: id.clone(),
+                control_id: Some(first.control_id),
+                code: "control_timeout".into(),
+                message: None,
+            }),
+            now,
+        ));
+        assert!(broker.sessions[&id].outstanding.is_empty());
+        assert!(broker.control_failed(&id).is_none());
+        assert_eq!(broker.applied(&id).unwrap().control_id, second.control_id);
+        acknowledge(
+            &mut broker,
+            1,
+            &id,
+            first.control_id,
+            MediaIntent {
+                input_muted: true,
+                output_suppressed: false,
+            },
+        );
+        assert!(!broker.state(&id).unwrap().muted);
+    }
+
+    #[test]
+    fn media_control_alias_is_pending_authorized_same_pane_and_cannot_enable_levels() {
+        let now = Instant::now();
+        let mut broker = MediaBroker::new();
+        broker.client_connected(1, true);
+        let old = live_call(&mut broker, 1, pane(7), now);
+        let later = now + MEDIA_INPUT_WINDOW + Duration::from_secs(1);
+        let (sent, rx) = open(&mut broker, pane(7), later);
+        let (_, successor, _) = opened_session(&sent);
+        run(broker.client_control(
+            1,
+            MediaControl::Close(MediaClose::new(&old, close_code::REPLACED, "renewal")),
+            later,
+        ));
+        let before = broker.next_control_id;
+        assert!(matches!(
+            broker.dispatch_control(&old, Some(true), None, Some(false), later),
+            Err((error_code::NOT_READY, _))
+        ));
+        assert_eq!(broker.next_control_id, before);
+        assert_eq!(broker.intent(pane(7)), MediaIntent::default());
+        let dispatch = broker
+            .dispatch_control(&old, Some(true), Some(true), None, later)
+            .unwrap();
+        assert_eq!(dispatch.session_ids, vec![successor.clone()]);
+        run(dispatch.actions);
+        assert!(broker.intent(pane(7)).input_muted && broker.intent(pane(7)).output_suppressed);
+        let sent = run(broker.mute(&old, false).unwrap());
+        assert!(
+            matches!(&sent[..], [(1, MediaControl::Mute(mute))] if mute.session_id == successor && !mute.muted)
+        );
+        run(broker.client_control(
+            1,
+            MediaControl::Offer(MediaSdp {
+                session_id: successor.clone(),
+                sdp: "v=0".into(),
+            }),
+            later,
+        ));
+        assert_eq!(response(&rx)["result"]["session_id"], successor);
+        assert!(broker.mute(&old, true).is_err(), "offer consumed the alias");
+        assert!(broker
+            .dispatch_control(&old, Some(true), None, None, later)
+            .is_err());
+    }
+
+    #[test]
+    fn media_control_delivery_failure_is_owned_idempotent_and_never_rolls_back_intent() {
+        let now = Instant::now();
+        let mut broker = MediaBroker::new();
+        broker.client_connected(1, true);
+        broker.client_connected(2, true);
+        let id = live_call(&mut broker, 1, pane(7), now);
+        let other = live_call(&mut broker, 2, pane(8), now);
+        let dispatch = broker
+            .dispatch_control(&id, Some(true), Some(true), None, now)
+            .unwrap();
+        run(dispatch.actions);
+        assert!(broker.control_delivery_failed(2, &id, now).is_empty());
+        assert!(broker.sessions.contains_key(&id));
+        let sent = run(broker.control_delivery_failed(1, &id, now));
+        assert!(
+            sent.iter().all(|(_, control)| control.session_id() != id),
+            "never notify the failed target"
+        );
+        assert_eq!(
+            broker.state(&id).unwrap().code.as_deref(),
+            Some(close_code::DISCONNECTED)
+        );
+        assert!(broker.control_delivery_failed(1, &id, now).is_empty());
+        assert!(broker.sessions.contains_key(&other));
+        assert!(broker.intent(pane(7)).input_muted && broker.intent(pane(7)).output_suppressed);
+        acknowledge(
+            &mut broker,
+            1,
+            &id,
+            dispatch.control_id,
+            MediaIntent {
+                input_muted: true,
+                output_suppressed: true,
+            },
+        );
+        assert!(broker.applied(&id).is_none());
+        // Even an equal reused session string owned by another client cannot be ended.
+        let replacement = broker.sessions.remove(&other).unwrap();
+        broker.sessions.insert(id.clone(), replacement);
+        assert!(broker.control_delivery_failed(1, &id, now).is_empty());
+        assert_eq!(broker.sessions[&id].client_id, 2);
     }
 
     // smarty-voice#133: a provider renewal an hour into a native call reopens media with nobody typing.
@@ -3606,7 +4702,12 @@ mod tests {
         let later = now + MEDIA_INPUT_WINDOW + Duration::from_secs(1);
         let (sent, rx) = open_with_id(&mut broker, pane(7), Some("cancel-renewal"), later);
         let (_, renewal, _) = opened_session(&sent);
-        assert!(sent.iter().any(|(_, control)| matches!(control, MediaControl::Mute(mute) if mute.session_id == renewal && mute.muted)));
+        assert!(initial_control(&sent).input_muted);
+        assert_eq!(initial_control(&sent).session_id, renewal);
+        assert!(sent.iter().all(|(_, control)| !matches!(
+            control,
+            MediaControl::Mute(_) | MediaControl::Control(_)
+        )));
         let sent = run(broker.close_by_open_id("cancel-renewal", later).unwrap());
         assert!(
             matches!(&sent[..], [(1, MediaControl::Close(close))] if close.session_id == renewal)
@@ -3928,7 +5029,10 @@ mod tests {
         let (sent, offer_rx) = open(&mut broker, pane(7), now);
         let (_, id, _) = opened_session(&sent);
         let (_, rx) = device_request(&mut broker, &id, "opening", Some(true), None, now);
-        assert_eq!(response(&rx)["error"]["code"], error_code::NOT_READY);
+        assert_eq!(
+            response(&rx)["error"]["code"],
+            error_code::SESSION_NOT_FOUND
+        );
         assert!(!broker.sessions[&id].wants_muted);
         send_offer(&mut broker, &id, now);
         let _ = response(&offer_rx);
@@ -4009,8 +5113,7 @@ mod tests {
             .is_empty());
         assert!(!broker.state(&id).unwrap().muted);
         assert_eq!(broker.applied(&id).unwrap().control_id, second);
-        assert_eq!(broker.pane_intent[&pane(7)].input_muted, Some(false));
-        assert_eq!(broker.pane_intent[&pane(7)].output_suppressed, Some(false));
+        assert_eq!(broker.intent(pane(7)), MediaIntent::default());
     }
 
     #[test]
@@ -4113,8 +5216,12 @@ mod tests {
         let later = now + MEDIA_INPUT_WINDOW + Duration::from_secs(1);
         let (sent, _offer_rx) = open_with_id(&mut broker, pane(7), Some("renewal"), later);
         let (_, successor, _) = opened_session(&sent);
-        assert!(sent.iter().any(|(_, control)| matches!(control, MediaControl::Control(control)
-            if control.session_id == successor && control.input_muted == Some(true) && control.output_suppressed == Some(true))));
+        assert_eq!(initial_control(&sent).session_id, successor);
+        assert!(initial_control(&sent).input_muted && initial_control(&sent).output_suppressed);
+        assert!(sent.iter().all(|(_, control)| !matches!(
+            control,
+            MediaControl::Mute(_) | MediaControl::Control(_)
+        )));
         let (sent, rx) = device_request(
             &mut broker,
             &source,
@@ -4130,7 +5237,12 @@ mod tests {
             2
         );
         let inherited = device_id(&sent, &successor);
-        run(broker.client_control(1, applied(&successor, inherited, false, false), later));
+        let (_, events) =
+            observe(broker.client_control(1, applied(&successor, inherited, false, false), later));
+        assert!(matches!(&events[..], [event] if matches!(&event.data,
+            SubscriptionEventData::MediaControlsApplied(data)
+                if data.session_id == successor && data.request_id == "handover"
+                    && data.epoch == 2 && data.pane_id == "p_7")));
         assert!(
             rx.try_recv().is_err(),
             "internal successor ack cannot settle source control"
@@ -4177,16 +5289,19 @@ mod tests {
         );
         let (sent, offer_rx) = open(&mut broker, pane(7), now);
         let (_, next, _) = opened_session(&sent);
-        assert!(sent
-            .iter()
-            .any(|(_, control)| matches!(control, MediaControl::Mute(mute) if mute.muted)));
-        let inherited = device_id(&sent, &next);
-        assert!(sent.iter().any(
-            |(_, control)| matches!(control, MediaControl::Control(control)
-            if control.input_muted == Some(true) && control.output_suppressed == Some(true))
-        ));
+        assert!(initial_control(&sent).input_muted && initial_control(&sent).output_suppressed);
+        assert!(sent.iter().all(|(_, control)| !matches!(
+            control,
+            MediaControl::Mute(_) | MediaControl::Control(_)
+        )));
         send_offer(&mut broker, &next, now);
         let _ = response(&offer_rx);
+        // An actual older admitted control, not a fabricated startup ACK.
+        let dispatch = broker
+            .dispatch_control(&next, None, None, None, now)
+            .unwrap();
+        let inherited = dispatch.control_id;
+        run(dispatch.actions);
         let (_, unmute_rx) =
             device_request(&mut broker, &next, "unmute", Some(false), Some(false), now);
         run(broker.client_control(1, applied(&next, inherited, true, true), now));
@@ -4199,9 +5314,13 @@ mod tests {
         let (_, last, _) = opened_session(&sent);
         assert!(!broker.sessions[&last].wants_muted);
         assert!(!broker.sessions[&last].wants_output_suppressed);
-        assert!(sent.iter().any(
-            |(_, control)| matches!(control, MediaControl::Control(control)
-            if control.input_muted == Some(false) && control.output_suppressed == Some(false))
+        assert!(!initial_control(&sent).input_muted && !initial_control(&sent).output_suppressed);
+        assert!(matches!(
+            &sent[..],
+            [
+                (1, MediaControl::OpenInitial(_)),
+                (1, MediaControl::Open(_))
+            ]
         ));
     }
 
@@ -4211,20 +5330,23 @@ mod tests {
         let mut broker = MediaBroker::new();
         broker.client_connected(1, true);
         broker.client_connected(2, true);
-        assert!(broker.set_levels(pane(7), true).is_empty());
-        assert!(broker.set_levels(pane(7), true).is_empty());
+        assert!(broker.set_levels(pane(7), true, now).is_empty());
+        assert!(broker.set_levels(pane(7), true, now).is_empty());
         let source = live_call(&mut broker, 1, pane(7), now);
         let other = live_call(&mut broker, 2, pane(8), now);
         assert_eq!(
-            broker.sessions[&source].next_control_id, 2,
+            broker.sessions[&source].outstanding.len(),
+            1,
             "future open inherited levels"
         );
-        assert_eq!(broker.sessions[&other].next_control_id, 1);
-        let sent = run(broker.set_levels(pane(7), false));
+        assert_eq!(broker.sessions[&source].levels_requested, Some(true));
+        assert!(broker.sessions[&other].outstanding.is_empty());
+        assert_eq!(broker.sessions[&other].levels_requested, Some(false));
+        let sent = run(broker.set_levels(pane(7), false, now));
         assert!(matches!(&sent[..], [(1, MediaControl::Control(control))]
             if control.session_id == source && control.levels == Some(false)));
-        assert!(broker.set_levels(pane(7), false).is_empty());
-        let sent = run(broker.set_levels(pane(7), true));
+        assert!(broker.set_levels(pane(7), false, now).is_empty());
+        let sent = run(broker.set_levels(pane(7), true, now));
         let internal = device_id(&sent, &source);
         let (sent, rx) = device_request(&mut broker, &source, "api", Some(true), None, now);
         run(broker.client_control(1, applied(&source, internal, false, false), now));
@@ -4245,7 +5367,7 @@ mod tests {
             |(_, control)| matches!(control, MediaControl::Control(control)
             if control.session_id == successor && control.levels == Some(true))
         ));
-        let sent = run(broker.set_levels(pane(7), false));
+        let sent = run(broker.set_levels(pane(7), false, later));
         assert_eq!(
             sent.len(),
             2,
@@ -4271,9 +5393,13 @@ mod tests {
             })
         };
         assert!(broker.client_control(1, levels(&source), now).is_empty());
-        run(broker.set_levels(pane(8), true));
+        run(broker.set_levels(pane(8), true, now));
         assert!(broker.client_control(1, levels(&source), now).is_empty());
-        run(broker.set_levels(pane(7), true));
+        assert!(
+            broker.levels(&source).is_none(),
+            "unsubscribed levels are dropped"
+        );
+        run(broker.set_levels(pane(7), true, now));
         let (_, events) = observe(broker.client_control(1, levels(&source), now));
         assert!(
             matches!(&events[..], [SubscriptionEventEnvelope { data: SubscriptionEventData::MediaLevels(event), .. }]
@@ -4290,13 +5416,23 @@ mod tests {
         let (_, events) =
             observe(broker.client_control(1, levels(&next), now + Duration::from_millis(100)));
         assert_eq!(events.len(), 1);
-        run(broker.set_levels(pane(7), false));
+        run(broker.set_levels(pane(7), false, now + Duration::from_millis(100)));
+        let previous = broker.levels(&next).cloned();
         assert!(broker
-            .client_control(1, levels(&next), now + Duration::from_secs(1))
+            .client_control(
+                1,
+                MediaControl::Levels(MediaLevels {
+                    session_id: next.clone(),
+                    input_peak: 0.9,
+                    output_peak: 0.8,
+                }),
+                now + Duration::from_secs(1)
+            )
             .is_empty());
-        assert!(
-            broker.levels(&next).is_some(),
-            "telemetry accessor remains independent of interest"
+        assert_eq!(
+            broker.levels(&next),
+            previous.as_ref(),
+            "unsubscribed levels cannot update telemetry"
         );
     }
 
@@ -4537,7 +5673,8 @@ mod tests {
             // Runtime gates answer/control/close on this seam before dispatch.
             assert_eq!(broker.state(&id), original);
             assert!(broker.sessions[&id].pending_controls.is_empty());
-            assert_eq!(broker.sessions[&id].next_control_id, 1);
+            assert_eq!(broker.next_control_id, 1);
+            assert!(broker.sessions[&id].outstanding.is_empty());
         }
         run(broker.close(&id, now));
         assert!(broker.check_epoch(Some(&id), None, Some(1)).is_err());
@@ -4607,7 +5744,22 @@ mod tests {
             let control_rx = if cause != close_code::TIMEOUT {
                 send_offer(&mut broker, &id, now);
                 let _ = response(&offer_rx);
-                Some(device_request(&mut broker, &id, "pending", Some(true), Some(true), now).1)
+                let control_at = if cause == close_code::UNANSWERED {
+                    now + MEDIA_ANSWER_TIMEOUT - Duration::from_secs(1)
+                } else {
+                    now
+                };
+                Some(
+                    device_request(
+                        &mut broker,
+                        &id,
+                        "pending",
+                        Some(true),
+                        Some(true),
+                        control_at,
+                    )
+                    .1,
+                )
             } else {
                 None
             };
@@ -4644,7 +5796,7 @@ mod tests {
     }
 
     #[test]
-    fn out_of_order_ack_cannot_resolve_an_older_api_request_or_rewrite_newer_intent() {
+    fn older_recognized_ack_settles_its_api_request_without_rewriting_newer_telemetry_or_intent() {
         let now = Instant::now();
         let mut broker = MediaBroker::new();
         broker.client_connected(1, true);
@@ -4656,14 +5808,460 @@ mod tests {
         run(broker.client_control(1, applied(&id, device_id(&newer, &id), false, false), now));
         assert_eq!(response(&newer_rx)["id"], "newer");
         assert!(older_rx.try_recv().is_err());
-        assert!(broker
-            .client_control(1, applied(&id, device_id(&older, &id), true, true), now)
-            .is_empty());
+        let (_, events) = observe(broker.client_control(
+            1,
+            applied(&id, device_id(&older, &id), true, true),
+            now,
+        ));
+        assert_eq!(response(&older_rx)["id"], "older");
+        assert!(matches!(&events[..], [event] if matches!(&event.data,
+            SubscriptionEventData::MediaControlsApplied(data) if data.request_id == "older" && data.input_muted)));
         assert!(!broker.state(&id).unwrap().muted);
+        assert_eq!(
+            broker.applied(&id).unwrap().control_id,
+            device_id(&newer, &id)
+        );
         assert!(!broker.sessions[&id].wants_muted);
         assert!(!broker.sessions[&id].wants_output_suppressed);
-        run(broker.expire(now + MEDIA_CONTROL_TIMEOUT, |_| true));
-        assert_eq!(response(&older_rx)["error"]["code"], error_code::TIMEOUT);
+        assert!(broker.sessions[&id].outstanding.is_empty());
+        assert!(broker
+            .expire(now + MEDIA_CONTROL_TIMEOUT, |_| true)
+            .is_empty());
+        assert!(older_rx.try_recv().is_err());
+    }
+
+    // Keep: these trust-boundary and deadline races cannot be reached cheaply with
+    // physical audio; the runtime writer owns the complementary actual JSON flow.
+    #[test]
+    fn authority_preflight_precedes_intent_for_retired_consumed_abandoned_expired_and_foreign_targets(
+    ) {
+        for cause in [
+            "retired",
+            "consumed",
+            "abandoned",
+            "expired",
+            "expired_source",
+            "wrong_client",
+            "wrong_pane",
+        ] {
+            let now = Instant::now();
+            let mut broker = MediaBroker::new();
+            broker.client_connected(1, true);
+            broker.client_connected(2, true);
+            let source = live_call(&mut broker, 1, pane(7), now);
+            let later = now + MEDIA_INPUT_WINDOW + Duration::from_secs(1);
+            let (sent, offer_rx, delivery) = tracked_open(&mut broker, "renewal", later);
+            let (_, successor, _) = opened_session(&sent);
+            let target = match cause {
+                "retired" => {
+                    run(broker.close(&source, later));
+                    source.clone()
+                }
+                "consumed" => {
+                    send_offer(&mut broker, &successor, later);
+                    let _ = response(&offer_rx);
+                    run(broker.answer(&successor, "v=0".into(), later).unwrap());
+                    peer_state(&mut broker, &successor, MediaPeerState::Connected, later);
+                    let _ = open(&mut broker, pane(7), later);
+                    source.clone()
+                }
+                "abandoned" => {
+                    delivery.send(()).unwrap();
+                    successor.clone()
+                }
+                "expired" => {
+                    broker
+                        .sessions
+                        .get_mut(&successor)
+                        .unwrap()
+                        .pending
+                        .as_mut()
+                        .unwrap()
+                        .deadline = now;
+                    successor.clone()
+                }
+                "expired_source" => {
+                    broker.sessions.get_mut(&source).unwrap().connect_deadline = Some(now);
+                    successor.clone()
+                }
+                "wrong_client" => {
+                    broker.sessions.get_mut(&successor).unwrap().client_id = 2;
+                    successor.clone()
+                }
+                "wrong_pane" => {
+                    broker.sessions.get_mut(&successor).unwrap().pane = pane(8);
+                    successor.clone()
+                }
+                _ => unreachable!(),
+            };
+            let policies = broker.pane_intents.clone();
+            let next = broker.next_control_id;
+            let snapshot = |broker: &MediaBroker| {
+                broker
+                    .sessions
+                    .iter()
+                    .map(|(id, session)| {
+                        (
+                            id.clone(),
+                            (
+                                session.wants_muted,
+                                session.wants_output_suppressed,
+                                session.outstanding.clone(),
+                            ),
+                        )
+                    })
+                    .collect::<HashMap<_, _>>()
+            };
+            let before = snapshot(&broker);
+            assert!(
+                broker
+                    .dispatch_control(&target, Some(true), Some(true), None, later)
+                    .is_err(),
+                "{cause}"
+            );
+            assert!(broker.mute(&target, true).is_err(), "{cause}");
+            assert_eq!(broker.pane_intents, policies, "{cause}");
+            assert_eq!(broker.next_control_id, next, "{cause}");
+            assert_eq!(snapshot(&broker), before, "{cause}");
+        }
+    }
+
+    #[test]
+    fn named_replacement_fails_its_waiter_but_successor_ack_publishes_successor_identity_only() {
+        let now = Instant::now();
+        let mut broker = MediaBroker::new();
+        broker.client_connected(1, true);
+        let source = live_call(&mut broker, 1, pane(7), now);
+        let later = now + MEDIA_INPUT_WINDOW + Duration::from_secs(1);
+        let (sent, offer_rx) = open_with_id(&mut broker, pane(7), Some("successor"), later);
+        let (_, successor, _) = opened_session(&sent);
+        let (sent, rx) =
+            device_request(&mut broker, &source, "outer", Some(true), Some(true), later);
+        let cid = device_id(&sent, &source);
+        assert_eq!(
+            device_id(&sent, &successor),
+            cid,
+            "one admitted fanout, one CID"
+        );
+        let actions = broker.client_control(
+            1,
+            MediaControl::Close(MediaClose::new(&source, close_code::REPLACED, "renewing")),
+            later,
+        );
+        assert!(actions
+            .iter()
+            .filter_map(|action| match action {
+                MediaAction::Respond { session_id, .. } => Some(session_id),
+                _ => None,
+            })
+            .all(Option::is_none));
+        observe(actions);
+        let failed = response(&rx);
+        assert_eq!(failed["error"]["code"], error_code::CONTROL_FAILED);
+        assert_eq!(failed["error"]["close_code"], close_code::REPLACED);
+        // The source's response lifetime never becomes a successor event deadline.
+        let applied_at = later + MEDIA_CONTROL_TIMEOUT;
+        let (_, events) =
+            observe(broker.client_control(1, applied(&successor, cid, true, true), applied_at));
+        assert!(matches!(&events[..], [event] if matches!(&event.data,
+            SubscriptionEventData::MediaControlsApplied(data)
+                if data.session_id == successor && data.request_id == "outer"
+                    && data.epoch == 2 && data.pane_id == "p_7")));
+        assert!(rx.try_recv().is_err());
+        assert!(broker
+            .client_control(1, applied(&source, cid, true, true), applied_at)
+            .is_empty());
+        assert!(broker.sessions[&successor].pending_controls.is_empty());
+        let next = broker.next_control_id;
+        let (_, retired_rx) = device_request(
+            &mut broker,
+            &source,
+            "retired",
+            Some(false),
+            None,
+            applied_at,
+        );
+        let retired = response(&retired_rx);
+        assert_eq!(retired["error"]["code"], error_code::SESSION_NOT_FOUND);
+        assert_eq!(retired["error"]["close_code"], close_code::REPLACED);
+        assert_eq!(broker.next_control_id, next);
+        assert!(broker.intent(pane(7)).input_muted && broker.intent(pane(7)).output_suppressed);
+        send_offer(&mut broker, &successor, applied_at);
+        assert_eq!(response(&offer_rx)["result"]["session_id"], successor);
+    }
+
+    #[test]
+    fn older_failure_settles_its_waiter_but_legacy_unknown_and_failed_ids_never_apply() {
+        let now = Instant::now();
+        let mut broker = MediaBroker::new();
+        broker.client_connected(1, true);
+        broker.client_connected(2, true);
+        let id = live_call(&mut broker, 1, pane(7), now);
+        let (older, older_rx) = device_request(&mut broker, &id, "older", Some(true), None, now);
+        let older = device_id(&older, &id);
+        let (newer, newer_rx) = device_request(&mut broker, &id, "newer", Some(false), None, now);
+        let newer = device_id(&newer, &id);
+        run(broker.client_control(1, applied(&id, newer, false, false), now));
+        assert_eq!(response(&newer_rx)["id"], "newer");
+        let failure = |control_id| {
+            MediaControl::ControlFailed(MediaControlFailed {
+                session_id: id.clone(),
+                control_id,
+                code: "control_timeout".into(),
+                message: None,
+            })
+        };
+        assert!(broker.client_control(1, failure(None), now).is_empty());
+        assert!(broker
+            .client_control(2, failure(Some(older)), now)
+            .is_empty());
+        assert!(broker
+            .client_control(1, failure(Some(newer + 100)), now)
+            .is_empty());
+        assert!(older_rx.try_recv().is_err());
+        assert!(broker.sessions[&id].outstanding.contains_key(&older));
+        let actions = broker.client_control(1, failure(Some(older)), now);
+        assert!(actions.iter().all(|action| matches!(
+            action,
+            MediaAction::Respond {
+                session_id: None,
+                ..
+            }
+        )));
+        run(actions);
+        let failed = response(&older_rx);
+        assert_eq!(failed["error"]["code"], error_code::CONTROL_FAILED);
+        assert!(failed["error"].get("close_code").is_none());
+        assert!(broker.sessions[&id].outstanding.is_empty());
+        assert_eq!(broker.applied(&id).unwrap().control_id, newer);
+        assert!(
+            broker.sessions[&id].telemetry.control_failed.is_none(),
+            "older failure cannot replace newest snapshot"
+        );
+        assert!(broker
+            .client_control(1, applied(&id, older, true, false), now)
+            .is_empty());
+        assert!(broker
+            .client_control(1, failure(Some(older)), now)
+            .is_empty());
+        assert_eq!(broker.intent(pane(7)), MediaIntent::default());
+        assert!(!broker.state(&id).unwrap().muted);
+        assert_eq!(
+            broker.state(&id).unwrap().state,
+            MediaSessionState::Connected
+        );
+    }
+
+    #[test]
+    fn public_timeout_does_not_release_device_credit_and_capacity_error_keeps_session_and_intent() {
+        let now = Instant::now();
+        let mut broker = MediaBroker::new();
+        broker.client_connected(1, true);
+        let id = live_call(&mut broker, 1, pane(7), now);
+        let mut requests = Vec::new();
+        for index in 0..MEDIA_DEVICE_CONTROL_CAPACITY {
+            let (sent, rx) = device_request(
+                &mut broker,
+                &id,
+                &format!("held-{index}"),
+                Some(index % 2 == 1),
+                None,
+                now,
+            );
+            requests.push((device_id(&sent, &id), rx));
+        }
+        let next = broker.next_control_id;
+        let intent = broker.intent(pane(7));
+        assert!(broker
+            .expire(
+                now + MEDIA_CONTROL_TIMEOUT - Duration::from_nanos(1),
+                |_| true
+            )
+            .is_empty());
+        let actions = broker.expire(now + MEDIA_CONTROL_TIMEOUT, |_| true);
+        assert_eq!(actions.len(), MEDIA_DEVICE_CONTROL_CAPACITY);
+        assert!(actions.iter().all(|action| matches!(
+            action,
+            MediaAction::Respond {
+                session_id: None,
+                ..
+            }
+        )));
+        run(actions);
+        for (_, rx) in &requests {
+            assert_eq!(response(rx)["error"]["code"], error_code::TIMEOUT);
+        }
+        assert!(broker.sessions[&id].pending_controls.is_empty());
+        assert_eq!(
+            broker.sessions[&id].outstanding.len(),
+            MEDIA_DEVICE_CONTROL_CAPACITY
+        );
+        let (sent, rx) = device_request(
+            &mut broker,
+            &id,
+            "full",
+            Some(false),
+            Some(true),
+            now + MEDIA_CONTROL_TIMEOUT,
+        );
+        assert!(sent.is_empty());
+        let full = response(&rx);
+        assert_eq!(full["error"]["code"], error_code::CONTROL_FAILED);
+        assert!(full["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("32 outstanding"));
+        assert!(full["error"].get("close_code").is_none());
+        assert_eq!(broker.next_control_id, next);
+        assert_eq!(broker.intent(pane(7)), intent);
+        assert_eq!(
+            broker.state(&id).unwrap().state,
+            MediaSessionState::Connected
+        );
+        let (_, events) = observe(broker.client_control(
+            1,
+            applied(&id, requests[0].0, false, false),
+            now + MEDIA_CONTROL_TIMEOUT,
+        ));
+        assert!(
+            events.is_empty(),
+            "late observation cannot revive expired response/event"
+        );
+        assert_eq!(
+            broker.sessions[&id].outstanding.len(),
+            MEDIA_DEVICE_CONTROL_CAPACITY - 1
+        );
+        let (sent, rx) = device_request(
+            &mut broker,
+            &id,
+            "recovered",
+            Some(false),
+            None,
+            now + MEDIA_CONTROL_TIMEOUT,
+        );
+        assert_eq!(device_id(&sent, &id), next);
+        assert!(rx.try_recv().is_err());
+        assert!(requests[0].1.try_recv().is_err());
+    }
+
+    #[test]
+    fn successor_delivery_failure_preserves_source_waiter_until_its_own_ack() {
+        let now = Instant::now();
+        let mut broker = MediaBroker::new();
+        broker.client_connected(1, true);
+        let source = live_call(&mut broker, 1, pane(7), now);
+        let later = now + MEDIA_INPUT_WINDOW + Duration::from_secs(1);
+        let (sent, offer_rx) = open(&mut broker, pane(7), later);
+        let (_, successor, _) = opened_session(&sent);
+        let (sent, rx) =
+            device_request(&mut broker, &source, "source-only", Some(true), None, later);
+        observe(broker.control_delivery_failed(1, &successor, later));
+        assert_eq!(
+            response(&offer_rx)["error"]["close_code"],
+            close_code::DISCONNECTED
+        );
+        assert_eq!(
+            broker.state(&source).unwrap().state,
+            MediaSessionState::Connected
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "a different target cannot fail the named waiter"
+        );
+        assert!(broker
+            .control_delivery_failed(1, &successor, later)
+            .is_empty());
+        run(broker.client_control(
+            1,
+            applied(&source, device_id(&sent, &source), true, false),
+            later,
+        ));
+        assert_eq!(response(&rx)["result"]["session_id"], source);
+        assert!(broker.intent(pane(7)).input_muted);
+    }
+
+    #[test]
+    fn rejected_or_failed_levels_off_reconciles_on_existing_events_and_renewal_defaults_off() {
+        let now = Instant::now();
+        let mut broker = MediaBroker::new();
+        broker.client_connected(1, true);
+        let source = live_call(&mut broker, 1, pane(7), now);
+        let sent = run(broker.set_levels(pane(7), true, now));
+        run(broker.client_control(
+            1,
+            applied(&source, device_id(&sent, &source), false, false),
+            now,
+        ));
+        let mut ids = Vec::new();
+        for _ in 0..MEDIA_DEVICE_CONTROL_CAPACITY {
+            let dispatch = broker
+                .dispatch_control(&source, None, None, None, now)
+                .unwrap();
+            ids.push(dispatch.control_id);
+            run(dispatch.actions);
+        }
+        let next = broker.next_control_id;
+        assert!(
+            broker.set_levels(pane(7), false, now).is_empty(),
+            "off cannot bypass capacity"
+        );
+        assert!(!broker.levels_interest.contains(&pane(7)));
+        assert_eq!(broker.sessions[&source].levels_requested, Some(true));
+        assert_eq!(broker.next_control_id, next);
+        assert!(broker
+            .client_control(
+                1,
+                MediaControl::Levels(MediaLevels {
+                    session_id: source.clone(),
+                    input_peak: 0.9,
+                    output_peak: 0.8,
+                }),
+                now
+            )
+            .is_empty());
+        assert!(
+            broker.levels(&source).is_none(),
+            "always drop unsubscribed levels"
+        );
+        assert!(broker
+            .client_control(1, applied(&source, ids[0], false, false), now)
+            .is_empty());
+        let sent = run(broker.client_control(1, connected(&source), now));
+        assert!(matches!(&sent[..], [(1, MediaControl::Control(control))]
+            if control.session_id == source && control.levels == Some(false)));
+        let off = device_id(&sent, &source);
+        assert!(broker
+            .client_control(
+                1,
+                MediaControl::ControlFailed(MediaControlFailed {
+                    session_id: source.clone(),
+                    control_id: Some(off),
+                    code: "control_timeout".into(),
+                    message: None,
+                }),
+                now
+            )
+            .is_empty());
+        assert_eq!(broker.sessions[&source].levels_requested, None);
+        let dispatch = broker
+            .dispatch_control(&source, Some(true), None, None, now)
+            .unwrap();
+        let sent = run(dispatch.actions);
+        assert!(matches!(&sent[..], [(1, MediaControl::Control(control))]
+            if control.levels == Some(false) && control.input_muted == Some(true)));
+        assert!(
+            broker.client_control(1, connected(&source), now).is_empty(),
+            "one retry per real event, no recursion"
+        );
+        let later = now + MEDIA_INPUT_WINDOW + Duration::from_secs(1);
+        let (sent, _offer_rx) = open(&mut broker, pane(7), later);
+        let (_, successor, _) = opened_session(&sent);
+        assert_eq!(broker.sessions[&successor].levels_requested, Some(false));
+        assert!(broker.sessions[&successor].outstanding.is_empty());
+        assert!(sent.iter().all(|(_, control)| !matches!(
+            control,
+            MediaControl::Control(_) | MediaControl::Mute(_)
+        )));
     }
 
     #[test]
