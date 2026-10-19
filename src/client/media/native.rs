@@ -1506,6 +1506,158 @@ mod tests {
         }
     }
 
+    /// Run on macOS: `cargo test --locked --features native-media --bin herdr client::media::native::tests::manual_connected_cpal_input_device_change -- --ignored --exact --nocapture --test-threads=1`
+    /// The positive marker is `HERDR_CPAL_CONNECTED_INFO <MediaInfo JSON>`; the human/harness
+    /// changes the default input only after that marker and restores devices after the test.
+    /// Capture and WebRTC stay local to this process.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires real CoreAudio devices and an external default-input switch"]
+    fn manual_connected_cpal_input_device_change() {
+        use cpal::traits::{DeviceTrait, HostTrait};
+        use std::io::Write;
+
+        struct TrackingGuard {
+            inner: Option<Box<dyn std::any::Any>>,
+            released: Arc<AtomicBool>,
+        }
+
+        impl Drop for TrackingGuard {
+            fn drop(&mut self) {
+                drop(self.inner.take());
+                self.released.store(true, Ordering::Release);
+            }
+        }
+
+        struct TrackingCpalAudio(Arc<AtomicBool>);
+
+        impl AudioBackend for TrackingCpalAudio {
+            fn open(self: Box<Self>, io: AudioIo) -> Result<OpenedAudio, String> {
+                let mut opened = Box::new(super::cpal_audio::CpalAudio).open(io)?;
+                let inner = std::mem::replace(&mut opened._guard, Box::new(()));
+                opened._guard = Box::new(TrackingGuard {
+                    inner: Some(inner),
+                    released: Arc::clone(&self.0),
+                });
+                Ok(opened)
+            }
+        }
+
+        fn default_device_ids() -> Result<(String, String), String> {
+            let host = cpal::default_host();
+            let input = host
+                .default_input_device()
+                .ok_or_else(|| "there is no default input device".to_owned())?
+                .id()
+                .map_err(|error| format!("default input identity: {error}"))?
+                .id()
+                .to_owned();
+            let output = host
+                .default_output_device()
+                .ok_or_else(|| "there is no default output device".to_owned())?
+                .id()
+                .map_err(|error| format!("default output identity: {error}"))?
+                .id()
+                .to_owned();
+            Ok((input, output))
+        }
+
+        let (input_before, output_before) =
+            default_device_ids().expect("query initial CoreAudio default-device identities");
+        let released = Arc::new(AtomicBool::new(false));
+        let (events_tx, events) = std_mpsc::channel();
+        let events_tx = Mutex::new(events_tx);
+        let sink: PeerEventSink = Arc::new(move |event| {
+            if let Ok(events_tx) = events_tx.lock() {
+                let _ = events_tx.send(event);
+            }
+        });
+        let mut peer = start_with_audio(
+            "media_test".to_owned(),
+            sink,
+            Box::new(TrackingCpalAudio(Arc::clone(&released))),
+        )
+        .expect("real CPAL peer starts");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let offer = match events.recv_timeout(Duration::from_secs(15)) {
+            Ok(PeerEvent::Offer { session_id, sdp }) => {
+                assert_eq!(session_id, "media_test");
+                sdp
+            }
+            other => panic!("expected a real CPAL media offer, got {other:?}"),
+        };
+        let (remote, _channel, info) = runtime.block_on(connect_remote(&mut peer, offer, &events));
+        assert_eq!(info.session_id, "media_test", "connected Info session");
+        assert_eq!(
+            default_device_ids().expect("query connected default-device identities"),
+            (input_before.clone(), output_before.clone()),
+            "default devices changed during setup; wait for the connected marker"
+        );
+        let info_json = serde_json::to_string(&info).expect("serialize connected media info");
+        println!("HERDR_CPAL_CONNECTED_INFO {info_json}");
+        std::io::stdout()
+            .flush()
+            .expect("flush connected media info marker");
+
+        let (device_changed_closed, guard_released_before_closed) =
+            match events.recv_timeout(Duration::from_secs(120)) {
+                Ok(PeerEvent::Closed {
+                    session_id, code, ..
+                }) => (
+                    session_id == "media_test" && code == close_code::DEVICE_CHANGED,
+                    released.load(Ordering::Acquire),
+                ),
+                Ok(event) => {
+                    eprintln!("expected device_changed Closed, got {event:?}");
+                    (false, false)
+                }
+                Err(error) => {
+                    eprintln!("timed out waiting for device_changed Closed: {error}");
+                    (false, false)
+                }
+            };
+        let (input_changed, output_unchanged) = match default_device_ids() {
+            Ok((input_after, output_after)) => {
+                (input_after != input_before, output_after == output_before)
+            }
+            Err(error) => {
+                eprintln!("could not query default-device identities after close: {error}");
+                (false, false)
+            }
+        };
+
+        let _ = runtime
+            .block_on(async { tokio::time::timeout(Duration::from_secs(2), remote.close()).await });
+        let worker_done = match peer.done.as_ref() {
+            Some(done) => matches!(done.recv_timeout(Duration::from_secs(2)), Ok(())),
+            None => false,
+        };
+        let worker_stopped = peer.stopped.load(Ordering::Acquire);
+        peer.close();
+
+        assert!(
+            device_changed_closed,
+            "the peer did not close with device_changed"
+        );
+        assert!(
+            guard_released_before_closed,
+            "the underlying CPAL streams were not released before Closed"
+        );
+        assert!(
+            worker_done && worker_stopped,
+            "the peer worker did not stop"
+        );
+        assert!(input_changed, "the default input identity did not change");
+        assert!(
+            output_unchanged,
+            "the default output identity changed; this does not prove input-change handling"
+        );
+    }
+
     #[test]
     fn native_peer_confirms_mute_before_connect() {
         let (mut peer, devices, events) = start_fake();
