@@ -69,6 +69,10 @@ pub mod close_code {
     pub const PANE_CLOSED: &str = "pane_closed";
     /// The client did not send an offer in time.
     pub const TIMEOUT: &str = "timeout";
+    /// The API caller disconnected before the offer response could be delivered.
+    pub const ABANDONED: &str = "abandoned";
+    /// The remote peer did not answer an offered session in time.
+    pub const UNANSWERED: &str = "unanswered";
     /// A newer session for the same pane replaced this one.
     pub const REPLACED: &str = "replaced";
 }
