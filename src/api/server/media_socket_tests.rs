@@ -203,11 +203,16 @@ fn successful_offer(write_half_closed: bool, extra_input: bool) {
         matches!(
             media.controls.as_slice(),
             [
-                crate::protocol::media::MediaControl::OpenInitial(_),
-                crate::protocol::media::MediaControl::Open(_)
-            ]
+                crate::protocol::media::MediaControl::OpenInitial(initial),
+                crate::protocol::media::MediaControl::Open(open)
+            ] if initial.session_id.as_str() == id.as_str()
+                && initial.pane_id.as_str() == open.pane_id.as_str()
+                && open.pane_id.as_str() == "w1:p7"
+                && !initial.input_muted
+                && !initial.output_suppressed
+                && open.session_id.as_str() == id.as_str()
         ),
-        "successful response teardown retains only the compatibility open pair, not media.close"
+        "successful response teardown preserves only the paired startup controls"
     );
 }
 

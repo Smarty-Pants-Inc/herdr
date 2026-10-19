@@ -492,13 +492,20 @@ fn channel_media_pending_disconnect_abandons_before_a_late_offer() {
         matches!(
             media.controls.as_slice(),
             [
-                crate::protocol::media::MediaControl::OpenInitial(_),
-                crate::protocol::media::MediaControl::Open(_),
+                crate::protocol::media::MediaControl::OpenInitial(initial),
+                crate::protocol::media::MediaControl::Open(open),
                 crate::protocol::media::MediaControl::Close(close)
-            ] if close.session_id == id
-                && close.code.as_deref() == Some(crate::protocol::media::close_code::ABANDONED)
+            ] if initial.session_id.as_str() == id.as_str()
+                && initial.pane_id.as_str() == open.pane_id.as_str()
+                && open.pane_id.as_str() == "w1:p7"
+                && !initial.input_muted
+                && !initial.output_suppressed
+                && open.session_id.as_str() == id.as_str()
+                && close.session_id.as_str() == id.as_str()
+                && close.code.as_deref()
+                    == Some(crate::protocol::media::close_code::ABANDONED)
         ),
-        "pre-delivery abandonment preserves the open pair and sends only its expected close"
+        "late work preserves paired startup and exactly one abandoned close"
     );
 }
 
@@ -630,10 +637,15 @@ fn channel_media_successful_offer_survives_response_channel_and_receipt_drop() {
         matches!(
             media.controls.as_slice(),
             [
-                crate::protocol::media::MediaControl::OpenInitial(_),
-                crate::protocol::media::MediaControl::Open(_)
-            ]
+                crate::protocol::media::MediaControl::OpenInitial(initial),
+                crate::protocol::media::MediaControl::Open(open)
+            ] if initial.session_id.as_str() == id.as_str()
+                && initial.pane_id.as_str() == open.pane_id.as_str()
+                && open.pane_id.as_str() == "w1:p7"
+                && !initial.input_muted
+                && !initial.output_suppressed
+                && open.session_id.as_str() == id.as_str()
         ),
-        "a successful response leaves only the compatibility open pair, with no close"
+        "successful response drop preserves only the paired startup controls"
     );
 }

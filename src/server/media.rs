@@ -4702,6 +4702,10 @@ mod tests {
         let later = now + MEDIA_INPUT_WINDOW + Duration::from_secs(1);
         let (sent, rx) = open_with_id(&mut broker, pane(7), Some("cancel-renewal"), later);
         let (_, renewal, _) = opened_session(&sent);
+        assert!(
+            matches!(&sent[..], [(1, MediaControl::OpenInitial(initial))]
+            if initial.session_id == renewal && initial.input_muted && !initial.output_suppressed)
+        );
         assert!(initial_control(&sent).input_muted);
         assert_eq!(initial_control(&sent).session_id, renewal);
         assert!(sent.iter().all(|(_, control)| !matches!(
