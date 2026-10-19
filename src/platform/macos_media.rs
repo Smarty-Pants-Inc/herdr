@@ -1,6 +1,7 @@
 //! CoreAudio device identity and default-device change policy for native media.
 //!
-//! CPAL's default-output monitor reports DeviceChanged after automatic rerouting.
+//! CPAL's default-output monitor reports DeviceChanged after automatic rerouting,
+//! or DeviceNotAvailable when no replacement default exists.
 //! Its input stream instead pins a HAL device and exposes no default-input event,
 //! so the peer invokes the identity check below off callbacks at most once a second.
 //! We close rather than claim that a call transparently reopened different devices.
@@ -31,4 +32,13 @@ pub(crate) fn default_input_check(
 
 pub(crate) fn stream_device_changed(error: &cpal::Error) -> bool {
     error.kind() == cpal::ErrorKind::DeviceChanged
+}
+
+/// Only for streams opened from the host's default output device.
+pub(crate) fn default_output_stream_device_changed(error: &cpal::Error) -> bool {
+    // CoreAudio's default-output monitor pauses on no default and reports DeviceNotAvailable.
+    matches!(
+        error.kind(),
+        cpal::ErrorKind::DeviceChanged | cpal::ErrorKind::DeviceNotAvailable
+    )
 }

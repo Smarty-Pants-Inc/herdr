@@ -1052,7 +1052,7 @@ mod cpal_audio {
                     });
                 },
                 move |stream_error| {
-                    if macos_media::stream_device_changed(&stream_error) {
+                    if macos_media::default_output_stream_device_changed(&stream_error) {
                         changed();
                     } else {
                         error(format!("speaker: {stream_error}"));
@@ -1061,6 +1061,47 @@ mod cpal_audio {
                 None,
             )
             .map_err(|error| format!("speaker: {error}"))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::macos_media;
+        use cpal::{Error, ErrorKind};
+
+        #[test]
+        fn default_output_without_replacement_is_device_changed() {
+            let error = Error::new(ErrorKind::DeviceNotAvailable);
+            assert!(macos_media::default_output_stream_device_changed(&error));
+        }
+
+        #[test]
+        fn unavailable_input_is_not_device_changed() {
+            let error = Error::new(ErrorKind::DeviceNotAvailable);
+            assert!(!macos_media::stream_device_changed(&error));
+        }
+
+        #[test]
+        fn unrelated_output_errors_are_not_device_changed() {
+            for kind in [
+                ErrorKind::HostUnavailable,
+                ErrorKind::PermissionDenied,
+                ErrorKind::StreamInvalidated,
+                ErrorKind::Xrun,
+                ErrorKind::BackendError,
+                ErrorKind::Other,
+            ] {
+                assert!(!macos_media::default_output_stream_device_changed(
+                    &Error::new(kind)
+                ));
+            }
+        }
+
+        #[test]
+        fn explicit_device_changed_is_recognized_for_input_and_output() {
+            let error = Error::new(ErrorKind::DeviceChanged);
+            assert!(macos_media::stream_device_changed(&error));
+            assert!(macos_media::default_output_stream_device_changed(&error));
+        }
     }
 }
 
