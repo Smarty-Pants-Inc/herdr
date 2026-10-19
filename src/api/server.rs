@@ -153,6 +153,8 @@ fn default_capabilities() -> Option<ServerCapabilities> {
         health_check: true,
         ssh_agent_registration: false,
         media_open_cancel: true,
+        media_control: true,
+        media_events: true,
         guarded_live_handoff: crate::platform::capabilities().live_handoff,
         expected_terminal_guard: true,
         pane_close_expected_terminal_guard: true,
@@ -454,6 +456,7 @@ fn retired_pane_graphics_method_error(line: &str, id: &str) -> Option<ErrorRespo
     Some(ErrorResponse {
         id: id.into(),
         error: ErrorBody {
+            close_code: None,
             code: "unknown_method".into(),
             message: format!("unknown method: {method}"),
         },
@@ -543,6 +546,7 @@ fn handle_connection_with_stop(
                     error: ErrorBody {
                         code: "invalid_request".into(),
                         message: format!("invalid request: {request_error}"),
+                        close_code: None,
                     },
                 });
             write_json_line_allow_disconnect(&mut stream, &response)?;
@@ -618,6 +622,7 @@ fn handle_connection_with_stop(
                 api_tx,
                 event_hub,
                 running,
+                server_stop,
             );
             match &result {
                 Ok(()) => crate::logging::api_request_completed(
@@ -751,6 +756,31 @@ fn handle_connection_with_stop(
             }
             result
         }
+        Method::MediaControl(params) => {
+            // The broker owns the control deadline. The generic five-second app
+            // timeout would race its five-second acknowledgement timeout.
+            let response = if server_stop.is_some_and(ServerStop::is_requested) {
+                Some(error_response_json(
+                    request_id.clone(),
+                    "server_unavailable",
+                    "server is shutting down".to_owned(),
+                ))
+            } else {
+                dispatch_held_media(
+                    Request {
+                        id: request_id.clone(),
+                        method: Method::MediaControl(params),
+                    },
+                    context,
+                    api_tx,
+                    None,
+                    &mut stream,
+                    running,
+                    server_stop,
+                )?
+            };
+            finish_wait_response(&mut stream, response, &request_id, method, changes_ui)
+        }
         Method::PaneMediaOpen(params) => {
             let (delivery, response_write_rx) = MediaResponseDelivery::new();
             let response = if server_stop.is_some_and(ServerStop::is_requested) {
@@ -760,14 +790,14 @@ fn handle_connection_with_stop(
                     "server is shutting down".to_owned(),
                 ))
             } else {
-                dispatch_media_open(
+                dispatch_held_media(
                     Request {
                         id: request_id.clone(),
                         method: Method::PaneMediaOpen(params),
                     },
                     context,
                     api_tx,
-                    response_write_rx,
+                    Some(response_write_rx),
                     &mut stream,
                     running,
                     server_stop,
@@ -1170,6 +1200,7 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::PaneMediaOpen(_) => "pane.media_open",
         Method::MediaAnswer(_) => "media.answer",
         Method::MediaMute(_) => "media.mute",
+        Method::MediaControl(_) => "media.control",
         Method::MediaState(_) => "media.state",
         Method::MediaClose(_) => "media.close",
     }
@@ -1421,6 +1452,7 @@ mod windows_tests {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // Transport owner and both existing dispatch sources.
 fn stream_subscriptions(
     mut stream: LocalStream,
     request_id: String,
@@ -1428,8 +1460,10 @@ fn stream_subscriptions(
     api_tx: &ApiRequestSender,
     event_hub: &EventHub,
     running: &Arc<AtomicBool>,
+    server_stop: Option<&ServerStop>,
 ) -> std::io::Result<()> {
     let event_start_sequence = event_hub.current_sequence();
+    let media_start_sequence = event_hub.current_media_sequence();
     let mut subscriptions = Vec::with_capacity(params.subscriptions.len());
     for (index, subscription) in params.subscriptions.into_iter().enumerate() {
         let active = match ActiveSubscription::new(
@@ -1439,6 +1473,7 @@ fn stream_subscriptions(
             api_tx,
             event_hub,
             event_start_sequence,
+            media_start_sequence,
         ) {
             Ok(active) => active,
             Err(mut response) => {
@@ -1469,7 +1504,9 @@ fn stream_subscriptions(
     }
 
     loop {
-        if should_stop_connection(&mut stream, running)? {
+        if server_stop.is_some_and(ServerStop::is_requested)
+            || should_stop_connection(&mut stream, running)?
+        {
             return Ok(());
         }
 
@@ -1488,7 +1525,9 @@ fn stream_subscriptions(
                 }
             };
             for event in events {
-                if should_stop_connection(&mut stream, running)? {
+                if server_stop.is_some_and(ServerStop::is_requested)
+                    || should_stop_connection(&mut stream, running)?
+                {
                     return Ok(());
                 }
                 if let Err(err) = write_json_line(&mut stream, &event) {
@@ -1570,11 +1609,12 @@ impl Drop for MediaResponseDelivery {
     }
 }
 
-fn dispatch_media_open(
+/// Open alone passes an abandonment receipt; controls must never acquire one.
+fn dispatch_held_media(
     request: Request,
     context: ApiRequestContext,
     api_tx: &ApiRequestSender,
-    response_write_complete: std::sync::mpsc::Receiver<()>,
+    response_write_complete: Option<std::sync::mpsc::Receiver<()>>,
     stream: &mut LocalStream,
     running: &Arc<AtomicBool>,
     server_stop: Option<&ServerStop>,
@@ -1586,7 +1626,7 @@ fn dispatch_media_open(
         context,
         peer_pidfd: None,
         respond_to,
-        response_write_complete: Some(response_write_complete),
+        response_write_complete,
     }) {
         return Ok(Some(error_response_json(
             request_id,
@@ -1746,6 +1786,7 @@ fn error_response_json(id: String, code: &str, message: String) -> String {
         error: ErrorBody {
             code: code.into(),
             message,
+            close_code: None,
         },
     })
     .unwrap_or_else(|_| {
@@ -2425,7 +2466,7 @@ mod tests {
             &api_tx,
             &EventHub::default(),
             &Arc::new(AtomicBool::new(true)),
-            None,
+            default_capabilities(),
         )
         .unwrap();
 
@@ -2433,6 +2474,8 @@ mod tests {
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
         assert_eq!(response["id"], "ordinary");
         assert_eq!(response["result"]["type"], "pong");
+        assert_eq!(response["result"]["capabilities"]["media_control"], true);
+        assert_eq!(response["result"]["capabilities"]["media_events"], true);
     }
 
     #[test]
@@ -2454,6 +2497,8 @@ mod tests {
                 health_check: true,
                 ssh_agent_registration: false,
                 media_open_cancel: true,
+                media_control: true,
+                media_events: true,
                 guarded_live_handoff: true,
                 expected_terminal_guard: true,
                 pane_close_expected_terminal_guard: true,

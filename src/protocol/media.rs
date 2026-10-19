@@ -85,6 +85,8 @@ pub mod close_code {
     pub const ABANDONED: &str = "abandoned";
     /// The remote peer did not answer an offered session in time.
     pub const UNANSWERED: &str = "unanswered";
+    /// The answered peer did not connect (including its data channel) within 15 seconds.
+    pub const NEGOTIATION_TIMEOUT: &str = "negotiation_timeout";
     /// A newer session for the same pane replaced this one.
     pub const REPLACED: &str = "replaced";
 }
@@ -498,6 +500,22 @@ mod tests {
         })
         .validate()
         .is_err());
+    }
+
+    #[test]
+    fn negotiation_timeout_retains_the_terminal_reason_in_the_existing_close_envelope() {
+        let close = MediaControl::Close(MediaClose::new(
+            "media_1",
+            close_code::NEGOTIATION_TIMEOUT,
+            "the media peer did not connect in time after the answer",
+        ));
+        let ServerMessage::EndpointControl { kind, data } = close.server_message().unwrap() else {
+            panic!("media close is an endpoint control");
+        };
+        assert_eq!(kind, MEDIA_CLOSE_KIND);
+        assert_eq!(MediaControl::decode(&kind, &data), Some(Ok(close)));
+        let value: serde_json::Value = serde_json::from_str(&data).unwrap();
+        assert_eq!(value["code"], "negotiation_timeout");
     }
 
     #[test]

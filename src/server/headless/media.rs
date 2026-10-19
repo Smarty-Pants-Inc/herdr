@@ -1,6 +1,8 @@
 use super::*;
 
-use crate::server::media::{error_code, error_response, success_response, MediaAction};
+use crate::server::media::{
+    error_code, error_response, error_response_with_close_code, success_response, MediaAction,
+};
 
 pub(super) fn is_media_method(method: &api::schema::Method) -> bool {
     matches!(
@@ -8,6 +10,7 @@ pub(super) fn is_media_method(method: &api::schema::Method) -> bool {
         api::schema::Method::PaneMediaOpen(_)
             | api::schema::Method::MediaAnswer(_)
             | api::schema::Method::MediaMute(_)
+            | api::schema::Method::MediaControl(_)
             | api::schema::Method::MediaState(_)
             | api::schema::Method::MediaClose(_)
     )
@@ -17,6 +20,7 @@ impl HeadlessServer {
     pub(super) fn perform_media_actions(&mut self, actions: Vec<MediaAction>) {
         for action in actions {
             match action {
+                MediaAction::Publish { event } => self.app.event_hub.push_media(event),
                 MediaAction::Send { client_id, control } => match control.server_message() {
                     Ok(message) => {
                         self.send_to_client(client_id, message);
@@ -38,6 +42,21 @@ impl HeadlessServer {
                     }
                 }
             }
+        }
+    }
+
+    pub(super) fn drain_media_interest_transitions(&mut self) {
+        let transitions = self
+            .app
+            .event_hub
+            .take_media_interest_transitions(|canonical| {
+                self.app
+                    .parse_current_public_pane_id(canonical)
+                    .map(|(_, pane)| pane)
+            });
+        for (pane, enabled) in transitions {
+            let actions = self.media.set_levels(pane, enabled);
+            self.perform_media_actions(actions);
         }
     }
 
@@ -107,8 +126,8 @@ impl HeadlessServer {
         let _ = msg.respond_to.send(response);
     }
 
-    /// `pane.media_open` answers later, when the bound client sends its offer; the other media
-    /// methods answer at once.
+    /// Opens wait for an offer and controls wait for the matching applied ack.
+    /// Answer remains dispatch-only: it must never wait for Connected.
     pub(super) fn handle_media_api_request(&mut self, msg: api::ApiRequestMessage) {
         use api::schema::{Method, ResponseResult};
 
@@ -120,6 +139,33 @@ impl HeadlessServer {
         } = msg;
         let id = request.id;
         let now = Instant::now();
+        // Epoch validation is a read-only broker gate, before any command can
+        // change desired controls, clear an answer deadline, or reserve an open id.
+        let (session_id, open_id, epoch) = match &request.method {
+            Method::MediaAnswer(params) => (Some(params.session_id.as_str()), None, params.epoch),
+            Method::MediaControl(params) => (Some(params.session_id.as_str()), None, params.epoch),
+            Method::MediaClose(params)
+                if params.session_id.is_some() != params.open_id.is_some() =>
+            {
+                (
+                    params.session_id.as_deref(),
+                    params.open_id.as_deref(),
+                    params.epoch,
+                )
+            }
+            _ => (None, None, None),
+        };
+        let terminal_code =
+            session_id.and_then(|session_id| self.media.close_cause(session_id, now));
+        if let Err((code, message)) = self.media.check_epoch(session_id, open_id, epoch) {
+            let _ = respond_to.send(error_response_with_close_code(
+                id,
+                code,
+                message,
+                terminal_code.as_deref(),
+            ));
+            return;
+        }
         let immediate = match request.method {
             Method::PaneMediaOpen(target) => {
                 let Some((workspace_index, pane_id)) = self.app.parse_pane_id(&target.pane_id)
@@ -127,6 +173,11 @@ impl HeadlessServer {
                     let _ = respond_to.send(error_response(id, "pane_not_found", "pane not found"));
                     return;
                 };
+                let Some(canonical) = self.app.public_pane_id(workspace_index, pane_id) else {
+                    let _ = respond_to.send(error_response(id, "pane_not_found", "pane not found"));
+                    return;
+                };
+                self.media.set_pane_event_id(pane_id, canonical);
                 let viewers = self
                     .clients
                     .keys()
@@ -159,6 +210,20 @@ impl HeadlessServer {
                     self.media.answer(&params.session_id, params.sdp, now)
                 }
             }
+            Method::MediaControl(params) => {
+                // No response-delivery receipt: losing this caller cannot abandon
+                // an already established media session. The broker owns the reply.
+                let actions = self.media.control(
+                    id,
+                    respond_to,
+                    &params.session_id,
+                    params.input_muted,
+                    params.output_suppressed,
+                    now,
+                );
+                self.perform_media_actions(actions);
+                return;
+            }
             Method::MediaMute(params) => self.media.mute(&params.session_id, params.muted),
             Method::MediaState(params) => {
                 let response = match self.media.state(&params.session_id) {
@@ -187,7 +252,13 @@ impl HeadlessServer {
                 self.perform_media_actions(actions);
                 success_response(id, ResponseResult::Ok {})
             }
-            Err((code, message)) => error_response(id, code, message),
+            Err((code, message)) => {
+                let close_code =
+                    matches!(code, error_code::SESSION_NOT_FOUND | error_code::REFUSED)
+                        .then_some(terminal_code.as_deref())
+                        .flatten();
+                error_response_with_close_code(id, code, message, close_code)
+            }
         };
         let _ = respond_to.send(response);
     }

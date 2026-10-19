@@ -361,6 +361,8 @@ pub enum Method {
     MediaAnswer(MediaAnswerParams),
     #[serde(rename = "media.mute")]
     MediaMute(MediaMuteParams),
+    #[serde(rename = "media.control")]
+    MediaControl(MediaControlParams),
     #[serde(rename = "media.state")]
     MediaState(MediaSessionTarget),
     #[serde(rename = "media.close")]

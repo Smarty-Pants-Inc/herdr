@@ -2,6 +2,10 @@ use super::*;
 
 use crate::protocol::media::{MediaControl, MediaOpen, MediaPeerState, MediaSdp, MediaStateUpdate};
 
+#[cfg(target_os = "linux")]
+#[path = "media_socket.rs"]
+mod socket;
+
 fn connect_media_shell(
     server: &mut HeadlessServer,
     client_id: u64,
@@ -286,6 +290,7 @@ async fn pending_media_cancellation_enqueues_open_refusal_before_close_success()
                 method: api::schema::Method::MediaClose(api::schema::MediaCloseParams {
                     session_id,
                     open_id: close_open_id,
+                    epoch: None,
                 }),
             },
             responses_tx.clone(),
@@ -307,6 +312,7 @@ async fn pending_media_cancellation_enqueues_open_refusal_before_close_success()
         .expect("close success is JSON");
         assert_eq!(refusal["id"], "pending-open");
         assert_eq!(refusal["error"]["code"], "media_refused");
+        assert_eq!(refusal["error"]["close_code"], "closed");
         assert_eq!(
             refusal["error"]["message"],
             "closed: the caller ended the session"
@@ -341,6 +347,7 @@ async fn unknown_media_open_id_close_is_idempotent_and_refuses_a_later_open() {
                 method: api::schema::Method::MediaClose(api::schema::MediaCloseParams {
                     session_id: None,
                     open_id: Some(open_id.into()),
+                    epoch: None,
                 }),
             },
         );
@@ -417,6 +424,7 @@ async fn media_open_id_cancels_pending_offered_and_connected_sessions_without_re
                 api::schema::Method::MediaAnswer(api::schema::MediaAnswerParams {
                     session_id: open.session_id.clone(),
                     sdp: "v=0 answer".into(),
+                    epoch: None,
                 }),
             );
             assert_eq!(json(&answer_response)["result"]["type"], "ok");
@@ -446,6 +454,7 @@ async fn media_open_id_cancels_pending_offered_and_connected_sessions_without_re
             api::schema::Method::MediaClose(api::schema::MediaCloseParams {
                 session_id: None,
                 open_id: Some(open_id),
+                epoch: None,
             }),
         );
         assert_eq!(json(&cancelled)["result"]["type"], "ok");
@@ -468,6 +477,7 @@ async fn media_open_id_cancels_pending_offered_and_connected_sessions_without_re
             api::schema::Method::MediaAnswer(api::schema::MediaAnswerParams {
                 session_id: open.session_id.clone(),
                 sdp: "v=0 late answer".into(),
+                epoch: None,
             }),
         );
         assert_eq!(
@@ -553,6 +563,7 @@ async fn duplicate_live_open_id_and_invalid_media_close_selectors_are_rejected_b
         api::schema::Method::MediaClose(api::schema::MediaCloseParams {
             session_id: None,
             open_id: Some("voice-live".into()),
+            epoch: None,
         }),
     );
     assert_eq!(json(&cancelled)["result"]["type"], "ok");
@@ -719,6 +730,7 @@ async fn successful_media_answer_prevents_unanswered_expiry_in_headless_server()
         api::schema::Method::MediaAnswer(api::schema::MediaAnswerParams {
             session_id: open.session_id.clone(),
             sdp: "v=0 answer".into(),
+            epoch: None,
         }),
     );
     assert_eq!(json(&answer_response)["result"]["type"], "ok");

@@ -37,6 +37,10 @@ pub struct ErrorResponse {
 pub struct ErrorBody {
     pub code: String,
     pub message: String,
+    /// Causal media close reason for open/answer/control/close failures, without
+    /// changing code or message. Omitted when no causal close is known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub close_code: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -288,6 +292,13 @@ pub enum ResponseResult {
         sdp: String,
         // Legacy servers omitted this field; current broker offers begin at one.
         #[serde(default)]
+        epoch: u64,
+    },
+    MediaControlsApplied {
+        session_id: String,
+        request_id: String,
+        input_muted: bool,
+        output_suppressed: bool,
         epoch: u64,
     },
     MediaSession {

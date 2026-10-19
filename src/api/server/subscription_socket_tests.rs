@@ -451,6 +451,7 @@ fn refused_subscriptions_carry_stable_error_codes() {
                 error: ErrorBody {
                     code: "pane_not_found".into(),
                     message: "pane pane_9 not found".into(),
+                    close_code: None,
                 },
             })
             .unwrap(),

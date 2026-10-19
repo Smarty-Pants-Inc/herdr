@@ -21,14 +21,13 @@ struct Connection {
 
 impl Connection {
     fn new() -> Self {
+        Self::for_request(media_request())
+    }
+
+    fn for_request(request: Request) -> Self {
         let (mut client, server) = UnixStream::pair().unwrap();
         client.set_read_timeout(Some(TEST_TIMEOUT)).unwrap();
-        writeln!(
-            client,
-            "{}",
-            serde_json::to_string(&media_request()).unwrap()
-        )
-        .unwrap();
+        writeln!(client, "{}", serde_json::to_string(&request).unwrap()).unwrap();
         let server: LocalStream = uds_local_socket::Stream::from(server).into();
         let context = ApiRequestContext::capture(local_stream_peer_identity(&server));
         let (api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -264,6 +263,31 @@ fn media_socket_wait_exits_and_abandons_when_listener_or_server_owner_stops() {
         media.expire();
         media.assert_abandoned(&id);
     }
+}
+
+#[test]
+fn media_control_socket_owner_stop_releases_waiter_without_abandonment_receipt() {
+    let mut connection = Connection::for_request(Request {
+        id: "held-control".into(),
+        method: Method::MediaControl(crate::api::schema::MediaControlParams {
+            session_id: "established".into(),
+            input_muted: Some(true),
+            output_suppressed: None,
+            epoch: None,
+        }),
+    });
+    let request = connection.request();
+    assert!(
+        request.response_write_complete.is_none(),
+        "controls must not acquire open's abandonment receipt"
+    );
+    connection.assert_waiting();
+    connection.stop.request(ShutdownReason::HostShutdown);
+    connection.finish();
+    assert!(request
+        .respond_to
+        .send("late broker outcome".into())
+        .is_err());
 }
 
 #[test]

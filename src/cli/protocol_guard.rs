@@ -36,6 +36,7 @@ pub(super) fn mismatch_response(
     Some(ErrorResponse {
         id: request_id.to_string(),
         error: ErrorBody {
+            close_code: None,
             code: "protocol_mismatch".into(),
             message,
         },

@@ -314,6 +314,7 @@ impl MediaHarness {
         use crate::server::media::MediaAction;
         for action in actions {
             match action {
+                MediaAction::Publish { .. } => {}
                 MediaAction::Send { client_id, control } => {
                     assert_eq!(client_id, 1);
                     self.controls.push(control);

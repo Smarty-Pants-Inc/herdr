@@ -331,6 +331,8 @@ struct ServerCapabilitiesJson {
     health_check: bool,
     ssh_agent_registration: bool,
     media_open_cancel: bool,
+    media_control: bool,
+    media_events: bool,
 }
 
 #[derive(Serialize)]
@@ -386,6 +388,8 @@ fn server_status_json(server: &ServerRuntimeStatus) -> ServerStatusJson {
                     health_check: capabilities.health_check,
                     ssh_agent_registration: capabilities.ssh_agent_registration,
                     media_open_cancel: capabilities.media_open_cancel,
+                    media_control: capabilities.media_control,
+                    media_events: capabilities.media_events,
                 }),
             compatible: protocol.map(|value| value == crate::protocol::PROTOCOL_VERSION),
             endpoint_compatible: capabilities.as_ref().and_then(|capabilities| {
@@ -494,6 +498,8 @@ mod tests {
                 refuse_if_exists_guard: true,
                 input_consumer: false,
                 media_open_cancel: true,
+                media_control: true,
+                media_events: true,
             }),
         }
     }
@@ -529,6 +535,8 @@ mod tests {
         assert_eq!(value["capabilities"]["expected_agent_session_guard"], true);
         assert_eq!(value["capabilities"]["expected_agent_status_guard"], true);
         assert_eq!(value["capabilities"]["media_open_cancel"], true);
+        assert_eq!(value["capabilities"]["media_control"], true);
+        assert_eq!(value["capabilities"]["media_events"], true);
         let ServerRuntimeStatus::Running {
             version, protocol, ..
         } = server
@@ -546,6 +554,8 @@ mod tests {
         assert_eq!(value["capabilities"]["expected_agent_session_guard"], false);
         assert_eq!(value["capabilities"]["expected_agent_status_guard"], false);
         assert_eq!(value["capabilities"]["media_open_cancel"], false);
+        assert_eq!(value["capabilities"]["media_control"], false);
+        assert_eq!(value["capabilities"]["media_events"], false);
     }
 
     #[test]
