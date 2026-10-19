@@ -429,6 +429,31 @@ fn graphics_owner_is_active(
             .is_some_and(|shell| shell.endpoint_is_active(owner))
 }
 
+/// Post peer events to the existing client-loop queue. Only meter samples may drop:
+/// critical success is an admission receipt, not controller processing or server delivery.
+fn media_peer_event_sink(
+    tx: tokio::sync::mpsc::Sender<ClientLoopEvent>,
+) -> media::peer::PeerEventSink {
+    use media::peer::PeerEventSinkError;
+    std::sync::Arc::new(move |event| {
+        let tx = tx.clone();
+        Box::pin(async move {
+            if event.is_best_effort() {
+                match tx.try_send(ClientLoopEvent::Media(event)) {
+                    Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Ok(()),
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                        Err(PeerEventSinkError::ConsumerClosed)
+                    }
+                }
+            } else {
+                tx.send(ClientLoopEvent::Media(event))
+                    .await
+                    .map_err(|_| PeerEventSinkError::ConsumerClosed)
+            }
+        })
+    })
+}
+
 /// The main client event loop.
 ///
 /// Uses a threaded architecture:
@@ -457,12 +482,7 @@ async fn run_client_loop(
 
     // Channel for events from the resize, server reader and media peer threads.
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<ClientLoopEvent>(256);
-    let media_tx = event_tx.clone();
-    let media_sink: media::peer::PeerEventSink = Arc::new(move |event: media::peer::PeerEvent| {
-        if media_tx.try_send(ClientLoopEvent::Media(event)).is_err() {
-            warn!("dropping media peer event: client loop queue is full or closed");
-        }
-    });
+    let media_sink = media_peer_event_sink(event_tx.clone());
 
     let mut state = ClientState {
         blit_encoder: render_ansi::BlitEncoder::new(),
@@ -2438,3 +2458,154 @@ async fn run_client_loop(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod media_sink_tests {
+    use std::task::{Context, Poll, Waker};
+
+    use super::*;
+    use crate::protocol::media::{
+        close_code, MediaApplied, MediaControlFailed, MediaInfo, MediaLevels, MediaPeerState,
+    };
+    use media::peer::{PeerEvent, PeerEventFuture, PeerEventSinkError};
+
+    fn poll(future: &mut PeerEventFuture) -> Poll<Result<(), PeerEventSinkError>> {
+        future
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+    }
+
+    fn levels() -> PeerEvent {
+        PeerEvent::Levels(MediaLevels {
+            session_id: "m1".into(),
+            input_peak: 0.25,
+            output_peak: 0.5,
+        })
+    }
+
+    fn scoped(event: PeerEvent) -> PeerEvent {
+        PeerEvent::Scoped {
+            generation: 7,
+            event: Box::new(event),
+        }
+    }
+
+    fn critical_events() -> Vec<PeerEvent> {
+        vec![
+            PeerEvent::Applied(MediaApplied {
+                session_id: "m1".into(),
+                control_id: 1,
+                input_muted: true,
+                output_suppressed: true,
+            }),
+            PeerEvent::ControlFailed(MediaControlFailed {
+                session_id: "m1".into(),
+                control_id: Some(2),
+                code: "control_timeout".into(),
+                message: None,
+            }),
+            PeerEvent::Closed {
+                session_id: "m1".into(),
+                code: close_code::DISCONNECTED,
+                message: "ended".into(),
+            },
+            PeerEvent::State {
+                session_id: "m1".into(),
+                state: MediaPeerState::Connected,
+                muted: false,
+                detail: None,
+            },
+            PeerEvent::Offer {
+                session_id: "m1".into(),
+                sdp: "v=0".into(),
+            },
+            PeerEvent::Info(MediaInfo {
+                session_id: "m1".into(),
+                version: "test".into(),
+                commit: "test".into(),
+                pid: 1,
+                input_device: "input".into(),
+                output_device: "output".into(),
+            }),
+        ]
+    }
+
+    // C6 / trust boundary: exercise the real root producer and its actual queue size,
+    // not a substitute sink that discards outcomes or acknowledges event construction.
+    #[test]
+    fn media_sink_only_levels_are_best_effort() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ClientLoopEvent>(256);
+        let sink = media_peer_event_sink(tx.clone());
+        for _ in 0..256 {
+            assert!(tx.try_send(ClientLoopEvent::Timer).is_ok());
+        }
+        for event in [levels(), scoped(levels())] {
+            assert!(event.is_best_effort());
+            assert_eq!(poll(&mut sink(event)), Poll::Ready(Ok(())));
+            assert_eq!(rx.len(), 256, "only the unrelated events remain");
+        }
+        let mut critical = critical_events();
+        critical.extend(critical_events().into_iter().map(scoped));
+        critical.push(scoped(scoped(levels())));
+        for event in critical {
+            assert!(!event.is_best_effort());
+            let mut delivery = sink(event.clone());
+            assert_eq!(poll(&mut delivery), Poll::Pending);
+            assert_eq!(rx.len(), 256);
+            assert!(matches!(rx.try_recv(), Ok(ClientLoopEvent::Timer)));
+            assert_eq!(poll(&mut delivery), Poll::Ready(Ok(())));
+            for _ in 0..255 {
+                assert!(matches!(rx.try_recv(), Ok(ClientLoopEvent::Timer)));
+            }
+            let Ok(ClientLoopEvent::Media(received)) = rx.try_recv() else {
+                panic!("critical event admitted once after preceding unrelated events");
+            };
+            assert_eq!(received, event);
+            assert!(rx.try_recv().is_err());
+            for _ in 0..256 {
+                assert!(tx.try_send(ClientLoopEvent::Timer).is_ok());
+            }
+        }
+        // Closing a consumer while a critical send waits is an explicit failure.
+        let mut delivery = sink(scoped(critical_events().remove(0)));
+        assert_eq!(poll(&mut delivery), Poll::Pending);
+        rx.close();
+        assert_eq!(
+            poll(&mut delivery),
+            Poll::Ready(Err(PeerEventSinkError::ConsumerClosed))
+        );
+        for event in [levels(), scoped(levels()), scoped(scoped(levels()))]
+            .into_iter()
+            .chain(critical_events())
+            .chain(critical_events().into_iter().map(scoped))
+        {
+            assert_eq!(
+                poll(&mut sink(event)),
+                Poll::Ready(Err(PeerEventSinkError::ConsumerClosed))
+            );
+        }
+    }
+
+    #[test]
+    fn media_sink_cancelled_waiter_does_not_enqueue_later() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ClientLoopEvent>(256);
+        let sink = media_peer_event_sink(tx.clone());
+        for _ in 0..256 {
+            assert!(tx.try_send(ClientLoopEvent::Timer).is_ok());
+        }
+        let mut delivery = sink(critical_events().remove(0));
+        assert_eq!(poll(&mut delivery), Poll::Pending);
+        drop(delivery);
+        for _ in 0..256 {
+            assert!(matches!(rx.try_recv(), Ok(ClientLoopEvent::Timer)));
+        }
+        assert!(rx.try_recv().is_err());
+        let event = scoped(critical_events().remove(0));
+        assert_eq!(poll(&mut sink(event.clone())), Poll::Ready(Ok(())));
+        let Ok(ClientLoopEvent::Media(received)) = rx.try_recv() else {
+            panic!("successor event admitted");
+        };
+        assert_eq!(received, event);
+        assert!(rx.try_recv().is_err());
+    }
+}

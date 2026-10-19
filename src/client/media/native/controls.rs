@@ -4,6 +4,9 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use super::super::peer::PeerInitialState;
+
+pub(super) const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 pub(super) const LEVELS_INTERVAL: Duration = Duration::from_millis(100);
 
 /// A request token combines a monotonically increasing generation and its boolean value.
@@ -22,6 +25,26 @@ pub(crate) struct AudioState {
 }
 
 impl AudioState {
+    /// Publish protection before constructing callbacks or opening either stream. Zero
+    /// applied tokens deliberately mean no real encoder/outer-render observation yet.
+    pub(super) fn with_initial(initial: PeerInitialState) -> Self {
+        Self {
+            input_request: AtomicU64::new(2 | u64::from(initial.input_muted)),
+            output_request: AtomicU64::new(2 | u64::from(initial.output_suppressed)),
+            ..Self::default()
+        }
+    }
+
+    /// Terminal-only fail-stop. Never manufacture callback evidence or resume controls
+    /// after this operation; no generation allocation may prevent protective teardown.
+    pub(super) fn force_protective_gates(&self) {
+        self.input_request.fetch_or(1, Ordering::AcqRel);
+        self.output_request.fetch_or(1, Ordering::AcqRel);
+        self.levels.store(false, Ordering::Release);
+        self.input_peak.store(0, Ordering::Relaxed);
+        self.output_peak.store(0, Ordering::Relaxed);
+    }
+
     pub(super) fn input_token(&self) -> u64 {
         self.input_request.load(Ordering::Acquire)
     }
@@ -66,10 +89,14 @@ fn record_peak(atomic: &AtomicU32, value: f32) {
 
 struct Pending {
     control_id: Option<u64>,
-    input: Option<u64>,
-    output: Option<u64>,
-    muted: bool,
-    suppressed: bool,
+    input: u64,
+    output: u64,
+    deadline: Instant,
+}
+
+pub(super) enum ControlOutcome {
+    Applied(Confirmation),
+    Failed { control_id: Option<u64> },
 }
 
 pub(super) struct Confirmation {
@@ -153,33 +180,55 @@ impl Controls {
         }
         self.pending = Some(Pending {
             control_id,
-            input,
-            output,
-            muted: input_muted.unwrap_or(self.muted),
-            suppressed: output_suppressed.unwrap_or(self.suppressed),
+            // Snapshot current requests, not cached combined observations. Omitted
+            // axes can still be unobserved after an earlier command timed out.
+            input: self.audio.input_token(),
+            output: self.audio.output_token(),
+            deadline: now + CONTROL_TIMEOUT,
         });
         Ok(())
     }
 
-    pub(super) fn confirmed(&mut self) -> Option<Confirmation> {
+    pub(super) fn poll(&mut self, now: Instant) -> Option<ControlOutcome> {
+        let input = self.audio.input_token();
+        let output = self.audio.output_token();
+        let input_applied = self.audio.input_applied.load(Ordering::Acquire);
+        let output_applied = self.audio.output_applied.load(Ordering::Acquire);
+        // Legacy State reports only independently observed input, including when
+        // output is withheld or input is first discovered at the failure deadline.
+        if input_applied == input {
+            self.muted = enabled(input);
+        }
+        if output_applied == output {
+            self.suppressed = enabled(output);
+        }
         let pending = self.pending.as_ref()?;
-        if pending
-            .input
-            .is_some_and(|token| self.audio.input_applied.load(Ordering::Acquire) != token)
-            || pending
-                .output
-                .is_some_and(|token| self.audio.output_applied.load(Ordering::Acquire) != token)
+        if now >= pending.deadline {
+            let pending = self.pending.take()?;
+            return Some(ControlOutcome::Failed {
+                control_id: pending.control_id,
+            });
+        }
+        if input_applied != pending.input
+            || (pending.control_id.is_some() && output_applied != pending.output)
         {
             return None;
         }
         let pending = self.pending.take()?;
-        self.muted = pending.muted;
-        self.suppressed = pending.suppressed;
-        Some(Confirmation {
+        Some(ControlOutcome::Applied(Confirmation {
             control_id: pending.control_id,
-            muted: self.muted,
+            muted: enabled(pending.input),
             suppressed: self.suppressed,
-        })
+        }))
+    }
+
+    /// Compatibility for read-only speaker unit fixtures, never a production bypass.
+    #[cfg(test)]
+    pub(super) fn confirmed(&mut self) -> Option<Confirmation> {
+        match self.poll(Instant::now())? {
+            ControlOutcome::Applied(confirmation) => Some(confirmation),
+            ControlOutcome::Failed { .. } => None,
+        }
     }
 
     pub(super) fn take_levels(&mut self, now: Instant) -> Option<(f32, f32)> {
@@ -206,6 +255,176 @@ impl Controls {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Keep: #316 device-data safety and deadline failure paths are deterministic
+    // here; the native integration tests separately exercise real callback evidence.
+    #[test]
+    fn initial_gates_are_unobserved_and_terminal_gates_never_fake_evidence() {
+        let audio = AudioState::with_initial(PeerInitialState {
+            input_muted: true,
+            output_suppressed: false,
+        });
+        assert_eq!((audio.input_token(), audio.output_token()), (3, 2));
+        assert_eq!(audio.input_applied.load(Ordering::Acquire), 0);
+        assert_eq!(audio.output_drained.load(Ordering::Acquire), 0);
+        assert_eq!(audio.output_applied.load(Ordering::Acquire), 0);
+        audio.force_protective_gates();
+        assert_eq!((audio.input_token(), audio.output_token()), (3, 3));
+        assert!(!audio.levels_enabled());
+        assert_eq!(audio.input_applied.load(Ordering::Acquire), 0);
+        assert_eq!(audio.output_applied.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn timeout_is_take_once_and_omitted_axes_wait_for_current_observation() {
+        let now = Instant::now();
+        let audio = Arc::new(AudioState::with_initial(PeerInitialState::default()));
+        let mut controls = Controls::new(Arc::clone(&audio));
+        controls
+            .begin(Some(1), Some(true), Some(true), None, now)
+            .unwrap();
+        audio
+            .input_applied
+            .store(audio.input_token(), Ordering::Release);
+        assert!(controls
+            .poll(now + CONTROL_TIMEOUT - Duration::from_nanos(1))
+            .is_none());
+        assert!(matches!(
+            controls.poll(now + CONTROL_TIMEOUT),
+            Some(ControlOutcome::Failed {
+                control_id: Some(1)
+            })
+        ));
+        assert!(controls.poll(now + CONTROL_TIMEOUT).is_none());
+        assert!(controls.muted);
+        assert!(!controls.suppressed);
+        controls
+            .begin(Some(2), None, None, Some(true), now + CONTROL_TIMEOUT)
+            .unwrap();
+        assert!(controls.poll(now + CONTROL_TIMEOUT).is_none());
+        audio
+            .output_applied
+            .store(audio.output_token(), Ordering::Release);
+        match controls.poll(now + CONTROL_TIMEOUT) {
+            Some(ControlOutcome::Applied(confirmation)) => {
+                assert_eq!(confirmation.control_id, Some(2));
+                assert!(confirmation.muted && confirmation.suppressed);
+            }
+            _ => panic!("current omitted output still needs its real observation"),
+        }
+    }
+
+    #[test]
+    fn legacy_is_input_only_and_deadline_reports_last_observed_input() {
+        let now = Instant::now();
+        let audio = Arc::new(AudioState::with_initial(PeerInitialState::default()));
+        let mut controls = Controls::new(Arc::clone(&audio));
+        controls.begin(None, Some(true), None, None, now).unwrap();
+        assert!(matches!(
+            controls.poll(now + CONTROL_TIMEOUT),
+            Some(ControlOutcome::Failed { control_id: None })
+        ));
+        assert!(!controls.muted, "a request is not an observed State");
+        controls
+            .begin(None, Some(true), None, None, now + CONTROL_TIMEOUT)
+            .unwrap();
+        audio
+            .input_applied
+            .store(audio.input_token(), Ordering::Release);
+        assert!(matches!(
+            controls.poll(now + CONTROL_TIMEOUT),
+            Some(ControlOutcome::Applied(_))
+        ));
+        assert!(controls.muted);
+        assert_eq!(audio.output_applied.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn first_observation_at_deadline_fails_without_rolling_back_truthful_axes() {
+        let now = Instant::now();
+        let audio = Arc::new(AudioState::with_initial(PeerInitialState::default()));
+        let mut controls = Controls::new(Arc::clone(&audio));
+        controls
+            .begin(Some(1), Some(true), Some(true), None, now)
+            .unwrap();
+        audio
+            .input_applied
+            .store(audio.input_token(), Ordering::Release);
+        audio
+            .output_applied
+            .store(audio.output_token(), Ordering::Release);
+        assert!(matches!(
+            controls.poll(now + CONTROL_TIMEOUT),
+            Some(ControlOutcome::Failed {
+                control_id: Some(1)
+            })
+        ));
+        assert!(controls.muted && controls.suppressed);
+        assert!(controls.poll(now + CONTROL_TIMEOUT).is_none());
+        assert!(enabled(audio.input_token()) && enabled(audio.output_token()));
+    }
+
+    #[test]
+    fn partial_output_timeout_and_late_input_cannot_confirm_explicit_false_successor() {
+        let now = Instant::now();
+        let audio = Arc::new(AudioState::with_initial(PeerInitialState::default()));
+        let mut controls = Controls::new(Arc::clone(&audio));
+        controls
+            .begin(Some(1), Some(true), Some(true), None, now)
+            .unwrap();
+        let stale_input = audio.input_token();
+        audio
+            .output_applied
+            .store(audio.output_token(), Ordering::Release);
+        assert!(matches!(
+            controls.poll(now + CONTROL_TIMEOUT),
+            Some(ControlOutcome::Failed {
+                control_id: Some(1)
+            })
+        ));
+        assert!(!controls.muted && controls.suppressed);
+        controls
+            .begin(Some(2), Some(false), None, None, now + CONTROL_TIMEOUT)
+            .unwrap();
+        audio.input_applied.store(stale_input, Ordering::Release);
+        assert!(controls.poll(now + CONTROL_TIMEOUT).is_none());
+        audio
+            .input_applied
+            .store(audio.input_token(), Ordering::Release);
+        match controls.poll(now + CONTROL_TIMEOUT) {
+            Some(ControlOutcome::Applied(confirmation)) => {
+                assert_eq!(confirmation.control_id, Some(2));
+                assert!(!confirmation.muted && confirmation.suppressed);
+            }
+            _ => panic!("only fresh input may confirm the explicit-false successor"),
+        }
+        assert!(controls.poll(now + CONTROL_TIMEOUT).is_none());
+    }
+
+    #[test]
+    fn exhausted_generation_publishes_neither_axis_and_repeated_values_advance() {
+        let audio = Arc::new(AudioState::with_initial(PeerInitialState::default()));
+        let mut controls = Controls::new(Arc::clone(&audio));
+        audio.output_request.store(u64::MAX, Ordering::Release);
+        assert!(controls
+            .begin(Some(1), Some(true), Some(false), None, Instant::now())
+            .is_err());
+        assert_eq!(audio.input_token(), 2);
+        assert_eq!(audio.output_token(), u64::MAX);
+        audio.output_request.store(2, Ordering::Release);
+        controls
+            .begin(None, Some(false), None, None, Instant::now())
+            .unwrap();
+        assert_eq!(audio.input_token(), 4);
+        audio.input_applied.store(4, Ordering::Release);
+        assert!(controls.confirmed().is_some());
+        controls
+            .begin(None, Some(false), None, None, Instant::now())
+            .unwrap();
+        assert_eq!(audio.input_token(), 6);
+        audio.input_applied.store(4, Ordering::Release);
+        assert!(controls.confirmed().is_none());
+    }
 
     #[test]
     fn levels_are_opt_in_finite_clamped_and_throttled() {

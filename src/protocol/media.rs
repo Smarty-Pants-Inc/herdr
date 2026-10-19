@@ -25,6 +25,8 @@ pub const MEDIA_WEBRTC_CAPABILITY: &str = "media.webrtc.v1";
 
 /// Server → client: open a media session for a pane the client just typed into.
 pub const MEDIA_OPEN_KIND: &str = "media.open.v1";
+/// Server → client: open with the complete privacy policy before device startup.
+pub const MEDIA_OPEN_INITIAL_KIND: &str = "media.open.initial.v1";
 /// Client → server: the client's SDP offer.
 pub const MEDIA_OFFER_KIND: &str = "media.offer.v1";
 /// Server → client: the remote peer's SDP answer.
@@ -35,6 +37,8 @@ pub const MEDIA_MUTE_KIND: &str = "media.mute.v1";
 pub const MEDIA_CONTROL_KIND: &str = "media.control.v1";
 /// Client → server: a device control was applied at the device boundary.
 pub const MEDIA_APPLIED_KIND: &str = "media.applied.v1";
+/// Client → server: a control ended without a paired device acknowledgement.
+pub const MEDIA_CONTROL_FAILED_KIND: &str = "media.control_failed.v1";
 /// Client → server: the latest opt-in audio levels.
 pub const MEDIA_LEVELS_KIND: &str = "media.levels.v1";
 /// Client → server: connected device and build information.
@@ -52,6 +56,15 @@ pub const MEDIA_INPUT_WINDOW: Duration = Duration::from_secs(10);
 pub const MAX_MEDIA_SDP_BYTES: usize = 64 * 1024;
 /// Upper bound for identifiers, codes and short detail strings in media controls.
 pub const MAX_MEDIA_TEXT_BYTES: usize = 512;
+
+/// Inclusive queued + active native command budgets. Broker device admission is separate.
+pub(crate) const MEDIA_DEVICE_CONTROL_CAPACITY: usize = 32;
+// Used by the optional native-media command queue, absent from default-feature builds.
+#[allow(dead_code)]
+pub(crate) const MEDIA_LEGACY_MUTE_CAPACITY: usize = 32;
+// Used by the optional native-media command queue, absent from default-feature builds.
+#[allow(dead_code)]
+pub(crate) const MEDIA_ANSWER_CAPACITY: usize = 1;
 
 /// Close and refusal codes shared by the client, the server and API callers.
 pub mod close_code {
@@ -83,6 +96,10 @@ pub mod close_code {
     pub const TIMEOUT: &str = "timeout";
     /// A newer session for the same pane replaced this one.
     pub const REPLACED: &str = "replaced";
+    /// A native command class has exhausted its inclusive admission allowance.
+    pub const CONTROL_QUEUE_FULL: &str = "control_queue_full";
+    /// The client's bounded legacy privacy memory cannot reserve a new key safely.
+    pub const INTENT_CAPACITY: &str = "intent_capacity";
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -90,6 +107,15 @@ pub struct MediaOpen {
     pub session_id: String,
     /// Pane id exactly as the client sent it in its last pane input.
     pub pane_id: String,
+}
+
+/// Complete startup policy. Both booleans are required, including explicit false.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MediaOpenInitial {
+    pub session_id: String,
+    pub pane_id: String,
+    pub input_muted: bool,
+    pub output_suppressed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -122,6 +148,17 @@ pub struct MediaApplied {
     pub control_id: u64,
     pub input_muted: bool,
     pub output_suppressed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MediaControlFailed {
+    pub session_id: String,
+    /// None identifies legacy Mute, never an Answer or another correlated command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_id: Option<u64>,
+    pub code: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -184,11 +221,13 @@ impl MediaClose {
 #[derive(Debug, Clone, PartialEq)]
 pub enum MediaControl {
     Open(MediaOpen),
+    OpenInitial(MediaOpenInitial),
     Offer(MediaSdp),
     Answer(MediaSdp),
     Mute(MediaMute),
     Control(MediaDeviceControl),
     Applied(MediaApplied),
+    ControlFailed(MediaControlFailed),
     Levels(MediaLevels),
     Info(MediaInfo),
     State(MediaStateUpdate),
@@ -199,11 +238,13 @@ impl MediaControl {
     pub fn kind(&self) -> &'static str {
         match self {
             Self::Open(_) => MEDIA_OPEN_KIND,
+            Self::OpenInitial(_) => MEDIA_OPEN_INITIAL_KIND,
             Self::Offer(_) => MEDIA_OFFER_KIND,
             Self::Answer(_) => MEDIA_ANSWER_KIND,
             Self::Mute(_) => MEDIA_MUTE_KIND,
             Self::Control(_) => MEDIA_CONTROL_KIND,
             Self::Applied(_) => MEDIA_APPLIED_KIND,
+            Self::ControlFailed(_) => MEDIA_CONTROL_FAILED_KIND,
             Self::Levels(_) => MEDIA_LEVELS_KIND,
             Self::Info(_) => MEDIA_INFO_KIND,
             Self::State(_) => MEDIA_STATE_KIND,
@@ -214,10 +255,12 @@ impl MediaControl {
     pub fn session_id(&self) -> &str {
         match self {
             Self::Open(open) => &open.session_id,
+            Self::OpenInitial(open) => &open.session_id,
             Self::Offer(sdp) | Self::Answer(sdp) => &sdp.session_id,
             Self::Mute(mute) => &mute.session_id,
             Self::Control(control) => &control.session_id,
             Self::Applied(applied) => &applied.session_id,
+            Self::ControlFailed(failed) => &failed.session_id,
             Self::Levels(levels) => &levels.session_id,
             Self::Info(info) => &info.session_id,
             Self::State(state) => &state.session_id,
@@ -238,11 +281,13 @@ impl MediaControl {
         }
         let decoded = match kind {
             MEDIA_OPEN_KIND => parse(kind, data).map(Self::Open),
+            MEDIA_OPEN_INITIAL_KIND => parse(kind, data).map(Self::OpenInitial),
             MEDIA_OFFER_KIND => parse(kind, data).map(Self::Offer),
             MEDIA_ANSWER_KIND => parse(kind, data).map(Self::Answer),
             MEDIA_MUTE_KIND => parse(kind, data).map(Self::Mute),
             MEDIA_CONTROL_KIND => parse(kind, data).map(Self::Control),
             MEDIA_APPLIED_KIND => parse(kind, data).map(Self::Applied),
+            MEDIA_CONTROL_FAILED_KIND => parse(kind, data).map(Self::ControlFailed),
             MEDIA_LEVELS_KIND => parse(kind, data).map(Self::Levels),
             MEDIA_INFO_KIND => parse(kind, data).map(Self::Info),
             MEDIA_STATE_KIND => parse(kind, data).map(Self::State),
@@ -260,12 +305,16 @@ impl MediaControl {
         let valid = session_ok
             && match self {
                 Self::Open(open) => !open.pane_id.is_empty() && text_ok(&open.pane_id),
+                Self::OpenInitial(open) => !open.pane_id.is_empty() && text_ok(&open.pane_id),
                 Self::Offer(sdp) | Self::Answer(sdp) => {
                     !sdp.sdp.is_empty() && sdp.sdp.len() <= MAX_MEDIA_SDP_BYTES
                 }
                 Self::Mute(_) => true,
                 Self::Control(_) => true,
                 Self::Applied(_) => true,
+                Self::ControlFailed(failed) => {
+                    !failed.code.is_empty() && text_ok(&failed.code) && optional_ok(&failed.message)
+                }
                 Self::Levels(levels) => {
                     levels.input_peak.is_finite()
                         && levels.output_peak.is_finite()
@@ -291,10 +340,12 @@ impl MediaControl {
     fn data(&self) -> serde_json::Result<String> {
         match self {
             Self::Open(open) => serde_json::to_string(open),
+            Self::OpenInitial(open) => serde_json::to_string(open),
             Self::Offer(sdp) | Self::Answer(sdp) => serde_json::to_string(sdp),
             Self::Mute(mute) => serde_json::to_string(mute),
             Self::Control(control) => serde_json::to_string(control),
             Self::Applied(applied) => serde_json::to_string(applied),
+            Self::ControlFailed(failed) => serde_json::to_string(failed),
             Self::Levels(levels) => serde_json::to_string(levels),
             Self::Info(info) => serde_json::to_string(info),
             Self::State(state) => serde_json::to_string(state),
@@ -327,6 +378,12 @@ mod tests {
                 session_id: "media_1".into(),
                 pane_id: "w1:p2".into(),
             }),
+            MediaControl::OpenInitial(MediaOpenInitial {
+                session_id: "media_1".into(),
+                pane_id: "w1:p2".into(),
+                input_muted: true,
+                output_suppressed: false,
+            }),
             MediaControl::Offer(MediaSdp {
                 session_id: "media_1".into(),
                 sdp: "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n".into(),
@@ -351,6 +408,18 @@ mod tests {
                 control_id: 7,
                 input_muted: true,
                 output_suppressed: false,
+            }),
+            MediaControl::ControlFailed(MediaControlFailed {
+                session_id: "media_1".into(),
+                control_id: Some(7),
+                code: "control_timeout".into(),
+                message: Some("device observation timed out".into()),
+            }),
+            MediaControl::ControlFailed(MediaControlFailed {
+                session_id: "media_1".into(),
+                control_id: None,
+                code: "awaiting_consent".into(),
+                message: None,
             }),
             MediaControl::Levels(MediaLevels {
                 session_id: "media_1".into(),
@@ -494,6 +563,100 @@ mod tests {
         })
         .validate()
         .is_err());
+    }
+
+    #[test]
+    fn media_initial_requires_both_booleans_and_bounds_identifiers() {
+        for data in [
+            r#"{"session_id":"m","pane_id":"p"}"#,
+            r#"{"session_id":"m","pane_id":"p","input_muted":true}"#,
+            r#"{"session_id":"m","pane_id":"p","output_suppressed":false}"#,
+            r#"{"session_id":"m","pane_id":"","input_muted":false,"output_suppressed":false}"#,
+        ] {
+            assert!(matches!(
+                MediaControl::decode(MEDIA_OPEN_INITIAL_KIND, data),
+                Some(Err(_))
+            ));
+        }
+        let mut initial = MediaOpenInitial {
+            session_id: "m".into(),
+            pane_id: "p".into(),
+            input_muted: false,
+            output_suppressed: false,
+        };
+        assert!(MediaControl::OpenInitial(initial.clone())
+            .validate()
+            .is_ok());
+        initial.pane_id = "x".repeat(MAX_MEDIA_TEXT_BYTES + 1);
+        assert!(MediaControl::OpenInitial(initial.clone())
+            .validate()
+            .is_err());
+        initial.pane_id = "p".into();
+        initial.session_id = "x".repeat(MAX_MEDIA_TEXT_BYTES + 1);
+        assert!(MediaControl::OpenInitial(initial).validate().is_err());
+    }
+
+    #[test]
+    fn media_control_failure_is_optional_bounded_and_not_an_applied_extension() {
+        assert_eq!(
+            MediaControl::decode(
+                MEDIA_CONTROL_FAILED_KIND,
+                r#"{"session_id":"m","code":"control_timeout","future":1}"#,
+            ),
+            Some(Ok(MediaControl::ControlFailed(MediaControlFailed {
+                session_id: "m".into(),
+                control_id: None,
+                code: "control_timeout".into(),
+                message: None,
+            })))
+        );
+        let mut failed = MediaControlFailed {
+            session_id: "m".into(),
+            control_id: Some(1),
+            code: "control_timeout".into(),
+            message: None,
+        };
+        for code in [String::new(), "x".repeat(MAX_MEDIA_TEXT_BYTES + 1)] {
+            failed.code = code;
+            assert!(MediaControl::ControlFailed(failed.clone())
+                .validate()
+                .is_err());
+        }
+        failed.code = "control_timeout".into();
+        failed.message = Some("x".repeat(MAX_MEDIA_TEXT_BYTES + 1));
+        assert!(MediaControl::ControlFailed(failed.clone())
+            .validate()
+            .is_err());
+        failed.message = None;
+        failed.session_id.clear();
+        assert!(MediaControl::ControlFailed(failed).validate().is_err());
+        assert_eq!(MediaControl::decode("media.control_failed.v2", "{}"), None);
+    }
+
+    #[test]
+    fn old_media_open_and_applied_shapes_remain_unchanged() {
+        let open = MediaControl::Open(MediaOpen {
+            session_id: "m".into(),
+            pane_id: "p".into(),
+        });
+        assert_eq!(open.kind(), MEDIA_OPEN_KIND);
+        assert_eq!(open.data().unwrap(), r#"{"session_id":"m","pane_id":"p"}"#);
+        let applied = MediaControl::Applied(MediaApplied {
+            session_id: "m".into(),
+            control_id: 7,
+            input_muted: true,
+            output_suppressed: false,
+        });
+        assert_eq!(applied.kind(), MEDIA_APPLIED_KIND);
+        assert_eq!(
+            applied.data().unwrap(),
+            r#"{"session_id":"m","control_id":7,"input_muted":true,"output_suppressed":false}"#
+        );
+        assert_eq!(MEDIA_DEVICE_CONTROL_CAPACITY, 32);
+        assert_eq!(MEDIA_LEGACY_MUTE_CAPACITY, 32);
+        assert_eq!(MEDIA_ANSWER_CAPACITY, 1);
+        assert_eq!(close_code::CONTROL_QUEUE_FULL, "control_queue_full");
+        assert_eq!(close_code::INTENT_CAPACITY, "intent_capacity");
     }
 
     #[test]
