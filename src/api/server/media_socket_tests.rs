@@ -199,10 +199,20 @@ fn successful_offer(write_half_closed: bool, extra_input: bool) {
         media.broker.state(&id).unwrap().state,
         crate::api::schema::MediaSessionState::Offered
     );
-    assert_eq!(
-        media.controls.len(),
-        1,
-        "successful response teardown must not send media.close"
+    assert!(
+        matches!(
+            media.controls.as_slice(),
+            [
+                crate::protocol::media::MediaControl::OpenInitial(initial),
+                crate::protocol::media::MediaControl::Open(open)
+            ] if initial.session_id.as_str() == id.as_str()
+                && initial.pane_id.as_str() == open.pane_id.as_str()
+                && open.pane_id.as_str() == "w1:p7"
+                && !initial.input_muted
+                && !initial.output_suppressed
+                && open.session_id.as_str() == id.as_str()
+        ),
+        "successful response teardown preserves only the paired startup controls"
     );
 }
 
