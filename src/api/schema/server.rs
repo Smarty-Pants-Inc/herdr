@@ -72,4 +72,15 @@ pub struct ServerCapabilities {
     /// Supports the local `pane.input_consumer.*` methods (Linux servers only).
     #[serde(default)]
     pub input_consumer: bool,
+    /// Supports caller-selected `open_id` on `pane.media_open` and cancellation
+    /// via `media.close` by `open_id`. Closing an unknown id is idempotent and
+    /// leaves a tombstone for up to 120 seconds; at most 256 unknown-id tombstones
+    /// are retained and the media `expire` pass prunes elapsed ones. For a pending
+    /// open, the cancellation step enqueues its refusal before the close success on
+    /// the app response channel; replies on separate connections may arrive either order.
+    /// Each `media_offer` includes a per-pane `epoch`; sessions close as
+    /// `abandoned` when the waiting caller disconnects and as `unanswered` when
+    /// the offer is not answered in time.
+    #[serde(default)]
+    pub media_open_cancel: bool,
 }
