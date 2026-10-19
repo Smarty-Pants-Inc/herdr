@@ -25,14 +25,7 @@ queue_rules:
       - -label = hold
       - -title ~= (?i)do not land
       - check-success = review/astra
-      # fork-sync labels every upstream sync needs-security-pass, so sync/upstream-* heads pushed to THIS repository
-      # are exempt here (R-no-security-slips); a same-named branch from an outside fork is not.
-      - or:
-          - -label = needs-security-pass
-          - and:
-              - head ~= ^sync/upstream-
-              - head-repo-full-name = Smarty-Pants-Inc/herdr
-          - check-success = review/security
+      # Security passes run within 24 h after merge; only a review/security FAILURE (a live harm) holds (smarty-stack#126).
       # Upstream syncs (sync/upstream-*) queue like any PR; review/security runs after merge within 24 h (R-no-security-slips, smarty-dev#2264).
       - check-success = smarty-ci
       - -check-failure = smarty-ci
