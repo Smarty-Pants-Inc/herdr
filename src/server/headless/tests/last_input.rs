@@ -119,6 +119,8 @@ pub(super) fn assert_media_owner_and_age(
         "fresh-owner".into(),
         respond_to,
         pane,
+        None,
+        None,
         |_| true,
         owner_at + Duration::from_secs(9),
     );
@@ -133,6 +135,8 @@ pub(super) fn assert_media_owner_and_age(
         "stale-owner".into(),
         respond_to,
         pane,
+        None,
+        None,
         |_| true,
         owner_at + Duration::from_secs(11),
     );
@@ -236,9 +240,15 @@ async fn accepted_client_api_direct_and_clipboard_input_have_explicit_sender_sem
     // The API input cleared attribution, not the microphone routing owner.
     let (tx, _rx) = std::sync::mpsc::channel();
     let (_, pane) = server.app.parse_pane_id(&pane_id).unwrap();
-    let actions = server
-        .media
-        .open("media-owner".into(), tx, pane, |_| true, Instant::now());
+    let actions = server.media.open(
+        "media-owner".into(),
+        tx,
+        pane,
+        None,
+        None,
+        |_| true,
+        Instant::now(),
+    );
     assert!(actions.iter().any(|action| matches!(
         action,
         crate::server::media::MediaAction::Send {

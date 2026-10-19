@@ -236,6 +236,23 @@ pub(crate) fn local_stream_peer_closed(stream: &mut LocalStream) -> io::Result<b
     probe_stream_closed(stream)
 }
 
+/// Whether a one-shot caller can no longer receive its response. Unlike the
+/// subscription probe, this must neither consume extra input nor interpret a
+/// caller's write-half-close as abandonment while its response side is open.
+pub(crate) fn local_stream_response_peer_closed(stream: &mut LocalStream) -> io::Result<bool> {
+    #[cfg(unix)]
+    {
+        crate::platform::local_stream_response_peer_closed(stream)
+    }
+
+    #[cfg(windows)]
+    {
+        // PeekNamedPipe is already non-consuming; named pipes have no socket
+        // write-half-close that needs a separate distinction.
+        probe_stream_closed(stream)
+    }
+}
+
 pub(crate) fn set_local_stream_polling(stream: &mut LocalStream, enabled: bool) -> io::Result<()> {
     #[cfg(unix)]
     {

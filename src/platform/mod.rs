@@ -733,8 +733,8 @@ impl ChildExitReason {
 
 #[cfg(unix)]
 pub(crate) use unix_common::{
-    classify_child_exit, poll_fd_readable, process_identity_for_pty, read_fd,
-    shared_ssh_control_path,
+    classify_child_exit, local_stream_response_peer_closed, poll_fd_readable,
+    process_identity_for_pty, read_fd, shared_ssh_control_path,
 };
 
 #[cfg(all(unix, test))]

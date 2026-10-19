@@ -90,6 +90,32 @@ pub(crate) fn poll_fd_readable(fd: std::os::fd::RawFd, timeout_ms: i32) -> std::
     }
 }
 
+/// Probe only response-side loss. Read EOF (including POLLRDHUP) can mean the
+/// caller finished sending its request but is still waiting for our response.
+/// A zero-time poll consumes no pipelined bytes and does not change socket mode.
+pub(crate) fn local_stream_response_peer_closed(
+    stream: &crate::ipc::LocalStream,
+) -> std::io::Result<bool> {
+    use std::os::fd::AsRawFd as _;
+
+    let crate::ipc::LocalStream::UdSocket(stream) = stream;
+    let mut descriptor = libc::pollfd {
+        fd: stream.inner().as_raw_fd(),
+        events: 0,
+        revents: 0,
+    };
+    // SAFETY: poll borrows one initialized descriptor and returns immediately.
+    if unsafe { libc::poll(&mut descriptor, 1, 0) } < 0 {
+        let error = std::io::Error::last_os_error();
+        return if error.kind() == std::io::ErrorKind::Interrupted {
+            Ok(false)
+        } else {
+            Err(error)
+        };
+    }
+    Ok(descriptor.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0)
+}
+
 pub(crate) fn shutdown_client_stream(stream: &crate::ipc::LocalStream) -> std::io::Result<()> {
     let crate::ipc::LocalStream::UdSocket(stream) = stream;
     stream.inner().shutdown(std::net::Shutdown::Both)

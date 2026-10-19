@@ -2607,6 +2607,7 @@ mod tests {
                     MediaAction::Respond {
                         respond_to,
                         response,
+                        session_id: _,
                     } => {
                         let _ = respond_to.send(response);
                     }
@@ -2653,6 +2654,8 @@ mod tests {
                 "fixture-open".to_owned(),
                 tx,
                 crate::layout::PaneId::from_raw(316),
+                None,
+                None,
                 |_| true,
                 now,
             );
@@ -2917,7 +2920,10 @@ mod tests {
             let _ = tokio::time::timeout(ICE_GATHER_TIMEOUT, gathered.recv()).await;
             let answer = peer.local_description().await.unwrap().sdp;
             assert_loopback_candidates(&answer, "routed remote answer");
-            let actions = fixture.broker.answer(&session, answer).unwrap();
+            let actions = fixture
+                .broker
+                .answer(&session, answer, Instant::now())
+                .unwrap();
             fixture.actions(actions);
             fixture.until(Duration::from_secs(20), |fixture| {
                 fixture.broker.info(&session).is_some()
@@ -3069,6 +3075,8 @@ mod tests {
                     "stale-input-negative".to_owned(),
                     reply,
                     crate::layout::PaneId::from_raw(316),
+                    None,
+                    None,
                     |_| true,
                     Instant::now(),
                 );

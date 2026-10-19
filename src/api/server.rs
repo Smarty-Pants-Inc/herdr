@@ -22,14 +22,16 @@ use crate::api::{
 };
 use crate::ipc::{
     bind_local_listener, is_connection_closed_error, local_stream_peer_closed,
-    local_stream_peer_identity, local_stream_peer_pidfd, poll_local_stream_read,
-    remove_socket_file_if_owned, set_local_stream_polling, socket_file_identity, LocalStream,
-    LocalStreamRead, SocketFileIdentity,
+    local_stream_peer_identity, local_stream_peer_pidfd, local_stream_response_peer_closed,
+    poll_local_stream_read, remove_socket_file_if_owned, set_local_stream_polling,
+    socket_file_identity, LocalStream, LocalStreamRead, SocketFileIdentity,
 };
 use crate::server::shutdown::{ServerStop, ShutdownReason};
 
 #[cfg(test)]
 mod channel_contract_tests;
+#[cfg(all(test, unix))]
+mod media_socket_tests;
 #[cfg(test)]
 mod subscription_socket_tests;
 
@@ -150,6 +152,7 @@ fn default_capabilities() -> Option<ServerCapabilities> {
         surface_interest: true,
         health_check: true,
         ssh_agent_registration: false,
+        media_open_cancel: true,
         guarded_live_handoff: crate::platform::capabilities().live_handoff,
         expected_terminal_guard: true,
         pane_close_expected_terminal_guard: true,
@@ -747,6 +750,62 @@ fn handle_connection_with_stop(
                 }
             }
             result
+        }
+        Method::PaneMediaOpen(params) => {
+            let (delivery, response_write_rx) = MediaResponseDelivery::new();
+            let response = if server_stop.is_some_and(ServerStop::is_requested) {
+                Some(error_response_json(
+                    request_id.clone(),
+                    "server_unavailable",
+                    "server is shutting down".to_owned(),
+                ))
+            } else {
+                dispatch_media_open(
+                    Request {
+                        id: request_id.clone(),
+                        method: Method::PaneMediaOpen(params),
+                    },
+                    context,
+                    api_tx,
+                    response_write_rx,
+                    &mut stream,
+                    running,
+                    server_stop,
+                )?
+            };
+            let Some(response) = response else {
+                return Ok(());
+            };
+            let result = write_text_line(&mut stream, &response);
+            if result.is_ok() {
+                delivery.delivered();
+            } else {
+                drop(delivery);
+            }
+            match &result {
+                Ok(()) => crate::logging::api_request_completed(
+                    &request_id,
+                    method,
+                    api_response_outcome(&response),
+                    changes_ui,
+                ),
+                Err(err) if is_connection_closed_error(err) => {
+                    crate::logging::api_request_completed(
+                        &request_id,
+                        method,
+                        "client_disconnected",
+                        changes_ui,
+                    );
+                }
+                Err(err) => {
+                    crate::logging::api_request_failed(&request_id, method, &err.to_string())
+                }
+            }
+            if result.as_ref().is_err_and(is_connection_closed_error) {
+                Ok(())
+            } else {
+                result
+            }
         }
         method_body => {
             let (response_write_tx, response_write_rx) = std::sync::mpsc::channel();
@@ -1484,6 +1543,80 @@ pub(super) fn should_stop_connection(
     }
 
     local_stream_peer_closed(stream)
+}
+
+/// Media alone uses the existing receipt as a failure marker: `()` abandons the
+/// session, while disconnecting the receipt after a successful write releases it.
+/// Keep it on the connection stack so every early return (including probe errors)
+/// reports failure without a per-request monitor or a surviving sender clone.
+struct MediaResponseDelivery(Option<std::sync::mpsc::Sender<()>>);
+
+impl MediaResponseDelivery {
+    fn new() -> (Self, std::sync::mpsc::Receiver<()>) {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        (Self(Some(sender)), receiver)
+    }
+
+    fn delivered(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for MediaResponseDelivery {
+    fn drop(&mut self) {
+        if let Some(sender) = self.0.take() {
+            let _ = sender.send(());
+        }
+    }
+}
+
+fn dispatch_media_open(
+    request: Request,
+    context: ApiRequestContext,
+    api_tx: &ApiRequestSender,
+    response_write_complete: std::sync::mpsc::Receiver<()>,
+    stream: &mut LocalStream,
+    running: &Arc<AtomicBool>,
+    server_stop: Option<&ServerStop>,
+) -> io::Result<Option<String>> {
+    let request_id = request.id.clone();
+    let (respond_to, response_rx) = std::sync::mpsc::channel();
+    if let Err(err) = api_tx.send(ApiRequestMessage {
+        request,
+        context,
+        peer_pidfd: None,
+        respond_to,
+        response_write_complete: Some(response_write_complete),
+    }) {
+        return Ok(Some(error_response_json(
+            request_id,
+            "server_unavailable",
+            format!("failed to dispatch request: {err}"),
+        )));
+    }
+
+    let owner_stopped =
+        || !running.load(Ordering::Relaxed) || server_stop.is_some_and(ServerStop::is_requested);
+    loop {
+        if owner_stopped() {
+            return Ok(None);
+        }
+        match response_rx.recv_timeout(CONNECTION_POLL_INTERVAL) {
+            Ok(response) => return Ok((!owner_stopped()).then_some(response)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if local_stream_response_peer_closed(stream)? {
+                    return Ok(None);
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Ok(Some(error_response_json(
+                    request_id,
+                    "server_unavailable",
+                    "app response channel closed".to_owned(),
+                )));
+            }
+        }
+    }
 }
 
 pub(super) fn dispatch_to_app_with_timeout(
@@ -2320,6 +2453,7 @@ mod tests {
                 surface_interest: true,
                 health_check: true,
                 ssh_agent_registration: false,
+                media_open_cancel: true,
                 guarded_live_handoff: true,
                 expected_terminal_guard: true,
                 pane_close_expected_terminal_guard: true,

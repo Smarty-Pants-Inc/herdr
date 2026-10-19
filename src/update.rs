@@ -3117,6 +3117,7 @@ mod tests {
                 expected_agent_status_guard: true,
                 refuse_if_exists_guard: true,
                 input_consumer: false,
+                media_open_cancel: true,
             }),
         };
         let missing_baseline = crate::api::RuntimeStatus {
@@ -3125,6 +3126,7 @@ mod tests {
         };
         let incompatible_generation = crate::api::RuntimeStatus {
             capabilities: Some(crate::api::schema::ServerCapabilities {
+                media_open_cancel: true,
                 endpoint_protocol_generation: Some(
                     crate::protocol::endpoint::ENDPOINT_PROTOCOL_GENERATION + 1,
                 ),
@@ -3199,6 +3201,7 @@ mod tests {
                     ssh_agent_registration: false,
                     guarded_live_handoff: true,
                     input_consumer: false,
+                    media_open_cancel: true,
                 }),
             },
         };
@@ -3457,6 +3460,7 @@ mod tests {
                     ssh_agent_registration: false,
                     guarded_live_handoff: true,
                     input_consumer: false,
+                    media_open_cancel: true,
                 }),
             },
         };
