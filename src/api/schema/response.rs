@@ -286,6 +286,9 @@ pub enum ResponseResult {
     MediaOffer {
         session_id: String,
         sdp: String,
+        // Legacy servers omitted this field; current broker offers begin at one.
+        #[serde(default)]
+        epoch: u64,
     },
     MediaSession {
         session_id: String,

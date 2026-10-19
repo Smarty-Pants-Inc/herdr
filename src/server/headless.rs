@@ -658,6 +658,14 @@ impl HeadlessServer {
                 needs_render,
                 self.git_refresh_scheduled(),
             );
+            // Media expiry must wake an otherwise idle runtime too. Delivery tracking
+            // polls only while an open's response is in flight; no per-request worker.
+            let next_deadline = self
+                .media
+                .next_deadline(now)
+                .into_iter()
+                .chain(next_deadline)
+                .min();
             let next_deadline = self
                 .pending_alt_screen_reads
                 .iter()
