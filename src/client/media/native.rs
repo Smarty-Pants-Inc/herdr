@@ -15,7 +15,14 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc as std_mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+mod controls;
+mod speaker;
+
+use controls::{enabled, AudioState, Controls};
+#[cfg(any(target_os = "macos", test))]
+use speaker::Speaker;
 
 use bytes::Bytes;
 use tokio::sync::{mpsc, watch};
@@ -36,7 +43,10 @@ use webrtc::track::track_local::TrackLocal;
 use webrtc::track::track_remote::TrackRemote;
 
 use super::peer::{MediaPeer, PeerEvent, PeerEventSink};
-use crate::protocol::media::{close_code, MediaPeerState};
+use crate::protocol::media::{
+    close_code, MediaApplied, MediaDeviceControl, MediaInfo, MediaLevels, MediaPeerState,
+    MAX_MEDIA_TEXT_BYTES,
+};
 
 /// The Opus and pipeline sample rate.
 pub(crate) const SAMPLE_RATE: u32 = 48_000;
@@ -49,14 +59,20 @@ const MAX_DECODED_SAMPLES: usize = 5_760;
 const PLAYBACK_CAPACITY: usize = SAMPLE_RATE as usize / 2;
 /// Captured frames waiting for the encoder (320 ms). Newer frames are dropped when full.
 const CAPTURE_QUEUE_FRAMES: usize = 16;
+/// Controls wait in this bounded FIFO while one command awaits the audio workers.
+const COMMAND_CAPACITY: usize = 32;
+/// Observe atomic encoder/callback confirmations off the realtime threads.
+const CONTROL_OBSERVE_INTERVAL: Duration = Duration::from_millis(10);
+const DEVICE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 const ICE_GATHER_TIMEOUT: Duration = Duration::from_secs(3);
 const PEER_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
 const THREAD_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
 /// The OpenAI Realtime peer expects a data channel with this label.
 const EVENTS_CHANNEL_LABEL: &str = "oai-events";
 
-/// Takes captured microphone samples.
-pub(crate) type CaptureFn = Box<dyn FnMut(&[f32]) + Send>;
+/// Takes mono microphone samples with the request token observed before conversion.
+/// Keeping that origin token prevents a late callback from becoming fresh unmuted audio.
+pub(crate) type CaptureFn = Box<dyn FnMut(u64, &[f32]) + Send>;
 /// Fills a speaker buffer.
 pub(crate) type PlaybackFn = Box<dyn FnMut(&mut [f32]) + Send>;
 
@@ -68,18 +84,66 @@ pub(crate) struct AudioIo {
     pub(crate) playback: PlaybackFn,
     /// Reports a device failure; the peer then closes with `device_error`.
     pub(crate) error: Arc<dyn Fn(String) + Send + Sync>,
+    changed: Arc<dyn Fn() + Send + Sync>,
+    audio: Arc<AudioState>,
+}
+
+/// Device ownership, bounded names, and an optional off-callback default-device check.
+/// The guard is deliberately thread-local, as CPAL streams are not Send on every host.
+pub(crate) struct OpenedAudio {
+    _guard: Box<dyn std::any::Any>,
+    input_device: String,
+    output_device: String,
+    default_changed: Option<Box<dyn FnMut() -> bool>>,
+}
+
+impl OpenedAudio {
+    fn new(guard: Box<dyn std::any::Any>, input: String, output: String) -> Self {
+        Self {
+            _guard: guard,
+            input_device: bounded_device_name(input),
+            output_device: bounded_device_name(output),
+            default_changed: None,
+        }
+    }
+
+    fn info(&self, session_id: &str) -> MediaInfo {
+        MediaInfo {
+            session_id: session_id.to_owned(),
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+            commit: crate::build_info::commit().to_owned(),
+            pid: std::process::id(),
+            input_device: self.input_device.clone(),
+            output_device: self.output_device.clone(),
+        }
+    }
+}
+
+fn bounded_device_name(mut name: String) -> String {
+    let mut end = name.len().min(MAX_MEDIA_TEXT_BYTES);
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    name.truncate(end);
+    name
+}
+
+struct CapturedFrame {
+    samples: Vec<f32>,
+    token: u64,
 }
 
 /// Microphone and speaker access.
 pub(crate) trait AudioBackend: Send {
     /// Start capture and playback. Dropping the returned guard stops both streams and
     /// releases the devices. It is dropped on the peer thread.
-    fn open(self: Box<Self>, io: AudioIo) -> Result<Box<dyn std::any::Any>, String>;
+    fn open(self: Box<Self>, io: AudioIo) -> Result<OpenedAudio, String>;
 }
 
 enum Command {
     Answer(String),
     Mute(bool),
+    Control(MediaDeviceControl),
     Close,
 }
 
@@ -89,17 +153,19 @@ enum Internal {
     ChannelOpen,
     /// The required events channel closed; the remote side ended the call.
     ChannelClosed,
+    DeviceChanged,
     Fatal(String),
 }
 
 /// How a session ended when it was not cancelled by the controller.
-type SessionEnd = Result<Option<String>, String>;
+type SessionEnd = Result<Option<(&'static str, String)>, String>;
 
 type Playback = Arc<Mutex<VecDeque<f32>>>;
 
 /// A running native media peer. Dropping it closes the session.
 pub(crate) struct NativePeer {
-    commands: mpsc::UnboundedSender<Command>,
+    commands: mpsc::Sender<Command>,
+    overloaded: Arc<AtomicBool>,
     /// Cancels setup and negotiation at their next await, so close never waits for them.
     cancel: watch::Sender<bool>,
     closed: Arc<AtomicBool>,
@@ -138,7 +204,9 @@ pub(crate) fn start_with_audio(
         .enable_all()
         .build()
         .map_err(|error| format!("could not start the media runtime: {error}"))?;
-    let (commands, command_rx) = mpsc::unbounded_channel();
+    let (commands, command_rx) = mpsc::channel(COMMAND_CAPACITY);
+    let overloaded = Arc::new(AtomicBool::new(false));
+    let thread_overloaded = Arc::clone(&overloaded);
     let (cancel, cancel_rx) = watch::channel(false);
     let (done_tx, done) = std_mpsc::channel();
     let closed = Arc::new(AtomicBool::new(false));
@@ -154,11 +222,16 @@ pub(crate) fn start_with_audio(
         .spawn(move || {
             let result = runtime.block_on(session(&emitter, audio, command_rx, cancel_rx));
             runtime.shutdown_timeout(Duration::from_millis(500));
+            let result = if thread_overloaded.load(Ordering::Acquire) {
+                Err("too many pending media commands".to_owned())
+            } else {
+                result
+            };
             match result {
                 Ok(None) => {}
-                Ok(Some(message)) => emitter.emit(PeerEvent::Closed {
+                Ok(Some((code, message))) => emitter.emit(PeerEvent::Closed {
                     session_id: emitter.session_id.clone(),
-                    code: close_code::CLOSED,
+                    code,
                     message,
                 }),
                 Err(message) => {
@@ -176,6 +249,7 @@ pub(crate) fn start_with_audio(
         .map_err(|error| format!("could not start the media thread: {error}"))?;
     Ok(NativePeer {
         commands,
+        overloaded,
         cancel,
         closed,
         stopped,
@@ -184,13 +258,27 @@ pub(crate) fn start_with_audio(
     })
 }
 
+impl NativePeer {
+    fn enqueue(&self, command: Command) {
+        if let Err(mpsc::error::TrySendError::Full(_)) = self.commands.try_send(command) {
+            self.overloaded.store(true, Ordering::Release);
+            // Cancellation releases devices before the thread reports the overload.
+            let _ = self.cancel.send(true);
+        }
+    }
+}
+
 impl MediaPeer for NativePeer {
     fn apply_answer(&mut self, sdp: String) {
-        let _ = self.commands.send(Command::Answer(sdp));
+        self.enqueue(Command::Answer(sdp));
     }
 
     fn set_muted(&mut self, muted: bool) {
-        let _ = self.commands.send(Command::Mute(muted));
+        self.enqueue(Command::Mute(muted));
+    }
+
+    fn apply_control(&mut self, control: MediaDeviceControl) {
+        self.enqueue(Command::Control(control));
     }
 
     fn close(&mut self) {
@@ -199,7 +287,7 @@ impl MediaPeer for NativePeer {
         };
         self.closed.store(true, Ordering::SeqCst);
         let _ = self.cancel.send(true);
-        let _ = self.commands.send(Command::Close);
+        let _ = self.commands.try_send(Command::Close);
         // Cancellation makes the peer thread drop the devices at its next await. Closing the
         // WebRTC connection can still take up to a second, so join off the client loop.
         let thread = self.thread.take();
@@ -252,12 +340,12 @@ impl Emitter {
 }
 
 /// One media session. Returns `Err` when the peer must report `device_error`, and
-/// `Ok(Some(message))` when the remote side ended the call. Audio is released and the peer
+/// `Ok(Some((code, message)))` for remote close or a changed device. Audio is released and the peer
 /// connection closed before it returns.
 async fn session(
     emitter: &Emitter,
     audio: Box<dyn AudioBackend>,
-    commands: mpsc::UnboundedReceiver<Command>,
+    commands: mpsc::Receiver<Command>,
     mut cancel: watch::Receiver<bool>,
 ) -> SessionEnd {
     if *cancel.borrow() {
@@ -266,9 +354,14 @@ async fn session(
     let (internal_tx, internal) = mpsc::unbounded_channel();
     let playback: Playback = Arc::new(Mutex::new(VecDeque::with_capacity(PLAYBACK_CAPACITY)));
     let (frames_tx, frames) = mpsc::channel(CAPTURE_QUEUE_FRAMES);
-    let muted = Arc::new(AtomicBool::new(false));
+    let audio_state = Arc::new(AudioState::default());
 
-    let audio_guard = audio.open(audio_io(frames_tx, Arc::clone(&playback), &internal_tx))?;
+    let mut audio_guard = audio.open(audio_io(
+        frames_tx,
+        Arc::clone(&playback),
+        Arc::clone(&audio_state),
+        &internal_tx,
+    ))?;
     // A close that arrived while the device opened releases it here, before any WebRTC work.
     if *cancel.borrow() {
         return Ok(None);
@@ -293,8 +386,9 @@ async fn session(
                 internal_tx,
                 frames,
                 playback,
-                muted,
+                audio: audio_state,
             },
+            &mut audio_guard,
         ) => result,
     };
     drop(audio_guard);
@@ -316,12 +410,12 @@ async fn cancelled(cancel: &mut watch::Receiver<bool>) {
 }
 
 struct Channels {
-    commands: mpsc::UnboundedReceiver<Command>,
+    commands: mpsc::Receiver<Command>,
     internal: mpsc::UnboundedReceiver<Internal>,
     internal_tx: mpsc::UnboundedSender<Internal>,
-    frames: mpsc::Receiver<Vec<f32>>,
+    frames: mpsc::Receiver<CapturedFrame>,
     playback: Playback,
-    muted: Arc<AtomicBool>,
+    audio: Arc<AudioState>,
 }
 
 /// The Opus parameters webrtc-rs registers by default.
@@ -354,15 +448,21 @@ async fn new_peer_connection() -> webrtc::error::Result<RTCPeerConnection> {
 }
 
 /// Negotiate, then run the control loop until close or failure.
-async fn drive(emitter: &Emitter, peer: &Arc<RTCPeerConnection>, channels: Channels) -> SessionEnd {
+async fn drive(
+    emitter: &Emitter,
+    peer: &Arc<RTCPeerConnection>,
+    channels: Channels,
+    devices: &mut OpenedAudio,
+) -> SessionEnd {
     let Channels {
         mut commands,
         mut internal,
         internal_tx,
         frames,
         playback,
-        muted,
+        audio,
     } = channels;
+    let mut controls = Controls::new(Arc::clone(&audio));
     let webrtc_error = |what: &str, error: webrtc::Error| format!("{what}: {error}");
 
     let track = Arc::new(TrackLocalStaticSample::new(
@@ -388,7 +488,7 @@ async fn drive(emitter: &Emitter, peer: &Arc<RTCPeerConnection>, channels: Chann
     tokio::spawn(encode_microphone(
         frames,
         track,
-        Arc::clone(&muted),
+        Arc::clone(&audio),
         internal_tx.clone(),
     ));
 
@@ -423,9 +523,15 @@ async fn drive(emitter: &Emitter, peer: &Arc<RTCPeerConnection>, channels: Chann
     }));
 
     let track_tx = internal_tx;
+    let playback_audio = Arc::clone(&audio);
     peer.on_track(Box::new(move |remote, _, _| {
         // The handler future runs under a lock; keep it short and play in a task.
-        tokio::spawn(play_remote(remote, Arc::clone(&playback), track_tx.clone()));
+        tokio::spawn(play_remote(
+            remote,
+            Arc::clone(&playback),
+            Arc::clone(&playback_audio),
+            track_tx.clone(),
+        ));
         Box::pin(async {})
     }));
 
@@ -453,9 +559,13 @@ async fn drive(emitter: &Emitter, peer: &Arc<RTCPeerConnection>, channels: Chann
     let mut connected = false;
     let mut channel_open = false;
     let mut reported_connected = false;
+    let mut observe = tokio::time::interval(CONTROL_OBSERVE_INTERVAL);
+    observe.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut device_check = tokio::time::interval(DEVICE_CHECK_INTERVAL);
+    device_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
-            command = commands.recv() => match command {
+            command = commands.recv(), if controls.idle() => match command {
                 Some(Command::Answer(sdp)) => {
                     let answer = RTCSessionDescription::answer(sdp)
                         .map_err(|error| webrtc_error("invalid answer", error))?;
@@ -463,19 +573,30 @@ async fn drive(emitter: &Emitter, peer: &Arc<RTCPeerConnection>, channels: Chann
                         .await
                         .map_err(|error| webrtc_error("could not apply the answer", error))?;
                     if !reported_connected {
-                        emitter.state(MediaPeerState::Connecting, muted.load(Ordering::SeqCst));
+                        emitter.state(MediaPeerState::Connecting, controls.muted);
                     }
                 }
                 Some(Command::Mute(mute)) => {
-                    muted.store(mute, Ordering::SeqCst);
-                    let state = if reported_connected {
-                        MediaPeerState::Connected
-                    } else {
-                        MediaPeerState::Connecting
-                    };
-                    emitter.state(state, mute);
+                    controls.begin(None, Some(mute), None, None, Instant::now())?;
+                }
+                Some(Command::Control(control)) => {
+                    controls.begin(
+                        Some(control.control_id),
+                        control.input_muted,
+                        control.output_suppressed,
+                        control.levels,
+                        Instant::now(),
+                    )?;
                 }
                 Some(Command::Close) | None => return Ok(None),
+            },
+            _ = observe.tick(), if controls.observing() => {},
+            _ = device_check.tick() => {
+                if audio.device_changed.load(Ordering::Acquire)
+                    || devices.default_changed.as_mut().is_some_and(|changed| changed())
+                {
+                    return Ok(Some((close_code::DEVICE_CHANGED, "the default audio device changed".to_owned())));
+                }
             },
             event = internal.recv() => match event {
                 Some(Internal::PeerState(RTCPeerConnectionState::Connected)) => connected = true,
@@ -486,15 +607,45 @@ async fn drive(emitter: &Emitter, peer: &Arc<RTCPeerConnection>, channels: Chann
                 Some(Internal::PeerState(_)) => {}
                 Some(Internal::ChannelOpen) => channel_open = true,
                 Some(Internal::ChannelClosed) => {
-                    return Ok(Some("the remote side closed the events channel".to_owned()));
+                    return Ok(Some((close_code::CLOSED, "the remote side closed the events channel".to_owned())));
+                }
+                Some(Internal::DeviceChanged) => {
+                    return Ok(Some((close_code::DEVICE_CHANGED, "the default audio device changed".to_owned())));
                 }
                 Some(Internal::Fatal(message)) => return Err(message),
                 None => return Ok(None),
             },
         }
+        if let Some(confirmation) = controls.confirmed() {
+            if let Some(control_id) = confirmation.control_id {
+                emitter.emit(PeerEvent::Applied(MediaApplied {
+                    session_id: emitter.session_id.clone(),
+                    control_id,
+                    input_muted: confirmation.muted,
+                    output_suppressed: confirmation.suppressed,
+                }));
+            } else {
+                emitter.state(
+                    if reported_connected {
+                        MediaPeerState::Connected
+                    } else {
+                        MediaPeerState::Connecting
+                    },
+                    confirmation.muted,
+                );
+            }
+        }
         if connected && channel_open && !reported_connected {
             reported_connected = true;
-            emitter.state(MediaPeerState::Connected, muted.load(Ordering::SeqCst));
+            emitter.state(MediaPeerState::Connected, controls.muted);
+            emitter.emit(PeerEvent::Info(devices.info(&emitter.session_id)));
+        }
+        if let Some((input_peak, output_peak)) = controls.take_levels(Instant::now()) {
+            emitter.emit(PeerEvent::Levels(MediaLevels {
+                session_id: emitter.session_id.clone(),
+                input_peak,
+                output_peak,
+            }));
         }
     }
 }
@@ -502,9 +653,9 @@ async fn drive(emitter: &Emitter, peer: &Arc<RTCPeerConnection>, channels: Chann
 /// Encode captured 20 ms frames and write them to the local track. Sends silence while
 /// muted so the remote side keeps a steady stream.
 async fn encode_microphone(
-    mut frames: mpsc::Receiver<Vec<f32>>,
+    mut frames: mpsc::Receiver<CapturedFrame>,
     track: Arc<TrackLocalStaticSample>,
-    muted: Arc<AtomicBool>,
+    audio: Arc<AudioState>,
     internal: mpsc::UnboundedSender<Internal>,
 ) {
     let mut encoder =
@@ -515,16 +666,18 @@ async fn encode_microphone(
                 return;
             }
         };
-    let silence = [0.0_f32; FRAME_SAMPLES];
     let mut packet = [0_u8; 1500];
+    let mut encoded_token = 0;
     while let Some(frame) = frames.recv().await {
-        let input = if muted.load(Ordering::SeqCst) {
-            &silence[..]
-        } else {
-            &frame[..]
-        };
-        let size = match encoder.encode_float(input, &mut packet) {
-            Ok(size) => size,
+        let (size, token) = match encode_frame(
+            &mut encoder,
+            &mut encoded_token,
+            &frame,
+            &audio,
+            &mut packet,
+        ) {
+            Ok(Some(encoded)) => encoded,
+            Ok(None) => continue,
             Err(error) => {
                 let _ = internal.send(Internal::Fatal(format!("Opus encoding failed: {error}")));
                 return;
@@ -538,13 +691,47 @@ async fn encode_microphone(
         if let Err(error) = track.write_sample(&sample).await {
             tracing::debug!(%error, "could not send a microphone frame");
         }
+        // Only the real encoder confirms. Previous writes are finished before this
+        // release, so an Applied cannot race an older in-flight microphone sample.
+        audio.input_applied.store(token, Ordering::Release);
     }
+}
+
+fn encode_frame(
+    encoder: &mut opus::Encoder,
+    encoded_token: &mut u64,
+    frame: &CapturedFrame,
+    audio: &AudioState,
+    packet: &mut [u8],
+) -> Result<Option<(usize, u64)>, opus::Error> {
+    let token = audio.input_token();
+    // Reject queued and partial pre-control capture, including the first unmuted frame.
+    if frame.token != token {
+        return Ok(None);
+    }
+    if *encoded_token != token {
+        // Do not carry pre-mute Opus prediction/lookahead into confirmed silence.
+        encoder.reset_state()?;
+        *encoded_token = token;
+    }
+    let silence = [0.0_f32; FRAME_SAMPLES];
+    let samples = if enabled(token) {
+        &silence[..]
+    } else {
+        &frame.samples[..]
+    };
+    // Meter exactly the post-mute samples sent to Opus, never the raw muted mic.
+    audio.input_peak(samples);
+    encoder
+        .encode_float(samples, packet)
+        .map(|size| Some((size, token)))
 }
 
 /// Decode the remote audio track into the playback buffer.
 async fn play_remote(
     remote: Arc<TrackRemote>,
     playback: Playback,
+    audio: Arc<AudioState>,
     internal: mpsc::UnboundedSender<Internal>,
 ) {
     let mut decoder = match opus::Decoder::new(SAMPLE_RATE, opus::Channels::Mono) {
@@ -559,17 +746,26 @@ async fn play_remote(
         if packet.payload.is_empty() {
             continue;
         }
+        let token = audio.output_token();
         match decoder.decode_float(&packet.payload, &mut pcm, false) {
-            Ok(count) => push_playback(&playback, &pcm[..count.min(pcm.len())]),
+            Ok(count) => push_playback(&playback, &audio, token, &pcm[..count.min(pcm.len())]),
             Err(error) => tracing::debug!(%error, "could not decode a remote audio packet"),
         }
     }
 }
 
-fn push_playback(playback: &Playback, samples: &[f32]) {
+fn push_playback(playback: &Playback, audio: &AudioState, token: u64, samples: &[f32]) {
+    if enabled(token) || audio.output_token() != token {
+        return;
+    }
     let Ok(mut buffer) = playback.lock() else {
         return;
     };
+    // Check again under the producer lock: a packet decoded before suppression must
+    // never refill the drained ring after the speaker confirms that suppression.
+    if audio.output_token() != token {
+        return;
+    }
     let samples = &samples[samples.len().saturating_sub(PLAYBACK_CAPACITY)..];
     let overflow = (buffer.len() + samples.len()).saturating_sub(PLAYBACK_CAPACITY);
     let dropped = overflow.min(buffer.len());
@@ -579,36 +775,67 @@ fn push_playback(playback: &Playback, samples: &[f32]) {
 
 /// Callbacks that connect an audio backend to the encoder and the playback buffer.
 fn audio_io(
-    frames: mpsc::Sender<Vec<f32>>,
+    frames: mpsc::Sender<CapturedFrame>,
     playback: Playback,
+    audio: Arc<AudioState>,
     internal: &mpsc::UnboundedSender<Internal>,
 ) -> AudioIo {
     let mut pending = Vec::with_capacity(FRAME_SAMPLES * 2);
+    let mut capture_token = 0;
+    let capture_audio = Arc::clone(&audio);
+    let playback_audio = Arc::clone(&audio);
+    let changed_audio = Arc::clone(&audio);
     let error_tx = internal.clone();
+    let changed_tx = internal.clone();
     AudioIo {
         // ponytail: allocates one Vec per 20 ms frame on the device thread; a lock-free
         // frame pool is only worth it if glitches show up.
-        capture: Box::new(move |samples| {
+        capture: Box::new(move |token, samples| {
+            // Conversion may span a control change. Reject that old callback rather
+            // than relabeling its samples (or interpolation history) as newly unmuted.
+            if token != capture_audio.input_token() {
+                return;
+            }
+            if capture_token != token {
+                pending.clear();
+                capture_token = token;
+            }
             pending.extend_from_slice(samples);
             while pending.len() >= FRAME_SAMPLES {
-                let frame: Vec<f32> = pending.drain(..FRAME_SAMPLES).collect();
+                let samples: Vec<f32> = pending.drain(..FRAME_SAMPLES).collect();
                 // A full queue drops the frame rather than blocking the device thread.
-                let _ = frames.try_send(frame);
+                let _ = frames.try_send(CapturedFrame { samples, token });
             }
         }),
         playback: Box::new(move |out| {
+            let token = playback_audio.output_token();
             // Never block the device thread: play silence when the buffer is busy.
             let Ok(mut buffer) = playback.try_lock() else {
                 out.fill(0.0);
                 return;
             };
-            for sample in out.iter_mut() {
-                *sample = buffer.pop_front().unwrap_or(0.0);
+            if enabled(token) {
+                buffer.clear();
+                out.fill(0.0);
+                playback_audio
+                    .output_drained
+                    .store(token, Ordering::Release);
+            } else {
+                for sample in out.iter_mut() {
+                    *sample = buffer.pop_front().unwrap_or(0.0);
+                }
             }
+            // Deliberately no output_applied here: the outer CPAL resampler/pending
+            // buffer has not necessarily written silence to the device yet.
         }),
         error: Arc::new(move |message| {
             let _ = error_tx.send(Internal::Fatal(message));
         }),
+        changed: Arc::new(move || {
+            changed_audio.device_changed.store(true, Ordering::Release);
+            let _ = changed_tx.send(Internal::DeviceChanged);
+        }),
+        audio,
     }
 }
 
@@ -628,6 +855,11 @@ impl Resampler {
             position: 0.0,
             last: 0.0,
         }
+    }
+
+    pub(crate) fn reset(&mut self) {
+        self.position = 0.0;
+        self.last = 0.0;
     }
 
     /// Append the resampled `input` to `out`.
@@ -667,14 +899,16 @@ mod cpal_audio {
     use cpal::{FromSample, SampleFormat, SizedSample, StreamConfig};
 
     use super::{
-        AudioBackend, AudioIo, CaptureFn, PlaybackFn, Resampler, FRAME_SAMPLES, SAMPLE_RATE,
+        AudioBackend, AudioIo, AudioState, CaptureFn, OpenedAudio, PlaybackFn, Resampler, Speaker,
+        FRAME_SAMPLES, SAMPLE_RATE,
     };
+    use crate::platform::macos_media;
 
     /// The default CoreAudio microphone and speaker.
     pub(super) struct CpalAudio;
 
     impl AudioBackend for CpalAudio {
-        fn open(self: Box<Self>, io: AudioIo) -> Result<Box<dyn std::any::Any>, String> {
+        fn open(self: Box<Self>, io: AudioIo) -> Result<OpenedAudio, String> {
             let host = cpal::default_host();
             let input = host
                 .default_input_device()
@@ -682,6 +916,9 @@ mod cpal_audio {
             let output = host
                 .default_output_device()
                 .ok_or_else(|| "no default speaker".to_owned())?;
+            let input_name = macos_media::device_name(&input)?;
+            let output_name = macos_media::device_name(&output)?;
+            let input_check = macos_media::default_input_check(&input)?;
             let input_config = input
                 .default_input_config()
                 .map_err(|error| format!("microphone: {error}"))?;
@@ -690,21 +927,41 @@ mod cpal_audio {
                 .map_err(|error| format!("speaker: {error}"))?;
 
             let capture = match input_config.sample_format() {
-                SampleFormat::F32 => {
-                    input_stream::<f32>(&input, input_config.config(), io.capture, &io.error)
-                }
-                SampleFormat::I16 => {
-                    input_stream::<i16>(&input, input_config.config(), io.capture, &io.error)
-                }
+                SampleFormat::F32 => input_stream::<f32>(
+                    &input,
+                    input_config.config(),
+                    io.capture,
+                    &io.error,
+                    &io.changed,
+                    Arc::clone(&io.audio),
+                ),
+                SampleFormat::I16 => input_stream::<i16>(
+                    &input,
+                    input_config.config(),
+                    io.capture,
+                    &io.error,
+                    &io.changed,
+                    Arc::clone(&io.audio),
+                ),
                 other => Err(format!("unsupported microphone sample format {other}")),
             }?;
             let playback = match output_config.sample_format() {
-                SampleFormat::F32 => {
-                    output_stream::<f32>(&output, output_config.config(), io.playback, &io.error)
-                }
-                SampleFormat::I16 => {
-                    output_stream::<i16>(&output, output_config.config(), io.playback, &io.error)
-                }
+                SampleFormat::F32 => output_stream::<f32>(
+                    &output,
+                    output_config.config(),
+                    io.playback,
+                    &io.error,
+                    &io.changed,
+                    io.audio,
+                ),
+                SampleFormat::I16 => output_stream::<i16>(
+                    &output,
+                    output_config.config(),
+                    io.playback,
+                    &io.error,
+                    &io.changed,
+                    io.audio,
+                ),
                 other => Err(format!("unsupported speaker sample format {other}")),
             }?;
             capture
@@ -713,7 +970,10 @@ mod cpal_audio {
             playback
                 .play()
                 .map_err(|error| format!("speaker: {error}"))?;
-            Ok(Box::new((capture, playback)))
+            let mut opened =
+                OpenedAudio::new(Box::new((capture, playback)), input_name, output_name);
+            opened.default_changed = Some(input_check);
+            Ok(opened)
         }
     }
 
@@ -722,6 +982,8 @@ mod cpal_audio {
         config: StreamConfig,
         mut capture: CaptureFn,
         error: &Arc<dyn Fn(String) + Send + Sync>,
+        changed: &Arc<dyn Fn() + Send + Sync>,
+        audio: Arc<AudioState>,
     ) -> Result<cpal::Stream, String>
     where
         T: SizedSample,
@@ -731,11 +993,18 @@ mod cpal_audio {
         let mut resampler = Resampler::new(config.sample_rate, SAMPLE_RATE);
         let mut mono = Vec::with_capacity(FRAME_SAMPLES * 2);
         let mut resampled = Vec::with_capacity(FRAME_SAMPLES * 2);
+        let mut token = 0;
         let error = Arc::clone(error);
+        let changed = Arc::clone(changed);
         device
             .build_input_stream(
                 config,
                 move |data: &[T], _: &cpal::InputCallbackInfo| {
+                    let requested = audio.input_token();
+                    if token != requested {
+                        resampler.reset();
+                        token = requested;
+                    }
                     mono.clear();
                     mono.extend(data.chunks(channels).map(|frame| {
                         frame.iter().map(|&s| f32::from_sample_(s)).sum::<f32>()
@@ -743,9 +1012,15 @@ mod cpal_audio {
                     }));
                     resampled.clear();
                     resampler.process(&mono, &mut resampled);
-                    capture(&resampled);
+                    capture(token, &resampled);
                 },
-                move |stream_error| error(format!("microphone: {stream_error}")),
+                move |stream_error| {
+                    if macos_media::stream_device_changed(&stream_error) {
+                        changed();
+                    } else {
+                        error(format!("microphone: {stream_error}"));
+                    }
+                },
                 None,
             )
             .map_err(|error| format!("microphone: {error}"))
@@ -754,31 +1029,35 @@ mod cpal_audio {
     fn output_stream<T>(
         device: &cpal::Device,
         config: StreamConfig,
-        mut playback: PlaybackFn,
+        playback: PlaybackFn,
         error: &Arc<dyn Fn(String) + Send + Sync>,
+        changed: &Arc<dyn Fn() + Send + Sync>,
+        audio: Arc<AudioState>,
     ) -> Result<cpal::Stream, String>
     where
         T: SizedSample + FromSample<f32>,
+        f32: FromSample<T>,
     {
         let channels = usize::from(config.channels).max(1);
-        let mut resampler = Resampler::new(SAMPLE_RATE, config.sample_rate);
-        let mut chunk = vec![0.0_f32; FRAME_SAMPLES / 2];
-        let mut pending = Vec::with_capacity(FRAME_SAMPLES * 2);
+        let mut speaker = Speaker::new(config.sample_rate, playback, audio);
         let error = Arc::clone(error);
+        let changed = Arc::clone(changed);
         device
             .build_output_stream(
                 config,
                 move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
-                    let frames = data.len() / channels;
-                    while pending.len() < frames {
-                        playback(&mut chunk);
-                        resampler.process(&chunk, &mut pending);
-                    }
-                    for (frame, value) in data.chunks_mut(channels).zip(pending.drain(..frames)) {
-                        frame.fill(T::from_sample_(value));
+                    speaker.render(data, channels, |value| {
+                        let sample = T::from_sample_(value);
+                        (sample, f32::from_sample_(sample))
+                    });
+                },
+                move |stream_error| {
+                    if macos_media::stream_device_changed(&stream_error) {
+                        changed();
+                    } else {
+                        error(format!("speaker: {stream_error}"));
                     }
                 },
-                move |stream_error| error(format!("speaker: {stream_error}")),
                 None,
             )
             .map_err(|error| format!("speaker: {error}"))
@@ -793,6 +1072,61 @@ mod tests {
     struct FakeDevices {
         opened: AtomicBool,
         released: AtomicBool,
+        default_changed: AtomicBool,
+        callbacks: Mutex<Option<FakeCallbacks>>,
+        audio: Mutex<Option<Arc<AudioState>>>,
+    }
+
+    struct FakeCallbacks {
+        capture: CaptureFn,
+        speaker: Speaker,
+        changed: Arc<dyn Fn() + Send + Sync>,
+    }
+
+    impl FakeDevices {
+        fn capture(&self, samples: &[f32]) {
+            self.capture_with_token(self.state().input_token(), samples);
+        }
+
+        fn capture_with_token(&self, token: u64, samples: &[f32]) {
+            (self.callbacks.lock().unwrap().as_mut().unwrap().capture)(token, samples);
+        }
+
+        fn render(&self) -> Vec<f32> {
+            let mut out = vec![1.0; 127];
+            self.callbacks
+                .lock()
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .speaker
+                .render(&mut out, 1, |sample| (sample, sample));
+            out
+        }
+
+        fn state(&self) -> Arc<AudioState> {
+            Arc::clone(self.audio.lock().unwrap().as_ref().unwrap())
+        }
+
+        fn wait_request(&self, input: bool, previous: u64) -> u64 {
+            let audio = self.state();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                let token = if input {
+                    audio.input_token()
+                } else {
+                    audio.output_token()
+                };
+                if token != previous {
+                    return token;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "the control did not reach the audio worker"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
     }
 
     struct FakeAudio(Arc<FakeDevices>);
@@ -801,17 +1135,36 @@ mod tests {
 
     impl Drop for FakeGuard {
         fn drop(&mut self) {
+            self.0.callbacks.lock().unwrap().take();
+            self.0.audio.lock().unwrap().take();
             self.0.released.store(true, Ordering::SeqCst);
         }
     }
 
     impl AudioBackend for FakeAudio {
-        fn open(self: Box<Self>, mut io: AudioIo) -> Result<Box<dyn std::any::Any>, String> {
-            // Exercise both paths once: 40 ms of tone in, 10 ms out.
-            (io.capture)(&vec![0.1; FRAME_SAMPLES * 2]);
-            (io.playback)(&mut [1.0; 480]);
+        fn open(self: Box<Self>, mut io: AudioIo) -> Result<OpenedAudio, String> {
+            // Exercise the real frame packer and outer renderer, then retain the
+            // callbacks so tests can withhold actual capture/output confirmations.
+            (io.capture)(io.audio.input_token(), &vec![0.1; FRAME_SAMPLES * 2]);
+            let mut speaker = Speaker::new(44_100, io.playback, Arc::clone(&io.audio));
+            speaker.render(&mut [1.0; 480], 1, |sample| (sample, sample));
+            *self.0.audio.lock().unwrap() = Some(io.audio);
+            *self.0.callbacks.lock().unwrap() = Some(FakeCallbacks {
+                capture: io.capture,
+                speaker,
+                changed: io.changed,
+            });
             self.0.opened.store(true, Ordering::SeqCst);
-            Ok(Box::new(FakeGuard(Arc::clone(&self.0))))
+            let devices = Arc::clone(&self.0);
+            let mut opened = OpenedAudio::new(
+                Box::new(FakeGuard(Arc::clone(&self.0))),
+                "test microphone".to_owned(),
+                "test speaker".to_owned(),
+            );
+            opened.default_changed = Some(Box::new(move || {
+                devices.default_changed.load(Ordering::Acquire)
+            }));
+            Ok(opened)
         }
     }
 
@@ -901,10 +1254,14 @@ mod tests {
     fn close_during_a_slow_device_open_returns_at_once_and_starts_no_media() {
         struct SlowAudio(Arc<FakeDevices>);
         impl AudioBackend for SlowAudio {
-            fn open(self: Box<Self>, _io: AudioIo) -> Result<Box<dyn std::any::Any>, String> {
+            fn open(self: Box<Self>, _io: AudioIo) -> Result<OpenedAudio, String> {
                 std::thread::sleep(Duration::from_millis(300));
                 self.0.opened.store(true, Ordering::SeqCst);
-                Ok(Box::new(FakeGuard(Arc::clone(&self.0))))
+                Ok(OpenedAudio::new(
+                    Box::new(FakeGuard(Arc::clone(&self.0))),
+                    String::new(),
+                    String::new(),
+                ))
             }
         }
         let devices = Arc::new(FakeDevices::default());
@@ -950,9 +1307,8 @@ mod tests {
         assert!(events.recv_timeout(Duration::from_millis(200)).is_err());
     }
 
-    /// Answer the peer's offer with a real in-process WebRTC peer, as the Realtime server
-    /// would, and return that remote connection and its events channel once both sides
-    /// report connected.
+    /// Answer with a real in-process WebRTC peer, then wait for client Connected/Info
+    /// and a positive remote events-channel Open signal (discovery alone is too early).
     async fn connect_remote(
         peer: &mut NativePeer,
         offer: String,
@@ -960,6 +1316,7 @@ mod tests {
     ) -> (
         Arc<RTCPeerConnection>,
         Arc<webrtc::data_channel::RTCDataChannel>,
+        MediaInfo,
     ) {
         let mut media = MediaEngine::default();
         media.register_default_codecs().expect("codecs");
@@ -976,7 +1333,15 @@ mod tests {
         );
         let (channel_tx, mut channel_rx) = mpsc::unbounded_channel();
         remote.on_data_channel(Box::new(move |channel| {
-            let _ = channel_tx.send(channel);
+            // webrtc 0.17.2 calls this before handle_open installs the transport.
+            // Closing the discovered Connecting channel can return Ok without
+            // closing anything. Do not publish it until its on_open actually fires.
+            let channel_tx = channel_tx.clone();
+            let opened = Arc::clone(&channel);
+            channel.on_open(Box::new(move || {
+                let _ = channel_tx.send(opened);
+                Box::pin(async {})
+            }));
             Box::pin(async {})
         }));
         remote
@@ -1005,45 +1370,109 @@ mod tests {
                 other => panic!("expected the peer to connect, got {other:?}"),
             }
         }
+        let info = match events.recv_timeout(Duration::from_secs(5)) {
+            Ok(PeerEvent::Info(info)) => info,
+            other => panic!("expected Info after Connected, got {other:?}"),
+        };
         let channel = tokio::time::timeout(Duration::from_secs(5), channel_rx.recv())
             .await
             .expect("remote events channel")
             .expect("remote events channel");
         assert_eq!(channel.label(), EVENTS_CHANNEL_LABEL);
-        (remote, channel)
+        assert_eq!(
+            channel.ready_state(),
+            webrtc::data_channel::data_channel_state::RTCDataChannelState::Open
+        );
+        (remote, channel, info)
     }
 
     #[test]
-    fn remote_closing_the_events_channel_ends_the_call_and_releases_the_devices() {
+    fn connected_peer_reports_info_and_remote_channel_close_releases_devices_with_or_without_payload(
+    ) {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
             .build()
             .expect("test runtime");
-        let (mut peer, devices, events) = start_fake();
-        let offer = wait_offer(&events);
-        runtime.block_on(async {
-            let (remote, channel) = connect_remote(&mut peer, offer, &events).await;
-            assert!(!devices.released.load(Ordering::SeqCst));
+        for send_payload in [false, true] {
+            // Use a new peer for each case so a payload on one channel cannot mask
+            // an empty-open-channel-close regression on the other.
+            let (mut peer, devices, events) = start_fake();
+            let offer = wait_offer(&events);
+            runtime.block_on(async {
+                let (remote, channel, info) = connect_remote(&mut peer, offer, &events).await;
+                assert_eq!(info.session_id, "media_test");
+                assert_eq!(info.version, env!("CARGO_PKG_VERSION"));
+                assert_eq!(info.commit, crate::build_info::commit());
+                assert_eq!(info.pid, std::process::id());
+                assert_eq!(info.input_device, "test microphone");
+                assert_eq!(info.output_device, "test speaker");
+                assert!(!devices.released.load(Ordering::SeqCst));
+                if send_payload {
+                    channel
+                        .send_text("healthy events channel")
+                        .await
+                        .expect("an open channel can send");
+                }
 
-            // Only the channel goes away; ICE and DTLS stay up on the remote side.
-            channel.close().await.expect("close the events channel");
-            match events.recv_timeout(Duration::from_secs(10)) {
-                Ok(PeerEvent::Closed { code, .. }) => assert_eq!(code, close_code::CLOSED),
-                other => panic!("expected Closed after the channel closed, got {other:?}"),
-            }
-            assert!(wait_until(&devices.released, Duration::from_secs(2)));
-            assert!(wait_until(&peer.stopped, Duration::from_secs(3)));
-            let _ = remote.close().await;
-        });
-        peer.close();
+                // A positive round trip through both audio workers proves the healthy
+                // open channel did not end the session or release its audio devices.
+                peer.apply_control(device_control(1, Some(false), Some(false), None));
+                devices.wait_request(true, 0);
+                devices.wait_request(false, 0);
+                devices.capture(&[0.3; FRAME_SAMPLES]);
+                devices.render();
+                applied(&events, 1, false, false);
+                assert!(!devices.released.load(Ordering::SeqCst));
+                assert!(!peer.stopped.load(Ordering::SeqCst));
+                assert_eq!(
+                    channel.ready_state(),
+                    webrtc::data_channel::data_channel_state::RTCDataChannelState::Open
+                );
+                assert!(matches!(
+                    remote.ice_connection_state(),
+                    webrtc::ice_transport::ice_connection_state::RTCIceConnectionState::Connected
+                        | webrtc::ice_transport::ice_connection_state::RTCIceConnectionState::Completed
+                ));
+                assert_eq!(
+                    remote.sctp().transport().state(),
+                    webrtc::dtls_transport::dtls_transport_state::RTCDtlsTransportState::Connected
+                );
+
+                // Close only the open channel, not the live remote ICE/DTLS transports.
+                // Client cleanup may subsequently tear them down in response.
+                channel.close().await.expect("close the events channel");
+                match events.recv_timeout(Duration::from_secs(10)) {
+                    Ok(PeerEvent::Closed {
+                        session_id,
+                        code,
+                        message,
+                    }) => {
+                        assert_eq!(session_id, "media_test");
+                        assert_eq!(code, close_code::CLOSED);
+                        assert_eq!(message, "the remote side closed the events channel");
+                    }
+                    other => panic!("expected Closed after the channel closed, got {other:?}"),
+                }
+                assert!(
+                    devices.released.load(Ordering::SeqCst),
+                    "Closed must follow device release"
+                );
+                assert!(wait_until(&peer.stopped, Duration::from_secs(3)));
+                let _ = remote.close().await;
+            });
+            peer.close();
+        }
     }
 
     #[test]
     fn native_peer_confirms_mute_before_connect() {
-        let (mut peer, _devices, events) = start_fake();
+        let (mut peer, devices, events) = start_fake();
         wait_offer(&events);
         peer.set_muted(true);
+        devices.wait_request(true, 0);
+        assert!(events.recv_timeout(Duration::from_millis(60)).is_err());
+        devices.capture(&[0.2; FRAME_SAMPLES]);
         match events.recv_timeout(Duration::from_secs(5)) {
             Ok(PeerEvent::State { state, muted, .. }) => {
                 assert!(muted);
@@ -1058,7 +1487,7 @@ mod tests {
     fn native_peer_reports_device_failure_as_closed() {
         struct BrokenAudio;
         impl AudioBackend for BrokenAudio {
-            fn open(self: Box<Self>, _io: AudioIo) -> Result<Box<dyn std::any::Any>, String> {
+            fn open(self: Box<Self>, _io: AudioIo) -> Result<OpenedAudio, String> {
                 Err("no microphone".to_owned())
             }
         }
@@ -1078,6 +1507,424 @@ mod tests {
             }
             other => panic!("expected Closed, got {other:?}"),
         }
+    }
+
+    fn device_control(
+        id: u64,
+        input: Option<bool>,
+        output: Option<bool>,
+        levels: Option<bool>,
+    ) -> MediaDeviceControl {
+        MediaDeviceControl {
+            session_id: "media_test".to_owned(),
+            control_id: id,
+            input_muted: input,
+            output_suppressed: output,
+            levels,
+        }
+    }
+
+    fn applied(events: &std_mpsc::Receiver<PeerEvent>, id: u64, muted: bool, suppressed: bool) {
+        match events.recv_timeout(Duration::from_secs(3)) {
+            Ok(PeerEvent::Applied(update)) => {
+                assert_eq!(update.session_id, "media_test");
+                assert_eq!(update.control_id, id);
+                assert_eq!(update.input_muted, muted);
+                assert_eq!(update.output_suppressed, suppressed);
+            }
+            other => panic!("expected Applied {id}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn native_controls_wait_for_real_capture_encoder_and_outer_speaker_in_fifo_order() {
+        let (mut peer, devices, events) = start_fake();
+        wait_offer(&events);
+        let audio = devices.state();
+        peer.apply_control(device_control(10, Some(true), Some(true), None));
+        peer.apply_control(device_control(11, Some(false), Some(false), None));
+        let input = devices.wait_request(true, 0);
+        let output = devices.wait_request(false, 0);
+        assert!(enabled(input) && enabled(output));
+        assert!(events.recv_timeout(Duration::from_millis(60)).is_err());
+        assert_eq!(audio.input_applied.load(Ordering::Acquire), 0);
+        assert_eq!(audio.output_applied.load(Ordering::Acquire), 0);
+
+        // A partial frame is not a capture/encoder confirmation. Even actual speaker
+        // silence cannot acknowledge the combined control until that frame completes.
+        devices.capture(&[0.7; FRAME_SAMPLES - 1]);
+        assert!(devices.render().iter().all(|&sample| sample == 0.0));
+        assert!(events.recv_timeout(Duration::from_millis(60)).is_err());
+        assert_eq!(
+            audio.input_token(),
+            input,
+            "the second control must still be queued"
+        );
+        assert_eq!(audio.output_token(), output);
+        devices.capture(&[0.7]);
+        applied(&events, 10, true, true);
+
+        let input = devices.wait_request(true, input);
+        let output = devices.wait_request(false, output);
+        assert!(!enabled(input) && !enabled(output));
+        devices.capture(&[0.4; FRAME_SAMPLES]);
+        assert!(
+            events.recv_timeout(Duration::from_millis(60)).is_err(),
+            "unmute does not bypass the pending outer output confirmation"
+        );
+        devices.render();
+        applied(&events, 11, false, false);
+        peer.close();
+    }
+
+    #[test]
+    fn real_opus_encoder_rejects_old_capture_and_encodes_silence_only_while_muted() {
+        use controls::LEVELS_INTERVAL;
+
+        let now = Instant::now();
+        let audio = Arc::new(AudioState::default());
+        let mut controls = Controls::new(Arc::clone(&audio));
+        let (frames_tx, mut frames) = mpsc::channel(CAPTURE_QUEUE_FRAMES);
+        let (internal, _internal_rx) = mpsc::unbounded_channel();
+        let playback: Playback = Arc::new(Mutex::new(VecDeque::new()));
+        let mut io = audio_io(
+            frames_tx,
+            Arc::clone(&playback),
+            Arc::clone(&audio),
+            &internal,
+        );
+        let mut speaker = Speaker::new(SAMPLE_RATE, io.playback, Arc::clone(&audio));
+        let mut encoder =
+            opus::Encoder::new(SAMPLE_RATE, opus::Channels::Mono, opus::Application::Voip).unwrap();
+        let mut decoder = opus::Decoder::new(SAMPLE_RATE, opus::Channels::Mono).unwrap();
+        let tone: Vec<f32> = (0..FRAME_SAMPLES)
+            .map(|i| (i as f32 * 440.0 * std::f32::consts::TAU / SAMPLE_RATE as f32).sin() * 0.7)
+            .collect();
+        let mut packet = [0_u8; 1500];
+        let mut encoded_token = 0;
+        controls
+            .begin(Some(1), None, None, Some(true), now)
+            .unwrap();
+        assert!(controls.confirmed().is_some());
+        (io.capture)(audio.input_token(), &tone);
+        let frame = frames.try_recv().unwrap();
+        encode_frame(
+            &mut encoder,
+            &mut encoded_token,
+            &frame,
+            &audio,
+            &mut packet,
+        )
+        .unwrap()
+        .unwrap();
+        let (input, _) = controls.take_levels(now + LEVELS_INTERVAL).unwrap();
+        assert!(input > 0.6, "real unmuted samples must reach the meter");
+        // Accumulate another real peak without consuming it before mute.
+        encode_frame(
+            &mut encoder,
+            &mut encoded_token,
+            &frame,
+            &audio,
+            &mut packet,
+        )
+        .unwrap()
+        .unwrap();
+        controls
+            .begin(Some(2), Some(true), None, Some(true), now + LEVELS_INTERVAL)
+            .unwrap();
+        assert!(encode_frame(
+            &mut encoder,
+            &mut encoded_token,
+            &frame,
+            &audio,
+            &mut packet
+        )
+        .unwrap()
+        .is_none());
+        let muted_token = audio.input_token();
+        (io.capture)(muted_token, &tone);
+        let frame = frames.try_recv().unwrap();
+        let (size, token) = encode_frame(
+            &mut encoder,
+            &mut encoded_token,
+            &frame,
+            &audio,
+            &mut packet,
+        )
+        .unwrap()
+        .unwrap();
+        let mut decoded = [0.0_f32; FRAME_SAMPLES];
+        decoder
+            .decode_float(&packet[..size], &mut decoded, false)
+            .unwrap();
+        assert!(decoded.iter().all(|sample| sample.abs() < 0.001));
+        // Input mute leaves real, unsuppressed speaker output and its meter intact.
+        push_playback(
+            &playback,
+            &audio,
+            audio.output_token(),
+            &[0.4; FRAME_SAMPLES],
+        );
+        let mut out = [0.0; FRAME_SAMPLES];
+        speaker.render(&mut out, 1, |sample| (sample, sample));
+        assert!(out.iter().all(|&sample| sample == 0.4));
+        assert_eq!(
+            controls.take_levels(now + LEVELS_INTERVAL * 2),
+            Some((0.0, 0.4)),
+            "neither raw muted input nor an accumulated pre-mute peak may escape"
+        );
+        assert!(
+            controls.confirmed().is_none(),
+            "encoding alone is not the completed track-write confirmation"
+        );
+        audio.input_applied.store(token, Ordering::Release);
+        assert!(controls.confirmed().unwrap().muted);
+
+        // A callback starts under mute and carries old conversion/resampler output
+        // across unmute. The production frame packer must preserve its origin token,
+        // discard it, and also discard a partial frame left by the muted generation.
+        (io.capture)(muted_token, &tone[..FRAME_SAMPLES - 1]);
+        controls
+            .begin(Some(3), Some(false), None, None, now + LEVELS_INTERVAL * 2)
+            .unwrap();
+        (io.capture)(muted_token, &tone);
+        assert!(matches!(
+            frames.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert!(controls.confirmed().is_none());
+        assert_eq!(audio.input_applied.load(Ordering::Acquire), muted_token);
+        assert_eq!(
+            controls.take_levels(now + LEVELS_INTERVAL * 3),
+            Some((0.0, 0.0)),
+            "unmute cannot resurrect old input telemetry"
+        );
+        let unmuted_token = audio.input_token();
+        (io.capture)(unmuted_token, &tone[..1]);
+        assert!(matches!(
+            frames.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert!(controls.confirmed().is_none());
+        (io.capture)(unmuted_token, &tone[1..]);
+        let mut first_fresh_frame = Some(frames.try_recv().unwrap());
+        let mut decoded_peak = 0.0_f32;
+        // Opus has standard startup fade/lookahead, so the first fresh frame can be
+        // quiet even when the input is audible. Keep the >0.1 audibility bar, but
+        // judge it over at most five (100 ms) frames containing only fresh tone.
+        for fresh_frame_index in 0..5 {
+            if fresh_frame_index > 0 {
+                (io.capture)(unmuted_token, &tone);
+            }
+            let frame = first_fresh_frame
+                .take()
+                .unwrap_or_else(|| frames.try_recv().unwrap());
+            assert_eq!(frame.token, unmuted_token);
+            assert_eq!(frame.samples, tone);
+            let (size, token) = encode_frame(
+                &mut encoder,
+                &mut encoded_token,
+                &frame,
+                &audio,
+                &mut packet,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(token, unmuted_token);
+            decoder
+                .decode_float(&packet[..size], &mut decoded, false)
+                .unwrap();
+            decoded_peak = decoded_peak.max(
+                decoded
+                    .iter()
+                    .map(|sample| sample.abs())
+                    .fold(0.0_f32, f32::max),
+            );
+        }
+        assert!(
+            decoded_peak > 0.1,
+            "fresh unmuted audio must exceed the audible threshold within five Opus frames; peak={decoded_peak}"
+        );
+        let (input, _) = controls.take_levels(now + LEVELS_INTERVAL * 4).unwrap();
+        assert!(input > 0.6, "fresh unmuted input peaks must resume");
+        audio.input_applied.store(unmuted_token, Ordering::Release);
+        assert!(!controls.confirmed().unwrap().muted);
+
+        // Legacy mute has the same silence and telemetry privacy boundary.
+        controls
+            .begin(None, Some(true), None, None, now + LEVELS_INTERVAL * 4)
+            .unwrap();
+        (io.capture)(audio.input_token(), &tone);
+        let frame = frames.try_recv().unwrap();
+        let (size, token) = encode_frame(
+            &mut encoder,
+            &mut encoded_token,
+            &frame,
+            &audio,
+            &mut packet,
+        )
+        .unwrap()
+        .unwrap();
+        decoder.reset_state().unwrap();
+        decoder
+            .decode_float(&packet[..size], &mut decoded, false)
+            .unwrap();
+        assert!(decoded.iter().all(|sample| sample.abs() < 0.001));
+        assert_eq!(
+            controls.take_levels(now + LEVELS_INTERVAL * 5),
+            Some((0.0, 0.0))
+        );
+        assert!(controls.confirmed().is_none());
+        audio.input_applied.store(token, Ordering::Release);
+        let confirmation = controls.confirmed().unwrap();
+        assert_eq!(confirmation.control_id, None);
+        assert!(confirmation.muted);
+    }
+
+    #[test]
+    fn native_levels_start_only_on_opt_in_and_stop_when_disabled() {
+        let (mut peer, devices, events) = start_fake();
+        wait_offer(&events);
+        devices.capture(&[0.9; FRAME_SAMPLES]);
+        devices.render();
+        assert!(events.recv_timeout(Duration::from_millis(120)).is_err());
+        peer.apply_control(device_control(1, None, None, Some(true)));
+        applied(&events, 1, false, false);
+        devices.capture(&[0.75; FRAME_SAMPLES]);
+        devices.render();
+        match events.recv_timeout(Duration::from_secs(2)) {
+            Ok(PeerEvent::Levels(levels)) => {
+                assert_eq!(levels.session_id, "media_test");
+                assert_eq!(levels.input_peak, 0.75);
+                assert_eq!(levels.output_peak, 0.0);
+            }
+            other => panic!("expected levels after opt-in, got {other:?}"),
+        }
+        peer.apply_control(device_control(2, None, None, Some(false)));
+        applied(&events, 2, false, false);
+        devices.capture(&[1.0; FRAME_SAMPLES]);
+        assert!(events.recv_timeout(Duration::from_millis(240)).is_err());
+        peer.close();
+    }
+
+    #[test]
+    fn native_muted_levels_are_zero_and_late_muted_capture_cannot_confirm_unmute() {
+        fn confirmation_and_levels(
+            events: &std_mpsc::Receiver<PeerEvent>,
+            control_id: Option<u64>,
+            muted: bool,
+            expected_peak: f32,
+        ) {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let mut confirmed = false;
+            let mut metered = false;
+            while !confirmed || !metered {
+                match events.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                    Ok(PeerEvent::Applied(update)) if control_id == Some(update.control_id) => {
+                        assert_eq!(update.input_muted, muted);
+                        assert!(!update.output_suppressed);
+                        confirmed = true;
+                    }
+                    Ok(PeerEvent::State { muted: applied, .. }) if control_id.is_none() => {
+                        assert_eq!(applied, muted);
+                        confirmed = true;
+                    }
+                    Ok(PeerEvent::Levels(levels)) => {
+                        assert_eq!(levels.session_id, "media_test");
+                        assert_eq!(levels.output_peak, 0.0);
+                        if muted {
+                            assert_eq!(levels.input_peak, 0.0, "muted mic telemetry must be zero");
+                            metered = true;
+                        } else {
+                            // A queued muted tick may precede the fresh unmuted peak.
+                            assert!(levels.input_peak == 0.0 || levels.input_peak == expected_peak);
+                            metered |= levels.input_peak == expected_peak;
+                        }
+                    }
+                    other => panic!("expected confirmation and input levels, got {other:?}"),
+                }
+            }
+        }
+
+        let (mut peer, devices, events) = start_fake();
+        wait_offer(&events);
+        let audio = devices.state();
+        // Enable levels and mute together, with actual nonzero FakeAudio input.
+        peer.apply_control(device_control(1, Some(true), None, Some(true)));
+        let muted_token = devices.wait_request(true, 0);
+        devices.capture(&[0.9; FRAME_SAMPLES]);
+        confirmation_and_levels(&events, Some(1), true, 0.0);
+
+        peer.apply_control(device_control(2, Some(false), None, None));
+        let unmuted_token = devices.wait_request(true, muted_token);
+        // Model a CPAL callback whose conversion began under the old muted token.
+        devices.capture_with_token(muted_token, &[0.9; FRAME_SAMPLES]);
+        match events.recv_timeout(Duration::from_secs(2)) {
+            Ok(PeerEvent::Levels(levels)) => assert_eq!(levels.input_peak, 0.0),
+            other => panic!("late muted capture must not confirm unmute, got {other:?}"),
+        }
+        assert_eq!(audio.input_applied.load(Ordering::Acquire), muted_token);
+        devices.capture(&[0.75; FRAME_SAMPLES]);
+        confirmation_and_levels(&events, Some(2), false, 0.75);
+
+        peer.set_muted(true);
+        devices.wait_request(true, unmuted_token);
+        devices.capture(&[0.8; FRAME_SAMPLES]);
+        confirmation_and_levels(&events, None, true, 0.0);
+        peer.close();
+    }
+
+    #[test]
+    fn native_device_change_event_and_default_input_check_close_after_device_release() {
+        for event_driven in [true, false] {
+            let (mut peer, devices, events) = start_fake();
+            wait_offer(&events);
+            if event_driven {
+                (devices.callbacks.lock().unwrap().as_ref().unwrap().changed)();
+            } else {
+                devices.default_changed.store(true, Ordering::Release);
+            }
+            match events.recv_timeout(Duration::from_secs(4)) {
+                Ok(PeerEvent::Closed { code, .. }) => assert_eq!(code, close_code::DEVICE_CHANGED),
+                other => panic!("expected device_changed, got {other:?}"),
+            }
+            assert!(devices.released.load(Ordering::SeqCst));
+            assert!(wait_until(&peer.stopped, Duration::from_secs(2)));
+            peer.close();
+        }
+    }
+
+    #[test]
+    fn native_command_overload_closes_instead_of_growing_an_unbounded_control_queue() {
+        let (mut peer, devices, events) = start_fake();
+        wait_offer(&events);
+        peer.apply_control(device_control(1, Some(true), None, None));
+        devices.wait_request(true, 0);
+        for id in 2..=(COMMAND_CAPACITY as u64 + 2) {
+            peer.apply_control(device_control(id, Some(false), None, None));
+        }
+        match events.recv_timeout(Duration::from_secs(4)) {
+            Ok(PeerEvent::Closed { code, message, .. }) => {
+                assert_eq!(code, close_code::DEVICE_ERROR);
+                assert!(message.contains("too many pending"));
+            }
+            other => panic!("expected an overload close, got {other:?}"),
+        }
+        assert!(devices.released.load(Ordering::SeqCst));
+        peer.close();
+    }
+
+    #[test]
+    fn device_info_bounds_names_by_utf8_bytes() {
+        let info = OpenedAudio::new(
+            Box::new(()),
+            format!("{}é", "a".repeat(511)),
+            "é".repeat(300),
+        )
+        .info("media_test");
+        assert_eq!(info.input_device.len(), 511);
+        assert_eq!(info.output_device.len(), 512);
+        assert_eq!(info.output_device.chars().count(), 256);
     }
 
     #[test]

@@ -7,12 +7,14 @@
 
 use std::sync::Arc;
 
-use crate::protocol::media::MediaPeerState;
+use crate::protocol::media::{
+    MediaApplied, MediaDeviceControl, MediaInfo, MediaLevels, MediaPeerState,
+};
 
 /// Asynchronous results from a peer. The peer calls the sink from its own threads.
 // Only the native peer constructs these; builds without it have none outside tests.
 #[cfg_attr(not(feature = "native-media"), allow(dead_code))]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum PeerEvent {
     /// The complete local SDP offer (ICE gathering finished or timed out).
     Offer { session_id: String, sdp: String },
@@ -23,6 +25,12 @@ pub(crate) enum PeerEvent {
         muted: bool,
         detail: Option<String>,
     },
+    /// A device control reached both capture/encoder and speaker callbacks.
+    Applied(MediaApplied),
+    /// Opted-in, throttled peaks measured by the capture and speaker paths.
+    Levels(MediaLevels),
+    /// Build, process and device information for the connected peer.
+    Info(MediaInfo),
     /// The peer ended on its own (device loss, ICE or DTLS failure). It has already released
     /// the microphone and speaker. `code` is one of `protocol::media::close_code`.
     Closed {
@@ -40,6 +48,9 @@ pub(crate) trait MediaPeer: Send {
     fn apply_answer(&mut self, sdp: String);
     /// Mute or unmute the local microphone. The peer confirms with a `State` event.
     fn set_muted(&mut self, muted: bool);
+    /// Queue device changes in arrival order. Confirm each with `Applied` only after the
+    /// audio paths observe it; a later control must not overwrite an unconfirmed one.
+    fn apply_control(&mut self, control: MediaDeviceControl);
     /// Stop media and release the microphone and speaker. Idempotent. Dropping a peer
     /// must have the same effect.
     fn close(&mut self);

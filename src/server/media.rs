@@ -13,8 +13,8 @@ use crate::api::schema::{
 };
 use crate::layout::PaneId;
 use crate::protocol::media::{
-    close_code, MediaClose, MediaControl, MediaMute, MediaOpen, MediaPeerState, MediaSdp,
-    MEDIA_INPUT_WINDOW,
+    close_code, MediaApplied, MediaClose, MediaControl, MediaInfo, MediaLevels, MediaMute,
+    MediaOpen, MediaPeerState, MediaSdp, MEDIA_INPUT_WINDOW,
 };
 
 /// How long `pane.media_open` waits for the client's offer. It covers the one-time consent
@@ -74,6 +74,13 @@ struct PendingOpen {
     deadline: Instant,
 }
 
+#[derive(Debug, Default)]
+struct MediaTelemetry {
+    applied: Option<MediaApplied>,
+    levels: Option<MediaLevels>,
+    info: Option<MediaInfo>,
+}
+
 #[derive(Debug)]
 struct MediaSession {
     client_id: u64,
@@ -89,6 +96,7 @@ struct MediaSession {
     state: MediaSessionState,
     muted: bool,
     pending: Option<PendingOpen>,
+    telemetry: MediaTelemetry,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,6 +124,15 @@ impl MediaSessionView {
 struct ClosedSession {
     closed_at: Instant,
     view: MediaSessionView,
+}
+
+fn store_client_media_state(session: &mut MediaSession, control: MediaControl) {
+    match control {
+        MediaControl::Applied(applied) => session.telemetry.applied = Some(applied),
+        MediaControl::Levels(levels) => session.telemetry.levels = Some(levels),
+        MediaControl::Info(info) => session.telemetry.info = Some(info),
+        _ => {}
+    }
 }
 
 #[derive(Debug)]
@@ -423,6 +440,7 @@ impl MediaBroker {
                     respond_to,
                     deadline: now + MEDIA_OPEN_TIMEOUT,
                 }),
+                telemetry: MediaTelemetry::default(),
             },
         );
         actions.push(MediaAction::Send {
@@ -453,11 +471,21 @@ impl MediaBroker {
         now: Instant,
     ) -> Vec<MediaAction> {
         let mut actions = Vec::new();
+        if control.validate().is_err() {
+            return actions;
+        }
         let session_id = control.session_id().to_owned();
         let Some(session) = self.sessions.get_mut(&session_id) else {
             return actions;
         };
         if session.client_id != client_id {
+            return actions;
+        }
+        if matches!(
+            &control,
+            MediaControl::Applied(_) | MediaControl::Levels(_) | MediaControl::Info(_)
+        ) {
+            store_client_media_state(session, control);
             return actions;
         }
         match control {
@@ -502,7 +530,13 @@ impl MediaBroker {
                 let message = message.unwrap_or_else(|| "the client ended the session".to_owned());
                 self.finish(&session_id, &code, &message, false, now, &mut actions);
             }
-            MediaControl::Open(_) | MediaControl::Answer(_) | MediaControl::Mute(_) => {}
+            MediaControl::Open(_)
+            | MediaControl::Answer(_)
+            | MediaControl::Mute(_)
+            | MediaControl::Control(_)
+            | MediaControl::Applied(_)
+            | MediaControl::Levels(_)
+            | MediaControl::Info(_) => {}
         }
         actions
     }
@@ -582,6 +616,30 @@ impl MediaBroker {
             .iter()
             .find(|closed| closed.view.session_id == session_id)
             .map(|closed| closed.view.clone())
+    }
+
+    // This broker seam is consumed by the optional media API/event integration.
+    #[allow(dead_code)]
+    pub(crate) fn applied(&self, session_id: &str) -> Option<&MediaApplied> {
+        self.sessions
+            .get(session_id)
+            .and_then(|session| session.telemetry.applied.as_ref())
+    }
+
+    // This broker seam is consumed by the optional media API/event integration.
+    #[allow(dead_code)]
+    pub(crate) fn levels(&self, session_id: &str) -> Option<&MediaLevels> {
+        self.sessions
+            .get(session_id)
+            .and_then(|session| session.telemetry.levels.as_ref())
+    }
+
+    // This broker seam is consumed by the optional media API/event integration.
+    #[allow(dead_code)]
+    pub(crate) fn info(&self, session_id: &str) -> Option<&MediaInfo> {
+        self.sessions
+            .get(session_id)
+            .and_then(|session| session.telemetry.info.as_ref())
     }
 
     /// End a session at the API caller's request. Unknown ids are a no-op.
@@ -1140,6 +1198,84 @@ mod tests {
             broker.state(&session_id).unwrap().code.as_deref(),
             Some(close_code::DECLINED)
         );
+    }
+
+    #[test]
+    fn broker_rejects_wrong_owner_and_stores_latest_device_state() {
+        let now = Instant::now();
+        let mut broker = MediaBroker::new();
+        broker.client_connected(1, true);
+        broker.client_connected(2, true);
+        let session_id = live_call(&mut broker, 1, pane(7), now);
+
+        assert!(run(broker.client_control(
+            2,
+            MediaControl::Applied(MediaApplied {
+                session_id: session_id.clone(),
+                control_id: 1,
+                input_muted: true,
+                output_suppressed: false,
+            }),
+            now,
+        ))
+        .is_empty());
+        assert!(broker.applied(&session_id).is_none());
+
+        run(broker.client_control(
+            1,
+            MediaControl::Applied(MediaApplied {
+                session_id: session_id.clone(),
+                control_id: 1,
+                input_muted: true,
+                output_suppressed: false,
+            }),
+            now,
+        ));
+        run(broker.client_control(
+            1,
+            MediaControl::Applied(MediaApplied {
+                session_id: session_id.clone(),
+                control_id: 2,
+                input_muted: false,
+                output_suppressed: true,
+            }),
+            now,
+        ));
+        assert_eq!(broker.applied(&session_id).unwrap().control_id, 2);
+        assert!(!broker.applied(&session_id).unwrap().input_muted);
+        assert!(broker.applied(&session_id).unwrap().output_suppressed);
+
+        run(broker.client_control(
+            1,
+            MediaControl::Levels(MediaLevels {
+                session_id: session_id.clone(),
+                input_peak: 0.25,
+                output_peak: 0.75,
+            }),
+            now,
+        ));
+        assert_eq!(
+            (
+                broker.levels(&session_id).unwrap().input_peak,
+                broker.levels(&session_id).unwrap().output_peak,
+            ),
+            (0.25, 0.75)
+        );
+
+        run(broker.client_control(
+            1,
+            MediaControl::Info(MediaInfo {
+                session_id: session_id.clone(),
+                version: "0.1.0".into(),
+                commit: "abc123".into(),
+                pid: 42,
+                input_device: "mic".into(),
+                output_device: "speaker".into(),
+            }),
+            now,
+        ));
+        assert_eq!(broker.info(&session_id).unwrap().pid, 42);
+        assert_eq!(broker.info(&session_id).unwrap().input_device, "mic");
     }
 
     #[test]

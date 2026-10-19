@@ -24,7 +24,7 @@ use crate::protocol::media::{
 pub(super) const MEDIA_CONSENT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Work for the client loop after a controller call.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(super) enum MediaEffect {
     /// Send this control to the endpoint.
     Send(ClientEndpointId, MediaControl),
@@ -44,8 +44,9 @@ struct MediaSession {
     session_id: String,
     /// The pane this call is for, so a renewal of it can be recognised (smarty-voice#133).
     pane_id: String,
-    /// The mute last applied to this call's peer: a renewal's new peer starts with it (herdr#102 security pass).
-    muted: bool,
+    /// Latest requested input mute, including controls awaiting the audio paths. A renewal
+    /// must retain this intent, not an older acknowledgement (herdr#102 security pass).
+    desired_input_muted: bool,
     peer: Box<dyn MediaPeer>,
 }
 
@@ -158,9 +159,37 @@ impl ClientMedia {
             }
             MediaControl::Mute(mute) => {
                 if let Some(session) = self.owned_session(endpoint_id, &mute.session_id) {
-                    session.muted = mute.muted;
+                    session.desired_input_muted = mute.muted;
                     session.peer.set_muted(mute.muted);
                 }
+            }
+            MediaControl::Control(control) => {
+                let Some(session) = self
+                    .session
+                    .as_mut()
+                    .filter(|session| session.session_id == control.session_id)
+                else {
+                    self.refuse(
+                        endpoint_id,
+                        control.session_id,
+                        close_code::CLOSED,
+                        "this client has no live peer for that media session",
+                    );
+                    return;
+                };
+                if &session.endpoint_id != endpoint_id {
+                    self.refuse(
+                        endpoint_id,
+                        control.session_id,
+                        close_code::WRONG_ENDPOINT,
+                        "this media session belongs to another server",
+                    );
+                    return;
+                }
+                if let Some(muted) = control.input_muted {
+                    session.desired_input_muted = muted;
+                }
+                session.peer.apply_control(control);
             }
             MediaControl::Close(close) => {
                 if self.owned_session(endpoint_id, &close.session_id).is_some() {
@@ -172,7 +201,11 @@ impl ClientMedia {
                 }
             }
             // Client-to-server kinds; a server never sends them.
-            MediaControl::Offer(_) | MediaControl::State(_) => {}
+            MediaControl::Offer(_)
+            | MediaControl::State(_)
+            | MediaControl::Applied(_)
+            | MediaControl::Levels(_)
+            | MediaControl::Info(_) => {}
         }
     }
 
@@ -345,6 +378,20 @@ impl ClientMedia {
                     }),
                 ));
             }
+            PeerEvent::Applied(applied) if applied.session_id == current => {
+                self.effects.push(MediaEffect::Send(
+                    endpoint_id,
+                    MediaControl::Applied(applied),
+                ));
+            }
+            PeerEvent::Levels(levels) if levels.session_id == current => {
+                self.effects
+                    .push(MediaEffect::Send(endpoint_id, MediaControl::Levels(levels)));
+            }
+            PeerEvent::Info(info) if info.session_id == current => {
+                self.effects
+                    .push(MediaEffect::Send(endpoint_id, MediaControl::Info(info)));
+            }
             PeerEvent::Closed {
                 session_id,
                 code,
@@ -382,7 +429,9 @@ impl ClientMedia {
     fn start(&mut self, endpoint_id: ClientEndpointId, session_id: String, pane_id: String) {
         // A renewal of the same call keeps its mute from the first sample (closed before the new peer opens).
         let keep_muted = self.session.as_ref().is_some_and(|previous| {
-            previous.muted && previous.endpoint_id == endpoint_id && previous.pane_id == pane_id
+            previous.desired_input_muted
+                && previous.endpoint_id == endpoint_id
+                && previous.pane_id == pane_id
         });
         if let Some(mut previous) = self.session.take() {
             previous.peer.close();
@@ -402,7 +451,7 @@ impl ClientMedia {
                     endpoint_id,
                     session_id,
                     pane_id,
-                    muted: keep_muted,
+                    desired_input_muted: keep_muted,
                     peer,
                 });
                 self.notice("Voice call started");
@@ -495,13 +544,16 @@ mod tests {
 
     use super::*;
     use crate::api::schema::MediaSessionState;
-    use crate::protocol::media::MediaPeerState;
+    use crate::protocol::media::{
+        MediaApplied, MediaDeviceControl, MediaInfo, MediaLevels, MediaPeerState,
+    };
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum PeerCall {
         Start(String),
         Answer(String, String),
         Mute(String, bool),
+        Control(String, MediaDeviceControl),
         Close(String),
     }
 
@@ -525,6 +577,13 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(PeerCall::Mute(self.session_id.clone(), muted));
+        }
+
+        fn apply_control(&mut self, control: MediaDeviceControl) {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(PeerCall::Control(self.session_id.clone(), control));
         }
 
         fn close(&mut self) {
@@ -560,6 +619,46 @@ mod tests {
 
     fn local() -> ClientEndpointId {
         ClientEndpointId::Local
+    }
+
+    fn remote() -> ClientEndpointId {
+        ClientEndpointId::Ssh(
+            crate::client::endpoint::ProfileId::parse("0123456789abcdef0123456789abcdef").unwrap(),
+        )
+    }
+
+    fn device_control(session_id: &str, control_id: u64) -> MediaDeviceControl {
+        MediaDeviceControl {
+            session_id: session_id.into(),
+            control_id,
+            input_muted: None,
+            output_suppressed: None,
+            levels: None,
+        }
+    }
+
+    fn device_events(session_id: &str) -> [PeerEvent; 3] {
+        [
+            PeerEvent::Applied(MediaApplied {
+                session_id: session_id.into(),
+                control_id: 7,
+                input_muted: true,
+                output_suppressed: true,
+            }),
+            PeerEvent::Levels(MediaLevels {
+                session_id: session_id.into(),
+                input_peak: 0.25,
+                output_peak: 0.5,
+            }),
+            PeerEvent::Info(MediaInfo {
+                session_id: session_id.into(),
+                version: "test-version".into(),
+                commit: "test-commit".into(),
+                pid: 42,
+                input_device: "microphone".into(),
+                output_device: "speaker".into(),
+            }),
+        ]
     }
 
     fn open(media: &mut ClientMedia, session_id: &str, pane_id: &str, now: Instant) {
@@ -875,10 +974,23 @@ mod tests {
     }
 
     fn started(mode: MediaMode) -> (ClientMedia, Calls) {
+        started_on(mode, &local())
+    }
+
+    fn started_on(mode: MediaMode, endpoint_id: &ClientEndpointId) -> (ClientMedia, Calls) {
         let (mut media, calls) = media(mode, false);
         let now = Instant::now();
-        media.note_pane_input(&local(), "pane_1", now);
-        open(&mut media, "m1", "pane_1", now);
+        media.note_pane_input(endpoint_id, "pane_1", now);
+        media.handle_server_control(
+            endpoint_id,
+            MediaControl::Open(MediaOpen {
+                session_id: "m1".into(),
+                pane_id: "pane_1".into(),
+            }),
+            true,
+            |_| Some("label pane_1".into()),
+            now,
+        );
         media.take_effects();
         (media, calls)
     }
@@ -1250,6 +1362,255 @@ mod tests {
             ]
         );
         assert!(media.take_effects().is_empty());
+    }
+
+    // Trust boundary: only the owning endpoint may reach the live peer. The native peer
+    // owns audio acknowledgement; dispatch must preserve arrival order without inventing one.
+    #[test]
+    fn device_controls_reach_the_owned_peer_in_arrival_order_without_early_ack() {
+        let owner = remote();
+        let (mut media, calls) = started_on(MediaMode::Auto, &owner);
+        let first = MediaDeviceControl {
+            input_muted: Some(true),
+            output_suppressed: Some(true),
+            levels: Some(true),
+            ..device_control("m1", 9)
+        };
+        let second = MediaDeviceControl {
+            input_muted: Some(false),
+            output_suppressed: Some(false),
+            levels: Some(false),
+            ..device_control("m1", 3)
+        };
+        for control in [&first, &second] {
+            // An existing call remains controllable even when its endpoint is not shown.
+            media.handle_server_control(
+                &owner,
+                MediaControl::Control(control.clone()),
+                false,
+                |_| None,
+                Instant::now(),
+            );
+        }
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![
+                PeerCall::Start("m1".into()),
+                PeerCall::Control("m1".into(), first),
+                PeerCall::Control("m1".into(), second),
+            ]
+        );
+        assert!(media.take_effects().is_empty(), "no speculative Applied");
+    }
+
+    #[test]
+    fn device_controls_for_unknown_pending_and_closed_sessions_reply_closed() {
+        let (mut media, calls) = started(MediaMode::Auto);
+        let now = Instant::now();
+        media.handle_server_control(
+            &remote(),
+            MediaControl::Control(device_control("unknown", 1)),
+            true,
+            |_| None,
+            now,
+        );
+        assert_eq!(
+            media.take_effects(),
+            vec![MediaEffect::Send(
+                remote(),
+                MediaControl::Close(MediaClose::new(
+                    "unknown",
+                    close_code::CLOSED,
+                    "this client has no live peer for that media session",
+                )),
+            )]
+        );
+        assert_eq!(*calls.lock().unwrap(), vec![PeerCall::Start("m1".into())]);
+
+        media.handle_server_control(
+            &local(),
+            MediaControl::Close(MediaClose::new("m1", close_code::CLOSED, "done")),
+            true,
+            |_| None,
+            now,
+        );
+        media.take_effects();
+        media.handle_server_control(
+            &local(),
+            MediaControl::Control(device_control("m1", 2)),
+            true,
+            |_| None,
+            now,
+        );
+        assert_eq!(refusal(&mut media).as_deref(), Some(close_code::CLOSED));
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![PeerCall::Start("m1".into()), PeerCall::Close("m1".into())]
+        );
+
+        let (mut pending, calls) = started(MediaMode::Ask);
+        pending.handle_server_control(
+            &local(),
+            MediaControl::Control(device_control("m1", 3)),
+            true,
+            |_| None,
+            now,
+        );
+        assert_eq!(refusal(&mut pending).as_deref(), Some(close_code::CLOSED));
+        assert!(pending.pending.is_some(), "no peer before consent");
+        assert!(calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn device_control_from_the_wrong_endpoint_cannot_reach_or_mute_the_peer() {
+        let (mut media, calls) = started(MediaMode::Auto);
+        media.handle_server_control(
+            &remote(),
+            MediaControl::Control(MediaDeviceControl {
+                input_muted: Some(true),
+                ..device_control("m1", 1)
+            }),
+            true,
+            |_| None,
+            Instant::now(),
+        );
+        assert_eq!(
+            media.take_effects(),
+            vec![MediaEffect::Send(
+                remote(),
+                MediaControl::Close(MediaClose::new(
+                    "m1",
+                    close_code::WRONG_ENDPOINT,
+                    "this media session belongs to another server",
+                )),
+            )]
+        );
+        assert_eq!(*calls.lock().unwrap(), vec![PeerCall::Start("m1".into())]);
+        assert!(!media.session.as_ref().unwrap().desired_input_muted);
+    }
+
+    #[test]
+    fn current_peer_applied_levels_and_info_go_only_to_its_endpoint() {
+        let owner = remote();
+        let (mut media, calls) = started_on(MediaMode::Auto, &owner);
+        for event in device_events("m1") {
+            media.handle_peer_event(event);
+        }
+        assert_eq!(
+            media.take_effects(),
+            vec![
+                MediaEffect::Send(
+                    owner.clone(),
+                    MediaControl::Applied(MediaApplied {
+                        session_id: "m1".into(),
+                        control_id: 7,
+                        input_muted: true,
+                        output_suppressed: true,
+                    }),
+                ),
+                MediaEffect::Send(
+                    owner.clone(),
+                    MediaControl::Levels(MediaLevels {
+                        session_id: "m1".into(),
+                        input_peak: 0.25,
+                        output_peak: 0.5,
+                    }),
+                ),
+                MediaEffect::Send(
+                    owner,
+                    MediaControl::Info(MediaInfo {
+                        session_id: "m1".into(),
+                        version: "test-version".into(),
+                        commit: "test-commit".into(),
+                        pid: 42,
+                        input_device: "microphone".into(),
+                        output_device: "speaker".into(),
+                    }),
+                ),
+            ]
+        );
+        assert_eq!(*calls.lock().unwrap(), vec![PeerCall::Start("m1".into())]);
+    }
+
+    #[test]
+    fn replaced_and_closed_peer_device_events_are_ignored() {
+        let (mut media, _) = started(MediaMode::Auto);
+        open(&mut media, "m2", "pane_1", Instant::now());
+        media.take_effects();
+        for event in device_events("m1") {
+            media.handle_peer_event(event);
+        }
+        assert!(media.take_effects().is_empty(), "old peer was replaced");
+
+        media.handle_peer_event(PeerEvent::Closed {
+            session_id: "m2".into(),
+            code: close_code::CLOSED,
+            message: "done".into(),
+        });
+        media.take_effects();
+        for event in device_events("m2") {
+            media.handle_peer_event(event);
+        }
+        assert!(media.take_effects().is_empty(), "current peer is closed");
+    }
+
+    // Data safety: a late acknowledgement must not unmute a replacement peer when the
+    // latest input mute is still in flight, nor undo a later requested unmute.
+    #[test]
+    fn renewal_uses_latest_requested_input_mute_not_an_older_applied_event() {
+        for desired in [true, false] {
+            let (mut media, calls) = started(MediaMode::Auto);
+            let now = Instant::now();
+            for (control_id, muted) in [(1, !desired), (2, desired)] {
+                media.handle_server_control(
+                    &local(),
+                    MediaControl::Control(MediaDeviceControl {
+                        input_muted: Some(muted),
+                        ..device_control("m1", control_id)
+                    }),
+                    true,
+                    |_| None,
+                    now,
+                );
+            }
+            media.handle_peer_event(PeerEvent::Applied(MediaApplied {
+                session_id: "m1".into(),
+                control_id: 1,
+                input_muted: !desired,
+                output_suppressed: false,
+            }));
+            // Omitting input_muted must retain its desired value.
+            media.handle_server_control(
+                &local(),
+                MediaControl::Control(MediaDeviceControl {
+                    output_suppressed: Some(true),
+                    levels: Some(true),
+                    ..device_control("m1", 3)
+                }),
+                true,
+                |_| None,
+                now,
+            );
+            open(
+                &mut media,
+                "m2",
+                "pane_1",
+                now + MEDIA_INPUT_WINDOW + Duration::from_secs(60),
+            );
+            assert_eq!(media.session.as_ref().unwrap().desired_input_muted, desired);
+            let calls = calls.lock().unwrap();
+            let start = calls
+                .iter()
+                .position(|call| *call == PeerCall::Start("m2".into()))
+                .expect("renewal starts without fresh input");
+            assert_eq!(calls[start - 1], PeerCall::Close("m1".into()));
+            let expected = if desired {
+                vec![PeerCall::Mute("m2".into(), true)]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(&calls[start + 1..], expected.as_slice());
+        }
     }
 
     #[test]

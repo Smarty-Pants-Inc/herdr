@@ -13,6 +13,9 @@ pub(crate) use diagnostic_owner::{
 #[cfg(unix)]
 pub(crate) mod ssh_agent;
 
+#[cfg(all(feature = "native-media", target_os = "macos"))]
+pub(crate) mod macos_media;
+
 /// Git metadata watches use the native backend directly except where native
 /// control calls need a bounded ownership boundary. Other notify users are
 /// deliberately unaffected.

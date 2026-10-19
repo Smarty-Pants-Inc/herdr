@@ -31,6 +31,14 @@ pub const MEDIA_OFFER_KIND: &str = "media.offer.v1";
 pub const MEDIA_ANSWER_KIND: &str = "media.answer.v1";
 /// Server → client: mute or unmute the local microphone.
 pub const MEDIA_MUTE_KIND: &str = "media.mute.v1";
+/// Server → client: apply a device control and report it when the device has applied it.
+pub const MEDIA_CONTROL_KIND: &str = "media.control.v1";
+/// Client → server: a device control was applied at the device boundary.
+pub const MEDIA_APPLIED_KIND: &str = "media.applied.v1";
+/// Client → server: the latest opt-in audio levels.
+pub const MEDIA_LEVELS_KIND: &str = "media.levels.v1";
+/// Client → server: connected device and build information.
+pub const MEDIA_INFO_KIND: &str = "media.info.v1";
 /// Client → server: peer state changes (connecting, connected, muted, failed).
 pub const MEDIA_STATE_KIND: &str = "media.state.v1";
 /// Both directions: end the session. Sent by the client before an offer, it is a refusal.
@@ -61,6 +69,10 @@ pub mod close_code {
     pub const WRONG_ENDPOINT: &str = "wrong_endpoint";
     /// The audio device or WebRTC peer failed.
     pub const DEVICE_ERROR: &str = "device_error";
+    /// A default audio device changed; the caller must renew the session.
+    // Emitted by the optional native-media client; other builds still expose its code.
+    #[allow(dead_code)]
+    pub const DEVICE_CHANGED: &str = "device_changed";
     /// The API caller or the user ended the session.
     pub const CLOSED: &str = "closed";
     /// The client or its connection went away.
@@ -90,6 +102,43 @@ pub struct MediaSdp {
 pub struct MediaMute {
     pub session_id: String,
     pub muted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MediaDeviceControl {
+    pub session_id: String,
+    pub control_id: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_muted: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_suppressed: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub levels: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MediaApplied {
+    pub session_id: String,
+    pub control_id: u64,
+    pub input_muted: bool,
+    pub output_suppressed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MediaLevels {
+    pub session_id: String,
+    pub input_peak: f32,
+    pub output_peak: f32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MediaInfo {
+    pub session_id: String,
+    pub version: String,
+    pub commit: String,
+    pub pid: u32,
+    pub input_device: String,
+    pub output_device: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -132,12 +181,16 @@ impl MediaClose {
 }
 
 /// One decoded media control, in either direction.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum MediaControl {
     Open(MediaOpen),
     Offer(MediaSdp),
     Answer(MediaSdp),
     Mute(MediaMute),
+    Control(MediaDeviceControl),
+    Applied(MediaApplied),
+    Levels(MediaLevels),
+    Info(MediaInfo),
     State(MediaStateUpdate),
     Close(MediaClose),
 }
@@ -149,6 +202,10 @@ impl MediaControl {
             Self::Offer(_) => MEDIA_OFFER_KIND,
             Self::Answer(_) => MEDIA_ANSWER_KIND,
             Self::Mute(_) => MEDIA_MUTE_KIND,
+            Self::Control(_) => MEDIA_CONTROL_KIND,
+            Self::Applied(_) => MEDIA_APPLIED_KIND,
+            Self::Levels(_) => MEDIA_LEVELS_KIND,
+            Self::Info(_) => MEDIA_INFO_KIND,
             Self::State(_) => MEDIA_STATE_KIND,
             Self::Close(_) => MEDIA_CLOSE_KIND,
         }
@@ -159,6 +216,10 @@ impl MediaControl {
             Self::Open(open) => &open.session_id,
             Self::Offer(sdp) | Self::Answer(sdp) => &sdp.session_id,
             Self::Mute(mute) => &mute.session_id,
+            Self::Control(control) => &control.session_id,
+            Self::Applied(applied) => &applied.session_id,
+            Self::Levels(levels) => &levels.session_id,
+            Self::Info(info) => &info.session_id,
             Self::State(state) => &state.session_id,
             Self::Close(close) => &close.session_id,
         }
@@ -180,6 +241,10 @@ impl MediaControl {
             MEDIA_OFFER_KIND => parse(kind, data).map(Self::Offer),
             MEDIA_ANSWER_KIND => parse(kind, data).map(Self::Answer),
             MEDIA_MUTE_KIND => parse(kind, data).map(Self::Mute),
+            MEDIA_CONTROL_KIND => parse(kind, data).map(Self::Control),
+            MEDIA_APPLIED_KIND => parse(kind, data).map(Self::Applied),
+            MEDIA_LEVELS_KIND => parse(kind, data).map(Self::Levels),
+            MEDIA_INFO_KIND => parse(kind, data).map(Self::Info),
             MEDIA_STATE_KIND => parse(kind, data).map(Self::State),
             MEDIA_CLOSE_KIND => parse(kind, data).map(Self::Close),
             _ => return None,
@@ -199,6 +264,20 @@ impl MediaControl {
                     !sdp.sdp.is_empty() && sdp.sdp.len() <= MAX_MEDIA_SDP_BYTES
                 }
                 Self::Mute(_) => true,
+                Self::Control(_) => true,
+                Self::Applied(_) => true,
+                Self::Levels(levels) => {
+                    levels.input_peak.is_finite()
+                        && levels.output_peak.is_finite()
+                        && (0.0..=1.0).contains(&levels.input_peak)
+                        && (0.0..=1.0).contains(&levels.output_peak)
+                }
+                Self::Info(info) => {
+                    text_ok(&info.version)
+                        && text_ok(&info.commit)
+                        && text_ok(&info.input_device)
+                        && text_ok(&info.output_device)
+                }
                 Self::State(state) => optional_ok(&state.detail),
                 Self::Close(close) => optional_ok(&close.code) && optional_ok(&close.message),
             };
@@ -214,6 +293,10 @@ impl MediaControl {
             Self::Open(open) => serde_json::to_string(open),
             Self::Offer(sdp) | Self::Answer(sdp) => serde_json::to_string(sdp),
             Self::Mute(mute) => serde_json::to_string(mute),
+            Self::Control(control) => serde_json::to_string(control),
+            Self::Applied(applied) => serde_json::to_string(applied),
+            Self::Levels(levels) => serde_json::to_string(levels),
+            Self::Info(info) => serde_json::to_string(info),
             Self::State(state) => serde_json::to_string(state),
             Self::Close(close) => serde_json::to_string(close),
         }
@@ -255,6 +338,32 @@ mod tests {
             MediaControl::Mute(MediaMute {
                 session_id: "media_1".into(),
                 muted: true,
+            }),
+            MediaControl::Control(MediaDeviceControl {
+                session_id: "media_1".into(),
+                control_id: 7,
+                input_muted: Some(true),
+                output_suppressed: Some(false),
+                levels: Some(true),
+            }),
+            MediaControl::Applied(MediaApplied {
+                session_id: "media_1".into(),
+                control_id: 7,
+                input_muted: true,
+                output_suppressed: false,
+            }),
+            MediaControl::Levels(MediaLevels {
+                session_id: "media_1".into(),
+                input_peak: 0.25,
+                output_peak: 0.75,
+            }),
+            MediaControl::Info(MediaInfo {
+                session_id: "media_1".into(),
+                version: "0.1.0".into(),
+                commit: "abc123".into(),
+                pid: 42,
+                input_device: "mic".into(),
+                output_device: "speaker".into(),
             }),
             MediaControl::State(MediaStateUpdate {
                 session_id: "media_1".into(),
@@ -355,6 +464,51 @@ mod tests {
         .unwrap();
         assert!(matches!(
             MediaControl::decode(MEDIA_OFFER_KIND, &huge),
+            Some(Err(_))
+        ));
+    }
+
+    #[test]
+    fn media_levels_require_finite_peaks_in_range() {
+        for value in ["NaN", "Infinity", "-Infinity", "-0.01", "1.01"] {
+            let data = format!(
+                r#"{{"session_id":"m","input_peak":{},"output_peak":0.5}}"#,
+                value
+            );
+            assert!(matches!(
+                MediaControl::decode(MEDIA_LEVELS_KIND, &data),
+                Some(Err(_)),
+            ));
+        }
+        assert!(MediaControl::Levels(MediaLevels {
+            session_id: "m".into(),
+            input_peak: f32::NAN,
+            output_peak: 0.5,
+        })
+        .validate()
+        .is_err());
+        assert!(MediaControl::Levels(MediaLevels {
+            session_id: "m".into(),
+            input_peak: 0.5,
+            output_peak: f32::INFINITY,
+        })
+        .validate()
+        .is_err());
+    }
+
+    #[test]
+    fn media_info_device_names_are_bounded_by_utf8_bytes() {
+        let huge = serde_json::to_string(&MediaInfo {
+            session_id: "m".into(),
+            version: "0.1.0".into(),
+            commit: "abc".into(),
+            pid: 42,
+            input_device: "界".repeat(MAX_MEDIA_TEXT_BYTES),
+            output_device: "speaker".into(),
+        })
+        .unwrap();
+        assert!(matches!(
+            MediaControl::decode(MEDIA_INFO_KIND, &huge),
             Some(Err(_))
         ));
     }

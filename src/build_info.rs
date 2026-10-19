@@ -10,6 +10,12 @@ pub fn build_id() -> Option<&'static str> {
     non_empty(option_env!("HERDR_BUILD_ID"))
 }
 
+/// Build-time Git revision, not an attestation that the source tree was clean.
+#[cfg(feature = "native-media")]
+pub fn commit() -> &'static str {
+    non_empty(option_env!("HERDR_BUILD_COMMIT")).unwrap_or("unknown")
+}
+
 pub fn version() -> String {
     match channel() {
         "stable" => BASE_VERSION.to_string(),
