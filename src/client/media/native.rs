@@ -433,16 +433,33 @@ fn opus_codec() -> RTCRtpCodecParameters {
     }
 }
 
+#[cfg(test)]
+fn loopback_setting_engine() -> webrtc::api::setting_engine::SettingEngine {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    let mut settings = webrtc::api::setting_engine::SettingEngine::default();
+    settings.set_include_loopback_candidate(true);
+    settings.set_ip_filter(Box::new(|ip| {
+        ip == IpAddr::V4(Ipv4Addr::LOCALHOST) || ip == IpAddr::V6(Ipv6Addr::LOCALHOST)
+    }));
+    // Query-only mDNS opens wildcard:5353 and joins multicast interfaces outside this
+    // fixture's loopback-only candidate filter.
+    settings.set_ice_multicast_dns_mode(webrtc::ice::mdns::MulticastDnsMode::Disabled);
+    settings
+}
+
 async fn new_peer_connection() -> webrtc::error::Result<RTCPeerConnection> {
     let mut media = MediaEngine::default();
     // Only Opus: capture encodes and playback decodes nothing else, so offering the other
     // default codecs (G722, PCMU, PCMA) would let an answer pick audio this peer cannot play.
     media.register_codec(opus_codec(), RTPCodecType::Audio)?;
     let registry = register_default_interceptors(Registry::new(), &mut media)?;
-    let api = APIBuilder::new()
+    let builder = APIBuilder::new()
         .with_media_engine(media)
-        .with_interceptor_registry(registry)
-        .build();
+        .with_interceptor_registry(registry);
+    #[cfg(test)]
+    let builder = builder.with_setting_engine(loopback_setting_engine());
+    let api = builder.build();
     // No ICE servers: host candidates reach the public ICE-lite remote peer.
     api.new_peer_connection(RTCConfiguration::default()).await
 }
@@ -1348,6 +1365,31 @@ mod tests {
         assert!(events.recv_timeout(Duration::from_millis(200)).is_err());
     }
 
+    fn assert_loopback_candidates(sdp: &str, side: &str) {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+        use webrtc::ice::candidate::{candidate_base::unmarshal_candidate, Candidate};
+
+        let mut addresses = std::collections::BTreeSet::new();
+        for line in sdp.lines().filter(|line| line.starts_with("a=candidate:")) {
+            let raw = line.strip_prefix("a=candidate:").expect("candidate prefix");
+            let candidate = unmarshal_candidate(raw)
+                .unwrap_or_else(|error| panic!("{side} candidate is invalid: {error}"));
+            let address = candidate.address();
+            let ip = address.parse::<IpAddr>().unwrap_or_else(|error| {
+                panic!("{side} candidate address {address:?} is not an IP: {error}")
+            });
+            assert!(
+                ip == IpAddr::V4(Ipv4Addr::LOCALHOST) || ip == IpAddr::V6(Ipv6Addr::LOCALHOST),
+                "{side} candidate address must be loopback, got {ip}"
+            );
+            addresses.insert(ip);
+        }
+        assert!(
+            !addresses.is_empty(),
+            "{side} SDP must contain at least one candidate"
+        );
+    }
+
     /// Answer with a real in-process WebRTC peer, then wait for client Connected/Info
     /// and a positive remote events-channel Open signal (discovery alone is too early).
     async fn connect_remote(
@@ -1366,6 +1408,7 @@ mod tests {
         let api = APIBuilder::new()
             .with_media_engine(media)
             .with_interceptor_registry(registry)
+            .with_setting_engine(loopback_setting_engine())
             .build();
         let remote = Arc::new(
             api.new_peer_connection(RTCConfiguration::default())
@@ -1385,6 +1428,7 @@ mod tests {
             }));
             Box::pin(async {})
         }));
+        assert_loopback_candidates(&offer, "native offer");
         remote
             .set_remote_description(RTCSessionDescription::offer(offer).expect("offer sdp"))
             .await
@@ -1397,6 +1441,7 @@ mod tests {
             .expect("apply answer");
         let _ = tokio::time::timeout(ICE_GATHER_TIMEOUT, gathered.recv()).await;
         let answer = remote.local_description().await.expect("local answer").sdp;
+        assert_loopback_candidates(&answer, "remote answer");
         peer.apply_answer(answer);
 
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
