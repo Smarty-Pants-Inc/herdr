@@ -1996,6 +1996,7 @@ mod tests {
             text: Bytes::from_static(b"forbidden"),
             enter: Bytes::from_static(b"\r"),
             delay: Duration::ZERO,
+            refuse_if_exists: None,
             reply,
         });
         let error = receipt
