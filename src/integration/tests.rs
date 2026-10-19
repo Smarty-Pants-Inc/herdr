@@ -1226,7 +1226,7 @@ fn claude_v9_integration_status_is_outdated_until_reinstalled() {
 
     assert_eq!(claude.path, hook_path);
     assert_eq!(claude.installed_version, Some(9));
-    assert_eq!(claude.expected_version, 10);
+    assert_eq!(claude.expected_version, 11);
     assert_eq!(claude.state, IntegrationStatusKind::Outdated);
 
     install_claude().unwrap();
@@ -1235,7 +1235,7 @@ fn claude_v9_integration_status_is_outdated_until_reinstalled() {
         hook_path,
         CLAUDE_INTEGRATION_VERSION,
     );
-    assert_eq!(status.installed_version, Some(10));
+    assert_eq!(status.installed_version, Some(11));
     assert_eq!(status.state, IntegrationStatusKind::Current);
 
     env.remove("HOME");
@@ -1265,8 +1265,129 @@ fn claude_v2_integration_status_is_outdated() {
 
     assert_eq!(claude.path, hook_path);
     assert_eq!(claude.installed_version, Some(2));
-    assert_eq!(claude.expected_version, 10);
+    assert_eq!(claude.expected_version, 11);
     assert_eq!(claude.state, IntegrationStatusKind::Outdated);
+
+    env.remove("HOME");
+    let _ = fs::remove_dir_all(base);
+}
+
+#[test]
+fn windows_hooks_decode_stdin_as_utf8() {
+    // Windows PowerShell decodes `[Console]::In` with the console input code
+    // page, which corrupts UTF-8 hook payloads on non-UTF-8 locales such as
+    // Korean Windows (CP949) and makes the hook silently drop the session.
+    // Every bundled PowerShell hook must read the raw stdin stream as UTF-8.
+    // See #5253.
+    for (name, asset) in [
+        (
+            "antigravity_cli",
+            include_str!("assets/antigravity_cli/herdr-agent-state.ps1"),
+        ),
+        (
+            "claude",
+            include_str!("assets/claude/herdr-agent-state.ps1"),
+        ),
+        ("codex", include_str!("assets/codex/herdr-agent-state.ps1")),
+        (
+            "copilot",
+            include_str!("assets/copilot/herdr-agent-state.ps1"),
+        ),
+        (
+            "cursor",
+            include_str!("assets/cursor/herdr-agent-state.ps1"),
+        ),
+        ("devin", include_str!("assets/devin/herdr-agent-state.ps1")),
+        ("droid", include_str!("assets/droid/herdr-agent-state.ps1")),
+        ("grok", include_str!("assets/grok/herdr-agent-state.ps1")),
+        ("kimi", include_str!("assets/kimi/herdr-agent-state.ps1")),
+        (
+            "letta",
+            include_str!("assets/letta/herdr-agent-session.ps1"),
+        ),
+        (
+            "mastracode",
+            include_str!("assets/mastracode/herdr-agent-state.ps1"),
+        ),
+        (
+            "qodercli",
+            include_str!("assets/qodercli/herdr-agent-state.ps1"),
+        ),
+        ("qwen", include_str!("assets/qwen/herdr-agent-session.ps1")),
+    ] {
+        assert!(
+            !asset.contains("[Console]::In.ReadToEnd()"),
+            "{name} hook must not decode stdin with the console input code page"
+        );
+        assert!(
+            asset.contains("[Console]::OpenStandardInput()")
+                && asset.contains("[System.Text.Encoding]::UTF8"),
+            "{name} hook must decode raw stdin as UTF-8"
+        );
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn claude_windows_hook_reports_utf8_session_path() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let env = integration_test_env();
+    let base = unique_base();
+    let home = base.join("home");
+    fs::create_dir_all(home.join(".claude")).unwrap();
+    env.set("HOME", &home);
+    let installed = install_claude().unwrap();
+
+    let capture = base.join("args.txt");
+    let fake_herdr = base.join("herdr-capture.ps1");
+    fs::write(
+        &fake_herdr,
+        "$capture = $env:HERDR_TEST_CAPTURE\n[System.IO.File]::WriteAllText($capture, ($args -join \"`n\"), [System.Text.UTF8Encoding]::new($false))\n",
+    )
+    .unwrap();
+
+    // A Korean profile path: decoded with a non-UTF-8 console input code page
+    // (CP949 on Korean Windows) it garbles the JSON and the hook exits silently.
+    let transcript = "C:\\Users\\\u{d55c}\u{ae00}\\transcript.jsonl";
+    let payload = format!(
+        r#"{{"hook_event_name":"SessionStart","session_id":"claude-session","transcript_path":{}}}"#,
+        serde_json::to_string(transcript).unwrap()
+    );
+
+    let mut child = Command::new("powershell")
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+        .arg(&installed.hook_path)
+        .arg("session")
+        .env("HERDR_ENV", "1")
+        .env("HERDR_PANE_ID", "w1:p2")
+        .env("HERDR_BIN_PATH", &fake_herdr)
+        .env("HERDR_TEST_CAPTURE", &capture)
+        .env_remove("CURSOR_VERSION")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(payload.as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "hook failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let args = fs::read_to_string(&capture).unwrap();
+    assert!(args.contains("report-agent-session"), "captured: {args}");
+    assert!(args.contains("--agent-session-id"), "captured: {args}");
+    assert!(args.contains("claude-session"), "captured: {args}");
+    assert!(args.contains(transcript), "captured: {args}");
 
     env.remove("HOME");
     let _ = fs::remove_dir_all(base);
@@ -1398,7 +1519,7 @@ fn codex_v2_integration_status_is_outdated() {
 
     assert_eq!(codex.path, hook_path);
     assert_eq!(codex.installed_version, Some(2));
-    assert_eq!(codex.expected_version, 9);
+    assert_eq!(codex.expected_version, 10);
     assert_eq!(codex.state, IntegrationStatusKind::Outdated);
 
     env.remove("HOME");
@@ -1429,20 +1550,11 @@ fn install_codex_writes_hook_and_updates_hooks_and_config() {
         .as_str()
         .unwrap()
         .contains(" session"));
-    assert!(hooks["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
-        .as_str()
-        .unwrap()
-        .contains(" working"));
+    assert!(hooks["hooks"].get("UserPromptSubmit").is_none());
     assert!(hooks["hooks"].get("PreToolUse").is_none());
     assert!(hooks["hooks"].get("PermissionRequest").is_none());
-    assert!(hooks["hooks"]["Stop"][0]["hooks"][0]["command"]
-        .as_str()
-        .unwrap()
-        .contains(" idle"));
-    assert!(hooks["hooks"]["Interrupt"][0]["hooks"][0]["command"]
-        .as_str()
-        .unwrap()
-        .contains(" idle"));
+    assert!(hooks["hooks"].get("Stop").is_none());
+    assert!(hooks["hooks"].get("Interrupt").is_none());
     assert!(config.contains("model = \"gpt-5.4\""));
     assert!(config.contains("[features]"));
     assert!(config.contains("hooks = true"));
@@ -1493,14 +1605,11 @@ fn install_codex_is_idempotent_for_hook_entries_and_feature_flag() {
     let config = fs::read_to_string(codex_dir.join("config.toml")).unwrap();
 
     assert_eq!(hooks["hooks"]["SessionStart"].as_array().unwrap().len(), 1);
-    assert_eq!(
-        hooks["hooks"]["UserPromptSubmit"].as_array().unwrap().len(),
-        1
-    );
+    assert!(hooks["hooks"].get("UserPromptSubmit").is_none());
     assert!(hooks["hooks"].get("PreToolUse").is_none());
     assert!(hooks["hooks"].get("PermissionRequest").is_none());
-    assert_eq!(hooks["hooks"]["Stop"].as_array().unwrap().len(), 1);
-    assert_eq!(hooks["hooks"]["Interrupt"].as_array().unwrap().len(), 1);
+    assert!(hooks["hooks"].get("Stop").is_none());
+    assert!(hooks["hooks"].get("Interrupt").is_none());
     assert_eq!(config.matches("hooks = true").count(), 1);
     assert!(!config.contains("codex_hooks"));
     assert!(config.contains("other = true"));
@@ -1529,6 +1638,49 @@ fn install_codex_only_migrates_top_level_feature_flags() {
 
     assert!(config.contains("[profiles.work.features]\nhooks = false\ncodex_hooks = false"));
     assert!(config.contains("[features]\nhooks = true\nother = true"));
+
+    env.remove("HOME");
+    let _ = fs::remove_dir_all(base);
+}
+
+#[test]
+fn install_codex_removes_turn_status_hooks_from_previous_integration() {
+    let env = integration_test_env();
+    let base = unique_base();
+    let home = base.join("home");
+    let codex_dir = home.join(".codex");
+    fs::create_dir_all(&codex_dir).unwrap();
+    let hook_path = codex_dir.join(CODEX_HOOK_INSTALL_NAME);
+    let hook = |action| json!({"type": "command", "command": hook_command(&hook_path, Some(action)), "timeout": 10});
+    let hooks = json!({
+        "hooks": {
+            "SessionStart": [{"hooks": [hook("session")]}],
+            "UserPromptSubmit": [{"hooks": [
+                hook("working"),
+                {"type": "command", "command": "echo keep", "timeout": 10}
+            ]}],
+            "Stop": [{"hooks": [hook("idle")]}],
+            "Interrupt": [{"hooks": [hook("idle")]}]
+        }
+    });
+    fs::write(
+        codex_dir.join("hooks.json"),
+        serde_json::to_string(&hooks).unwrap(),
+    )
+    .unwrap();
+    env.set("HOME", &home);
+
+    install_codex().unwrap();
+
+    let hooks: Value =
+        serde_json::from_str(&fs::read_to_string(codex_dir.join("hooks.json")).unwrap()).unwrap();
+    assert_eq!(hooks["hooks"]["SessionStart"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        hooks["hooks"]["UserPromptSubmit"][0]["hooks"],
+        json!([{"type": "command", "command": "echo keep", "timeout": 10}])
+    );
+    assert!(hooks["hooks"].get("Stop").is_none());
+    assert!(hooks["hooks"].get("Interrupt").is_none());
 
     env.remove("HOME");
     let _ = fs::remove_dir_all(base);
@@ -3936,7 +4088,7 @@ fn install_qwen_writes_session_hook_and_preserves_settings() {
     assert!(settings.get("permissions").is_some());
     let hook_asset = fs::read_to_string(&installed.hook_path).unwrap();
     assert!(hook_asset.contains("HERDR_INTEGRATION_ID=qwen"));
-    assert!(hook_asset.contains("HERDR_INTEGRATION_VERSION=1"));
+    assert!(hook_asset.contains("HERDR_INTEGRATION_VERSION=2"));
     assert!(hook_asset.contains("herdr:qwen"));
 
     install_qwen().unwrap();
@@ -4317,7 +4469,7 @@ fn install_cursor_uses_cursor_config_dir_env() {
 }
 
 #[test]
-fn cursor_v1_integration_status_is_current() {
+fn cursor_v1_integration_status_is_outdated() {
     let env = integration_test_env();
     let base = unique_base();
     let cursor_dir = base.join(".cursor");
@@ -4335,8 +4487,9 @@ fn cursor_v1_integration_status_is_current() {
         .iter()
         .find(|status| status.target == crate::api::schema::IntegrationTarget::Cursor)
         .expect("cursor integration status");
-    assert_eq!(cursor.state, IntegrationStatusKind::Current);
-    assert_eq!(cursor.installed_version, Some(CURSOR_INTEGRATION_VERSION));
+    assert_eq!(cursor.installed_version, Some(1));
+    assert_eq!(cursor.expected_version, CURSOR_INTEGRATION_VERSION);
+    assert_eq!(cursor.state, IntegrationStatusKind::Outdated);
 
     clear_integration_path_env(&env);
     let _ = fs::remove_dir_all(base);
@@ -4828,7 +4981,7 @@ fn install_antigravity_cli_writes_hook_and_updates_hooks_json() {
 }
 
 #[test]
-fn antigravity_cli_v2_install_is_outdated_until_reinstalled() {
+fn antigravity_cli_v3_install_is_outdated_until_reinstalled() {
     let env = integration_test_env();
     let base = unique_base();
     let agy_dir = base.join(".gemini").join("config");
@@ -4837,7 +4990,7 @@ fn antigravity_cli_v2_install_is_outdated_until_reinstalled() {
     fs::write(
         hook_dir.join(ANTIGRAVITY_CLI_HOOK_INSTALL_NAME),
         ANTIGRAVITY_CLI_HOOK_ASSET
-            .replace("HERDR_INTEGRATION_VERSION=3", "HERDR_INTEGRATION_VERSION=2"),
+            .replace("HERDR_INTEGRATION_VERSION=4", "HERDR_INTEGRATION_VERSION=3"),
     )
     .unwrap();
     env.set(ANTIGRAVITY_CLI_CONFIG_DIR_ENV_VAR, &agy_dir);
@@ -4850,8 +5003,8 @@ fn antigravity_cli_v2_install_is_outdated_until_reinstalled() {
     };
     let outdated = status();
     assert_eq!(outdated.state, IntegrationStatusKind::Outdated);
-    assert_eq!(outdated.installed_version, Some(2));
-    assert_eq!(outdated.expected_version, 3);
+    assert_eq!(outdated.installed_version, Some(3));
+    assert_eq!(outdated.expected_version, 4);
 
     install_antigravity_cli().unwrap();
     assert_eq!(status().state, IntegrationStatusKind::Current);

@@ -169,6 +169,51 @@ The iterator regressions cover base and caller entries, preferred key casing,
 and non-Unicode keys and values on Unix and Windows. Run the vendor unit tests
 on both platforms.
 
+## 0004 skip directories when resolving Windows programs
+
+status: active
+
+patch: `vendor/patches/portable-pty/0004-skip-directories-when-resolving-windows-programs.patch`
+
+herdr issue: https://github.com/herdrdev/herdr/issues/5267
+
+upstream discussion: none
+
+upstream pr: none
+
+vendored base: `portable-pty 0.9.0`
+
+local files:
+
+- `vendor/portable-pty/src/cmdbuilder.rs`
+
+reason: Windows `PATH` commonly contains a directory whose name matches a
+program, such as `C:\Windows\System32\PowerShell`. `search_path` returned that
+directory because `Path::exists()` is true for directories, so Herdr asked
+`CreateProcessW` to execute a directory and the pane failed to open with
+`Access is denied` (os error 5). Requiring `is_file()` for both the exact name
+and the PATHEXT candidates skips shadowing directories and finds the real
+executable, matching CreateProcessW's own `PATH` search.
+
+remove when: upstream `portable-pty` skips non-file `PATH` candidates, or Herdr
+replaces this launch path.
+
+verification:
+
+```sh
+python3 -m unittest scripts.test_vendor_portable_pty
+```
+
+On Windows, run the regression test against the vendored crate. It lives inside
+the Herdr workspace but is only a `[patch]` provider, not a workspace member, so
+build a standalone copy and mark it as its own workspace root:
+
+```sh
+cp -r vendor/portable-pty "$TMP/portable-pty"
+printf '\n[workspace]\n' >> "$TMP/portable-pty/Cargo.toml"
+cargo test --manifest-path "$TMP/portable-pty/Cargo.toml" windows_search_path_skips_directories
+```
+
 ## 0005 run a pre-exec hook in the pty child
 
 status: active
