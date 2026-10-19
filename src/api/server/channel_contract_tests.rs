@@ -314,6 +314,7 @@ impl MediaHarness {
         use crate::server::media::MediaAction;
         for action in actions {
             match action {
+                MediaAction::Publish { .. } => {}
                 MediaAction::Send { client_id, control } => {
                     assert_eq!(client_id, 1);
                     self.controls.push(control);
@@ -345,6 +346,46 @@ impl MediaHarness {
                 _ => None,
             })
             .expect("a media.open reached the client")
+    }
+
+    pub(super) fn assert_unprotected_open_pair(&self, session_id: &str) {
+        use crate::protocol::media::MediaControl;
+
+        assert_eq!(
+            self.controls
+                .iter()
+                .filter(|control| matches!(control, MediaControl::OpenInitial(_)))
+                .count(),
+            1,
+            "one complete initial open is sent"
+        );
+        assert_eq!(
+            self.controls
+                .iter()
+                .filter(|control| matches!(control, MediaControl::Open(_)))
+                .count(),
+            1,
+            "the v1 alternate is retained"
+        );
+        assert!(matches!(
+            self.controls.as_slice(),
+            [MediaControl::OpenInitial(initial), MediaControl::Open(open), ..]
+                if initial.session_id == session_id
+                    && initial.pane_id == "w1:p7"
+                    && !initial.input_muted
+                    && !initial.output_suppressed
+                    && open.session_id == initial.session_id
+                    && open.pane_id == initial.pane_id
+        ), "the complete false/false initial open is immediately followed by its same-ID, same-pane alternate"
+        );
+        assert_eq!(
+            self.controls[0].kind(),
+            crate::protocol::media::MEDIA_OPEN_INITIAL_KIND
+        );
+        assert_eq!(
+            self.controls[1].kind(),
+            crate::protocol::media::MEDIA_OPEN_KIND
+        );
     }
 
     pub(super) fn offer(&mut self, session_id: &str) {
@@ -446,6 +487,7 @@ fn channel_media_pending_disconnect_abandons_before_a_late_offer() {
     media.offer(&id);
     media.assert_abandoned(&id);
     media.expire();
+    media.assert_unprotected_open_pair(&id);
     assert!(
         matches!(
             media.controls.as_slice(),
@@ -590,6 +632,7 @@ fn channel_media_successful_offer_survives_response_channel_and_receipt_drop() {
         media.broker.state(&id).unwrap().state,
         crate::api::schema::MediaSessionState::Offered
     );
+    media.assert_unprotected_open_pair(&id);
     assert!(
         matches!(
             media.controls.as_slice(),

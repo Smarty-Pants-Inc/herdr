@@ -1,6 +1,12 @@
 use super::*;
 
-use crate::protocol::media::{MediaControl, MediaOpen, MediaPeerState, MediaSdp, MediaStateUpdate};
+use crate::protocol::media::{
+    MediaControl, MediaOpen, MediaOpenInitial, MediaPeerState, MediaSdp, MediaStateUpdate,
+};
+
+#[cfg(target_os = "linux")]
+#[path = "media_socket.rs"]
+mod socket;
 
 fn connect_media_shell(
     server: &mut HeadlessServer,
@@ -40,10 +46,48 @@ fn media_open_sent(
     control: &std::sync::mpsc::Receiver<Vec<u8>>,
     wait: Duration,
 ) -> Option<MediaOpen> {
+    media_initial_open_sent(control, wait).map(|open| MediaOpen {
+        session_id: open.session_id,
+        pane_id: open.pane_id,
+    })
+}
+
+fn media_initial_open_sent(
+    control: &std::sync::mpsc::Receiver<Vec<u8>>,
+    wait: Duration,
+) -> Option<MediaOpenInitial> {
     while let Ok(bytes) = control.recv_timeout(wait) {
         if let ServerMessage::EndpointControl { kind, data } = read_server_message(bytes) {
-            if let Some(Ok(MediaControl::Open(open))) = MediaControl::decode(&kind, &data) {
-                return Some(open);
+            match MediaControl::decode(&kind, &data) {
+                Some(Ok(MediaControl::OpenInitial(initial))) => {
+                    if !initial.input_muted && !initial.output_suppressed {
+                        // This contiguous same-ID v1 alternate is one logical
+                        // open, not a second session to consume on the next call.
+                        let bytes = control.recv_timeout(wait).expect("v1 open alternate");
+                        let ServerMessage::EndpointControl { kind, data } =
+                            read_server_message(bytes)
+                        else {
+                            panic!("expected the contiguous v1 open alternate");
+                        };
+                        assert_eq!(
+                            MediaControl::decode(&kind, &data),
+                            Some(Ok(MediaControl::Open(MediaOpen {
+                                session_id: initial.session_id.clone(),
+                                pane_id: initial.pane_id.clone(),
+                            })))
+                        );
+                    }
+                    return Some(initial);
+                }
+                Some(Ok(MediaControl::Open(open))) => {
+                    return Some(MediaOpenInitial {
+                        session_id: open.session_id,
+                        pane_id: open.pane_id,
+                        input_muted: false,
+                        output_suppressed: false,
+                    });
+                }
+                _ => {}
             }
         }
     }
@@ -286,6 +330,7 @@ async fn pending_media_cancellation_enqueues_open_refusal_before_close_success()
                 method: api::schema::Method::MediaClose(api::schema::MediaCloseParams {
                     session_id,
                     open_id: close_open_id,
+                    epoch: None,
                 }),
             },
             responses_tx.clone(),
@@ -307,6 +352,7 @@ async fn pending_media_cancellation_enqueues_open_refusal_before_close_success()
         .expect("close success is JSON");
         assert_eq!(refusal["id"], "pending-open");
         assert_eq!(refusal["error"]["code"], "media_refused");
+        assert_eq!(refusal["error"]["close_code"], "closed");
         assert_eq!(
             refusal["error"]["message"],
             "closed: the caller ended the session"
@@ -341,6 +387,7 @@ async fn unknown_media_open_id_close_is_idempotent_and_refuses_a_later_open() {
                 method: api::schema::Method::MediaClose(api::schema::MediaCloseParams {
                     session_id: None,
                     open_id: Some(open_id.into()),
+                    epoch: None,
                 }),
             },
         );
@@ -417,6 +464,7 @@ async fn media_open_id_cancels_pending_offered_and_connected_sessions_without_re
                 api::schema::Method::MediaAnswer(api::schema::MediaAnswerParams {
                     session_id: open.session_id.clone(),
                     sdp: "v=0 answer".into(),
+                    epoch: None,
                 }),
             );
             assert_eq!(json(&answer_response)["result"]["type"], "ok");
@@ -446,6 +494,7 @@ async fn media_open_id_cancels_pending_offered_and_connected_sessions_without_re
             api::schema::Method::MediaClose(api::schema::MediaCloseParams {
                 session_id: None,
                 open_id: Some(open_id),
+                epoch: None,
             }),
         );
         assert_eq!(json(&cancelled)["result"]["type"], "ok");
@@ -468,6 +517,7 @@ async fn media_open_id_cancels_pending_offered_and_connected_sessions_without_re
             api::schema::Method::MediaAnswer(api::schema::MediaAnswerParams {
                 session_id: open.session_id.clone(),
                 sdp: "v=0 late answer".into(),
+                epoch: None,
             }),
         );
         assert_eq!(
@@ -553,6 +603,7 @@ async fn duplicate_live_open_id_and_invalid_media_close_selectors_are_rejected_b
         api::schema::Method::MediaClose(api::schema::MediaCloseParams {
             session_id: None,
             open_id: Some("voice-live".into()),
+            epoch: None,
         }),
     );
     assert_eq!(json(&cancelled)["result"]["type"], "ok");
@@ -719,6 +770,7 @@ async fn successful_media_answer_prevents_unanswered_expiry_in_headless_server()
         api::schema::Method::MediaAnswer(api::schema::MediaAnswerParams {
             session_id: open.session_id.clone(),
             sdp: "v=0 answer".into(),
+            epoch: None,
         }),
     );
     assert_eq!(json(&answer_response)["result"]["type"], "ok");
@@ -800,7 +852,7 @@ async fn idle_headless_loop_wakes_for_media_deadlines_and_delivery_failure() {
             .iter()
             .find_map(|action| match action {
                 crate::server::media::MediaAction::Send {
-                    control: MediaControl::Open(open),
+                    control: MediaControl::OpenInitial(open),
                     ..
                 } => Some(open.session_id.clone()),
                 _ => None,

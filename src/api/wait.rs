@@ -40,6 +40,7 @@ pub(super) fn wait_for_output(
                     serde_json::to_string(&ErrorResponse {
                         id: request_id,
                         error: ErrorBody {
+                            close_code: None,
                             code: "invalid_regex".into(),
                             message: err.to_string(),
                         },
@@ -88,6 +89,7 @@ pub(super) fn wait_for_output(
                     error: ErrorBody {
                         code: "internal_error".into(),
                         message: "failed to decode pane read result".into(),
+                        close_code: None,
                     },
                 })
                 .unwrap(),
@@ -120,6 +122,7 @@ pub(super) fn wait_for_output(
                     error: ErrorBody {
                         code: "timeout".into(),
                         message: "timed out waiting for output match".into(),
+                        close_code: None,
                     },
                 })
                 .unwrap(),
@@ -234,6 +237,7 @@ pub(super) fn prompt_agent(
                 error: ErrorBody {
                     code: "invalid_request".into(),
                     message: message.into(),
+                    close_code: None,
                 },
             })
             .map_err(std::io::Error::other)?,
@@ -675,6 +679,7 @@ fn agent_from_response(
         error: ErrorBody {
             code: "internal_error".into(),
             message: "failed to decode agent response".into(),
+            close_code: None,
         },
     })?;
     if value.get("error").is_some() {
@@ -683,6 +688,7 @@ fn agent_from_response(
             error: ErrorBody {
                 code: "internal_error".into(),
                 message: "failed to decode agent error".into(),
+                close_code: None,
             },
         })?;
         return Err(ErrorResponse {
@@ -695,6 +701,7 @@ fn agent_from_response(
         error: ErrorBody {
             code: "internal_error".into(),
             message: "failed to decode agent result".into(),
+            close_code: None,
         },
     })
 }
@@ -734,6 +741,7 @@ fn agent_wait_timeout(
         error: ErrorBody {
             code: code.into(),
             message,
+            close_code: None,
         },
     })
     .map_err(std::io::Error::other)
@@ -743,6 +751,7 @@ fn agent_wait_not_running(request_id: String) -> std::io::Result<String> {
     serde_json::to_string(&ErrorResponse {
         id: request_id,
         error: ErrorBody {
+            close_code: None,
             code: "agent_not_running".into(),
             message: "agent is no longer running in the target pane".into(),
         },
@@ -780,6 +789,7 @@ pub(super) fn wait_for_event(
         api_tx,
         event_hub,
         event_hub.current_sequence(),
+        event_hub.current_media_sequence(),
     ) {
         Ok(active) => active,
         Err(response) => return Ok(Some(serde_json::to_string(&response).unwrap())),
@@ -809,6 +819,7 @@ pub(super) fn wait_for_event(
                     error: ErrorBody {
                         code: "timeout".into(),
                         message: "timed out waiting for event match".into(),
+                        close_code: None,
                     },
                 })
                 .unwrap(),
@@ -836,6 +847,7 @@ fn event_match_subscription(
             error: ErrorBody {
                 code: "unsupported_event_wait_match".into(),
                 message: "events.wait currently supports pane agent status matches".into(),
+                close_code: None,
             },
         }),
     }
@@ -848,6 +860,7 @@ fn wait_matched_response(request_id: &str, event: serde_json::Value) -> String {
             error: ErrorBody {
                 code: "internal_error".into(),
                 message: "failed to decode matched event".into(),
+                close_code: None,
             },
         })
         .unwrap();
@@ -859,6 +872,7 @@ fn wait_matched_response(request_id: &str, event: serde_json::Value) -> String {
             error: ErrorBody {
                 code: "unsupported_event_wait_match".into(),
                 message: "events.wait currently supports pane agent status matches".into(),
+                close_code: None,
             },
         })
         .unwrap();
@@ -937,6 +951,7 @@ mod tests {
         let disappeared = agent_wait_probe_error(ErrorResponse {
             id: "wait".into(),
             error: ErrorBody {
+                close_code: None,
                 code: "agent_not_found".into(),
                 message: "missing".into(),
             },
@@ -951,6 +966,7 @@ mod tests {
             error: ErrorBody {
                 code: "server_unavailable".into(),
                 message: "timed out waiting for app response".into(),
+                close_code: None,
             },
         })
         .unwrap();

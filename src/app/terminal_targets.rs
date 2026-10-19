@@ -55,6 +55,7 @@ impl App {
             return Ok(());
         }
         Err(crate::api::schema::ErrorBody {
+            close_code: None,
             code: "terminal_identity_mismatch".into(),
             message: format!(
                 "expected terminal {expected:?}, but the target pane owns {}",
@@ -100,6 +101,7 @@ impl App {
     ) -> Result<Option<crate::pty::actor::SessionInputGuard>, crate::api::schema::ErrorBody> {
         if expected_agent_status.is_some() && expected_agent_session_id.is_none() {
             return Err(crate::api::schema::ErrorBody {
+                close_code: None,
                 code: "invalid_request".into(),
                 message: "expected_agent_status requires expected_agent_session_id".into(),
             });
@@ -109,6 +111,7 @@ impl App {
         };
         if !crate::platform::expected_agent_session_guard_supported() {
             return Err(crate::api::schema::ErrorBody {
+                close_code: None,
                 code: "expected_agent_session_unsupported".into(),
                 message: "expected agent session guards are supported only on Linux".into(),
             });
@@ -121,6 +124,7 @@ impl App {
             let actual = terminal.detected_agent_status();
             if actual != expected {
                 return Err(crate::api::schema::ErrorBody {
+                    close_code: None,
                     code: "expected_status_mismatch".into(),
                     message: format!(
                         "the target's detected agent status is {actual:?}, not expected {expected:?}"
@@ -131,6 +135,7 @@ impl App {
             return Err(crate::api::schema::ErrorBody {
                 code: "expected_status_mismatch".into(),
                 message: "the target has no detected agent status".into(),
+                close_code: None,
             });
         }
 
@@ -163,12 +168,14 @@ impl App {
                 }))
             }
             Some(_) => Err(crate::api::schema::ErrorBody {
+                close_code: None,
                 code: "agent_session_mismatch".into(),
                 message: format!(
                     "the target's reported agent session does not match expected {expected:?}"
                 ),
             }),
             None => Err(crate::api::schema::ErrorBody {
+                close_code: None,
                 code: "agent_session_unknown".into(),
                 message: format!(
                     "the target has no accepted current agent session ID for expected {expected:?}"
@@ -189,6 +196,7 @@ impl App {
             return Ok(());
         }
         Err(crate::api::schema::ErrorBody {
+            close_code: None,
             code: "expected_pane_mismatch".into(),
             message: "the agent target no longer resolves to the expected pane".into(),
         })

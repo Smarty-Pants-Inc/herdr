@@ -2605,12 +2605,13 @@ mod tests {
                         self.wire_server(control);
                     }
                     MediaAction::Respond {
+                        session_id: _,
                         respond_to,
                         response,
-                        session_id: _,
                     } => {
                         let _ = respond_to.send(response);
                     }
+                    MediaAction::Publish { .. } => {}
                 }
             }
         }

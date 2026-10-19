@@ -1355,6 +1355,8 @@ mod tests {
         let (mut controls, mut responses) = (Vec::new(), Vec::new());
         for action in actions {
             match action {
+                // Subscription events are published through EventHub, not delivered to this client fixture.
+                crate::server::media::MediaAction::Publish { .. } => {}
                 crate::server::media::MediaAction::Send { control, .. } => controls.push(control),
                 crate::server::media::MediaAction::Respond {
                     respond_to,

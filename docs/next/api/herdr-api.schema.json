@@ -7,6 +7,13 @@
       "$defs": {
         "ErrorBody": {
           "properties": {
+            "close_code": {
+              "description": "Causal media close reason for open/answer/control/close failures, without\nchanging code or message. Omitted when no causal close is known.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "code": {
               "type": "string"
             },
@@ -2580,7 +2587,16 @@
           "type": "object"
         },
         "MediaAnswerParams": {
+          "description": "Dispatch the SDP answer immediately, without waiting for Connected. The session\nmust connect within 15 seconds after the answer or close with negotiation_timeout.\nAn optional epoch must match the session or return media_session_not_found;\nomission retains legacy behavior.",
           "properties": {
+            "epoch": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "sdp": {
               "type": "string"
             },
@@ -2595,7 +2611,7 @@
           "type": "object"
         },
         "MediaCloseParams": {
-          "description": "Select exactly one `session_id` or caller-selected `open_id` to close.\n\nClosing an unknown `open_id` is idempotent and records a cancellation tombstone for up to\n120 seconds. At most 256 unknown-id tombstones are retained; the media `expire` pass prunes\nelapsed ones. A later open with that id is refused rather than creating a client session.",
+          "description": "Select exactly one `session_id` or caller-selected `open_id` to close.\n\nClosing an unknown `open_id` is idempotent and records a cancellation tombstone for up to\n120 seconds. At most 256 unknown-id tombstones are retained; the media `expire` pass prunes\nelapsed ones. A later open with that id is refused rather than creating a client session.\nAn optional epoch must match the resolved session; a mismatch returns\nmedia_session_not_found without closing it. Omission retains legacy behavior.",
           "oneOf": [
             {
               "properties": {
@@ -2619,6 +2635,14 @@
             }
           ],
           "properties": {
+            "epoch": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "open_id": {
               "maxLength": 128,
               "minLength": 1,
@@ -2635,6 +2659,38 @@
               ]
             }
           },
+          "type": "object"
+        },
+        "MediaControlParams": {
+          "description": "Requires `media_control` capability. Controls are ordered per session in\nadmission order and may be submitted while the named session is `Offered`,\nbefore `media.answer`. Omitted fields retain desired intent. The API response\nis held until this named session acknowledges the matching control; a\nsuccessor's acknowledgement cannot settle the source request. Success is\n`media_controls_applied` with `session_id`, the outer API `request_id`, the\napplied `input_muted` and `output_suppressed` values, and the current `epoch`.\nA 5-second `media_timeout` is uncertain: application may still occur, and the\nsession stays open. If the named session ends first, the response is\n`media_control_failed` with its causal `close_code`; a successor's application\nis reported in its own `media.controls_applied` event with the successor's\nsession ID. Before a session reaches `Offered` (while opening/pending),\nor for an unknown, stale, or epoch-mismatched target, the error is\n`media_session_not_found`. Exhausting the 32 unresolved target-device\ncontrol slots returns `media_control_failed` with a clear message and no\n`close_code`, without ending the live session.\nDesired input-mute and output-suppression intent survives session close and\nrenewal until explicitly changed or the pane is removed from the live\ntopology; it is not persisted across server restart. New and renewed client\nsessions install both desired gates before `audio.open`. Renewal closes the\nold peer before opening its successor; if successor `audio.open` fails, the\ncall ends without audio and the voice caller must renew. Applied\nacknowledgements never overwrite newer desired intent. Legacy `media.mute` is\ndispatch-only. An optional epoch mismatch returns `media_session_not_found`\nwithout an effect; omission retains legacy behavior.",
+          "properties": {
+            "epoch": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "input_muted": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "output_suppressed": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "session_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "session_id"
+          ],
           "type": "object"
         },
         "MediaMuteParams": {
@@ -4863,6 +4919,23 @@
               },
               "required": [
                 "type"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "Requires media_events capability. Receive dotted media events for one\nvalidated pane, with untagged data (no data.type). First subscriber enables\nclient levels; last departure or disconnect disables them. Interest also\napplies to future sessions on the pane. Levels are limited to 10 Hz.",
+              "properties": {
+                "pane_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "media",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "pane_id"
               ],
               "type": "object"
             }
@@ -7549,6 +7622,22 @@
         {
           "properties": {
             "method": {
+              "const": "media.control",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/MediaControlParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "media.state",
               "type": "string"
             },
@@ -7601,6 +7690,173 @@
             "unknown"
           ],
           "type": "string"
+        },
+        "MediaControlsAppliedEvent": {
+          "properties": {
+            "epoch": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "input_muted": {
+              "type": "boolean"
+            },
+            "output_suppressed": {
+              "type": "boolean"
+            },
+            "pane_id": {
+              "type": "string"
+            },
+            "request_id": {
+              "type": "string"
+            },
+            "session_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pane_id",
+            "session_id",
+            "request_id",
+            "input_muted",
+            "output_suppressed",
+            "epoch"
+          ],
+          "type": "object"
+        },
+        "MediaErrorEvent": {
+          "properties": {
+            "code": {
+              "type": "string"
+            },
+            "message": {
+              "type": "string"
+            },
+            "pane_id": {
+              "type": "string"
+            },
+            "session_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pane_id",
+            "session_id",
+            "code",
+            "message"
+          ],
+          "type": "object"
+        },
+        "MediaHelperInfo": {
+          "properties": {
+            "commit": {
+              "type": "string"
+            },
+            "pid": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "version": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "version",
+            "commit",
+            "pid"
+          ],
+          "type": "object"
+        },
+        "MediaLevelsEvent": {
+          "description": "Audio peaks at most 10 Hz, reported only while the pane has media subscribers.",
+          "properties": {
+            "input_peak": {
+              "format": "float",
+              "type": "number"
+            },
+            "output_peak": {
+              "format": "float",
+              "type": "number"
+            },
+            "pane_id": {
+              "type": "string"
+            },
+            "session_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pane_id",
+            "session_id",
+            "input_peak",
+            "output_peak"
+          ],
+          "type": "object"
+        },
+        "MediaStartedEvent": {
+          "description": "Emitted once only after Connected and helper/device info are both available.",
+          "properties": {
+            "epoch": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "helper": {
+              "$ref": "#/schemas/subscription_event/$defs/MediaHelperInfo"
+            },
+            "input_device": {
+              "type": "string"
+            },
+            "output_device": {
+              "type": "string"
+            },
+            "pane_id": {
+              "type": "string"
+            },
+            "session_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pane_id",
+            "session_id",
+            "epoch",
+            "helper",
+            "input_device",
+            "output_device"
+          ],
+          "type": "object"
+        },
+        "MediaStoppedEvent": {
+          "description": "Terminal close with epoch and reason, including negotiation_timeout after the\n15-second answer-to-Connected deadline. media.device_changed is reserved, never emitted.",
+          "properties": {
+            "code": {
+              "type": "string"
+            },
+            "epoch": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "message": {
+              "type": "string"
+            },
+            "pane_id": {
+              "type": "string"
+            },
+            "session_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pane_id",
+            "session_id",
+            "epoch",
+            "code",
+            "message"
+          ],
+          "type": "object"
         },
         "PaneAgentSessionChangedEvent": {
           "description": "The agent in a pane reported a session different from the pane's previous\none: a new session value, or the same value with a different actual agent\nsession id (set, cleared, or replaced). A repeated report of the current\nsession with the same actual id emits nothing.",
@@ -7827,6 +8083,21 @@
             },
             {
               "$ref": "#/schemas/subscription_event/$defs/PaneAgentSessionChangedEvent"
+            },
+            {
+              "$ref": "#/schemas/subscription_event/$defs/MediaStartedEvent"
+            },
+            {
+              "$ref": "#/schemas/subscription_event/$defs/MediaStoppedEvent"
+            },
+            {
+              "$ref": "#/schemas/subscription_event/$defs/MediaErrorEvent"
+            },
+            {
+              "$ref": "#/schemas/subscription_event/$defs/MediaControlsAppliedEvent"
+            },
+            {
+              "$ref": "#/schemas/subscription_event/$defs/MediaLevelsEvent"
             }
           ]
         },
@@ -7835,7 +8106,12 @@
             "pane.output_matched",
             "pane.agent_status_changed",
             "pane.agent_session_changed",
-            "pane.scroll_changed"
+            "pane.scroll_changed",
+            "media.started",
+            "media.stopped",
+            "media.error",
+            "media.controls_applied",
+            "media.levels"
           ],
           "type": "string"
         }
@@ -11889,6 +12165,40 @@
             },
             {
               "properties": {
+                "epoch": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "input_muted": {
+                  "type": "boolean"
+                },
+                "output_suppressed": {
+                  "type": "boolean"
+                },
+                "request_id": {
+                  "type": "string"
+                },
+                "session_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "media_controls_applied",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "session_id",
+                "request_id",
+                "input_muted",
+                "output_suppressed",
+                "epoch"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
                 "code": {
                   "type": [
                     "string",
@@ -11971,6 +12281,16 @@
               "type": "boolean"
             },
             "live_handoff": {
+              "type": "boolean"
+            },
+            "media_control": {
+              "default": false,
+              "description": "Supports acknowledged `media.control` requests.",
+              "type": "boolean"
+            },
+            "media_events": {
+              "default": false,
+              "description": "Supports pane-scoped `media` subscriptions and dotted media events.",
               "type": "boolean"
             },
             "media_open_cancel": {

@@ -131,6 +131,7 @@ fn agent_explain(args: &[String]) -> std::io::Result<i32> {
                 let response = ErrorResponse {
                     id: "cli:agent:explain".into(),
                     error: ErrorBody {
+                        close_code: None,
                         code: "agent_explain_file_read_failed".into(),
                         message: format!("failed to read agent explain file {path}: {err}"),
                     },

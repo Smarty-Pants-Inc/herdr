@@ -83,4 +83,10 @@ pub struct ServerCapabilities {
     /// the offer is not answered in time.
     #[serde(default)]
     pub media_open_cancel: bool,
+    /// Supports acknowledged `media.control` requests.
+    #[serde(default)]
+    pub media_control: bool,
+    /// Supports pane-scoped `media` subscriptions and dotted media events.
+    #[serde(default)]
+    pub media_events: bool,
 }
