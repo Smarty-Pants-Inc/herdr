@@ -440,6 +440,7 @@ fn channel_media_open(
     let (respond_to, response_rx) = std::sync::mpsc::channel();
     api_tx
         .send(ApiRequestMessage {
+            media_subscription_reply: None,
             request: media_request(),
             context: ApiRequestContext::default(),
             peer_pidfd: None,

@@ -23,6 +23,7 @@ fn public_move(
 ) -> Result<PaneMoveResult, ErrorResponse> {
     let (respond_to, response_rx) = std::sync::mpsc::channel();
     server.handle_api_request_with_shutdown_check(crate::api::ApiRequestMessage {
+        media_subscription_reply: None,
         peer_pidfd: None,
         context: crate::api::ApiRequestContext::default(),
         request: crate::api::schema::Request {
@@ -131,6 +132,7 @@ async fn public_pane_move_keeps_previous_focus_within_its_workspace() {
             // the server's previous_pane_focus drives that client action.
             let (respond_to, response_rx) = std::sync::mpsc::channel();
             server.handle_api_request_with_shutdown_check(crate::api::ApiRequestMessage {
+                media_subscription_reply: None,
                 peer_pidfd: None,
                 context: crate::api::ApiRequestContext::default(),
                 request: crate::api::schema::Request {

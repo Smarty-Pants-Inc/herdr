@@ -129,6 +129,7 @@ fn media_api_request_with_sender(
     server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
         peer_pidfd: None,
         context: crate::api::ApiRequestContext::default(),
+        media_subscription_reply: None,
         request,
         respond_to,
         response_write_complete: None,
@@ -627,6 +628,7 @@ async fn failed_waiting_media_open_response_closes_through_headless_send_failure
     server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
         peer_pidfd: None,
         context: crate::api::ApiRequestContext::default(),
+        media_subscription_reply: None,
         request: api::schema::Request {
             id: "abandoned-open".into(),
             method: api::schema::Method::PaneMediaOpen(api::schema::MediaOpenParams {
@@ -943,6 +945,7 @@ async fn idle_headless_loop_wakes_for_media_deadlines_and_delivery_failure() {
             let (respond_to, state_response) = std::sync::mpsc::channel();
             api_tx
                 .send(api::ApiRequestMessage {
+                    media_subscription_reply: None,
                     peer_pidfd: None,
                     context: crate::api::ApiRequestContext::default(),
                     request: api::schema::Request {

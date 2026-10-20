@@ -6,7 +6,9 @@ use crate::api::schema::{
     PaneAgentStatusChangedEvent, PaneOutputMatchedEvent, PaneScrollChangedEvent, PaneScrollInfo,
     Request, Subscription, SubscriptionEventData, SubscriptionEventEnvelope, SubscriptionEventKind,
 };
-use crate::api::server::{dispatch_to_app_with_timeout, APP_RESPONSE_TIMEOUT};
+use crate::api::server::{
+    dispatch_media_subscription_binding, dispatch_to_app_with_timeout, APP_RESPONSE_TIMEOUT,
+};
 use crate::api::{ApiRequestSender, EventHub};
 
 pub(super) fn output_match_read_source(
@@ -66,9 +68,8 @@ pub(super) struct ActiveAgentSessionChangedSubscription {
 }
 
 pub(super) struct ActiveMediaSubscription {
-    pane_id: String,
+    binding: crate::api::MediaSubscriptionBinding,
     last_sequence: u64,
-    _interest: crate::api::event_hub::MediaInterest,
 }
 
 pub(super) struct ActiveScrollChangedSubscription {
@@ -128,7 +129,7 @@ impl ActiveSubscription {
         api_tx: &ApiRequestSender,
         event_hub: &EventHub,
         event_start_sequence: u64,
-        media_start_sequence: u64,
+        _media_start_sequence: u64,
     ) -> Result<Self, ErrorResponse> {
         let event_subscription = |event_kind| {
             Self::Event(ActiveEventSubscription {
@@ -264,21 +265,12 @@ impl ActiveSubscription {
                 ))
             }
             Subscription::Media { pane_id } => {
-                let probe = pane_get(format!("{request_id}:sub:{index}:probe"), &pane_id, api_tx)?;
-                // Public pane numbers are not raw PaneIds. Resolve only on the
-                // runtime side; retain that identity through moves until last drop.
-                let interest =
-                    event_hub
-                        .subscribe_media(probe.pane_id.clone())
-                        .map_err(|error| ErrorResponse {
-                            id: request_id.to_owned(),
-                            error: history_error(error),
-                        })?;
-                Ok(Self::Media(ActiveMediaSubscription {
-                    pane_id: probe.pane_id,
-                    last_sequence: media_start_sequence,
-                    _interest: interest,
-                }))
+                let binding = dispatch_media_subscription_binding(
+                    format!("{request_id}:sub:{index}:probe"),
+                    pane_id,
+                    api_tx,
+                )?;
+                Ok(Self::Media(ActiveMediaSubscription::new(binding)))
             }
             Subscription::PaneScrollChanged { pane_id } => {
                 let probe = pane_get(format!("{request_id}:sub:{index}:probe"), &pane_id, api_tx)?;
@@ -290,6 +282,10 @@ impl ActiveSubscription {
                 }))
             }
         }
+    }
+
+    pub(super) fn is_ended(&self) -> bool {
+        matches!(self, Self::Media(subscription) if subscription.binding.is_ended())
     }
 
     pub(super) fn poll(
@@ -376,12 +372,13 @@ impl ActiveSubscription {
             }
             Self::Media(subscription) => {
                 let events = event_hub
-                    .media_events_after_checked(subscription.last_sequence)
-                    .map_err(history_error)?;
+                    .media_events_after_checked(&subscription.binding, subscription.last_sequence)
+                    .map_err(history_error)?
+                    .unwrap_or_default();
                 let mut matching = Vec::new();
-                for (sequence, event) in events {
+                for (sequence, pane_id, event) in events {
                     subscription.last_sequence = sequence;
-                    if subscription.matches(&event) {
+                    if pane_id == subscription.binding.pane_id {
                         matching.push(serde_json::to_value(event).map_err(event_encoding_error)?);
                     }
                 }
@@ -421,25 +418,21 @@ fn history_error(error: EventHistoryError) -> ErrorBody {
 }
 
 impl ActiveMediaSubscription {
-    fn matches(&self, event: &SubscriptionEventEnvelope) -> bool {
-        let pane = match &event.data {
-            SubscriptionEventData::MediaStarted(data) => &data.pane_id,
-            SubscriptionEventData::MediaStopped(data) => &data.pane_id,
-            SubscriptionEventData::MediaError(data) => &data.pane_id,
-            SubscriptionEventData::MediaControlsApplied(data) => &data.pane_id,
-            SubscriptionEventData::MediaLevels(data) => &data.pane_id,
-            _ => return false,
-        };
-        pane == &self.pane_id
+    fn new(binding: crate::api::MediaSubscriptionBinding) -> Self {
+        Self {
+            last_sequence: binding.start_sequence,
+            binding,
+        }
     }
 
     fn poll(&mut self, event_hub: &EventHub) -> Result<Option<serde_json::Value>, ErrorBody> {
-        for (sequence, event) in event_hub
-            .media_events_after_checked(self.last_sequence)
+        for (sequence, pane_id, event) in event_hub
+            .media_events_after_checked(&self.binding, self.last_sequence)
             .map_err(history_error)?
+            .unwrap_or_default()
         {
             self.last_sequence = sequence;
-            if self.matches(&event) {
+            if pane_id == self.binding.pane_id {
                 return serde_json::to_value(event)
                     .map(Some)
                     .map_err(event_encoding_error);
@@ -916,17 +909,13 @@ mod tests {
     fn media_batch_reports_retention_loss_and_releases_interest_on_error() {
         let hub = EventHub::default();
         let pane = crate::layout::PaneId::from_raw(99);
-        let mut subscription = ActiveSubscription::Media(ActiveMediaSubscription {
-            pane_id: "w1:p1".into(),
-            last_sequence: hub.current_media_sequence(),
-            _interest: hub.subscribe_media("w1:p1".into()).unwrap(),
-        });
-        assert_eq!(
-            hub.take_media_interest_transitions(|_| Some(pane)),
-            vec![(pane, true)]
-        );
+        let mut subscription = ActiveSubscription::Media(ActiveMediaSubscription::new(
+            hub.subscribe_media(pane).unwrap(),
+        ));
+        assert_eq!(hub.take_media_interest_transitions(), vec![(pane, true)]);
         for _ in 0..513 {
             hub.push_media(
+                pane,
                 serde_json::from_value(serde_json::json!({
                     "event": "media.levels", "data": {
                         "pane_id": "w1:p1", "session_id": "session", "input_peak": 0.25, "output_peak": 0.5
@@ -940,9 +929,61 @@ mod tests {
         assert_eq!(error.code, "events_lost");
         assert!(error.close_code.is_none());
         drop(subscription);
-        assert_eq!(
-            hub.take_media_interest_transitions(|_| None),
-            vec![(pane, false)]
+        assert_eq!(hub.take_media_interest_transitions(), vec![(pane, false)]);
+    }
+
+    #[test]
+    fn media_raw_attribution_survives_alias_changes_and_dead_entry_is_removed_alone() {
+        let hub = EventHub::default();
+        let pane = crate::layout::PaneId::from_raw(100);
+        let other = crate::layout::PaneId::from_raw(101);
+        let media = ActiveSubscription::Media(ActiveMediaSubscription::new(
+            hub.subscribe_media(pane).unwrap(),
+        ));
+        let unrelated = ActiveSubscription::Media(ActiveMediaSubscription::new(
+            hub.subscribe_media(other).unwrap(),
+        ));
+        let mut subscriptions = vec![media, unrelated];
+        let levels = |alias: &str| {
+            serde_json::from_value(serde_json::json!({
+                "event": "media.levels", "data": {
+                    "pane_id": alias, "session_id": "session", "input_peak": 0.25, "output_peak": 0.5
+                }
+            }))
+            .unwrap()
+        };
+        hub.push_media(other, levels("w1:p1"));
+        hub.push_media(pane, levels("renumbered-public-id"));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let events = subscriptions[0].poll_batch(&tx, &hub).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["data"]["pane_id"], "renumbered-public-id");
+        assert_eq!(subscriptions[1].poll_batch(&tx, &hub).unwrap().len(), 1);
+        hub.push_media(
+            pane,
+            serde_json::from_value(serde_json::json!({
+                "event": "media.stopped", "data": {
+                    "pane_id": "renumbered-public-id", "session_id": "session", "epoch": 1,
+                    "code": "closed", "message": "session ended"
+                }
+            }))
+            .unwrap(),
+        );
+        assert_eq!(subscriptions[0].poll_batch(&tx, &hub).unwrap().len(), 1);
+        assert!(!subscriptions[0].is_ended(), "session end is not pane end");
+        // End before a stale consumer reads its pending events.
+        hub.push_media(pane, levels("w1:p1"));
+        hub.retain_live_media_panes(|| [other].into_iter().collect());
+        assert!(subscriptions[0].poll_batch(&tx, &hub).unwrap().is_empty());
+        subscriptions.retain(|subscription| !subscription.is_ended());
+        assert_eq!(subscriptions.len(), 1);
+        hub.push_media(other, levels("w1:p1"));
+        assert_eq!(subscriptions[0].poll_batch(&tx, &hub).unwrap().len(), 1);
+        hub.retain_live_media_panes(std::collections::HashSet::new);
+        subscriptions.retain(|subscription| !subscription.is_ended());
+        assert!(
+            subscriptions.is_empty(),
+            "only all-ended entries permit EOF"
         );
     }
 

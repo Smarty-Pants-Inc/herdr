@@ -3275,6 +3275,13 @@ impl HeadlessServer {
     }
 
     fn reject_api_request_for_shutdown(msg: api::ApiRequestMessage) {
+        if let Some(reply) = msg.media_subscription_reply {
+            let _ = reply.send(Err(api::schema::ErrorBody {
+                close_code: None,
+                code: "server_unavailable".into(),
+                message: "server is shutting down".into(),
+            }));
+        }
         let response = serde_json::to_string(&api::schema::ErrorResponse {
             id: msg.request.id,
             error: api::schema::ErrorBody {
@@ -3292,7 +3299,7 @@ impl HeadlessServer {
 
     fn handle_api_request_with_shutdown_check_inner(
         &mut self,
-        msg: api::ApiRequestMessage,
+        mut msg: api::ApiRequestMessage,
         skip_default_workspace_for_request: bool,
         client_local: bool,
     ) -> bool {
@@ -3300,6 +3307,32 @@ impl HeadlessServer {
             // During shutdown, respond with server_unavailable.
             Self::reject_api_request_for_shutdown(msg);
             return false;
+        }
+
+        if msg.media_subscription_reply.is_some() {
+            // Service the private seam at the real receiver, before ordinary
+            // dispatch consumes request/context, and after queued pane deaths.
+            let changed = self.drain_all_internal_events_with_forwarding();
+            if self.shutting_down || self.host_shutdown_requested() {
+                Self::reject_api_request_for_shutdown(msg);
+                return changed;
+            }
+            if let Some(reply) = msg.media_subscription_reply.take() {
+                let binding = match &msg.request.method {
+                    api::schema::Method::PaneGet(target) => {
+                        self.app.bind_media_subscription(&target.pane_id)
+                    }
+                    _ => Err(api::schema::ErrorBody {
+                        close_code: None,
+                        code: "invalid_params".into(),
+                        message: "media subscription bootstrap requires pane.get".into(),
+                    }),
+                };
+                // A disconnected/timed-out worker drops the captured RAII
+                // binding here; it cannot leave interest behind.
+                let _ = reply.send(binding);
+            }
+            return changed;
         }
 
         let frozen_alt_screen_read = match self.alt_screen_read_conflict(&msg.request) {

@@ -124,6 +124,7 @@ fn alice_record_and_media_age(
 fn last_input(server: &mut HeadlessServer, pane: &str) -> serde_json::Value {
     let (respond_to, response) = std::sync::mpsc::channel();
     server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+        media_subscription_reply: None,
         peer_pidfd: None,
         context: crate::api::ApiRequestContext::default(),
         request: api::schema::Request {

@@ -298,6 +298,24 @@ impl App {
         encode_success(id, ResponseResult::PaneCurrent { pane })
     }
 
+    /// Private bootstrap: resolve once and acquire history/lifetime/interest
+    /// before yielding App authority. No terminal-follow or public-id re-resolution.
+    pub(crate) fn bind_media_subscription(
+        &self,
+        target: &str,
+    ) -> Result<crate::api::MediaSubscriptionBinding, crate::api::schema::ErrorBody> {
+        let missing = || crate::api::schema::ErrorBody {
+            close_code: None,
+            code: "pane_not_found".into(),
+            message: format!("pane {target} not found"),
+        };
+        let (ws_idx, pane_id) = self.parse_pane_id(target).ok_or_else(missing)?;
+        // Match pane.get's initial validity check; the public result is not used
+        // to recover authority on the worker side.
+        self.pane_info(ws_idx, pane_id).ok_or_else(missing)?;
+        self.event_hub.subscribe_media(pane_id)
+    }
+
     pub(super) fn handle_pane_get(&mut self, id: String, target: PaneTarget) -> String {
         let Some((ws_idx, pane_id)) = self.parse_pane_id(&target.pane_id) else {
             return pane_not_found(id, &target.pane_id);
@@ -4128,6 +4146,81 @@ mod tests {
         }
     }
 
+    // Data safety: no-session bindings end at actual pane/container removal,
+    // not at a media-session stop or by interpreting public close aliases.
+    #[test]
+    fn media_binding_ends_on_pane_tab_and_workspace_close_without_a_session() {
+        for method in ["pane.close", "tab.close", "workspace.close"] {
+            let mut app = app_with_linked_worktree();
+            let raw = app.state.workspaces[0].tabs[0].root_pane;
+            let target = app.public_pane_id(0, raw).unwrap();
+            let binding = app.bind_media_subscription(&target).unwrap();
+            assert_eq!(binding.pane_id, raw);
+            let missing = app.bind_media_subscription("w999:p999").err().unwrap();
+            assert_eq!(missing.code, "pane_not_found");
+            assert_eq!(missing.message, "pane w999:p999 not found");
+            let params = match method {
+                "pane.close" => serde_json::json!({"pane_id": target}),
+                "tab.close" => serde_json::json!({"tab_id": app.public_tab_id(0, 0).unwrap()}),
+                _ => serde_json::json!({"workspace_id": app.public_workspace_id(0)}),
+            };
+            let request = serde_json::from_value(serde_json::json!({
+                "id": "close-bound-pane", "method": method, "params": params,
+            }))
+            .unwrap();
+            let response = app.handle_api_request(request);
+            let _: SuccessResponse = serde_json::from_str(&response).unwrap();
+            assert!(binding.is_ended(), "{method}");
+            assert!(
+                app.event_hub.take_media_interest_transitions().is_empty(),
+                "close before enable must never activate a replacement"
+            );
+        }
+    }
+
+    #[test]
+    fn media_binding_does_not_follow_a_reattached_terminal() {
+        let mut app = app_with_linked_worktree();
+        let root = app.state.workspaces[0].tabs[0].root_pane;
+        let other = app.state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
+        app.state.ensure_test_terminals();
+        let target = app.public_pane_id(0, root).unwrap();
+        let binding = app.bind_media_subscription(&target).unwrap();
+        let original = app.state.terminal_id_for_pane(0, root).unwrap();
+        let replacement = app.state.terminal_id_for_pane(0, other).unwrap();
+        app.state.workspaces[0].tabs[0]
+            .panes
+            .get_mut(&root)
+            .unwrap()
+            .attached_terminal_id = replacement;
+        app.state.workspaces[0].tabs[0]
+            .panes
+            .get_mut(&other)
+            .unwrap()
+            .attached_terminal_id = original.clone();
+        app.reconcile_media_subscription_lifetimes();
+        assert!(!binding.is_ended());
+        assert_eq!(binding.pane_id, root);
+        assert_eq!(
+            app.event_hub.take_media_interest_transitions(),
+            vec![(root, true)]
+        );
+        let response = app.handle_pane_close(
+            "close-host".into(),
+            PaneCloseParams {
+                pane_id: target,
+                expected_terminal: None,
+            },
+        );
+        let _: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(binding.is_ended());
+        assert_eq!(app.state.terminal_id_for_pane(0, other), Some(original));
+        assert_eq!(
+            app.event_hub.take_media_interest_transitions(),
+            vec![(root, false)]
+        );
+    }
+
     #[test]
     fn api_pane_close_closes_linked_worktree_workspace_only() {
         let mut app = app_with_linked_worktree();
@@ -4690,6 +4783,7 @@ mod tests {
         seed_terminal_states(&mut app);
         let source_public = app.public_pane_id(0, source).unwrap();
         let source_workspace = app.public_workspace_id(0);
+        let media_binding = app.bind_media_subscription(&source_public).unwrap();
 
         let response = app.handle_pane_move(
             "req".into(),
@@ -4734,6 +4828,15 @@ mod tests {
         );
         assert_ne!(move_result.pane.pane_id, source_public);
         assert_eq!(move_result.pane.terminal_id, source_terminal.to_string());
+        assert!(
+            !media_binding.is_ended(),
+            "moved out of the closed source container"
+        );
+        assert_eq!(media_binding.pane_id, source);
+        assert_eq!(
+            app.event_hub.take_media_interest_transitions(),
+            vec![(source, true)]
+        );
         assert_eq!(app.state.workspaces.len(), 1);
         assert_eq!(
             app.state.workspaces[0].tabs[0].terminal_id(source),

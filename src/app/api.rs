@@ -415,8 +415,14 @@ impl App {
                 None
             };
         let terminal_cwd_reported = matches!(ev, AppEvent::TerminalCwdReported { .. });
+        let pane_died = matches!(&ev, AppEvent::PaneDied { .. });
         let previous_toast = self.state.toast.clone();
         let mut pane_updates = self.state.handle_app_event(ev);
+        if pane_died {
+            // PaneExited was emitted before removal. A one-pane tab may emit
+            // no later layout event, so reconcile at the actual state boundary.
+            self.reconcile_media_subscription_lifetimes();
+        }
         if update_ready.is_some() {
             self.state.latest_release_notes = crate::release_notes::load_latest();
         }
@@ -919,7 +925,36 @@ impl App {
         });
     }
 
+    fn reconcile_media_subscription_lifetimes(&self) {
+        self.event_hub.retain_live_media_panes(|| {
+            self.state
+                .workspaces
+                .iter()
+                .flat_map(|workspace| workspace.tabs.iter())
+                .flat_map(|tab| tab.panes.keys().copied())
+                .collect()
+        });
+    }
+
     pub(super) fn emit_event(&mut self, event: crate::api::schema::EventEnvelope) {
+        use crate::api::schema::EventKind;
+
+        // Structural boundaries only. LayoutUpdated also covers geometry and
+        // must not add a topology walk to resize/render/output hot paths.
+        if matches!(
+            event.event,
+            EventKind::WorkspaceCreated
+                | EventKind::WorkspaceClosed
+                | EventKind::WorkspaceMoved
+                | EventKind::TabCreated
+                | EventKind::TabClosed
+                | EventKind::TabMoved
+                | EventKind::PaneCreated
+                | EventKind::PaneClosed
+                | EventKind::PaneMoved
+        ) {
+            self.reconcile_media_subscription_lifetimes();
+        }
         self.run_plugin_event_hooks(&event);
         self.event_hub.push(event);
     }
@@ -2464,6 +2499,34 @@ contains = ["herdr-api-cache-marker"]
     }
 
     #[test]
+    fn media_binding_ends_after_single_pane_process_removal_without_layout_event() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &crate::config::Config::default(),
+            crate::app::AppPolicy::TEST,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("bound-exit")];
+        app.state.ensure_test_terminals();
+        let raw = app.state.workspaces[0].tabs[0].root_pane;
+        let target = app.public_pane_id(0, raw).unwrap();
+        let binding = app.bind_media_subscription(&target).unwrap();
+        app.handle_internal_event(AppEvent::PaneDied {
+            pane_id: raw,
+            exit_reason: crate::platform::ChildExitReason::Exited,
+        });
+        assert!(binding.is_ended());
+        assert!(app.find_pane(raw).is_none());
+        assert!(app
+            .event_hub
+            .events_after(0)
+            .iter()
+            .all(|(_, event)| event.event != crate::api::schema::EventKind::LayoutUpdated));
+    }
+
+    #[test]
     fn pane_exit_emits_layout_updated_when_tab_survives() {
         let event_hub = crate::api::EventHub::default();
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -2479,12 +2542,16 @@ contains = ["herdr-api-cache-marker"]
         app.state.workspaces = vec![workspace];
         app.state.ensure_test_terminals();
         let tab_id = app.public_tab_id(0, 0).unwrap();
+        let media_binding = app
+            .bind_media_subscription(&app.public_pane_id(0, dead_pane).unwrap())
+            .unwrap();
 
         app.handle_internal_event(AppEvent::PaneDied {
             pane_id: dead_pane,
             exit_reason: crate::platform::ChildExitReason::Exited,
         });
 
+        assert!(media_binding.is_ended());
         let events = event_hub.events_after(0);
         let pane_exited = events
             .iter()

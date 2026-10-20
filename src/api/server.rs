@@ -998,6 +998,7 @@ fn handle_request_with_context(
                 peer_pidfd: None,
                 respond_to,
                 response_write_complete: None,
+                media_subscription_reply: None,
             });
             return response;
         }
@@ -1510,9 +1511,14 @@ fn stream_subscriptions(
             return Ok(());
         }
 
+        subscriptions.retain(|subscription| !subscription.is_ended());
+        if subscriptions.is_empty() {
+            return Ok(());
+        }
         for subscription in &mut subscriptions {
             let events = match subscription.poll_batch(api_tx, event_hub) {
                 Ok(events) => events,
+                Err(_) if subscription.is_ended() => continue,
                 Err(error) => {
                     write_json_line_allow_disconnect(
                         &mut stream,
@@ -1525,6 +1531,11 @@ fn stream_subscriptions(
                 }
             };
             for event in events {
+                // A close can follow batch capture. Discard unsent old-pane
+                // history instead of flushing it after the lifetime boundary.
+                if subscription.is_ended() {
+                    break;
+                }
                 if server_stop.is_some_and(ServerStop::is_requested)
                     || should_stop_connection(&mut stream, running)?
                 {
@@ -1537,6 +1548,10 @@ fn stream_subscriptions(
                     return Err(err);
                 }
             }
+        }
+        subscriptions.retain(|subscription| !subscription.is_ended());
+        if subscriptions.is_empty() {
+            return Ok(());
         }
         std::thread::sleep(CONNECTION_POLL_INTERVAL);
     }
@@ -1627,6 +1642,7 @@ fn dispatch_held_media(
         peer_pidfd: None,
         respond_to,
         response_write_complete,
+        media_subscription_reply: None,
     }) {
         return Ok(Some(error_response_json(
             request_id,
@@ -1657,6 +1673,45 @@ fn dispatch_held_media(
             }
         }
     }
+}
+
+/// Only media subscription bootstrap gets a typed reply. The ordinary pane.get
+/// request is a private routing carrier, not an identity encoded in JSON or id.
+pub(super) fn dispatch_media_subscription_binding(
+    request_id: String,
+    pane_id: String,
+    api_tx: &ApiRequestSender,
+) -> Result<crate::api::MediaSubscriptionBinding, ErrorResponse> {
+    let unavailable = |message: String| ErrorResponse {
+        id: request_id.clone(),
+        error: ErrorBody {
+            close_code: None,
+            code: "server_unavailable".into(),
+            message,
+        },
+    };
+    let (respond_to, _response_rx) = std::sync::mpsc::channel();
+    let (reply, binding_rx) = std::sync::mpsc::channel();
+    api_tx
+        .send(ApiRequestMessage {
+            request: Request {
+                id: request_id.clone(),
+                method: Method::PaneGet(crate::api::schema::PaneTarget { pane_id }),
+            },
+            context: ApiRequestContext::default(),
+            peer_pidfd: None,
+            respond_to,
+            response_write_complete: None,
+            media_subscription_reply: Some(reply),
+        })
+        .map_err(|error| unavailable(format!("failed to dispatch request: {error}")))?;
+    binding_rx
+        .recv_timeout(APP_RESPONSE_TIMEOUT)
+        .map_err(|error| unavailable(format!("request handling failed: {error}")))?
+        .map_err(|error| ErrorResponse {
+            id: request_id,
+            error,
+        })
 }
 
 pub(super) fn dispatch_to_app_with_timeout(
@@ -1711,6 +1766,7 @@ fn dispatch_to_app(
         peer_pidfd,
         respond_to,
         response_write_complete,
+        media_subscription_reply: None,
     }) {
         return error_response_json(
             request_id,
@@ -1753,6 +1809,35 @@ fn dispatch_to_app(
             )
         }
     }
+}
+
+// Failure boundary: losing either side of the private reply must keep the
+// existing server_unavailable outcome rather than accepting a bare public id.
+#[cfg(test)]
+#[test]
+fn media_bootstrap_dispatch_preserves_closed_channel_errors() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    drop(rx);
+    let error = dispatch_media_subscription_binding("dispatch".into(), "w1:p1".into(), &tx)
+        .err()
+        .expect("closed request channel");
+    assert_eq!(error.id, "dispatch");
+    assert_eq!(error.error.code, "server_unavailable");
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let worker = std::thread::spawn(move || {
+        let request: ApiRequestMessage = rx.blocking_recv().expect("bootstrap request");
+        assert!(request.media_subscription_reply.is_some());
+        assert_eq!(request.context, ApiRequestContext::default());
+        assert!(matches!(request.request.method, Method::PaneGet(_)));
+        drop(request);
+    });
+    let error = dispatch_media_subscription_binding("reply".into(), "w1:p1".into(), &tx)
+        .err()
+        .expect("closed reply channel");
+    assert_eq!(error.id, "reply");
+    assert_eq!(error.error.code, "server_unavailable");
+    worker.join().expect("receiver completed");
 }
 
 #[cfg(test)]

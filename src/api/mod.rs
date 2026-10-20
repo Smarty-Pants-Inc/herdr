@@ -10,6 +10,7 @@ mod subscriptions;
 mod wait;
 
 pub use event_hub::EventHub;
+pub(crate) use event_hub::MediaSubscriptionBinding;
 #[cfg(unix)]
 pub(crate) use server::start_server_at_with_stop_control;
 pub use server::ServerHandle;
@@ -165,6 +166,10 @@ pub struct ApiRequestMessage {
 
     pub respond_to: std::sync::mpsc::Sender<String>,
     pub response_write_complete: Option<std::sync::mpsc::Receiver<()>>,
+    /// Private, typed subscription bootstrap. Never serialized or put in origin context.
+    pub(crate) media_subscription_reply: Option<
+        std::sync::mpsc::Sender<Result<MediaSubscriptionBinding, crate::api::schema::ErrorBody>>,
+    >,
 }
 
 pub type ApiRequestSender = mpsc::UnboundedSender<ApiRequestMessage>;

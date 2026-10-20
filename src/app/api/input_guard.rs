@@ -2636,6 +2636,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let (respond_to, _response) = std::sync::mpsc::channel();
         tx.send(crate::api::ApiRequestMessage {
+            media_subscription_reply: None,
             peer_pidfd: None,
             request: Request {
                 id: "queued-peer-exit".into(),
@@ -2855,6 +2856,7 @@ finally:
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let (respond_to, _) = std::sync::mpsc::channel();
         tx.send(crate::api::ApiRequestMessage {
+            media_subscription_reply: None,
             peer_pidfd: None,
             request,
             context: accepted,

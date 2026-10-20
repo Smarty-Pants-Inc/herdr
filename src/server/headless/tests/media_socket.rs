@@ -51,6 +51,15 @@ impl Socket {
         serde_json::from_str(&line).expect("a complete JSON socket response")
     }
 
+    fn assert_eof(&mut self) {
+        let mut line = String::new();
+        let read = self.client.as_mut().unwrap().read_line(&mut line).unwrap();
+        assert_eq!(
+            read, 0,
+            "expected socket EOF, got post-completion data: {line:?}"
+        );
+    }
+
     fn assert_held(&self) {
         assert!(
             matches!(self.done.try_recv(), Err(mpsc::TryRecvError::Empty)),
@@ -205,6 +214,19 @@ async fn subscribe(server: &mut HeadlessServer, tx: &api::ApiRequestSender, pane
         "subscription bootstrap returned: {response}"
     );
     socket
+}
+
+async fn json_api(
+    server: &mut HeadlessServer,
+    tx: &api::ApiRequestSender,
+    id: &str,
+    method: &str,
+    params: Value,
+) -> Value {
+    let mut socket = Socket::new(tx, &server.app.event_hub, request(id, method, params));
+    service(server).await;
+    socket.finish();
+    socket.response()
 }
 
 #[tokio::test]
@@ -1115,7 +1137,7 @@ async fn json_last_subscriber_capacity_rejection_drops_levels_and_reconciles_on_
 }
 
 #[tokio::test]
-async fn json_control_broker_timeout_wins_after_generic_app_timeout_and_keeps_session() {
+async fn json_control_timeout_publishes_late_ack_event_without_resurrecting_response() {
     let MediaServerWithClient {
         mut server,
         pane_id,
@@ -1125,6 +1147,12 @@ async fn json_control_broker_timeout_wins_after_generic_app_timeout_and_keeps_se
     } = media_server_with_client(82);
     let tx = sockets(&mut server);
     let open = offered(&mut server, &tx, &pane_id, &control, 82, "timeout").await;
+    let mut subscription = subscribe(&mut server, &tx, &pane_id).await;
+    server.drain_media_interest_transitions();
+    let levels = device_control(&control, Duration::from_secs(2)).unwrap();
+    assert_eq!(levels.levels, Some(true));
+    applied(&mut server, 82, &levels, false, false);
+
     let mut socket = Socket::new(
         &tx,
         &server.app.event_hub,
@@ -1136,17 +1164,54 @@ async fn json_control_broker_timeout_wins_after_generic_app_timeout_and_keeps_se
     );
     service(&mut server).await;
     let command = device_control(&control, Duration::from_secs(2)).unwrap();
-    // Deliberately let APP_RESPONSE_TIMEOUT's 5s budget pass before servicing
-    // the broker. An APP_RESPONSE_TIMEOUT-bound dispatcher would already reply.
+    // APP_RESPONSE_TIMEOUT must not release this broker-owned public request.
     std::thread::sleep(Duration::from_millis(5100));
     socket.assert_held();
-    server.expire_media_sessions(Instant::now());
+    // Now advance the broker's captured clock explicitly, keeping the public
+    // JSON control request and the actual headless expiry path.
+    server.expire_media_sessions(
+        Instant::now() + crate::server::media::MEDIA_CONTROL_TIMEOUT + Duration::from_millis(1),
+    );
     socket.finish();
     let response = socket.response();
     assert_eq!(response["id"], "uncertain");
     assert_eq!(response["error"]["code"], "media_timeout");
     assert!(response["error"].get("close_code").is_none());
-    applied(&mut server, 82, &command, true, false);
+    socket.assert_eof();
+
+    let mut wrong_cid = command.clone();
+    wrong_cid.control_id = u64::MAX;
+    let mut sentinel = control_request(
+        &mut server,
+        &tx,
+        "sentinel",
+        &open.session_id,
+        Some(false),
+        None,
+    )
+    .await;
+    let sentinel_command = device_control(&control, Duration::from_secs(2)).unwrap();
+    applied(&mut server, 999, &command, true, false); // wrong client
+    applied(&mut server, 82, &wrong_cid, true, false); // wrong CID
+    applied(&mut server, 82, &command, false, false); // wrong applied pair
+    sentinel.assert_held();
+    applied(&mut server, 82, &sentinel_command, false, false);
+    sentinel.finish();
+    assert_eq!(sentinel.response()["result"]["request_id"], "sentinel");
+    let sentinel_event = subscription.response();
+    assert_eq!(sentinel_event["event"], "media.controls_applied");
+    assert_eq!(sentinel_event["data"]["request_id"], "sentinel");
+    assert_eq!(sentinel_event["data"]["input_muted"], false);
+
+    applied(&mut server, 82, &command, true, false); // valid ACK after timeout
+    let late_event = subscription.response();
+    assert_eq!(late_event["event"], "media.controls_applied");
+    assert_eq!(late_event["data"]["session_id"], open.session_id);
+    assert_eq!(late_event["data"]["request_id"], "uncertain");
+    assert_eq!(late_event["data"]["pane_id"], pane_id);
+    assert_eq!(late_event["data"]["input_muted"], true);
+    assert_eq!(late_event["data"]["output_suppressed"], false);
+
     let mut after_timeout = control_request(
         &mut server,
         &tx,
@@ -1158,7 +1223,7 @@ async fn json_control_broker_timeout_wins_after_generic_app_timeout_and_keeps_se
     .await;
     let next = device_control(&control, Duration::from_secs(2)).unwrap();
     after_timeout.assert_held();
-    applied(&mut server, 82, &command, true, false); // duplicate late result cannot settle next
+    applied(&mut server, 82, &command, true, false); // duplicate cannot settle or republish
     after_timeout.assert_held();
     applied(&mut server, 82, &next, false, false);
     after_timeout.finish();
@@ -1166,10 +1231,15 @@ async fn json_control_broker_timeout_wins_after_generic_app_timeout_and_keeps_se
         after_timeout.response()["result"]["request_id"],
         "after-timeout"
     );
+    let successor_event = subscription.response();
+    assert_eq!(successor_event["event"], "media.controls_applied");
+    assert_eq!(successor_event["data"]["request_id"], "after-timeout");
     assert_eq!(
         server.media.state(&open.session_id).unwrap().state,
         api::schema::MediaSessionState::Offered
     );
+    subscription.disconnect();
+    server.drain_media_interest_transitions();
     shutdown_test_runtimes(&mut server);
 }
 
@@ -1346,6 +1416,319 @@ async fn json_epoch_gate_precedes_answer_control_and_open_id_cancellation() {
 }
 
 #[tokio::test]
+async fn json_media_subscription_ends_on_real_pane_close_without_tearing_down_other_entries() {
+    // Data-safety boundary: a closed pane incarnation must not inherit media
+    // history, while an unrelated lifecycle entry on the same socket survives.
+    let MediaServerWithClient {
+        mut server,
+        pane_id,
+        control: _source_control,
+        render: _source_render,
+        _input: _source_input,
+    } = media_server_with_client(101);
+    let tx = sockets(&mut server);
+    let (other_pane, other_control, _other_render, _other_input) =
+        another_media_client(&mut server, 102);
+    let pane = json_api(
+        &mut server,
+        &tx,
+        "pane-before-close",
+        "pane.get",
+        json!({"pane_id": pane_id}),
+    )
+    .await;
+    assert_eq!(pane["result"]["pane"]["pane_id"], pane_id);
+    let terminal_id = pane["result"]["pane"]["terminal_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let mut media_only = subscribe(&mut server, &tx, &pane_id).await;
+    let mut mixed = Socket::new(
+        &tx,
+        &server.app.event_hub,
+        request(
+            "mixed-subscribe",
+            "events.subscribe",
+            json!({"subscriptions": [
+                {"type": "media", "pane_id": pane_id},
+                {"type": "pane.created"}
+            ]}),
+        ),
+    );
+    service(&mut server).await;
+    assert_eq!(mixed.response()["result"]["type"], "subscription_started");
+
+    let closed = json_api(
+        &mut server,
+        &tx,
+        "close-pane",
+        "pane.close",
+        json!({"pane_id": pane_id, "expected_terminal": terminal_id}),
+    )
+    .await;
+    assert_eq!(closed["result"]["type"], "ok");
+    media_only.assert_eof();
+    media_only.finish();
+    // This drains the already-queued old-incarnation interest transitions before
+    // a new pane exists; pure queue-ordering counters live beside the production hub.
+    server.drain_media_interest_transitions();
+
+    // The shared fixture defaults new panes to an exiting command. Keep this
+    // real split's shell alive through the subsequent subscription bootstrap.
+    server.app.state.default_shell = "/bin/sh".into();
+    let split = json_api(
+        &mut server,
+        &tx,
+        "create-new-pane",
+        "pane.split",
+        json!({"target_pane_id": other_pane, "direction": "right", "focus": true}),
+    )
+    .await;
+    assert_eq!(
+        split["result"]["type"], "pane_info",
+        "pane split returned: {split}"
+    );
+    let new_pane_id = split["result"]["pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let new_terminal_id = split["result"]["pane"]["terminal_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (new_workspace_index, new_raw_pane_id) = server
+        .app
+        .parse_pane_id(&new_pane_id)
+        .expect("the real split returned a resolvable pane id");
+    assert_eq!(
+        server.app.state.workspaces[new_workspace_index]
+            .terminal_id(new_raw_pane_id)
+            .unwrap()
+            .as_str(),
+        new_terminal_id.as_str()
+    );
+    let created = mixed.response();
+    assert_eq!(created["event"], "pane_created");
+    assert_eq!(created["data"]["pane"]["pane_id"], new_pane_id);
+
+    type_into(&mut server, 102, &new_pane_id);
+    let mut fresh = subscribe(&mut server, &tx, &new_pane_id).await;
+    server.drain_media_interest_transitions();
+    let fresh_open = offered(
+        &mut server,
+        &tx,
+        &new_pane_id,
+        &other_control,
+        102,
+        "fresh-pane",
+    )
+    .await;
+    assert_eq!(fresh_open.pane_id, new_pane_id);
+    assert_eq!(
+        server.app.parse_pane_id(&fresh_open.pane_id).unwrap().1,
+        new_raw_pane_id
+    );
+    assert_eq!(
+        device_control(&other_control, Duration::from_secs(2))
+            .unwrap()
+            .levels,
+        Some(true)
+    );
+    client_control(
+        &mut server,
+        102,
+        MediaControl::Info(MediaInfo {
+            session_id: fresh_open.session_id.clone(),
+            version: "test-helper".into(),
+            commit: "abc".into(),
+            pid: 7,
+            input_device: "test input".into(),
+            output_device: "test output".into(),
+        }),
+    );
+    answer_and_connect(
+        &mut server,
+        &tx,
+        &other_control,
+        102,
+        &fresh_open.session_id,
+    )
+    .await;
+    let fresh_event = fresh.response();
+    assert_eq!(fresh_event["event"], "media.started");
+    assert_eq!(fresh_event["data"]["pane_id"], new_pane_id);
+    assert_eq!(fresh_event["data"]["session_id"], fresh_open.session_id);
+    media_only.assert_eof(); // even a later real broker event cannot resurrect the closed stream
+
+    fresh.disconnect();
+    mixed.disconnect();
+    server.drain_media_interest_transitions();
+    close_session(&mut server, &tx, &fresh_open.session_id).await;
+    shutdown_test_runtimes(&mut server);
+}
+
+#[tokio::test]
+async fn json_media_subscription_follows_raw_pane_incarnation_through_real_move_renumber() {
+    // Do not manufacture pane-number reuse: the actual move handler returns the
+    // old/new public ids and terminal ids while preserving the runtime PaneId.
+    let MediaServerWithClient {
+        mut server,
+        pane_id,
+        control,
+        render: _render,
+        _input,
+    } = media_server_with_client(103);
+    let tx = sockets(&mut server);
+    let (other_pane, other_control, _other_render, _other_input) =
+        another_media_client(&mut server, 104);
+    let source = json_api(
+        &mut server,
+        &tx,
+        "source-pane",
+        "pane.get",
+        json!({"pane_id": pane_id}),
+    )
+    .await;
+    let target = json_api(
+        &mut server,
+        &tx,
+        "target-pane",
+        "pane.get",
+        json!({"pane_id": other_pane}),
+    )
+    .await;
+    let source_id = source["result"]["pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let terminal_id = source["result"]["pane"]["terminal_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let destination_workspace = target["result"]["pane"]["workspace_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let other_id = target["result"]["pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let raw_before = server.app.parse_pane_id(&source_id).unwrap().1;
+
+    let source_open = offered(&mut server, &tx, &source_id, &control, 103, "move-source").await;
+    let other_open = offered(
+        &mut server,
+        &tx,
+        &other_id,
+        &other_control,
+        104,
+        "move-other",
+    )
+    .await;
+    let mut source_subscription = subscribe(&mut server, &tx, &source_id).await;
+    let mut other_subscription = subscribe(&mut server, &tx, &other_id).await;
+
+    let moved = json_api(
+        &mut server,
+        &tx,
+        "move-pane",
+        "pane.move",
+        json!({
+            "pane_id": source_id,
+            "destination": {"type": "new_tab", "workspace_id": destination_workspace, "label": "moved-media"},
+            "focus": true
+        }),
+    )
+    .await;
+    assert_eq!(
+        moved["result"]["type"], "pane_move",
+        "pane move returned: {moved}"
+    );
+    let move_result = &moved["result"]["move_result"];
+    let moved_pane_id = move_result["pane"]["pane_id"].as_str().unwrap().to_owned();
+    assert_eq!(move_result["previous_pane_id"], source_id);
+    assert_ne!(
+        source_id, moved_pane_id,
+        "real move must demonstrate public renumbering"
+    );
+    assert_eq!(move_result["pane"]["terminal_id"], terminal_id);
+    let raw_after = server.app.parse_pane_id(&moved_pane_id).unwrap().1;
+    assert_eq!(
+        raw_before, raw_after,
+        "the production move retained the pane incarnation"
+    );
+    // Bind again through the moved public id. Its broker event still carries the
+    // session's original public pane string, so only raw-incarnation matching fits.
+    let mut moved_subscription = subscribe(&mut server, &tx, &moved_pane_id).await;
+
+    server.drain_media_interest_transitions();
+    let source_levels = device_control(&control, Duration::from_secs(2)).unwrap();
+    assert_eq!(source_levels.session_id, source_open.session_id);
+    assert_eq!(source_levels.levels, Some(true));
+    let other_levels = device_control(&other_control, Duration::from_secs(2)).unwrap();
+    assert_eq!(other_levels.session_id, other_open.session_id);
+    assert_eq!(other_levels.levels, Some(true));
+
+    // Publish a real other-pane event first. Its independent subscription proves
+    // publication happened; the source socket must skip it and return only P.
+    client_control(
+        &mut server,
+        104,
+        MediaControl::Info(MediaInfo {
+            session_id: other_open.session_id.clone(),
+            version: "test-helper".into(),
+            commit: "abc".into(),
+            pid: 7,
+            input_device: "test input".into(),
+            output_device: "test output".into(),
+        }),
+    );
+    answer_and_connect(
+        &mut server,
+        &tx,
+        &other_control,
+        104,
+        &other_open.session_id,
+    )
+    .await;
+    let other_event = other_subscription.response();
+    assert_eq!(other_event["event"], "media.started");
+    assert_eq!(other_event["data"]["session_id"], other_open.session_id);
+    client_control(
+        &mut server,
+        103,
+        MediaControl::Info(MediaInfo {
+            session_id: source_open.session_id.clone(),
+            version: "test-helper".into(),
+            commit: "abc".into(),
+            pid: 7,
+            input_device: "test input".into(),
+            output_device: "test output".into(),
+        }),
+    );
+    answer_and_connect(&mut server, &tx, &control, 103, &source_open.session_id).await;
+    let source_event = source_subscription.response();
+    assert_eq!(source_event["event"], "media.started");
+    assert_eq!(source_event["data"]["session_id"], source_open.session_id);
+    assert_eq!(source_event["data"]["epoch"], 1);
+    assert_eq!(source_event["data"]["pane_id"], source_id);
+    let moved_event = moved_subscription.response();
+    assert_eq!(moved_event["event"], "media.started");
+    assert_eq!(moved_event["data"]["session_id"], source_open.session_id);
+    assert_eq!(moved_event["data"]["pane_id"], source_id);
+    assert_ne!(moved_event["data"]["pane_id"], moved_pane_id);
+
+    source_subscription.disconnect();
+    moved_subscription.disconnect();
+    other_subscription.disconnect();
+    server.drain_media_interest_transitions();
+    close_session(&mut server, &tx, &source_open.session_id).await;
+    close_session(&mut server, &tx, &other_open.session_id).await;
+    shutdown_test_runtimes(&mut server);
+}
+
+#[tokio::test]
 async fn json_media_subscription_filters_canonical_pane_and_emits_untagged_broker_events() {
     let MediaServerWithClient {
         mut server,
@@ -1358,6 +1741,9 @@ async fn json_media_subscription_filters_canonical_pane_and_emits_untagged_broke
     let alias = format!("p_{}", raw.raw());
     type_into(&mut server, 85, &alias);
     let tx = sockets(&mut server);
+    let (other_pane, _other_control, _other_render, _other_input) =
+        another_media_client(&mut server, 105);
+    let (_, other_raw) = server.app.parse_pane_id(&other_pane).unwrap();
     let mut subscription = subscribe(&mut server, &tx, &alias).await;
     server.drain_media_interest_transitions(); // interest exists even before open
     let open = offered(&mut server, &tx, &alias, &control, 85, "events").await;
@@ -1375,10 +1761,11 @@ async fn json_media_subscription_filters_canonical_pane_and_emits_untagged_broke
         },
     });
     server.perform_media_actions(vec![crate::server::media::MediaAction::Publish {
+        pane_id: other_raw,
         event: api::schema::SubscriptionEventEnvelope {
             event: api::schema::SubscriptionEventKind::MediaLevels,
             data: api::schema::SubscriptionEventData::MediaLevels(api::schema::MediaLevelsEvent {
-                pane_id: format!("{pane_id}-not-the-pane"),
+                pane_id: other_pane,
                 session_id: "other".into(),
                 input_peak: 0.1,
                 output_peak: 0.2,
@@ -1532,17 +1919,9 @@ async fn json_media_subscribers_enable_first_disable_last_and_cleanup_failed_set
     failed.finish();
     assert_eq!(failed.response()["error"]["code"], "pane_not_found");
     server.drain_media_interest_transitions();
-    assert_eq!(
-        device_control(&control, Duration::from_secs(2))
-            .unwrap()
-            .levels,
-        Some(true)
-    );
-    assert_eq!(
-        device_control(&control, Duration::from_secs(2))
-            .unwrap()
-            .levels,
-        Some(false)
+    assert!(
+        device_control(&control, Duration::from_millis(50)).is_none(),
+        "a wholly abandoned partial setup emits no transient levels interest"
     );
 
     let mut failed_write = Socket::new(
@@ -1564,19 +1943,28 @@ async fn json_media_subscribers_enable_first_disable_last_and_cleanup_failed_set
     service(&mut server).await;
     failed_write.finish();
     server.drain_media_interest_transitions();
+    assert!(
+        device_control(&control, Duration::from_millis(50)).is_none(),
+        "a failed subscription acknowledgement emits no transient levels interest"
+    );
+    assert!(server.media.state(&open.session_id).unwrap().code.is_none());
+
+    let mut resubscribed = subscribe(&mut server, &tx, &pane_id).await;
+    server.drain_media_interest_transitions();
     assert_eq!(
         device_control(&control, Duration::from_secs(2))
             .unwrap()
             .levels,
         Some(true)
     );
+    resubscribed.disconnect();
+    server.drain_media_interest_transitions();
     assert_eq!(
         device_control(&control, Duration::from_secs(2))
             .unwrap()
             .levels,
         Some(false)
     );
-    assert!(server.media.state(&open.session_id).unwrap().code.is_none());
     shutdown_test_runtimes(&mut server);
 }
 
@@ -1603,9 +1991,8 @@ async fn idle_headless_loop_json_interest(queue_before_run: bool) {
     if queue_before_run {
         let mut prestart = subscribe(&mut server, &tx, &pane_id).await;
         prestart.disconnect();
-        // Both transitions precede run/notified: one coalesced permit must
-        // deliver the whole queue, without a later API request to wake it.
-        assert!(device_control(&control, Duration::from_millis(50)).is_none());
+        // The runtime has not consumed this entirely abandoned interest yet;
+        // verify below that the coalesced notification carries no stale command.
     }
     let (_, raw) = server.app.parse_pane_id(&pane_id).unwrap();
     let alias = format!("p_{}", raw.raw());
@@ -1618,14 +2005,10 @@ async fn idle_headless_loop_json_interest(queue_before_run: bool) {
     let observer = std::thread::spawn(move || {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             if queue_before_run {
-                for enabled in [true, false] {
-                    assert_eq!(
-                        device_control(&control, Duration::from_secs(2))
-                            .expect("pre-run queued interest reaches the real client")
-                            .levels,
-                        Some(enabled)
-                    );
-                }
+                assert!(
+                    device_control(&control, Duration::from_millis(50)).is_none(),
+                    "pre-run subscription dropped before run emits no stale levels command"
+                );
             }
             let mut subscription = Socket::new(
                 &tx,
@@ -1773,7 +2156,7 @@ async fn json_answer_returns_immediately_then_negotiation_deadline_emits_stopped
     assert!(server
         .app
         .event_hub
-        .take_media_interest_transitions(|_| Some(raw))
+        .take_media_interest_transitions()
         .is_empty());
     server.app.state.terminals.insert(terminal_id, terminal);
     server.app.state.assert_invariants_for_test();

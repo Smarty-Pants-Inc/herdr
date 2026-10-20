@@ -196,12 +196,28 @@ unknown session IDs. Do not parse `message` to discover the close reason:
 ```
 
 Subscribe on a persistent socket with `events.subscribe` and a pane-scoped
-`media` subscription. The server validates and canonicalizes the pane ID; events
-from other panes are not delivered by this subscription:
+`media` subscription. The server validates the selector and binds the entry to
+that runtime pane incarnation, not to its reusable public ID or its terminal.
+Events from other pane incarnations are not delivered by this subscription:
 
 ```json
 {"id":"media-events","method":"events.subscribe","params":{"subscriptions":[{"type":"media","pane_id":"w1:p1"}]}}
 ```
+
+The binding and its live-history cursor are captured together under server
+App authority. Events preceding that capture are not replayed. Moving or
+renumbering the same pane preserves the entry; reattaching its terminal does not
+move the entry to another pane. Closing the pane (including tab/workspace close
+or process removal) ends the entry and discards its queued media history. A
+restored pane has a fresh runtime incarnation even if its public ID is unchanged.
+A media session ending alone does **not** end the pane's subscription.
+
+An ended media entry is removed without a final event or a `pane_not_found`
+stream error. Other entries on a mixed subscription connection remain active;
+the server sends EOF only when no entries remain. There is no ordering boundary
+between media history and the separate lifecycle history. Do not expect a final
+`media.stopped` for an ended pane subscription; use lifecycle subscriptions or
+authoritative reads when pane-close notification is needed.
 
 Media subscription events use the dotted `event` names below and **untagged
 `data`**: there is no `data.type`. Every data object includes `pane_id` and
@@ -226,7 +242,9 @@ Media subscription events use the dotted `event` names below and **untagged
 
 The first media subscriber for a pane requests client level reporting; the last
 subscriber leaving requests levels off, including socket disconnect and failed
-subscription setup. Subscribing before a session opens also applies to future
+subscription setup. Counts and queued transitions use the captured runtime
+pane incarnation, never a delayed public-ID lookup; closing before the first
+enable is serviced cannot activate a replacement pane. Subscribing before a session opens also applies to future
 sessions on that pane. A new or renewed session starts with levels off unless a
 subscriber exists. The server drops each incoming levels message immediately
 when its pane has no subscribers. If the levels-off control fails or is
@@ -238,6 +256,21 @@ control events are not throttled by the level limit. `media.device_changed` is
 reserved and is **never emitted**; device changes are close reasons, not a sixth
 event kind. Reconnect and resubscribe after socket loss; events are live notices,
 not a durable replay log.
+
+Internally, `ApiRequestMessage.media_subscription_reply` is a private typed
+bootstrap reply, serviced by the headless receiver after queued internal events
+are drained. It carries the raw pane binding, RAII interest, and history cursor;
+none is added to public requests, responses, origin context, or media envelopes.
+Lifetime reconciliation runs only in structural `App::emit_event` gates
+(workspace/tab/pane created, closed, or moved) and immediately after
+`state.handle_app_event` handles `PaneDied` in
+`handle_internal_event_with_pane_updates`. With no bindings it skips topology
+collection. Otherwise each such boundary performs one O(P+B) pass over P runtime
+panes and B distinct bound panes, plus the bounded media history when entries end.
+`LayoutUpdated` is deliberately excluded because it also describes geometry.
+There is no lifetime topology work per output/PTY event, render, media event,
+or subscription poll, and interest transitions wake the existing runtime Notify
+path rather than adding a timer.
 
 ### Registered agent channels (unreleased)
 

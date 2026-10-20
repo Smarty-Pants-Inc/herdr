@@ -11,34 +11,59 @@ struct EventHubState {
     events: Vec<(u64, crate::api::schema::EventEnvelope)>,
 }
 
+type MediaHistoryEntry = (
+    u64,
+    crate::layout::PaneId,
+    crate::api::schema::SubscriptionEventEnvelope,
+);
+
 #[derive(Default)]
 struct MediaEventHubState {
     next_sequence: u64,
-    events: std::collections::VecDeque<(u64, crate::api::schema::SubscriptionEventEnvelope)>,
-    interest: std::collections::HashMap<String, usize>,
-    transitions: std::collections::VecDeque<(String, bool)>,
-    resolved: std::collections::HashMap<String, crate::layout::PaneId>,
-    pane_interest: std::collections::HashMap<crate::layout::PaneId, usize>,
+    evicted_through: u64,
+    // The raw producer identity is private; the public envelope is unchanged.
+    events: std::collections::VecDeque<MediaHistoryEntry>,
+    interest: std::collections::HashMap<crate::layout::PaneId, MediaPaneInterest>,
+    dirty: std::collections::HashSet<crate::layout::PaneId>,
+    enabled: std::collections::HashSet<crate::layout::PaneId>,
 }
 
-/// Connection-owned interest: every setup/write/transport failure releases it.
-pub(super) struct MediaInterest {
+struct MediaPaneInterest {
+    count: usize,
+    live: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Captured together under App authority and the media-state lock. Owning the
+/// reply already owns interest, even before the socket worker receives it.
+pub(crate) struct MediaSubscriptionBinding {
     hub: EventHub,
-    pane: String,
+    pub(crate) pane_id: crate::layout::PaneId,
+    pub(crate) start_sequence: u64,
+    live: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
-impl Drop for MediaInterest {
+impl MediaSubscriptionBinding {
+    pub(crate) fn is_ended(&self) -> bool {
+        !self.live.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+impl Drop for MediaSubscriptionBinding {
     fn drop(&mut self) {
         let Ok(mut state) = self.hub.media.lock() else {
             return;
         };
-        let Some(count) = state.interest.get_mut(&self.pane) else {
+        let Some(interest) = state.interest.get_mut(&self.pane_id) else {
             return;
         };
-        *count -= 1;
-        if *count == 0 {
-            state.interest.remove(&self.pane);
-            state.transitions.push_back((self.pane.clone(), false));
+        if !std::sync::Arc::ptr_eq(&interest.live, &self.live) {
+            return;
+        }
+        interest.count -= 1;
+        if interest.count == 0 {
+            self.live.store(false, std::sync::atomic::Ordering::Release);
+            state.interest.remove(&self.pane_id);
+            state.dirty.insert(self.pane_id);
             drop(state);
             self.hub.media_interest_notify.notify_one();
         }
@@ -104,15 +129,21 @@ impl EventHub {
 
     /// A separate bounded history: media envelopes are deliberately not the
     /// tagged general EventEnvelope and levels must not evict lifecycle events.
-    pub(crate) fn push_media(&self, event: crate::api::schema::SubscriptionEventEnvelope) {
+    pub(crate) fn push_media(
+        &self,
+        pane_id: crate::layout::PaneId,
+        event: crate::api::schema::SubscriptionEventEnvelope,
+    ) {
         let Ok(mut state) = self.media.lock() else {
             return;
         };
         state.next_sequence += 1;
         let sequence = state.next_sequence;
-        state.events.push_back((sequence, event));
+        state.events.push_back((sequence, pane_id, event));
         if state.events.len() > Self::MAX_EVENTS {
-            state.events.pop_front();
+            if let Some((sequence, _, _)) = state.events.pop_front() {
+                state.evicted_through = sequence;
+            }
         }
     }
 
@@ -122,75 +153,124 @@ impl EventHub {
 
     pub(super) fn media_events_after_checked(
         &self,
+        binding: &MediaSubscriptionBinding,
         sequence: u64,
-    ) -> Result<Vec<(u64, crate::api::schema::SubscriptionEventEnvelope)>, EventHistoryError> {
+    ) -> Result<Option<Vec<MediaHistoryEntry>>, EventHistoryError> {
+        // An ended entry wins over retention loss, including loss that happened
+        // before its close. Both decisions share the lifetime/interest lock.
+        if binding.is_ended() {
+            return Ok(None);
+        }
         let state = self
             .media
             .lock()
             .map_err(|_| EventHistoryError::Unavailable)?;
-        if state
-            .events
-            .front()
-            .is_some_and(|(first, _)| sequence < first.saturating_sub(1))
-        {
+        if binding.is_ended() {
+            return Ok(None);
+        }
+        if sequence < state.evicted_through {
             return Err(EventHistoryError::Lost);
         }
-        Ok(state
-            .events
-            .iter()
-            .filter(|(seq, _)| *seq > sequence)
-            .cloned()
-            .collect())
+        Ok(Some(
+            state
+                .events
+                .iter()
+                .filter(|(seq, _, _)| *seq > sequence)
+                .cloned()
+                .collect(),
+        ))
     }
 
-    pub(super) fn subscribe_media(&self, pane: String) -> Result<MediaInterest, EventHistoryError> {
+    /// Only App bootstrap may call this in production: resolution and acquiring
+    /// this RAII binding must be one App-owned operation, not two worker steps.
+    pub(crate) fn subscribe_media(
+        &self,
+        pane_id: crate::layout::PaneId,
+    ) -> Result<MediaSubscriptionBinding, crate::api::schema::ErrorBody> {
         let mut state = self
             .media
             .lock()
-            .map_err(|_| EventHistoryError::Unavailable)?;
-        let count = state.interest.entry(pane.clone()).or_default();
-        *count += 1;
-        if *count == 1 {
-            state.transitions.push_back((pane.clone(), true));
+            .map_err(|_| crate::api::schema::ErrorBody {
+                close_code: None,
+                code: "server_unavailable".into(),
+                message: "event history is unavailable".into(),
+            })?;
+        let interest = state
+            .interest
+            .entry(pane_id)
+            .or_insert_with(|| MediaPaneInterest {
+                count: 0,
+                live: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            });
+        interest.count += 1;
+        let live = interest.live.clone();
+        let first = interest.count == 1;
+        let start_sequence = state.next_sequence;
+        if first {
+            state.dirty.insert(pane_id);
             self.media_interest_notify.notify_one();
         }
-        Ok(MediaInterest {
+        Ok(MediaSubscriptionBinding {
             hub: self.clone(),
-            pane,
+            pane_id,
+            start_sequence,
+            live,
         })
+    }
+
+    /// Called only at App topology boundaries. Laziness gives zero pane walks
+    /// when there are no bindings; otherwise one O(P+B) pass, not B pane scans.
+    pub(crate) fn retain_live_media_panes(
+        &self,
+        live_panes: impl FnOnce() -> std::collections::HashSet<crate::layout::PaneId>,
+    ) {
+        let Ok(mut state) = self.media.lock() else {
+            return;
+        };
+        if state.interest.is_empty() {
+            return;
+        }
+        let live_panes = live_panes();
+        let mut ended = std::collections::HashSet::new();
+        state.interest.retain(|pane, interest| {
+            if live_panes.contains(pane) {
+                return true;
+            }
+            interest
+                .live
+                .store(false, std::sync::atomic::Ordering::Release);
+            ended.insert(*pane);
+            false
+        });
+        if ended.is_empty() {
+            return;
+        }
+        // Drop queued history atomically with ending the lifetime and interest.
+        // Removing records is not overflow and must not manufacture history loss.
+        state.events.retain(|(_, pane, _)| !ended.contains(pane));
+        state.dirty.extend(ended);
+        drop(state);
+        self.media_interest_notify.notify_one();
     }
 
     pub(crate) fn media_interest_notify(&self) -> std::sync::Arc<tokio::sync::Notify> {
         self.media_interest_notify.clone()
     }
 
-    pub(crate) fn take_media_interest_transitions(
-        &self,
-        mut resolve: impl FnMut(&str) -> Option<crate::layout::PaneId>,
-    ) -> Vec<(crate::layout::PaneId, bool)> {
+    pub(crate) fn take_media_interest_transitions(&self) -> Vec<(crate::layout::PaneId, bool)> {
         let Ok(mut state) = self.media.lock() else {
             return Vec::new();
         };
         let mut transitions = Vec::new();
-        while let Some((canonical, enabled)) = state.transitions.pop_front() {
-            if enabled {
-                let Some(pane) = resolve(&canonical) else {
-                    continue;
-                };
-                state.resolved.insert(canonical, pane);
-                let count = state.pane_interest.entry(pane).or_default();
-                *count += 1;
-                if *count == 1 {
-                    transitions.push((pane, true));
-                }
-            } else if let Some(pane) = state.resolved.remove(&canonical) {
-                if let Some(count) = state.pane_interest.get_mut(&pane) {
-                    *count -= 1;
-                    if *count == 0 {
-                        state.pane_interest.remove(&pane);
-                        transitions.push((pane, false));
-                    }
-                }
+        // Reconcile the final desired state, coalescing close-before-enable and
+        // repeated first/last changes without ever resolving a public alias.
+        let dirty = std::mem::take(&mut state.dirty);
+        for pane in dirty {
+            let enabled = state.interest.contains_key(&pane);
+            if enabled && state.enabled.insert(pane) {
+                transitions.push((pane, true));
+            } else if !enabled && state.enabled.remove(&pane) {
+                transitions.push((pane, false));
             }
         }
         transitions
@@ -246,38 +326,28 @@ mod tests {
         let hub = EventHub::default();
         let pane = crate::layout::PaneId::from_raw(91);
         let notify = hub.media_interest_notify();
-        let first = hub.subscribe_media("w1:p1".into()).unwrap();
-        let second = hub.subscribe_media("w1:p1".into()).unwrap();
+        let first = hub.subscribe_media(pane).unwrap();
+        let second = hub.subscribe_media(pane).unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(1), notify.notified())
             .await
             .unwrap();
-        assert_eq!(
-            hub.take_media_interest_transitions(|_| Some(pane)),
-            vec![(pane, true)]
-        );
+        assert_eq!(hub.take_media_interest_transitions(), vec![(pane, true)]);
         drop(first);
-        assert!(hub
-            .take_media_interest_transitions(|_| Some(pane))
-            .is_empty());
-        // A move changes the canonical id but not the raw pane's interest.
-        let moved = hub.subscribe_media("w2:p1".into()).unwrap();
-        assert!(hub
-            .take_media_interest_transitions(|_| Some(pane))
-            .is_empty());
+        assert!(hub.take_media_interest_transitions().is_empty());
+        // A move/renumber does not change the raw pane's interest.
+        let moved = hub.subscribe_media(pane).unwrap();
+        assert!(hub.take_media_interest_transitions().is_empty());
         drop(second);
-        assert!(hub.take_media_interest_transitions(|_| None).is_empty());
+        assert!(hub.take_media_interest_transitions().is_empty());
         drop(moved);
         tokio::time::timeout(std::time::Duration::from_secs(1), notify.notified())
             .await
             .unwrap();
-        assert_eq!(
-            hub.take_media_interest_transitions(|_| None),
-            vec![(pane, false)]
-        );
+        assert_eq!(hub.take_media_interest_transitions(), vec![(pane, false)]);
         let state = hub.media.lock().unwrap();
         assert!(state.interest.is_empty());
-        assert!(state.resolved.is_empty());
-        assert!(state.pane_interest.is_empty());
+        assert!(state.dirty.is_empty());
+        assert!(state.enabled.is_empty());
     }
 
     #[test]
@@ -287,26 +357,34 @@ mod tests {
             SubscriptionEventKind,
         };
         let hub = EventHub::default();
+        let pane = crate::layout::PaneId::from_raw(92);
+        let binding = hub.subscribe_media(pane).unwrap();
         hub.push(event());
         for _ in 0..=EventHub::MAX_EVENTS {
-            hub.push_media(SubscriptionEventEnvelope {
-                event: SubscriptionEventKind::MediaLevels,
-                data: SubscriptionEventData::MediaLevels(MediaLevelsEvent {
-                    pane_id: "w1:p1".into(),
-                    session_id: "session".into(),
-                    input_peak: 0.25,
-                    output_peak: 0.5,
-                }),
-            });
+            hub.push_media(
+                pane,
+                SubscriptionEventEnvelope {
+                    event: SubscriptionEventKind::MediaLevels,
+                    data: SubscriptionEventData::MediaLevels(MediaLevelsEvent {
+                        pane_id: "w1:p1".into(),
+                        session_id: "session".into(),
+                        input_peak: 0.25,
+                        output_peak: 0.5,
+                    }),
+                },
+            );
         }
         assert_eq!(hub.events_after_checked(0).unwrap().len(), 1);
         assert_eq!(hub.current_sequence(), 1);
         assert_eq!(
-            hub.media_events_after_checked(0),
+            hub.media_events_after_checked(&binding, 0),
             Err(EventHistoryError::Lost)
         );
         assert_eq!(
-            hub.media_events_after_checked(1).unwrap().len(),
+            hub.media_events_after_checked(&binding, 1)
+                .unwrap()
+                .unwrap()
+                .len(),
             EventHub::MAX_EVENTS
         );
         assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -315,9 +393,109 @@ mod tests {
         }))
         .is_err());
         assert_eq!(
-            hub.media_events_after_checked(1),
+            hub.media_events_after_checked(&binding, 1),
             Err(EventHistoryError::Unavailable)
         );
+    }
+
+    fn levels(pane_id: &str) -> crate::api::schema::SubscriptionEventEnvelope {
+        serde_json::from_value(serde_json::json!({
+            "event": "media.levels", "data": {
+                "pane_id": pane_id, "session_id": "session", "input_peak": 0.25, "output_peak": 0.5
+            }
+        }))
+        .unwrap()
+    }
+
+    // Trust boundary: alias reuse, queued enables, and bootstrap/close races
+    // must never activate or deliver media for another pane incarnation.
+    #[test]
+    fn media_binding_captures_cursor_before_reply_and_close_wins_over_loss() {
+        let hub = EventHub::default();
+        let old = crate::layout::PaneId::from_raw(93);
+        let replacement = crate::layout::PaneId::from_raw(94);
+        hub.push_media(old, levels("w1:p1"));
+        let binding = hub.subscribe_media(replacement).unwrap();
+        assert_eq!(binding.start_sequence, 1);
+        assert!(hub
+            .media_events_after_checked(&binding, binding.start_sequence)
+            .unwrap()
+            .unwrap()
+            .is_empty());
+        // Capture is already registered, even while a typed reply is queued.
+        let (tx, rx) = std::sync::mpsc::channel();
+        assert!(tx.send(binding).is_ok());
+        for _ in 0..=EventHub::MAX_EVENTS {
+            hub.push_media(replacement, levels("w1:p1"));
+        }
+        hub.retain_live_media_panes(std::collections::HashSet::new);
+        let binding = rx.recv().unwrap();
+        assert!(binding.is_ended());
+        assert_eq!(hub.media_events_after_checked(&binding, 0).unwrap(), None);
+        assert!(hub.take_media_interest_transitions().is_empty());
+        assert!(hub
+            .media
+            .lock()
+            .unwrap()
+            .events
+            .iter()
+            .all(|(_, pane, _)| *pane != replacement));
+    }
+
+    #[test]
+    fn abandoned_typed_reply_releases_interest_before_runtime_enable() {
+        let hub = EventHub::default();
+        let pane = crate::layout::PaneId::from_raw(97);
+        let (tx, rx) = std::sync::mpsc::channel::<
+            Result<MediaSubscriptionBinding, crate::api::schema::ErrorBody>,
+        >();
+        let binding = hub.subscribe_media(pane).unwrap();
+        drop(rx);
+        let failed = tx.send(Ok(binding)).expect_err("worker is gone");
+        drop(failed);
+        assert!(hub.media.lock().unwrap().interest.is_empty());
+        assert!(hub.take_media_interest_transitions().is_empty());
+    }
+
+    #[test]
+    fn media_close_coalesces_interest_and_preserves_unrelated_history() {
+        let hub = EventHub::default();
+        hub.retain_live_media_panes(|| panic!("no bindings must not walk panes"));
+        let old = crate::layout::PaneId::from_raw(95);
+        let new = crate::layout::PaneId::from_raw(96);
+        let old_binding = hub.subscribe_media(old).unwrap();
+        let old_duplicate = hub.subscribe_media(old).unwrap();
+        assert_eq!(hub.take_media_interest_transitions(), vec![(old, true)]);
+        let new_binding = hub.subscribe_media(new).unwrap();
+        hub.push_media(old, levels("same-public-id"));
+        hub.push_media(new, levels("same-public-id"));
+        hub.retain_live_media_panes(|| [new].into_iter().collect());
+        assert!(old_binding.is_ended());
+        assert!(old_duplicate.is_ended());
+        assert!(!new_binding.is_ended());
+        let transitions = hub.take_media_interest_transitions();
+        assert_eq!(transitions.len(), 2);
+        assert!(transitions.contains(&(old, false)));
+        assert!(transitions.contains(&(new, true)));
+        let history = hub
+            .media_events_after_checked(&new_binding, 0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].1, new);
+        drop(old_binding);
+        drop(old_duplicate);
+        assert!(hub.take_media_interest_transitions().is_empty());
+        // Coalesce repeated last-drop/new-interest transitions for the same live
+        // incarnation without disabling another subscriber's levels.
+        drop(new_binding);
+        let again = hub.subscribe_media(new).unwrap();
+        assert!(hub.take_media_interest_transitions().is_empty());
+        drop(again);
+        assert_eq!(hub.take_media_interest_transitions(), vec![(new, false)]);
+        let unopened = hub.subscribe_media(old).unwrap();
+        drop(unopened);
+        assert!(hub.take_media_interest_transitions().is_empty());
     }
 
     #[test]

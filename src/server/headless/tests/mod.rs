@@ -270,6 +270,7 @@ fn headless_pane_list(server: &mut HeadlessServer) -> Vec<api::schema::PaneInfo>
     server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
         peer_pidfd: None,
         context: crate::api::ApiRequestContext::default(),
+        media_subscription_reply: None,
         request: api::schema::Request {
             id: "list-titles".into(),
             method: api::schema::Method::PaneList(api::schema::PaneListParams::default()),
@@ -329,6 +330,7 @@ fn headless_api_request_drains_all_pending_internal_events_before_reading_state(
         server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
             peer_pidfd: None,
             context: crate::api::ApiRequestContext::default(),
+            media_subscription_reply: None,
             request: api::schema::Request {
                 id: "headless_stop_after_events".into(),
                 method: api::schema::Method::ServerStop(api::schema::EmptyParams::default()),
@@ -2158,6 +2160,7 @@ async fn client_local_navigation_does_not_emit_global_focus_transitions() {
         crate::api::ApiRequestMessage {
             peer_pidfd: None,
             context: crate::api::ApiRequestContext::default(),
+            media_subscription_reply: None,
             request: crate::api::schema::Request {
                 id: "focus-own-tab".into(),
                 method: crate::api::schema::Method::TabFocus(crate::api::schema::TabTarget {
@@ -2252,6 +2255,7 @@ async fn client_local_navigation_emits_pane_focused_only_when_that_client_moves(
             api::ApiRequestMessage {
                 peer_pidfd: None,
                 context: crate::api::ApiRequestContext::default(),
+                media_subscription_reply: None,
                 request: api::schema::Request {
                     id: "navigate".into(),
                     method,
@@ -2378,6 +2382,7 @@ async fn repeated_layout_action_reapplies_controller_geometry() {
         crate::api::ApiRequestMessage {
             peer_pidfd: None,
             context: crate::api::ApiRequestContext::default(),
+            media_subscription_reply: None,
             request: crate::api::schema::Request {
                 id: "resize-layout".into(),
                 method: crate::api::schema::Method::LayoutSetSplitRatio(
@@ -2588,6 +2593,7 @@ async fn public_close_reapplies_controller_geometry() {
         server.handle_api_request_with_shutdown_check(crate::api::ApiRequestMessage {
             peer_pidfd: None,
             context: crate::api::ApiRequestContext::default(),
+            media_subscription_reply: None,
             request: crate::api::schema::Request {
                 id: "public-close-geometry".into(),
                 method: crate::api::schema::Method::PaneClose(
@@ -2792,6 +2798,7 @@ async fn public_background_tab_create_preserves_client_locations() {
     server.handle_api_request_with_shutdown_check(crate::api::ApiRequestMessage {
         peer_pidfd: None,
         context: crate::api::ApiRequestContext::default(),
+        media_subscription_reply: None,
         request: crate::api::schema::Request {
             id: "create-background-tab".into(),
             method: crate::api::schema::Method::TabCreate(crate::api::schema::TabCreateParams {
@@ -2843,6 +2850,7 @@ async fn public_workspace_focus_preserves_each_clients_remembered_tabs() {
     server.handle_api_request_with_shutdown_check(crate::api::ApiRequestMessage {
         peer_pidfd: None,
         context: crate::api::ApiRequestContext::default(),
+        media_subscription_reply: None,
         request: crate::api::schema::Request {
             id: "focus-second-workspace".into(),
             method: crate::api::schema::Method::WorkspaceFocus(
@@ -2927,6 +2935,7 @@ async fn public_agent_focus_replaces_a_diverged_client_shell_projection() {
     server.handle_api_request_with_shutdown_check(crate::api::ApiRequestMessage {
         peer_pidfd: None,
         context: crate::api::ApiRequestContext::default(),
+        media_subscription_reply: None,
         request: crate::api::schema::Request {
             id: "focus-first-agent".into(),
             method: crate::api::schema::Method::AgentFocus(crate::api::schema::AgentTarget {
@@ -3005,6 +3014,7 @@ async fn public_api_focus_replaces_every_client_shell_projection() {
     server.handle_api_request_with_shutdown_check(crate::api::ApiRequestMessage {
         peer_pidfd: None,
         context: crate::api::ApiRequestContext::default(),
+        media_subscription_reply: None,
         request: crate::api::schema::Request {
             id: "test.client.shell.workspace.focus".into(),
             method: crate::api::schema::Method::WorkspaceFocus(
@@ -3645,6 +3655,7 @@ async fn worktree_discovery_does_not_block_client_typing() {
         server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
             peer_pidfd: None,
             context: crate::api::ApiRequestContext::default(),
+            media_subscription_reply: None,
             request: api::schema::Request {
                 id: "blocked-read".into(),
                 method,
@@ -5546,6 +5557,7 @@ fn windows_shutdown_probe_preserves_panes_and_agent_sessions() {
                 server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
                     peer_pidfd: None,
                     context: api::ApiRequestContext::default(),
+                    media_subscription_reply: None,
                     request: api::schema::Request {
                         id: "shutdown-race".into(),
                         method: api::schema::Method::WorkspaceRename(
@@ -8104,6 +8116,7 @@ fn notification_show_api_forwards_one_semantic_client_notification() {
     let changed = server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
         peer_pidfd: None,
         context: crate::api::ApiRequestContext::default(),
+        media_subscription_reply: None,
         request: api::schema::Request {
             id: "notify".into(),
             method: api::schema::Method::NotificationShow(api::schema::NotificationShowParams {
@@ -8168,6 +8181,7 @@ fn notification_show_api_preserves_colon_in_forwarded_title() {
     let changed = server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
         peer_pidfd: None,
         context: crate::api::ApiRequestContext::default(),
+        media_subscription_reply: None,
         request: api::schema::Request {
             id: "notify".into(),
             method: api::schema::Method::NotificationShow(api::schema::NotificationShowParams {
@@ -8215,6 +8229,7 @@ fn notification_show_api_validates_empty_title_before_disabled_delivery() {
     let changed = server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
         peer_pidfd: None,
         context: crate::api::ApiRequestContext::default(),
+        media_subscription_reply: None,
         request: api::schema::Request {
             id: "notify".into(),
             method: api::schema::Method::NotificationShow(api::schema::NotificationShowParams {
@@ -8247,6 +8262,7 @@ fn notification_show_api_reports_no_foreground_client() {
     let changed = server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
         peer_pidfd: None,
         context: crate::api::ApiRequestContext::default(),
+        media_subscription_reply: None,
         request: api::schema::Request {
             id: "notify".into(),
             method: api::schema::Method::NotificationShow(api::schema::NotificationShowParams {
@@ -8297,6 +8313,7 @@ fn notification_show_api_includes_sound_in_semantic_event() {
         server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
             peer_pidfd: None,
             context: crate::api::ApiRequestContext::default(),
+            media_subscription_reply: None,
             request: api::schema::Request {
                 id: "notify".into(),
                 method: api::schema::Method::NotificationShow(
@@ -8367,6 +8384,7 @@ fn completion_guard_api_report(server: &mut HeadlessServer, method: api::schema:
     server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
         peer_pidfd: None,
         context: crate::api::ApiRequestContext::default(),
+        media_subscription_reply: None,
         request: api::schema::Request {
             id: "completion-probe".into(),
             method,
@@ -8390,6 +8408,7 @@ fn report_agent_changed(
     let changed = server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
         peer_pidfd: None,
         context: crate::api::ApiRequestContext::default(),
+        media_subscription_reply: None,
         request: api::schema::Request {
             id: format!("render-probe-{seq}"),
             method: api::schema::Method::PaneReportAgent(api::schema::PaneReportAgentParams {
@@ -8484,6 +8503,7 @@ fn report_agent_session_with(
     let changed = server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
         peer_pidfd: None,
         context: crate::api::ApiRequestContext::for_local_peer_pid(Some(std::process::id())),
+        media_subscription_reply: None,
         request: api::schema::Request {
             id: format!("session-probe-{seq}"),
             method: api::schema::Method::PaneReportAgentSession(
@@ -8698,6 +8718,7 @@ fn api_report_agent_stores_valid_resume_argv_and_rejects_invalid() {
     server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
         peer_pidfd: None,
         context: api::ApiRequestContext::default(),
+        media_subscription_reply: None,
         request: api::schema::Request {
             id: "invalid-resume".into(),
             method: report(vec!["/opt/prime/prime-agent", "--resume", "01a0"]),
@@ -8721,6 +8742,7 @@ fn api_report_agent_stores_valid_resume_argv_and_rejects_invalid() {
     server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
         peer_pidfd: None,
         context: api::ApiRequestContext::default(),
+        media_subscription_reply: None,
         request: api::schema::Request {
             id: "not-owner".into(),
             method: api::schema::Method::PaneReportAgentSession(
@@ -9112,6 +9134,7 @@ fn stale_api_agent_report_does_not_forward_done_sound() {
     let changed = server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
         peer_pidfd: None,
         context: crate::api::ApiRequestContext::default(),
+        media_subscription_reply: None,
         request: api::schema::Request {
             id: "stale".into(),
             method: api::schema::Method::PaneReportAgent(api::schema::PaneReportAgentParams {
@@ -9279,6 +9302,7 @@ impl CrossPaneGuardFixture {
         self.server
             .handle_api_request_with_shutdown_check(api::ApiRequestMessage {
                 peer_pidfd: None,
+                media_subscription_reply: None,
                 request: api::schema::Request {
                     id: id.into(),
                     method,

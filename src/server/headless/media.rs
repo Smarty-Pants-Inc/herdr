@@ -23,7 +23,9 @@ impl HeadlessServer {
         let mut pending = std::collections::VecDeque::from(actions);
         while let Some(action) = pending.pop_front() {
             match action {
-                MediaAction::Publish { event } => self.app.event_hub.push_media(event),
+                MediaAction::Publish { pane_id, event } => {
+                    self.app.event_hub.push_media(pane_id, event);
+                }
                 MediaAction::Send { client_id, control } => {
                     // Keep the actual dispatch target, not an API alias or another
                     // member of the fanout, across both encoding steps.
@@ -107,14 +109,7 @@ impl HeadlessServer {
     }
 
     pub(super) fn drain_media_interest_transitions(&mut self) {
-        let transitions = self
-            .app
-            .event_hub
-            .take_media_interest_transitions(|canonical| {
-                self.app
-                    .parse_current_public_pane_id(canonical)
-                    .map(|(_, pane)| pane)
-            });
+        let transitions = self.app.event_hub.take_media_interest_transitions();
         let now = Instant::now();
         for (pane, enabled) in transitions {
             let actions = self.media.set_levels(pane, enabled, now);
