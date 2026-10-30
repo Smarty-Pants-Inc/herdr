@@ -2,7 +2,7 @@
 // managed by herdr; reinstalling or updating the integration overwrites this file.
 // add custom hooks/plugins beside this file instead of editing it.
 // HERDR_INTEGRATION_ID=pi
-// HERDR_INTEGRATION_VERSION=12
+// HERDR_INTEGRATION_VERSION=13
 // @ts-nocheck
 
 import { AsyncResource } from "node:async_hooks";
@@ -24,6 +24,7 @@ const RECENT_CHANNEL_EPOCHS = 2;
 const MAX_CHANNEL_ID = 1024;
 const RECONNECT_DELAY_MS = 250;
 const REGISTRATION_TIMEOUT_MS = 2000;
+const STATE_RECONCILE_DELAY_MS = 5000;
 // A held guarded delivery (see handleDeliver) is acknowledged with its refusal this long before the
 // frame's admission deadline. Herdr's own wait ends at that deadline as delivery_unknown, so an ACK
 // sent exactly at the deadline could lose the race and turn a definite refusal into an unknown.
@@ -91,39 +92,75 @@ function enabled() {
   return HERDR_ENV === "1" && !!socketPath;
 }
 
-function sendRequestAttempt(request: unknown, timeoutMs: number): Promise<boolean> {
-  if (!enabled()) {
-    return Promise.resolve(true);
-  }
+function sendRequestAttempt(
+  request: Record<string, unknown>,
+  timeoutMs: number,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  if (!enabled() || signal?.aborted) return Promise.resolve(false);
 
   return new Promise((resolve) => {
     let done = false;
+    let buffer = Buffer.alloc(0);
+    let socket: net.Socket | undefined;
     let timeout: ReturnType<typeof setTimeout> | undefined;
-    const socket = net.createConnection(socketEndpoint!);
+    const cancel = () => finish(false);
     const finish = (delivered: boolean) => {
       if (done) return;
       done = true;
-      if (timeout) {
-        clearTimeout(timeout);
-      }
-      socket.destroy();
+      if (timeout) clearTimeout(timeout);
+      signal?.removeEventListener("abort", cancel);
+      socket?.destroy();
       resolve(delivered);
     };
 
-    socket.on("error", () => finish(false));
-    socket.on("connect", () => socket.write(`${JSON.stringify(request)}\n`));
-    socket.on("data", () => finish(true));
-    socket.on("end", () => finish(false));
+    signal?.addEventListener("abort", cancel, { once: true });
     timeout = setTimeout(() => finish(false), timeoutMs);
     timeout.unref?.();
+    try {
+      socket = net.createConnection(socketEndpoint!);
+      socket.on("error", () => finish(false));
+      socket.on("connect", () => {
+        if (done) return;
+        try {
+          socket!.write(`${JSON.stringify(request)}\n`);
+        } catch {
+          finish(false);
+        }
+      });
+      socket.on("data", (chunk: Buffer) => {
+        if (done) return;
+        // A write/partial JSON/error response is not delivery. Retain at most one bounded
+        // newline-framed response, and require this request's ordinary API success result.
+        const newline = chunk.indexOf(10);
+        const part = newline < 0 ? chunk : chunk.subarray(0, newline);
+        if (buffer.length + part.length > MAX_CHANNEL_FRAME) {
+          finish(false);
+          return;
+        }
+        buffer = Buffer.concat([buffer, part]);
+        if (newline < 0) return;
+        try {
+          const response = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(buffer));
+          finish(isRecord(response) && response.id === request.id &&
+            response.error === undefined && isRecord(response.result) && response.result.type === "ok");
+        } catch {
+          finish(false);
+        }
+      });
+      socket.on("end", () => finish(false));
+      socket.on("close", () => finish(false));
+    } catch {
+      finish(false);
+    }
   });
 }
 
-async function sendRequest(request: unknown): Promise<void> {
-  if (await sendRequestAttempt(request, 500)) {
-    return;
-  }
-  await sendRequestAttempt(request, 1500);
+async function sendRequest(request: Record<string, unknown>, signal?: AbortSignal): Promise<boolean> {
+  if (await sendRequestAttempt(request, 500, signal)) return true;
+  // A replacement/newer desired state can retire this request between attempts.
+  if (signal?.aborted) return false;
+  return sendRequestAttempt(request, 1500, signal);
 }
 
 type AgentState = "working" | "blocked" | "idle";
@@ -131,7 +168,8 @@ type AgentState = "working" | "blocked" | "idle";
 type QueuedState = {
   state: AgentState;
   message?: string;
-  seq: number;
+  sessionRef?: Record<string, unknown>;
+  generation: number;
 };
 
 let reportSeq = Date.now() * 1000;
@@ -166,11 +204,6 @@ function updateSessionRef(ctx: any): void {
   }
 }
 
-function withSessionRef(params: Record<string, unknown>): Record<string, unknown> {
-  const sessionRef = currentSessionRef();
-  return sessionRef ? { ...params, ...sessionRef } : params;
-}
-
 function currentSessionRef(): Record<string, unknown> | undefined {
   if (!currentAgentSessionId && !currentAgentSessionPath) {
     return undefined;
@@ -181,10 +214,10 @@ function currentSessionRef(): Record<string, unknown> | undefined {
   };
 }
 
-function reportSession(sessionStartSource?: string): Promise<void> {
+function reportSession(sessionStartSource?: string, signal?: AbortSignal): Promise<boolean> {
   const sessionRef = currentSessionRef();
   if (!sessionRef) {
-    return Promise.resolve();
+    return Promise.resolve(false);
   }
 
   return sendRequest({
@@ -198,52 +231,23 @@ function reportSession(sessionStartSource?: string): Promise<void> {
       session_start_source: sessionStartSource,
       ...sessionRef,
     },
-  });
+  }, signal);
 }
 
-function sendState(state: AgentState, message?: string, seq = nextReportSeq()): Promise<void> {
+function sendState(next: QueuedState, seq: number, signal: AbortSignal): Promise<boolean> {
   return sendRequest({
     id: `${source}:${Date.now()}:${Math.random().toString(36).slice(2)}`,
     method: "pane.report_agent",
-    params: withSessionRef({
+    params: {
       pane_id: paneId || "",
       source,
       agent: "pi",
-      state,
-      message,
+      state: next.state,
+      message: next.message,
       seq,
-    }),
-  });
-}
-
-let sendInFlight = false;
-let queuedState: QueuedState | undefined;
-
-function queueState(state: AgentState, message?: string): void {
-  queuedState = { state, message, seq: nextReportSeq() };
-  if (!sendInFlight) {
-    void drainStateQueue();
-  }
-}
-
-async function drainStateQueue(): Promise<void> {
-  if (sendInFlight) {
-    return;
-  }
-
-  sendInFlight = true;
-  try {
-    while (queuedState) {
-      const next = queuedState;
-      queuedState = undefined;
-      await sendState(next.state, next.message, next.seq);
-    }
-  } finally {
-    sendInFlight = false;
-    if (queuedState) {
-      void drainStateQueue();
-    }
-  }
+      ...next.sessionRef,
+    },
+  }, signal);
 }
 
 function isRecord(value: unknown): value is Record<string, any> {
@@ -273,6 +277,91 @@ export default function (pi) {
   let lastState: AgentState | undefined;
   let lastMessage: string | undefined;
   let rootSession = false;
+  // Desired state is dirty until its own correlated API success. These resources belong to
+  // this extension instance and lifecycle, never to an old session_start's async completion.
+  let lifecycleGeneration = 0;
+  let lifecycleRequests: AbortController | undefined;
+  let stateRequest: AbortController | undefined;
+  let queuedState: QueuedState | undefined;
+  let sendInFlight = false;
+  let reconcileRequested = false;
+  let stateRetryTimer: ReturnType<typeof setTimeout> | undefined;
+
+  function clearStateRetry() {
+    if (stateRetryTimer) clearTimeout(stateRetryTimer);
+    stateRetryTimer = undefined;
+  }
+
+  function retireStateDelivery() {
+    lifecycleGeneration += 1;
+    lifecycleRequests?.abort();
+    lifecycleRequests = undefined;
+    stateRequest?.abort();
+    stateRequest = undefined;
+    queuedState = undefined;
+    reconcileRequested = false;
+    clearStateRetry();
+    lastState = undefined;
+    lastMessage = undefined;
+  }
+
+  function kickStateQueue() {
+    if (!rootSession || !queuedState) return;
+    clearStateRetry();
+    if (sendInFlight) {
+      reconcileRequested = true;
+      return;
+    }
+    void drainStateQueue();
+  }
+
+  function scheduleStateRetry() {
+    if (!rootSession || !queuedState || stateRetryTimer) return;
+    const generation = lifecycleGeneration;
+    // Validated channel registration is the normal recovery event. This single dirty-only
+    // safety net also covers a healthy input channel, unsupported hosts and exhausted reconnects.
+    const timer = setTimeout(() => {
+      if (stateRetryTimer !== timer || generation !== lifecycleGeneration) return;
+      stateRetryTimer = undefined;
+      kickStateQueue();
+    }, STATE_RECONCILE_DELAY_MS);
+    stateRetryTimer = timer;
+    timer.unref?.();
+  }
+
+  function queueState(state: AgentState, message?: string) {
+    queuedState = { state, message, sessionRef: currentSessionRef(), generation: lifecycleGeneration };
+    // Never retry obsolete idle after a newer working/blocked state. Already written requests
+    // can still reach Herdr; the new cycle gets a strictly greater sequence below.
+    stateRequest?.abort();
+    kickStateQueue();
+  }
+
+  async function drainStateQueue(): Promise<void> {
+    if (sendInFlight || !rootSession || !queuedState) return;
+    sendInFlight = true;
+    try {
+      while (rootSession && queuedState) {
+        const next = queuedState;
+        reconcileRequested = false;
+        const controller = new AbortController();
+        stateRequest = controller;
+        // Allocate only for the latest item when beginning a cycle, not for a retired idle.
+        // Session reports share Herdr's sequence map and may have advanced it since last failure.
+        const delivered = await sendState(next, nextReportSeq(), controller.signal);
+        if (stateRequest === controller) stateRequest = undefined;
+        if (queuedState !== next || next.generation !== lifecycleGeneration) continue;
+        if (delivered) {
+          queuedState = undefined;
+        } else if (!reconcileRequested) {
+          scheduleStateRetry();
+          break;
+        }
+      }
+    } finally {
+      sendInFlight = false;
+    }
+  }
 
   // The guarded-input channel transport is owned by this extension instance, not by a
   // session_start callback. Pi runs session_start for a native /new, /resume or /fork inside a
@@ -898,6 +987,7 @@ export default function (pi) {
           channelEpoch = epoch;
           channelSessionGeneration = sessionGeneration;
           channelReady = true;
+          kickStateQueue();
           continue;
         }
         if (isRecord(parsed) && parsed.type === "deliver") {
@@ -942,12 +1032,13 @@ export default function (pi) {
   }
 
   function shutdownChannel() {
+    rootSession = false;
+    retireStateDelivery();
     clearReconnectTimer();
     channelClosing = true;
     dropConnection();
     channelTargetGeneration = undefined;
     currentContext = undefined;
-    rootSession = false;
   }
 
   function desiredState() {
@@ -963,6 +1054,7 @@ export default function (pi) {
   function publishState(force = false) {
     const next = desiredState();
     if (!force && next.state === lastState && next.message === lastMessage) {
+      kickStateQueue(); // Desired-value dedupe must not suppress an unacknowledged report.
       return;
     }
     lastState = next.state;
@@ -995,12 +1087,15 @@ export default function (pi) {
       shutdownChannel();
       return;
     }
+    retireStateDelivery();
+    const generation = lifecycleGeneration;
+    lifecycleRequests = new AbortController();
     rootSession = true;
     updateSessionRef(ctx);
     installChannel(ctx);
-    await reportSession(event?.reason);
+    await reportSession(event?.reason, lifecycleRequests.signal);
     // A reload can replace this extension mid-run without emitting another agent_start.
-    if (!rootSession || currentContext !== ctx) return;
+    if (!rootSession || generation !== lifecycleGeneration || currentContext !== ctx) return;
     agentActive = ctx?.isIdle?.() === false;
     publishState(true);
   });
@@ -1010,9 +1105,11 @@ export default function (pi) {
       return;
     }
     updateSessionRef(ctx);
-    void reportSession();
+    void reportSession(undefined, lifecycleRequests?.signal);
     agentActive = true;
-    publishState();
+    // A dirty in-flight working report may precede the session report's sequence. Supersede
+    // it even for identical desired values so its ignored-but-OK reply cannot clear newer work.
+    publishState(queuedState !== undefined);
   });
 
   pi.on("agent_settled", (_event, ctx) => {

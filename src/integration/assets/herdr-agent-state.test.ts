@@ -125,8 +125,9 @@ async function startRecordingServer(name: string): Promise<unknown[]> {
       if (newline === -1) {
         return;
       }
-      requests.push(JSON.parse(input.slice(0, newline)));
-      socket.end("{}\n");
+      const request = JSON.parse(input.slice(0, newline));
+      requests.push(request);
+      socket.end(correlatedRpcResponse(request));
     });
   });
   server = recordingServer;
@@ -136,6 +137,85 @@ async function startRecordingServer(name: string): Promise<unknown[]> {
   });
   configureIntegrationEnvironment(recordingSocketPath);
   return requests;
+}
+
+type PiLifecycleResponder = (
+  request: Record<string, any>,
+  requestIndex: number,
+  socket: net.Socket,
+  accept: () => void,
+  apply: () => void,
+) => void;
+
+async function startPiLifecycleServer(name: string, respond?: PiLifecycleResponder) {
+  const recordingSocketPath = join(
+    tmpdir(),
+    `herdr-pi-lifecycle-${name}-${process.pid}-${++importCounter}.sock`,
+  );
+  socketPath = recordingSocketPath;
+  await rm(recordingSocketPath, { force: true });
+
+  const requests: Record<string, any>[] = [];
+  const confirmedStates: Array<{ state: unknown; sessionId: unknown; seq: unknown }> = [];
+  let lastAppliedSeq = -Infinity;
+  const recordingServer = createServer((socket) => {
+    let input = "";
+    socket.setEncoding("utf8");
+    socket.on("error", () => {});
+    socket.on("data", (chunk) => {
+      input += chunk;
+      for (;;) {
+        const newline = input.indexOf("\n");
+        if (newline < 0) return;
+        const request: unknown = JSON.parse(input.slice(0, newline));
+        input = input.slice(newline + 1);
+        if (!isRecord(request)) {
+          socket.end();
+          return;
+        }
+        requests.push(request);
+        const apply = () => {
+          if (request.method === "pane.report_agent") {
+            const seq = requestSeq(request);
+            // Model Herdr's strict per-source sequence floor: a correlated response for a
+            // duplicate or reordered report does not mean that it changed the applied state.
+            if (typeof seq === "number" && seq > lastAppliedSeq) {
+              lastAppliedSeq = seq;
+              confirmedStates.push({
+                state: requestState(request),
+                sessionId: requestSessionID(request),
+                seq,
+              });
+            }
+          }
+        };
+        const accept = () => {
+          apply();
+          socket.end(correlatedRpcResponse(request));
+        };
+        if (respond) respond(request, requests.length, socket, accept, apply);
+        else accept();
+      }
+    });
+  });
+  server = recordingServer;
+  await new Promise<void>((resolve, reject) => {
+    recordingServer.once("error", reject);
+    recordingServer.listen(
+      originalPlatform === "win32" ? `\\\\.\\pipe\\${recordingSocketPath}` : recordingSocketPath,
+      resolve,
+    );
+  });
+
+  configureIntegrationEnvironment(recordingSocketPath);
+  return { requests, confirmedStates };
+}
+
+function correlatedRpcResponse(request: unknown): string {
+  if (!isRecord(request) || typeof request.id !== "string") {
+    throw new Error("Expected a correlated JSON-RPC request");
+  }
+  return `${JSON.stringify({ id: request.id, result: { type: "ok" } })}\n`;
 }
 
 for (const socketPlugin of socketPlugins) {
@@ -590,10 +670,10 @@ test("Pi waits for a replacement session report before publishing state", async 
       const request = JSON.parse(input.slice(0, newline));
       requests.push(request);
       if (isRecord(request) && request.method === "pane.report_agent_session") {
-        acknowledgeSessionReport = () => socket.end("{}\n");
+        acknowledgeSessionReport = () => socket.end(correlatedRpcResponse(request));
         return;
       }
-      socket.end("{}\n");
+      socket.end(correlatedRpcResponse(request));
     });
   });
   server = recordingServer;
@@ -672,7 +752,7 @@ async function startDroppedFirstResponseServer(name: string) {
         return;
       }
       deliveredRequests.push(request);
-      socket.end("{}\n");
+      socket.end(correlatedRpcResponse(request));
     });
   });
   server = recordingServer;
@@ -801,6 +881,255 @@ test("Pi retries working state after an unanswered socket attempt", async () => 
   expect(reportedWorking()).toBe(true);
 });
 
+test("Pi lifecycle retains idle until transport recovers without another turn", async () => {
+  let failedIdleSends = 0;
+  const { confirmedStates } = await startPiLifecycleServer("idle-recovery", (request, _index, socket, accept) => {
+    if (request.method === "pane.report_agent" && requestState(request) === "idle" && failedIdleSends < 2) {
+      failedIdleSends += 1;
+      socket.end();
+      return;
+    }
+    accept();
+  });
+  const { handlers, pi } = createExtensionHarness();
+  const { default: install } = await importFresh("./pi/herdr-agent-state.ts");
+  install(pi);
+
+  let idle = false;
+  const context = piContext(() => idle);
+  await handlers.get("session_start")?.({ reason: "startup" }, context);
+  await waitFor(() => confirmedStates.length === 1);
+  expect(confirmedStates[0].state).toBe("working");
+
+  idle = true;
+  handlers.get("agent_settled")?.({}, context);
+  await waitFor(() => confirmedStates.some((report) => report.state === "idle"), 7_000);
+
+  // The only event after startup is the original settlement; no later root turn repairs state.
+  expect(failedIdleSends).toBe(2);
+  expect(confirmedStates.map((report) => report.state)).toEqual(["working", "idle"]);
+}, 9_000);
+
+test("Pi lifecycle retries an idle report after a correlated API error", async () => {
+  let apiErrors = 0;
+  const { confirmedStates } = await startPiLifecycleServer("api-error", (request, _index, socket, accept) => {
+    if (request.method === "pane.report_agent" && apiErrors === 0) {
+      apiErrors += 1;
+      socket.end(`${JSON.stringify({ id: request.id, error: { code: -32000, message: "rejected" } })}\n`);
+      return;
+    }
+    accept();
+  });
+  const { handlers, pi } = createExtensionHarness();
+  const { default: install } = await importFresh("./pi/herdr-agent-state.ts");
+  install(pi);
+
+  await handlers.get("session_start")?.({ reason: "startup" }, piContext(() => true));
+  await waitFor(() => confirmedStates.some((report) => report.state === "idle"), 7_000);
+  expect(apiErrors).toBe(1);
+  expect(confirmedStates.map((report) => report.state)).toEqual(["idle"]);
+}, 9_000);
+
+test("Pi lifecycle requires a complete correlated success after partial, foreign-ID, and malformed frames", async () => {
+  let invalidResponses = 0;
+  const { confirmedStates } = await startPiLifecycleServer("invalid-responses", (request, requestIndex, socket, accept) => {
+    if (requestIndex > 3) {
+      accept();
+      return;
+    }
+    invalidResponses += 1;
+    if (requestIndex === 1) {
+      const frame = JSON.stringify({ id: request.id, result: { type: "ok" } });
+      const split = Math.floor(frame.length / 2);
+      socket.write(frame.slice(0, split));
+      setTimeout(() => {
+        if (!socket.destroyed) socket.end(frame.slice(split));
+      }, 20);
+    } else if (requestIndex === 2) {
+      socket.end(`${JSON.stringify({ id: "foreign-request", result: { type: "ok" } })}\n`);
+    } else {
+      socket.end("{malformed}\n");
+    }
+  });
+  const { handlers, pi } = createExtensionHarness();
+  const { default: install } = await importFresh("./pi/herdr-agent-state.ts");
+  install(pi);
+
+  await handlers.get("session_start")?.({ reason: "startup" }, piContext(() => true));
+  await waitFor(() => confirmedStates.some((report) => report.state === "idle"), 7_000);
+  expect(invalidResponses).toBe(3);
+  expect(confirmedStates.map((report) => report.state)).toEqual(["idle"]);
+}, 10_000);
+
+test("Pi lifecycle keeps the latest state across duplicate and reordered working/idle events", async () => {
+  const { confirmedStates } = await startPiLifecycleServer("duplicate-reordered");
+  const { handlers, pi } = createExtensionHarness();
+  const { default: install } = await importFresh("./pi/herdr-agent-state.ts");
+  install(pi);
+
+  let idle = true;
+  const context = piContext(() => idle);
+  await handlers.get("session_start")?.({ reason: "startup" }, context);
+  await waitFor(() => confirmedStates.length === 1);
+
+  idle = false;
+  handlers.get("agent_start")?.({}, context);
+  await waitFor(() => confirmedStates.length === 2);
+  handlers.get("agent_start")?.({}, context); // Duplicate working report.
+  handlers.get("agent_settled")?.({}, context); // A stale settlement while the agent is still active.
+  await Bun.sleep(30);
+  expect(confirmedStates.map((report) => report.state)).toEqual(["idle", "working"]);
+
+  idle = true;
+  handlers.get("agent_settled")?.({}, context);
+  await waitFor(() => confirmedStates.length === 3);
+  handlers.get("agent_settled")?.({}, context); // Duplicate idle report.
+  idle = false;
+  handlers.get("agent_start")?.({}, context); // Newer working supersedes the duplicate idle.
+  await waitFor(() => confirmedStates.length === 4);
+  handlers.get("agent_settled")?.({}, context); // Reordered/stale: Pi is not idle yet.
+  await Bun.sleep(30);
+
+  expect(confirmedStates.map((report) => report.state)).toEqual(["idle", "working", "idle", "working"]);
+});
+
+test("Pi lifecycle lets newer working supersede a dirty idle report with a delayed old ACK", async () => {
+  let failedIdleSends = 0;
+  let releaseIdleAck: (() => void) | undefined;
+  const { requests, confirmedStates } = await startPiLifecycleServer(
+    "working-supersedes-idle",
+    (request, _index, socket, accept, apply) => {
+      if (request.method === "pane.report_agent" && requestState(request) === "idle") {
+        if (failedIdleSends < 2) {
+          failedIdleSends += 1;
+          socket.end();
+          return;
+        }
+        // Herdr applies the idle report but has not completed its response yet.
+        apply();
+        releaseIdleAck = () => socket.end(correlatedRpcResponse(request));
+        return;
+      }
+      accept();
+    },
+  );
+  const { handlers, pi } = createExtensionHarness();
+  const { default: install } = await importFresh("./pi/herdr-agent-state.ts");
+  install(pi);
+
+  let idle = false;
+  const context = piContext(() => idle);
+  await handlers.get("session_start")?.({ reason: "startup" }, context);
+  await waitFor(() => confirmedStates.some((report) => report.state === "working"));
+  idle = true;
+  handlers.get("agent_settled")?.({}, context);
+  await waitFor(() => failedIdleSends === 2);
+  await waitFor(() => releaseIdleAck !== undefined, 7_000);
+
+  const oldIdleRequest = requests.filter((request) => requestState(request) === "idle").at(-1);
+  const idleSeq = requestSeq(oldIdleRequest);
+  expect(typeof idleSeq).toBe("number");
+  expect(confirmedStates[confirmedStates.length - 1].state).toBe("idle");
+
+  // A newer turn starts while the old idle response is unresolved. Whichever response completes
+  // first, Herdr's monotonic sequence floor must leave the applied pane state working.
+  idle = false;
+  handlers.get("agent_start")?.({}, context);
+  await Bun.sleep(40);
+  releaseIdleAck?.();
+  await waitFor(
+    () => confirmedStates.some(
+      (report) => report.state === "working" && typeof report.seq === "number" && report.seq > (idleSeq as number),
+    ),
+    2_000,
+  );
+  expect(confirmedStates[confirmedStates.length - 1].state).toBe("working");
+  expect(confirmedStates[confirmedStates.length - 1].seq).toBeGreaterThan(idleSeq as number);
+}, 10_000);
+
+for (const cancellation of ["session replacement", "shutdown"] as const) {
+  test(`Pi lifecycle cancels a dirty idle retry on ${cancellation}`, async () => {
+    let failedIdleSends = 0;
+    let cancelDirtyState = () => {};
+    let cancellationInvoked = false;
+    let cancellationScheduled = false;
+    const { requests, confirmedStates } = await startPiLifecycleServer(
+      `cancel-${cancellation.replaceAll(" ", "-")}`,
+      (request, _index, socket, accept) => {
+        if (
+          request.method === "pane.report_agent" &&
+          requestState(request) === "idle" &&
+          requestSessionID(request) === "original-session" &&
+          failedIdleSends < 2
+        ) {
+          failedIdleSends += 1;
+          socket.end();
+          if (failedIdleSends === 2 && !cancellationScheduled) {
+            cancellationScheduled = true;
+            queueMicrotask(() => {
+              cancelDirtyState();
+              cancellationInvoked = true;
+            });
+          }
+          return;
+        }
+        accept();
+      },
+    );
+    const { handlers, pi } = createExtensionHarness();
+    const { default: install } = await importFresh("./pi/herdr-agent-state.ts");
+    install(pi);
+
+    let originalIdle = false;
+    const originalContext = {
+      ...piContext(() => originalIdle),
+      sessionManager: {
+        getSessionFile: () => undefined,
+        getSessionId: () => "original-session",
+      },
+    };
+    await handlers.get("session_start")?.({ reason: "startup" }, originalContext);
+    await waitFor(() => confirmedStates.length === 1);
+    originalIdle = true;
+    handlers.get("agent_settled")?.({}, originalContext);
+
+    if (cancellation === "shutdown") {
+      cancelDirtyState = () => handlers.get("session_shutdown")?.({ reason: "quit" }, originalContext);
+    } else {
+      const replacementContext = {
+        ...piContext(() => false),
+        sessionManager: {
+          getSessionFile: () => undefined,
+          getSessionId: () => "replacement-session",
+        },
+      };
+      cancelDirtyState = () => {
+        void handlers.get("session_start")?.({ reason: "new" }, replacementContext);
+      };
+    }
+
+    await waitFor(() => cancellationInvoked, 1_000);
+    expect(failedIdleSends).toBe(2);
+    if (cancellation === "session replacement") {
+      await waitFor(
+        () => confirmedStates.some((report) => report.sessionId === "replacement-session" && report.state === "working"),
+        2_000,
+      );
+    }
+    await Bun.sleep(50);
+    const requestsAfterCancellation = requests.length;
+    await Bun.sleep(5_500);
+
+    if (cancellation === "shutdown") {
+      expect(requests.slice(requestsAfterCancellation).filter((request) => request.method === "pane.report_agent")).toEqual([]);
+      expect(confirmedStates[confirmedStates.length - 1]).toMatchObject({ state: "working", sessionId: "original-session" });
+    } else {
+      expect(requests.slice(requestsAfterCancellation).filter((request) => request.method === "pane.report_agent")).toEqual([]);
+      expect(confirmedStates[confirmedStates.length - 1]).toMatchObject({ state: "working", sessionId: "replacement-session" });
+    }
+  }, 9_000);
+}
+
 function completionHandlers(handlers: Map<string, Handler>): string[] {
   return ["agent_end", "agent_settled"].filter((event) => handlers.has(event));
 }
@@ -843,6 +1172,20 @@ function requestSessionPath(request: unknown): unknown {
     return undefined;
   }
   return request.params.agent_session_path;
+}
+
+function requestSessionID(request: unknown): unknown {
+  if (!isRecord(request) || !isRecord(request.params)) {
+    return undefined;
+  }
+  return request.params.agent_session_id;
+}
+
+function requestSeq(request: unknown): unknown {
+  if (!isRecord(request) || !isRecord(request.params)) {
+    return undefined;
+  }
+  return request.params.seq;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -934,7 +1277,7 @@ async function startChannelServer(
           connection.draftStates.push(request);
         } else {
           reports.push(request);
-          socket.end("{}\n");
+          socket.end(correlatedRpcResponse(request));
         }
       }
     });
