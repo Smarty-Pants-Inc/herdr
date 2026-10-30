@@ -3756,14 +3756,18 @@ fn pi_extension_refreshes_session_ref_before_agent_start_state() {
         .find("pi.on(\"agent_start\", (_event, ctx)")
         .expect("pi extension should receive agent_start context");
     let handler = &PI_EXTENSION_ASSET[agent_start..];
+    let handler_end = handler
+        .find("\n\n  pi.on(\"agent_settled\",")
+        .expect("pi extension should register agent_settled after agent_start");
+    let handler = &handler[..handler_end];
     let update_session = handler
         .find("updateSessionRef(ctx);")
         .expect("pi extension should refresh the active session on agent_start");
     let report_session = handler
-        .find("void reportSession();")
+        .find("void reportSession(undefined, lifecycleRequests?.signal);")
         .expect("pi extension should report the refreshed session before state");
     let publish_state = handler
-        .find("publishState();")
+        .find("publishState(queuedState !== undefined);")
         .expect("pi extension should publish working state after refreshing session");
 
     assert!(update_session < report_session);
