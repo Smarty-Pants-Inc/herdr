@@ -8672,7 +8672,11 @@ fn api_pi_resume_argv_retries_after_buffered_startup() {
             .display()
             .to_string();
         let session_ref = crate::agent_resume::AgentSessionRef::path(session_path.clone()).unwrap();
-        let recipe = vec!["managed-pi".into(), "--session".into(), session_path.clone()];
+        let recipe = vec![
+            "managed-pi".into(),
+            "--session".into(),
+            session_path.clone(),
+        ];
         let report = |state_report: bool, seq: u64, resume_argv: Option<Vec<String>>| {
             if state_report {
                 api::schema::Method::PaneReportAgent(api::schema::PaneReportAgentParams {
@@ -8800,10 +8804,8 @@ fn api_report_agent_stores_valid_resume_argv_and_rejects_invalid() {
         vec!["prime-agent", "--resume", "01a0", "--model", "x"]
     );
 
-    let response = completion_guard_api_response(
-        &mut server,
-        report(vec!["prime-agent", "--resume", "dup"]),
-    );
+    let response =
+        completion_guard_api_response(&mut server, report(vec!["prime-agent", "--resume", "dup"]));
     let error: api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();
     assert_eq!(error.error.code, "resume_not_accepted", "{response}");
     assert_eq!(
