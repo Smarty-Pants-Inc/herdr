@@ -8,12 +8,14 @@ import { join } from "node:path";
 const originalPlatform = process.platform;
 const originalArgv = process.argv;
 const originalCreateConnection = net.createConnection;
+const originalWarn = console.warn;
 const originalEnvironment = {
   HERDR_ENV: process.env.HERDR_ENV,
   HERDR_OMP_IDLE_DEBOUNCE_MS: process.env.HERDR_OMP_IDLE_DEBOUNCE_MS,
   HERDR_PANE_ID: process.env.HERDR_PANE_ID,
   HERDR_SOCKET_PATH: process.env.HERDR_SOCKET_PATH,
   OMPCODE: process.env.OMPCODE,
+  SMARTY_HERDR_RESTORE_PREFIX_JSON: process.env.SMARTY_HERDR_RESTORE_PREFIX_JSON,
 };
 
 let server: Server | undefined;
@@ -42,6 +44,7 @@ afterEach(async () => {
 
   Object.defineProperty(process, "platform", { value: originalPlatform });
   net.createConnection = originalCreateConnection;
+  console.warn = originalWarn;
   process.argv = originalArgv;
   for (const [name, value] of Object.entries(originalEnvironment)) {
     if (value === undefined) {
@@ -96,6 +99,7 @@ function createExtensionHarness() {
 function configureIntegrationEnvironment(recordingSocketPath: string) {
   // Tests may run inside an OMP shell; nested-session cases opt in explicitly.
   delete process.env.OMPCODE;
+  delete process.env.SMARTY_HERDR_RESTORE_PREFIX_JSON;
   process.env.HERDR_ENV = "1";
   process.env.HERDR_SOCKET_PATH = recordingSocketPath;
   process.env.HERDR_PANE_ID = "test:p1";
@@ -484,6 +488,229 @@ test("Pi reports a Windows session path", async () => {
   await waitFor(() => requests.length === 2);
 
   expect(requests.map(requestSessionPath)).toEqual([sessionPath, sessionPath]);
+});
+
+// These exercise the managed recipe's wire contract and failure paths, not a cold restore or
+// the launcher's role reconstruction. Keep reason: stale selectors can resume the wrong journal.
+const managedRestorePrefix = ["smarty-herdr-relaunch", "--restore", "--role", "worktree-agent",
+  "--name", "restore fixture", "--set", "lane=lane with spaces"];
+
+function captureRestoreWarnings(): string[] {
+  const warnings: string[] = [];
+  console.warn = (...args) => { warnings.push(args.join(" ")); };
+  return warnings;
+}
+
+test("Pi managed restore follows startup, new, resume, fork and reload in its owning reports", async () => {
+  let owned = false;
+  const { requests, confirmedStates } = await startPiLifecycleServer("managed-transitions",
+    (request, _index, socket, accept) => {
+      if (request.method === "pane.report_agent_session" && !owned) {
+        // A real server may reject the initial session-only recipe until state grants ownership.
+        socket.end(`${JSON.stringify({ id: request.id, error: { code: "resume_not_accepted" } })}\n`);
+      } else {
+        if (request.method === "pane.report_agent") owned = true;
+        accept();
+      }
+    });
+  process.env.SMARTY_HERDR_RESTORE_PREFIX_JSON = JSON.stringify(managedRestorePrefix);
+  process.argv = ["bun", "pi", "--session", "/tmp/stale-startup.jsonl", "--session-id", "stale"];
+  const warnings = captureRestoreWarnings();
+  const { handlers, pi } = createExtensionHarness();
+  const { default: install } = await importFresh("./pi/herdr-agent-state.ts");
+  install(pi);
+  const transitions = [
+    { reason: "startup", id: "initial", path: "/tmp/initial session.jsonl" },
+    { reason: "new", id: "new", path: "/tmp/new.jsonl" },
+    { reason: "resume", id: "resumed-id", path: undefined },
+    { reason: "fork", id: "forked", path: "C:\\Users\\User\\forked.jsonl" },
+    { reason: "reload", id: "reloaded", path: "/tmp/reloaded.jsonl" },
+  ];
+  for (const [index, transition] of transitions.entries()) {
+    const before = requests.length;
+    await handlers.get("session_start")?.({ reason: transition.reason }, {
+      ...piContext(() => transition.reason !== "reload"),
+      sessionManager: {
+        getSessionFile: () => transition.path,
+        getSessionId: () => transition.id,
+      },
+    });
+    await waitFor(() => confirmedStates.length === index + 1);
+    const reports = requests.slice(before);
+    expect(reports.map((report) => report.method)).toEqual(index === 0
+      ? ["pane.report_agent_session", "pane.report_agent_session", "pane.report_agent"]
+      : ["pane.report_agent_session", "pane.report_agent"]);
+    for (const report of reports) {
+      expect(report.params).toMatchObject({
+        source: "herdr:pi", agent: "pi", agent_session_id: transition.id,
+        resume_argv: [...managedRestorePrefix, "--session", transition.path ?? transition.id],
+      });
+      expect(report.params.agent_session_path).toBe(transition.path);
+    }
+    expect(reports[0].params.session_start_source).toBe(transition.reason);
+    expect(reports[reports.length - 1].params.state).toBe(transition.reason === "reload" ? "working" : "idle");
+  }
+  const uniqueReports = [...new Map(requests.map((request) => [request.id, request])).values()];
+  const sequences = uniqueReports.map((request) => request.params.seq);
+  expect(sequences.every((seq, index) => index === 0 || seq > sequences[index - 1])).toBe(true);
+  expect(warnings).toEqual([]);
+  handlers.get("session_shutdown")?.({}, {});
+});
+
+test("Pi managed restore refreshes the session reference when an agent starts", async () => {
+  const { requests, confirmedStates } = await startPiLifecycleServer("managed-agent-start");
+  process.env.SMARTY_HERDR_RESTORE_PREFIX_JSON = JSON.stringify(managedRestorePrefix);
+  const warnings = captureRestoreWarnings();
+  const { handlers, pi } = createExtensionHarness();
+  const { default: install } = await importFresh("./pi/herdr-agent-state.ts");
+  install(pi);
+  let file: string | undefined;
+  let id = "before-first-turn";
+  const context = { ...piContext(() => true), sessionManager: {
+    getSessionFile: () => file, getSessionId: () => id,
+  } };
+  await handlers.get("session_start")?.({ reason: "startup" }, context);
+  await waitFor(() => confirmedStates.length === 1);
+  expect(requests[1].params.resume_argv).toEqual([...managedRestorePrefix, "--session", id]);
+  file = "/tmp/current-session.jsonl";
+  id = "current-session";
+  handlers.get("agent_start")?.({}, context);
+  await waitFor(() => requests.length === 4);
+  for (const report of requests.slice(2)) {
+    expect(report.params.resume_argv).toEqual([...managedRestorePrefix, "--session", file]);
+    expect(report.params.agent_session_id).toBe(id);
+  }
+  expect(warnings).toEqual([]);
+  handlers.get("session_shutdown")?.({}, {});
+});
+
+for (const limit of ["64 arguments", "8192 UTF-8 bytes"] as const) {
+  test(`Pi managed restore accepts exactly ${limit} including its current session suffix`, async () => {
+    const { requests, confirmedStates } = await startPiLifecycleServer("managed-limit");
+    const session = "current-session";
+    const prefix = ["smarty-herdr-relaunch", "--restore"];
+    if (limit === "64 arguments") {
+      prefix.push(...Array(60).fill("x"));
+    } else {
+      const remaining = 8192 - [...prefix, "--session", session].reduce((sum, arg) => sum + Buffer.byteLength(arg), 0);
+      prefix.push("é".repeat(Math.floor(remaining / 2)) + (remaining % 2 ? "x" : ""));
+    }
+    process.env.SMARTY_HERDR_RESTORE_PREFIX_JSON = JSON.stringify(prefix);
+    const warnings = captureRestoreWarnings();
+    const { handlers, pi } = createExtensionHarness();
+    const { default: install } = await importFresh("./pi/herdr-agent-state.ts");
+    install(pi);
+    await handlers.get("session_start")?.({ reason: "startup" }, {
+      ...piContext(() => true), sessionManager: { getSessionId: () => session },
+    });
+    await waitFor(() => confirmedStates.length === 1);
+    for (const report of requests) expect(report.params.resume_argv).toEqual([...prefix, "--session", session]);
+    expect(warnings).toEqual([]);
+    handlers.get("session_shutdown")?.({}, {});
+  });
+}
+
+for (const invalid of [
+  { name: "empty environment", json: "" },
+  { name: "invalid JSON", json: "[not-json" },
+  { name: "object", json: "{}" },
+  { name: "null", json: "null" },
+  { name: "empty array", json: "[]" },
+  { name: "non-string argument", json: JSON.stringify([...managedRestorePrefix, 7]) },
+  { name: "executable path", json: JSON.stringify(["/bin/smarty-herdr-relaunch", "--restore"]) },
+  { name: "shell executable", json: JSON.stringify(["sh", "--restore"]) },
+  { name: "missing restore flag", json: JSON.stringify(["smarty-herdr-relaunch"]) },
+  ...["--session", "--session=old", "--session-id", "--session-id=old", "--resume", "-r", "--continue", "-c",
+    "--pi-arg=--session=old"].map((selector) => ({
+      name: `startup selector ${selector}`, json: JSON.stringify([...managedRestorePrefix, selector, "old"]),
+    })),
+  ...["private'input", "private\ninput", "private\u0000input", "private\u007finput", "private\u0085input"].map((arg, index) => ({
+    name: `unquotable argument ${index}`, json: JSON.stringify([...managedRestorePrefix, arg]),
+  })),
+  { name: "65 arguments with suffix", json: JSON.stringify(["smarty-herdr-relaunch", "--restore", ...Array(61).fill("x")]) },
+  { name: "oversized UTF-8 prefix", json: JSON.stringify([...managedRestorePrefix, "é".repeat(4096)]) },
+  { name: "oversized only with suffix", json: JSON.stringify(["smarty-herdr-relaunch", "--restore", "x".repeat(8150)]) },
+]) {
+  test(`Pi managed restore warns and omits resume_argv for ${invalid.name}`, async () => {
+    const { requests, confirmedStates } = await startPiLifecycleServer("managed-invalid-prefix");
+    process.env.SMARTY_HERDR_RESTORE_PREFIX_JSON = invalid.json;
+    const warnings = captureRestoreWarnings();
+    const { handlers, pi } = createExtensionHarness();
+    const { default: install } = await importFresh("./pi/herdr-agent-state.ts");
+    install(pi);
+    await handlers.get("session_start")?.({ reason: "startup" }, {
+      ...piContext(() => true), sessionManager: { getSessionId: () => "current-session" },
+    });
+    await waitFor(() => confirmedStates.length === 1);
+    expect(requests.map((request) => request.method)).toEqual(["pane.report_agent_session", "pane.report_agent"]);
+    for (const report of requests) expect(Object.hasOwn(report.params, "resume_argv")).toBe(false);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain("Managed role restore unavailable");
+    expect(warnings[0]).toContain("No role restoration is confirmed");
+    expect(warnings[0]).not.toContain("private");
+    expect(warnings[0]).not.toContain("current-session");
+    handlers.get("session_shutdown")?.({}, {});
+  });
+}
+
+for (const invalid of [
+  { name: "missing session", path: undefined, id: undefined },
+  { name: "relative path", path: "relative.jsonl", id: "otherwise-valid" },
+  { name: "malformed ID", path: undefined, id: 42 },
+  { name: "oversized ID", path: undefined, id: "é".repeat(257) },
+  { name: "oversized path", path: "/" + "é".repeat(2048), id: "otherwise-valid" },
+  { name: "apostrophe path", path: "/tmp/private's-session.jsonl", id: "otherwise-valid" },
+  { name: "control in ID", path: undefined, id: "private\u0085session" },
+  { name: "throwing session manager", path: undefined, id: undefined, throws: true },
+]) {
+  test(`Pi managed restore warns for ${invalid.name} then recovers on a valid session transition`, async () => {
+    const { requests, confirmedStates } = await startPiLifecycleServer("managed-invalid-session");
+    process.env.SMARTY_HERDR_RESTORE_PREFIX_JSON = JSON.stringify(managedRestorePrefix);
+    const warnings = captureRestoreWarnings();
+    const { handlers, pi } = createExtensionHarness();
+    const { default: install } = await importFresh("./pi/herdr-agent-state.ts");
+    install(pi);
+    await handlers.get("session_start")?.({ reason: "startup" }, {
+      ...piContext(() => true), sessionManager: {
+        getSessionFile: () => { if (invalid.throws) throw new Error("private error"); return invalid.path; },
+        getSessionId: () => invalid.id,
+      },
+    });
+    await waitFor(() => confirmedStates.length === 1);
+    for (const report of requests) expect(Object.hasOwn(report.params, "resume_argv")).toBe(false);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain("Managed role restore unavailable");
+    expect(warnings[0]).toContain("No role restoration is confirmed");
+    expect(warnings[0]).not.toContain("private");
+    const before = requests.length;
+    await handlers.get("session_start")?.({ reason: "new" }, {
+      ...piContext(() => true), sessionManager: { getSessionId: () => "recovered-session" },
+    });
+    await waitFor(() => confirmedStates.length === 2);
+    for (const report of requests.slice(before)) {
+      expect(report.params.resume_argv).toEqual([...managedRestorePrefix, "--session", "recovered-session"]);
+    }
+    expect(warnings).toHaveLength(1);
+    handlers.get("session_shutdown")?.({}, {});
+  });
+}
+
+test("Pi without a managed restore prefix keeps native session reports unchanged and silent", async () => {
+  const { requests, confirmedStates } = await startPiLifecycleServer("unmanaged-restore");
+  const warnings = captureRestoreWarnings();
+  const { handlers, pi } = createExtensionHarness();
+  const { default: install } = await importFresh("./pi/herdr-agent-state.ts");
+  install(pi);
+  for (const [index, reason] of ["startup", "new", "resume", "fork", "reload"].entries()) {
+    await handlers.get("session_start")?.({ reason }, {
+      ...piContext(() => true), sessionManager: { getSessionId: () => `unmanaged-${reason}` },
+    });
+    await waitFor(() => confirmedStates.length === index + 1);
+  }
+  expect(requests).toHaveLength(10);
+  for (const report of requests) expect(Object.hasOwn(report.params, "resume_argv")).toBe(false);
+  expect(warnings).toEqual([]);
+  handlers.get("session_shutdown")?.({}, {});
 });
 
 // smarty-dev#10398: an unset or empty HERDR_PANE_ID must not silence the extension. Herdr rebinds
