@@ -79,6 +79,9 @@ type Handler = (event: unknown, context: unknown) => unknown;
 function createExtensionHarness() {
   const handlers = new Map<string, Handler>();
   const eventHandlers = new Map<string, Handler>();
+  // Every fixture owns its extension's lifetime, including failed state-only transports.
+  // Retire dirty retries before the next test replaces the process-wide socket seam.
+  channelCleanups.push(() => { handlers.get("session_shutdown")?.({ reason: "quit" }, {}); });
   return {
     handlers,
     eventHandlers,
@@ -1538,7 +1541,6 @@ async function loadChannelAsset(
   const { default: install } = await importFresh("./pi/herdr-agent-state.ts");
   install(pi);
   const shutdown = () => { harness.handlers.get("session_shutdown")?.({ reason: "quit" }, {}); };
-  channelCleanups.push(shutdown);
   return { ...harness, pi, calls, shutdown };
 }
 
@@ -1703,8 +1705,7 @@ registeredChannelTest("Pi reconnects outside the fence when the load-time connec
   expect(connections[0].acks[0]).toMatchObject({ request_id: "fresh", status: "accepted" });
 });
 
-test("Pi Windows state reports still work but never advertise the unsupported receipt channel", async () => {
-  const { connections, reports } = await startChannelServer();
+function captureWindowsReportEndpoints() {
   const recordingSocketPath = process.env.HERDR_SOCKET_PATH!;
   const pipeEndpoint = `\\\\.\\pipe\\${recordingSocketPath}`;
   Object.defineProperty(process, "platform", { value: "win32" });
@@ -1717,23 +1718,100 @@ test("Pi Windows state reports still work but never advertise the unsupported re
     if (originalPlatform !== "win32" && args[0] === pipeEndpoint) args[0] = recordingSocketPath;
     return Reflect.apply(originalCreateConnection, net, args);
   }) as typeof net.createConnection;
-  const { handlers, pi, calls } = await loadChannelAsset(accepted);
-  let fallbackCalls = 0;
-  Object.assign(pi, { sendUserMessage: () => { fallbackCalls += 1; } });
-  await handlers.get("session_start")?.({}, channelContext());
-  await waitFor(() => reports.length === 1);
-  handlers.get("agent_start")?.({}, channelContext());
-  await waitFor(() => reports.length === 2);
-  await handlers.get("session_start")?.({ reason: "new" }, channelContext("session-2"));
-  await waitFor(() => reports.length === 3);
-  await Bun.sleep(300); // Beyond the reconnect delay: feature presence must not trigger a retry.
-  expect(requestStates(reports)).toEqual(["idle", "working", "idle"]);
-  expect(reports.map((report) => report.method)).toEqual(Array(3).fill("pane.report_agent"));
-  expect(endpoints).toEqual(Array(3).fill(pipeEndpoint));
-  expect(connections).toEqual([]);
-  expect(calls).toEqual([]);
-  expect(fallbackCalls).toBe(0);
-});
+  return { endpoints, pipeEndpoint };
+}
+
+for (const fixture of ["empty session manager", "missing session manager", "managed missing session manager"] as const) {
+  const name = "Pi Windows state reports still work but never advertise the unsupported receipt channel";
+  test(fixture === "empty session manager" ? name : `${name}: ${fixture}`, async () => {
+    const { connections, reports } = await startChannelServer();
+    const managed = fixture === "managed missing session manager";
+    if (managed) process.env.SMARTY_HERDR_RESTORE_PREFIX_JSON = JSON.stringify(managedRestorePrefix);
+    const warnings = captureRestoreWarnings();
+    const { endpoints, pipeEndpoint } = captureWindowsReportEndpoints();
+    const { handlers, pi, calls } = await loadChannelAsset(accepted);
+    const context = (generation = "session-1") => {
+      const { sessionManager, ...rest } = channelContext(generation);
+      return fixture === "empty session manager" ? { ...rest, sessionManager } : rest;
+    };
+    let fallbackCalls = 0;
+    Object.assign(pi, { sendUserMessage: () => { fallbackCalls += 1; } });
+    await handlers.get("session_start")?.({}, context());
+    await waitFor(() => reports.length === 1);
+    handlers.get("agent_start")?.({}, context());
+    await waitFor(() => reports.length === 2);
+    await handlers.get("session_start")?.({ reason: "new" }, context("session-2"));
+    await waitFor(() => reports.length === 3);
+    await Bun.sleep(300); // Beyond the reconnect delay: feature presence must not trigger a retry.
+    expect(requestStates(reports)).toEqual(["idle", "working", "idle"]);
+    expect(reports.map((report) => report.method)).toEqual(Array(3).fill("pane.report_agent"));
+    expect(endpoints).toEqual(Array(3).fill(pipeEndpoint));
+    for (const report of reports) {
+      expect(report.params).not.toHaveProperty("agent_session_id");
+      expect(report.params).not.toHaveProperty("agent_session_path");
+      expect(report.params).not.toHaveProperty("resume_argv");
+    }
+    expect(connections).toEqual([]);
+    expect(calls).toEqual([]);
+    expect(fallbackCalls).toBe(0);
+    expect(warnings).toHaveLength(managed ? 1 : 0);
+    if (managed) expect(warnings[0]).toContain("current Pi session reference is missing");
+  });
+}
+
+for (const managed of [false, true]) {
+  test(`Pi Windows ${managed ? "managed" : "unmanaged"} session and state reports share the resolved endpoint`, async () => {
+    const { connections, reports } = await startChannelServer();
+    if (managed) process.env.SMARTY_HERDR_RESTORE_PREFIX_JSON = JSON.stringify(managedRestorePrefix);
+    const warnings = captureRestoreWarnings();
+    const { endpoints, pipeEndpoint } = captureWindowsReportEndpoints();
+    const { handlers, calls } = await loadChannelAsset(accepted);
+    // Resolution belongs to extension load, not a later event or the mutable environment.
+    process.env.HERDR_SOCKET_PATH = "different-after-load.sock";
+    const transitions = [
+      { event: "session_start", reason: "startup", id: "initial-session", path: "C:\\Users\\User\\initial.jsonl" },
+      { event: "agent_start", reason: undefined, id: "current-session", path: undefined },
+      { event: "session_start", reason: "new", id: undefined, path: "C:\\Users\\User\\replacement.jsonl" },
+    ];
+    for (const [index, transition] of transitions.entries()) {
+      await handlers.get(transition.event)?.({ reason: transition.reason }, {
+        ...channelContext(`session-${index + 1}`),
+        sessionManager: {
+          getSessionId: () => transition.id,
+          getSessionFile: () => transition.path,
+        },
+      });
+      await waitFor(() => reports.length === (index + 1) * 2);
+      const pair = reports.slice(index * 2);
+      expect(pair.map((report) => report.method).sort()).toEqual(["pane.report_agent", "pane.report_agent_session"]);
+      const sessionReport = pair.find((report) => report.method === "pane.report_agent_session")!;
+      const stateReport = pair.find((report) => report.method === "pane.report_agent")!;
+      // session_start awaits its session report; agent_start publishes both without awaiting.
+      if (transition.event === "session_start") expect(pair[0]).toBe(sessionReport);
+      expect(sessionReport.params.session_start_source).toBe(transition.reason);
+      expect(stateReport.params.state).toBe(transition.event === "agent_start" ? "working" : "idle");
+      for (const report of pair) {
+        expect(report.params.agent_session_id).toBe(transition.id);
+        expect(report.params.agent_session_path).toBe(transition.path);
+        expect(Object.hasOwn(report.params, "agent_session_id")).toBe(transition.id !== undefined);
+        expect(Object.hasOwn(report.params, "agent_session_path")).toBe(transition.path !== undefined);
+        if (managed) {
+          expect(report.params.resume_argv).toEqual([
+            ...managedRestorePrefix, "--session", transition.path ?? transition.id,
+          ]);
+        } else {
+          expect(report.params).not.toHaveProperty("resume_argv");
+        }
+      }
+    }
+    await Bun.sleep(300);
+    expect(reports).toHaveLength(6);
+    expect(endpoints).toEqual(Array(6).fill(pipeEndpoint));
+    expect(connections).toEqual([]);
+    expect(calls).toEqual([]);
+    expect(warnings).toEqual([]);
+  });
+}
 
 registeredChannelTest("Pi waits for a whole correlated registration response then forwards split UTF-8 delivery literally", async () => {
   let finishRegistration!: () => void;
