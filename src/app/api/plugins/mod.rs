@@ -5216,7 +5216,7 @@ platforms = ["linux", "macos"]
 [[actions]]
 id = "hold"
 title = "Hold"
-command = ["sh", "-c", 'printf %s "${HERDR_PLUGIN_ACTION_TOKEN-none}" > tok.tmp && mv tok.tmp tok.txt; sleep 4 & while [ ! -e release ]; do sleep 0.02; done']
+command = ["sh", "-c", 'printf %s "${HERDR_PLUGIN_ACTION_TOKEN-none}" > tok.tmp && mv tok.tmp tok.txt; sleep 4 & i=0; while [ ! -e release ] && [ -d "$PWD" ] && [ "$i" -lt 1500 ]; do sleep 0.02; i=$((i+1)); done']
 
 [[startup]]
 command = ["sh", "-c", 'printf %s "${HERDR_PLUGIN_ACTION_TOKEN-none}" > hook.tmp && mv hook.tmp hook.txt']
