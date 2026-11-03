@@ -8362,6 +8362,14 @@ fn completion_guard_server(writer: ClientWriter) -> (HeadlessServer, crate::layo
 }
 
 fn completion_guard_api_report(server: &mut HeadlessServer, method: api::schema::Method) {
+    let response = completion_guard_api_response(server, method);
+    serde_json::from_str::<api::schema::SuccessResponse>(&response).expect("successful report");
+}
+
+fn completion_guard_api_response(
+    server: &mut HeadlessServer,
+    method: api::schema::Method,
+) -> String {
     let (respond_to, response_rx) = std::sync::mpsc::channel();
     server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
         peer_pidfd: None,
@@ -8373,10 +8381,9 @@ fn completion_guard_api_report(server: &mut HeadlessServer, method: api::schema:
         respond_to,
         response_write_complete: None,
     });
-    let response = response_rx
+    response_rx
         .recv_timeout(Duration::from_millis(100))
-        .unwrap();
-    serde_json::from_str::<api::schema::SuccessResponse>(&response).expect("successful report");
+        .unwrap()
 }
 
 fn report_agent_changed(
@@ -8648,6 +8655,120 @@ fn agent_session_report_emits_session_changed_only_for_a_new_session() {
     );
 }
 
+// In-process coverage makes startup reports precede detection deterministically.
+#[test]
+fn api_pi_resume_argv_retries_after_buffered_startup() {
+    for state_report in [false, true] {
+        let (writer, _control_rx, _render_rx) = test_client_writer();
+        let (mut server, pane_id) = completion_guard_server(writer);
+        let public_pane_id = server.app.public_pane_id(0, pane_id).unwrap();
+        let terminal_id = server.app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let terminal = &server.app.state.terminals[&terminal_id];
+        assert!(terminal.detected_agent.is_none());
+        let session_path = std::path::absolute(std::env::temp_dir().join("managed-session.jsonl"))
+            .expect("absolute session path")
+            .display()
+            .to_string();
+        let session_ref = crate::agent_resume::AgentSessionRef::path(session_path.clone()).unwrap();
+        let recipe = vec![
+            "managed-pi".into(),
+            "--session".into(),
+            session_path.clone(),
+        ];
+        let report = |state_report: bool, seq: u64, resume_argv: Option<Vec<String>>| {
+            if state_report {
+                api::schema::Method::PaneReportAgent(api::schema::PaneReportAgentParams {
+                    allow_cross_pane: true,
+                    pane_id: public_pane_id.clone(),
+                    source: "herdr:pi".into(),
+                    agent: "pi".into(),
+                    state: api::schema::PaneAgentState::Idle,
+                    message: None,
+                    seq: Some(seq),
+                    agent_session_id: None,
+                    agent_session_path: Some(session_path.clone()),
+                    resume_argv,
+                })
+            } else {
+                api::schema::Method::PaneReportAgentSession(
+                    api::schema::PaneReportAgentSessionParams {
+                        allow_cross_pane: true,
+                        pane_id: public_pane_id.clone(),
+                        source: "herdr:pi".into(),
+                        agent: "pi".into(),
+                        seq: Some(seq),
+                        agent_session_id: None,
+                        agent_session_path: Some(session_path.clone()),
+                        session_start_source: Some("startup".into()),
+                        resume_argv,
+                    },
+                )
+            }
+        };
+
+        completion_guard_api_report(&mut server, report(false, 1, None));
+        let response = completion_guard_api_response(
+            &mut server,
+            report(state_report, 2, Some(recipe.clone())),
+        );
+        let error: api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "resume_not_accepted", "{response}");
+        let terminal = &server.app.state.terminals[&terminal_id];
+        assert!(!terminal.session_ref_is_current(&session_ref));
+        assert!(terminal.reported_resume().is_none());
+        completion_guard_api_report(&mut server, report(state_report, 2, None));
+
+        server.handle_internal_event_with_forwarding(AppEvent::AgentProcessDetected {
+            pane_id,
+            agent: crate::detect::Agent::Pi,
+            observed_at: Instant::now(),
+        });
+        let terminal = &server.app.state.terminals[&terminal_id];
+        assert!(terminal.session_ref_is_current(&session_ref));
+        assert!(terminal.reported_resume().is_none());
+        completion_guard_api_report(&mut server, report(state_report, 3, Some(recipe.clone())));
+        assert_eq!(
+            server.app.state.terminals[&terminal_id]
+                .reported_resume()
+                .unwrap()
+                .argv,
+            recipe
+        );
+
+        let other_recipe = vec![
+            "managed-pi".into(),
+            "--session".into(),
+            "other-session.jsonl".into(),
+        ];
+        for seq in [3, 2] {
+            let response = completion_guard_api_response(
+                &mut server,
+                report(state_report, seq, Some(other_recipe.clone())),
+            );
+            let error: api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();
+            assert_eq!(error.error.code, "resume_not_accepted", "{response}");
+            completion_guard_api_report(&mut server, report(state_report, seq, None));
+            assert_eq!(
+                server.app.state.terminals[&terminal_id]
+                    .reported_resume()
+                    .unwrap()
+                    .argv,
+                recipe
+            );
+        }
+        completion_guard_api_report(&mut server, report(state_report, 4, Some(recipe.clone())));
+        assert_eq!(
+            server.app.state.terminals[&terminal_id]
+                .reported_resume()
+                .unwrap()
+                .argv,
+            recipe
+        );
+    }
+}
+
 #[test]
 fn api_report_agent_stores_valid_resume_argv_and_rejects_invalid() {
     let (writer, _control_rx, _render_rx) = test_client_writer();
@@ -8683,7 +8804,10 @@ fn api_report_agent_stores_valid_resume_argv_and_rejects_invalid() {
         vec!["prime-agent", "--resume", "01a0", "--model", "x"]
     );
 
-    completion_guard_api_report(&mut server, report(vec!["prime-agent", "--resume", "dup"]));
+    let response =
+        completion_guard_api_response(&mut server, report(vec!["prime-agent", "--resume", "dup"]));
+    let error: api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();
+    assert_eq!(error.error.code, "resume_not_accepted", "{response}");
     assert_eq!(
         server.app.state.terminals[&terminal_id]
             .reported_resume()
@@ -8754,41 +8878,65 @@ fn api_report_agent_stores_valid_resume_argv_and_rejects_invalid() {
 
 #[test]
 fn api_resume_argv_is_ignored_when_its_session_report_is_refused() {
-    let (writer, _control_rx, _render_rx) = test_client_writer();
-    let (mut server, pane_id) = completion_guard_server(writer);
-    let public_pane_id = server.app.public_pane_id(0, pane_id).unwrap();
-    let terminal_id = server.app.state.workspaces[0].tabs[0].panes[&pane_id]
-        .attached_terminal_id
-        .clone();
-    server.handle_internal_event_with_forwarding(AppEvent::AgentProcessDetected {
-        pane_id,
-        agent: crate::detect::Agent::Claude,
-        observed_at: Instant::now(),
-    });
-    let report = |session: &str| {
-        api::schema::Method::PaneReportAgentSession(api::schema::PaneReportAgentSessionParams {
-            allow_cross_pane: true,
-            pane_id: public_pane_id.clone(),
-            source: "herdr:claude".into(),
-            agent: "claude".into(),
-            seq: None,
-            agent_session_id: Some(session.into()),
-            agent_session_path: None,
-            session_start_source: None,
-            resume_argv: Some(vec!["claude".into(), "--resume".into(), session.into()]),
-        })
-    };
+    for state_report in [false, true] {
+        let (writer, _control_rx, _render_rx) = test_client_writer();
+        let (mut server, pane_id) = completion_guard_server(writer);
+        let public_pane_id = server.app.public_pane_id(0, pane_id).unwrap();
+        let terminal_id = server.app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        server.handle_internal_event_with_forwarding(AppEvent::AgentProcessDetected {
+            pane_id,
+            agent: crate::detect::Agent::Claude,
+            observed_at: Instant::now(),
+        });
+        let report = |session: &str, with_resume: bool| {
+            let resume_argv =
+                with_resume.then(|| vec!["claude".into(), "--resume".into(), session.into()]);
+            if state_report {
+                api::schema::Method::PaneReportAgent(api::schema::PaneReportAgentParams {
+                    allow_cross_pane: true,
+                    pane_id: public_pane_id.clone(),
+                    source: "herdr:claude".into(),
+                    agent: "claude".into(),
+                    state: api::schema::PaneAgentState::Idle,
+                    message: None,
+                    seq: None,
+                    agent_session_id: Some(session.into()),
+                    agent_session_path: None,
+                    resume_argv,
+                })
+            } else {
+                api::schema::Method::PaneReportAgentSession(
+                    api::schema::PaneReportAgentSessionParams {
+                        allow_cross_pane: true,
+                        pane_id: public_pane_id.clone(),
+                        source: "herdr:claude".into(),
+                        agent: "claude".into(),
+                        seq: None,
+                        agent_session_id: Some(session.into()),
+                        agent_session_path: None,
+                        session_start_source: None,
+                        resume_argv,
+                    },
+                )
+            }
+        };
 
-    completion_guard_api_report(&mut server, report("session-a"));
-    completion_guard_api_report(&mut server, report("session-b"));
+        completion_guard_api_report(&mut server, report("session-a", true));
+        let response = completion_guard_api_response(&mut server, report("session-b", true));
+        let error: api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "resume_not_accepted", "{response}");
+        completion_guard_api_report(&mut server, report("session-b", false));
 
-    let terminal = &server.app.state.terminals[&terminal_id];
-    assert!(terminal
-        .session_ref_is_current(&crate::agent_resume::AgentSessionRef::id("session-a").unwrap()));
-    assert_eq!(
-        terminal.reported_resume().unwrap().argv,
-        vec!["claude", "--resume", "session-a"]
-    );
+        let terminal = &server.app.state.terminals[&terminal_id];
+        let session_ref = crate::agent_resume::AgentSessionRef::id("session-a").unwrap();
+        assert!(terminal.session_ref_is_current(&session_ref));
+        assert_eq!(
+            terminal.reported_resume().unwrap().argv,
+            vec!["claude", "--resume", "session-a"]
+        );
+    }
 }
 
 fn completion_guard_notifications(
