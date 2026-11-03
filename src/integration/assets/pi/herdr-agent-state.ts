@@ -15,6 +15,7 @@ const socketEndpoint =
   process.platform === "win32" && socketPath ? `\\\\.\\pipe\\${socketPath}` : socketPath;
 const paneId = process.env.HERDR_PANE_ID;
 const source = "herdr:pi";
+const restorePrefixJson = process.env.SMARTY_HERDR_RESTORE_PREFIX_JSON;
 
 const MAX_CHANNEL_FRAME = 64 * 1024;
 const MAX_CHANNEL_LEDGER = 256;
@@ -175,6 +176,61 @@ type QueuedState = {
 let reportSeq = Date.now() * 1000;
 let currentAgentSessionId: string | undefined;
 let currentAgentSessionPath: string | undefined;
+let currentRestoreRefProblem: string | undefined;
+let lastRestoreProblem: string | undefined;
+
+// Match src/agent_resume.rs: limits count UTF-8 bytes, not JSON or shell-quoted bytes.
+function resumeArgvProblem(argv: unknown): string | undefined {
+  if (!Array.isArray(argv) || argv.length === 0 || argv.some((arg) => typeof arg !== "string")) {
+    return "resume_argv must be a nonempty JSON array of strings";
+  }
+  if (argv.length > 64) return "resume_argv allows at most 64 arguments";
+  if (argv.reduce((bytes, arg) => bytes + Buffer.byteLength(arg), 0) > 8192) {
+    return "resume_argv allows at most 8192 bytes";
+  }
+  if (argv.some((arg) => /[\u0000-\u001f\u007f-\u009f']/.test(arg))) {
+    return "resume_argv must not contain apostrophes or control characters";
+  }
+  if (!/^[a-zA-Z0-9_.][a-zA-Z0-9_.-]*$/.test(argv[0])) {
+    return "resume_argv must start with a plain command name, not a path";
+  }
+}
+
+function currentResumeArgv(): string[] | undefined {
+  if (restorePrefixJson === undefined) return undefined; // Unmanaged Pi is unchanged.
+  let prefix: unknown;
+  let problem: string | undefined;
+  try {
+    prefix = JSON.parse(restorePrefixJson);
+    problem = resumeArgvProblem(prefix);
+  } catch {
+    problem = "SMARTY_HERDR_RESTORE_PREFIX_JSON is not valid JSON";
+  }
+  if (!problem && (prefix[0] !== "smarty-herdr-relaunch" || prefix[1] !== "--restore")) {
+    problem = "restore prefix must start with smarty-herdr-relaunch --restore";
+  }
+  // The fixed prefix must never retain a startup selector, including forwarded Pi arguments.
+  if (!problem && prefix.some((arg) =>
+    /^(--session(?:-id)?|--resume|--continue|-r|-c)(=|$)/.test(arg.replace(/^--pi-arg=/, "")))) {
+    problem = "restore prefix must not include session selectors";
+  }
+  const session = currentAgentSessionPath ?? currentAgentSessionId;
+  problem ??= currentRestoreRefProblem;
+  if (!problem && !session) problem = "current Pi session reference is missing";
+  const argv = problem ? undefined : [...prefix, "--session", session];
+  problem ??= argv ? resumeArgvProblem(argv) : undefined;
+  if (problem) {
+    if (problem !== lastRestoreProblem) {
+      // Do not echo launch inputs or session references; they may contain private data.
+      console.warn(`[herdr] Managed role restore unavailable: ${problem}. ` +
+        "No role restoration is confirmed; Herdr may fall back to bare Pi.");
+    }
+    lastRestoreProblem = problem;
+    return undefined;
+  }
+  lastRestoreProblem = undefined;
+  return argv;
+}
 
 function nextReportSeq(): number {
   // Wall-clock based, not load-time based: a Pi started later in this pane (a nested probe that
@@ -185,6 +241,7 @@ function nextReportSeq(): number {
 }
 
 function updateSessionRef(ctx: any): void {
+  currentRestoreRefProblem = undefined;
   try {
     const file = ctx?.sessionManager?.getSessionFile?.();
     currentAgentSessionPath =
@@ -192,25 +249,38 @@ function updateSessionRef(ctx: any): void {
       (path.posix.isAbsolute(file) || path.win32.isAbsolute(file))
         ? file
         : undefined;
+    if (file != null && (!currentAgentSessionPath || Buffer.byteLength(file) > 4096 ||
+      /[\u0000-\u001f\u007f-\u009f']/.test(file))) {
+      currentRestoreRefProblem = "current Pi session path is invalid";
+    }
   } catch {
     currentAgentSessionPath = undefined;
+    currentRestoreRefProblem = "current Pi session path is unavailable";
   }
 
   try {
     const id = ctx?.sessionManager?.getSessionId?.();
     currentAgentSessionId = typeof id === "string" && id.length > 0 ? id : undefined;
+    if (id != null && (!currentAgentSessionId || Buffer.byteLength(id) > 512 ||
+      /[\u0000-\u001f\u007f-\u009f']/.test(id))) {
+      currentRestoreRefProblem = "current Pi session ID is invalid";
+    }
   } catch {
     currentAgentSessionId = undefined;
+    currentRestoreRefProblem = "current Pi session ID is unavailable";
   }
 }
 
 function currentSessionRef(): Record<string, unknown> | undefined {
+  const resumeArgv = currentResumeArgv();
   if (!currentAgentSessionId && !currentAgentSessionPath) {
     return undefined;
   }
   return {
     ...(currentAgentSessionId ? { agent_session_id: currentAgentSessionId } : {}),
     ...(currentAgentSessionPath ? { agent_session_path: currentAgentSessionPath } : {}),
+    // State reports must carry the recipe too: a session-only report cannot establish ownership.
+    ...(resumeArgv ? { resume_argv: resumeArgv } : {}),
   };
 }
 
