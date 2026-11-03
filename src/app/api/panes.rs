@@ -1847,6 +1847,13 @@ impl App {
         self.emit_pane_agent_session_changed(pane_id, previous_session);
         let applied =
             report_is_newer && self.session_report_applied(ws_idx, pane_id, session_ref.as_ref());
+        if params.resume_argv.is_some() && !applied {
+            return encode_error(
+                id,
+                "resume_not_accepted",
+                "resume_argv requires its session report to be accepted",
+            );
+        }
         self.report_agent_resume(
             id,
             ws_idx,
@@ -1854,7 +1861,7 @@ impl App {
             params.source,
             agent_label,
             params.seq.filter(|_| applied),
-            applied.then_some(params.resume_argv).flatten(),
+            params.resume_argv,
         )
     }
 
@@ -1911,6 +1918,13 @@ impl App {
         self.emit_pane_agent_session_changed(pane_id, previous_session);
         let applied =
             report_is_newer && self.session_report_applied(ws_idx, pane_id, session_ref.as_ref());
+        if params.resume_argv.is_some() && !applied {
+            return encode_error(
+                id,
+                "resume_not_accepted",
+                "resume_argv requires its session report to be accepted",
+            );
+        }
         self.report_agent_resume(
             id,
             ws_idx,
@@ -1918,7 +1932,7 @@ impl App {
             params.source,
             agent_label,
             params.seq.filter(|_| applied),
-            applied.then_some(params.resume_argv).flatten(),
+            params.resume_argv,
         )
     }
 
