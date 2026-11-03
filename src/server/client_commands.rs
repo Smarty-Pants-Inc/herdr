@@ -85,6 +85,7 @@ pub(crate) fn error_response(id: String, code: &str, message: impl Into<String>)
         error: ErrorBody {
             code: code.into(),
             message: message.into(),
+            close_code: None,
         },
     })
     .unwrap_or_else(|_| {

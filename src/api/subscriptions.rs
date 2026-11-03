@@ -65,6 +65,12 @@ pub(super) struct ActiveAgentSessionChangedSubscription {
     last_sequence: u64,
 }
 
+pub(super) struct ActiveMediaSubscription {
+    pane_id: String,
+    last_sequence: u64,
+    _interest: crate::api::event_hub::MediaInterest,
+}
+
 pub(super) struct ActiveScrollChangedSubscription {
     pane_id: String,
     last_scroll: Option<PaneScrollInfo>,
@@ -111,6 +117,7 @@ pub(super) enum ActiveSubscription {
     AgentStatusChanged(Box<ActiveAgentStatusChangedSubscription>),
     AgentSessionChanged(ActiveAgentSessionChangedSubscription),
     ScrollChanged(ActiveScrollChangedSubscription),
+    Media(ActiveMediaSubscription),
 }
 
 impl ActiveSubscription {
@@ -121,6 +128,7 @@ impl ActiveSubscription {
         api_tx: &ApiRequestSender,
         event_hub: &EventHub,
         event_start_sequence: u64,
+        media_start_sequence: u64,
     ) -> Result<Self, ErrorResponse> {
         let event_subscription = |event_kind| {
             Self::Event(ActiveEventSubscription {
@@ -182,6 +190,7 @@ impl ActiveSubscription {
                             return Err(ErrorResponse {
                                 id: request_id.to_string(),
                                 error: ErrorBody {
+                                    close_code: None,
                                     code: "invalid_regex".into(),
                                     message: err.to_string(),
                                 },
@@ -254,6 +263,23 @@ impl ActiveSubscription {
                     },
                 ))
             }
+            Subscription::Media { pane_id } => {
+                let probe = pane_get(format!("{request_id}:sub:{index}:probe"), &pane_id, api_tx)?;
+                // Public pane numbers are not raw PaneIds. Resolve only on the
+                // runtime side; retain that identity through moves until last drop.
+                let interest =
+                    event_hub
+                        .subscribe_media(probe.pane_id.clone())
+                        .map_err(|error| ErrorResponse {
+                            id: request_id.to_owned(),
+                            error: history_error(error),
+                        })?;
+                Ok(Self::Media(ActiveMediaSubscription {
+                    pane_id: probe.pane_id,
+                    last_sequence: media_start_sequence,
+                    _interest: interest,
+                }))
+            }
             Subscription::PaneScrollChanged { pane_id } => {
                 let probe = pane_get(format!("{request_id}:sub:{index}:probe"), &pane_id, api_tx)?;
 
@@ -285,6 +311,7 @@ impl ActiveSubscription {
             Self::ScrollChanged(subscription) => {
                 serde_json::to_value(subscription.poll(api_tx)?).ok()
             }
+            Self::Media(subscription) => subscription.poll(event_hub).ok().flatten(),
         }
     }
 
@@ -347,6 +374,19 @@ impl ActiveSubscription {
                 }
                 Ok(matching)
             }
+            Self::Media(subscription) => {
+                let events = event_hub
+                    .media_events_after_checked(subscription.last_sequence)
+                    .map_err(history_error)?;
+                let mut matching = Vec::new();
+                for (sequence, event) in events {
+                    subscription.last_sequence = sequence;
+                    if subscription.matches(&event) {
+                        matching.push(serde_json::to_value(event).map_err(event_encoding_error)?);
+                    }
+                }
+                Ok(matching)
+            }
             // These subscriptions sample current state, not retained event history.
             // Keep their existing cadence even when a lifecycle batch was nonempty.
             Self::OutputMatched(_) | Self::ScrollChanged(_) => {
@@ -360,20 +400,58 @@ fn subscription_events_after(
     event_hub: &EventHub,
     sequence: u64,
 ) -> Result<Vec<(u64, crate::api::schema::EventEnvelope)>, ErrorBody> {
-    event_hub.events_after_checked(sequence).map_err(|error| match error {
+    event_hub
+        .events_after_checked(sequence)
+        .map_err(history_error)
+}
+
+fn history_error(error: EventHistoryError) -> ErrorBody {
+    match error {
         EventHistoryError::Lost => ErrorBody {
+            close_code: None,
             code: "events_lost".into(),
             message: "event subscription fell behind retained history; resubscribe and resync with session.snapshot".into(),
         },
         EventHistoryError::Unavailable => ErrorBody {
+            close_code: None,
             code: "server_unavailable".into(),
             message: "event history is unavailable".into(),
         },
-    })
+    }
+}
+
+impl ActiveMediaSubscription {
+    fn matches(&self, event: &SubscriptionEventEnvelope) -> bool {
+        let pane = match &event.data {
+            SubscriptionEventData::MediaStarted(data) => &data.pane_id,
+            SubscriptionEventData::MediaStopped(data) => &data.pane_id,
+            SubscriptionEventData::MediaError(data) => &data.pane_id,
+            SubscriptionEventData::MediaControlsApplied(data) => &data.pane_id,
+            SubscriptionEventData::MediaLevels(data) => &data.pane_id,
+            _ => return false,
+        };
+        pane == &self.pane_id
+    }
+
+    fn poll(&mut self, event_hub: &EventHub) -> Result<Option<serde_json::Value>, ErrorBody> {
+        for (sequence, event) in event_hub
+            .media_events_after_checked(self.last_sequence)
+            .map_err(history_error)?
+        {
+            self.last_sequence = sequence;
+            if self.matches(&event) {
+                return serde_json::to_value(event)
+                    .map(Some)
+                    .map_err(event_encoding_error);
+            }
+        }
+        Ok(None)
+    }
 }
 
 fn event_encoding_error(error: serde_json::Error) -> ErrorBody {
     ErrorBody {
+        close_code: None,
         code: "internal_error".into(),
         message: format!("failed to encode subscription event: {error}"),
     }
@@ -677,6 +755,7 @@ fn pane_read(
         error: ErrorBody {
             code: "internal_error".into(),
             message: "failed to decode pane read response".into(),
+            close_code: None,
         },
     })?;
     if value.get("error").is_some() {
@@ -685,6 +764,7 @@ fn pane_read(
             error: ErrorBody {
                 code: "internal_error".into(),
                 message: "failed to decode pane read error".into(),
+                close_code: None,
             },
         });
     }
@@ -693,6 +773,7 @@ fn pane_read(
         error: ErrorBody {
             code: "internal_error".into(),
             message: "failed to decode pane read result".into(),
+            close_code: None,
         },
     })
 }
@@ -717,6 +798,7 @@ fn pane_get(
         error: ErrorBody {
             code: "internal_error".into(),
             message: "failed to decode pane get response".into(),
+            close_code: None,
         },
     })?;
     if value.get("error").is_some() {
@@ -726,6 +808,7 @@ fn pane_get(
                 error: ErrorBody {
                     code: "internal_error".into(),
                     message: "failed to decode pane get error".into(),
+                    close_code: None,
                 },
             })?;
         return Err(response);
@@ -735,6 +818,7 @@ fn pane_get(
         error: ErrorBody {
             code: "internal_error".into(),
             message: "failed to decode pane get result".into(),
+            close_code: None,
         },
     })
 }
@@ -811,6 +895,7 @@ mod tests {
             &api_tx,
             &event_hub,
             event_start_sequence,
+            event_hub.current_media_sequence(),
         )
         .expect("workspace focus subscription");
 
@@ -825,6 +910,42 @@ mod tests {
         assert_eq!(live_event["data"]["workspace_id"], "after_setup");
     }
 
+    // Failure boundary: deterministically outrun retention without depending on
+    // scheduling a socket writer slowly enough to overflow its history.
+    #[test]
+    fn media_batch_reports_retention_loss_and_releases_interest_on_error() {
+        let hub = EventHub::default();
+        let pane = crate::layout::PaneId::from_raw(99);
+        let mut subscription = ActiveSubscription::Media(ActiveMediaSubscription {
+            pane_id: "w1:p1".into(),
+            last_sequence: hub.current_media_sequence(),
+            _interest: hub.subscribe_media("w1:p1".into()).unwrap(),
+        });
+        assert_eq!(
+            hub.take_media_interest_transitions(|_| Some(pane)),
+            vec![(pane, true)]
+        );
+        for _ in 0..513 {
+            hub.push_media(
+                serde_json::from_value(serde_json::json!({
+                    "event": "media.levels", "data": {
+                        "pane_id": "w1:p1", "session_id": "session", "input_peak": 0.25, "output_peak": 0.5
+                    }
+                }))
+                .unwrap(),
+            );
+        }
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let error = subscription.poll_batch(&tx, &hub).unwrap_err();
+        assert_eq!(error.code, "events_lost");
+        assert!(error.close_code.is_none());
+        drop(subscription);
+        assert_eq!(
+            hub.take_media_interest_transitions(|_| None),
+            vec![(pane, false)]
+        );
+    }
+
     #[test]
     fn workspace_metadata_subscription_uses_dedicated_event_kind() {
         let event_hub = EventHub::default();
@@ -836,6 +957,7 @@ mod tests {
             &api_tx,
             &event_hub,
             event_hub.current_sequence(),
+            event_hub.current_media_sequence(),
         )
         .expect("workspace metadata subscription");
 
@@ -862,6 +984,7 @@ mod tests {
             &api_tx,
             &event_hub,
             start,
+            event_hub.current_media_sequence(),
         )
         .unwrap();
         event_hub.push(presentation_event(None));

@@ -140,6 +140,7 @@ enum LoopEvent {
     Api(Box<api::ApiRequestMessage>),
     ServerEvent(ServerEvent),
     RenderRequested,
+    MediaInterestChanged,
     ClientConnectionsAccepted(io::Result<()>),
 }
 
@@ -450,6 +451,9 @@ impl HeadlessServer {
         #[cfg(unix)]
         let mut registered_client_identity = self.client_socket_identity.clone();
 
+        // The shared hub outlives this loop; retain its signal across render continues.
+        let media_interest_notify = self.app.event_hub.media_interest_notify();
+
         loop {
             crate::render_prof::event("loop.tick");
             crate::render_prof::flush_if_due();
@@ -716,6 +720,7 @@ impl HeadlessServer {
                     },
                     _ = sleep_until_or_pending(next_deadline) => LoopEvent::Timer,
                     _ = self.app.render_notify.notified() => LoopEvent::RenderRequested,
+                    _ = media_interest_notify.notified() => LoopEvent::MediaInterestChanged,
                     accepted = client_connections => LoopEvent::ClientConnectionsAccepted(accepted),
                 }
             };
@@ -744,6 +749,7 @@ impl HeadlessServer {
 
             match event {
                 LoopEvent::Timer => {}
+                LoopEvent::MediaInterestChanged => self.drain_media_interest_transitions(),
                 LoopEvent::ClientConnectionsAccepted(Ok(())) => {
                     client_accept_retry_after = None;
                 }
@@ -1682,6 +1688,7 @@ impl HeadlessServer {
                         error: api::schema::ErrorBody {
                             code: "invalid_params".into(),
                             message: "window title is empty".into(),
+                            close_code: None,
                         },
                     })
                     .unwrap_or_else(|_| "{}".to_string());
@@ -3050,6 +3057,7 @@ impl HeadlessServer {
         }
         let status = crate::detect::manifest::agent_state_label(terminal.state);
         Some(api::schema::ErrorBody {
+            close_code: None,
             code: "agent_not_idle".into(),
             message: format!(
                 "cannot read {requested} lines while {} is {status}: its alternate-screen history can only be captured by scrolling while idle. Wait and retry, or use --source visible",
@@ -3270,6 +3278,7 @@ impl HeadlessServer {
         let response = serde_json::to_string(&api::schema::ErrorResponse {
             id: msg.request.id,
             error: api::schema::ErrorBody {
+                close_code: None,
                 code: "server_unavailable".into(),
                 message: "server is shutting down".into(),
             },
@@ -3324,6 +3333,7 @@ impl HeadlessServer {
                 Err(err) => serde_json::to_string(&api::schema::ErrorResponse {
                     id: msg.request.id,
                     error: api::schema::ErrorBody {
+                        close_code: None,
                         code: "handoff_failed".into(),
                         message: err.to_string(),
                     },
@@ -3532,6 +3542,7 @@ impl HeadlessServer {
                 serde_json::to_string(&api::schema::ErrorResponse {
                     id: String::new(),
                     error: api::schema::ErrorBody {
+                        close_code: None,
                         code: "serialization_error".into(),
                         message: err.to_string(),
                     },

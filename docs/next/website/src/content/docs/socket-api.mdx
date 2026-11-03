@@ -111,9 +111,133 @@ Raw socket method names use dot notation:
 | Events | `events.subscribe`, `events.wait` |
 | Integrations | `integration.install`, `integration.uninstall` |
 | Plugins | `plugin.link`, `plugin.list`, `plugin.unlink`, `plugin.enable`, `plugin.disable`, `plugin.action.list`, `plugin.action.invoke`, `plugin.log.list`, `plugin.pane.open`, `plugin.pane.focus`, `plugin.pane.close` |
-| Media | `pane.media_open`, `media.answer`, `media.mute`, `media.state`, `media.close` |
+| Media | `pane.media_open`, `media.answer`, `media.mute`, `media.control`, `media.state`, `media.close` |
 
 `pane.media_open` asks the attached Herdr client whose input last reached the pane, within 10 seconds, to act as the WebRTC audio peer for that pane: it captures the microphone and plays the reply on the user's machine, and the server carries only SDP and control. Before relying on caller-selected `open_id` cancellation and offer retirement, check `ping.result.capabilities.media_open_cancel == true`; older servers may not support these semantics. It routes only to that client, and only when it advertises native media support (`media.webrtc.v1`). Pass an optional caller-chosen `open_id` (non-empty printable ASCII, at most 128 bytes) so a caller can cancel before it learns the generated session id; live `open_id` values must be unique. Closing an unknown `open_id` is idempotent: it records a tombstone for up to 120 seconds (at most 256 unknown IDs, pruned by the media `expire` pass), so a later matching open is refused with `media_refused` and `closed: cancelled before open` without reaching the client. When cancelling a pending open, in the same server step the refusal is enqueued before the close success on the app response channel; replies sent over separate connections may arrive in either order. The response is `media_offer` with a `session_id`, the client's SDP offer, and a per-pane `epoch`. Post the remote answer with `media.answer`, mute with `media.mute`, poll `media.state` (`opening`, `offered`, `connecting`, `connected`, `failed` or `closed` with a `code`), and end the call with `media.close`, which accepts exactly one of `session_id` or `open_id` and releases the microphone. An offer that is not answered within 20 seconds closes with `unanswered`; if the waiting API caller disconnects, the session closes with `abandoned`. Errors: `media_no_client` (no recent input from an attached client), `media_unsupported_client` (the client that typed last has no media support), `media_refused` (the client declined or the caller closed it; the message starts with a code such as `declined`, `closed`, `disabled`, `not_viewed` or `stale_input`) and `media_timeout`. The client setting `media = "off" | "ask" | "auto"` controls consent; `ask`, the default, prompts once per client run.
+
+For acknowledged controls, check `ping.result.capabilities.media_control == true`.
+For pane media events, check `ping.result.capabilities.media_events == true`.
+Both capabilities default to `false` when absent in an older server's response;
+`media_open_cancel` alone does not imply either feature. These are additive local
+JSON API features, not changes to a frozen client endpoint codec.
+
+`media.control` requires `session_id` and accepts optional booleans `input_muted`
+(stop microphone audio) and `output_suppressed` (suppress reply playback). Omitted
+fields retain the desired value. Controls are ordered per session in server
+admission order and may be submitted in `offered` state, before `media.answer`.
+The server **holds the API response until the client acknowledges the matching
+control ID as applied**; enqueueing a control is not success. A successful result
+has `type: "media_controls_applied"`, `session_id`, `request_id` equal to the outer
+API request's `id`, both applied boolean fields, and the current `epoch`:
+
+```json
+{"id":"control-1","method":"media.control","params":{"session_id":"session","epoch":7,"input_muted":true,"output_suppressed":false}}
+{"id":"control-1","result":{"type":"media_controls_applied","session_id":"session","request_id":"control-1","input_muted":true,"output_suppressed":false,"epoch":7}}
+```
+
+Before a session reaches `offered` (while opening/pending), and for unknown,
+stale, or epoch-mismatched targets, `media.control` returns
+`media_session_not_found`.
+
+If the 32 unresolved target-device control slots are full, it returns
+`media_control_failed` with a clear message and no `close_code`; the session
+remains live. Only the matching acknowledgement from the session named in the
+request settles its response. A successor's acknowledgement cannot settle a
+source request. If the named session ends before its acknowledgement, the
+response is `media_control_failed`; a known causal reason is its `close_code`. In
+particular, if the session is retired or replaced first, the response carries
+that session's `close_code`. The successor's own application is reported as a
+`media.controls_applied` event under its own `session_id`, never as the old
+response. The acknowledgement deadline is **5 seconds**. `media_timeout` means
+application is uncertain: the client may already have applied the control, or
+may apply it later. It is not proof of
+non-application and does not close the session. Do not treat it as an automatic
+retry instruction. Disconnecting only the control caller does not end the media
+session. `media.mute` remains the legacy dispatch-only method: its `ok` response
+is not an applied acknowledgement.
+
+Desired input-mute and output-suppression intent is recorded separately from
+applied state. It survives `device_changed` and session close until explicitly
+changed or the pane is removed from the live pane topology; it is not persisted
+across server restart.
+
+A new or renewed client session installs both desired input-mute and
+output-suppression gates before invoking `audio.open`, rather than opening audio
+and applying those gates afterward. Applied acknowledgements do not overwrite
+newer desired intent. Renewal has limited availability: the client closes the
+old peer before opening its successor. If the successor's `audio.open` fails,
+the call ends without audio and the voice caller must renew; audio is not
+preserved across that failed handover.
+
+`media.answer` returns immediately after dispatch; it does not wait for a
+connection. After an answer, the client has **15 seconds** to reach `connected`
+(peer connected and the `oai-events` data channel open). Otherwise the session
+ends with `negotiation_timeout`, visible in `media.state` and `media.stopped`.
+This is separate from the unanswered-offer deadline above.
+
+`media.answer`, `media.control`, and `media.close` accept an optional unsigned
+`epoch` copied from the offer. If provided and different from the resolved
+session's epoch, the request fails with `media_session_not_found` and has no
+effect; a known causal close reason is also returned as `close_code`. Omitting
+`epoch` preserves legacy behavior. Session IDs are opaque and use a random
+broker-boot generation to avoid reuse across rapid restarts; do not construct
+IDs or infer epochs from them. Older servers may ignore optional epoch fields,
+so these fields alone are not a fail-closed negotiation mechanism with an old
+server.
+
+Close-caused failures of open, answer, control, and close keep the existing
+`error.code` and `error.message`, and additionally include optional
+`error.close_code` (for example `device_changed`, `unanswered`, `abandoned`, or
+`negotiation_timeout`). It is omitted when no causal close is known, including
+unknown session IDs. Do not parse `message` to discover the close reason:
+
+```json
+{"id":"control-1","error":{"code":"media_control_failed","message":"session ended","close_code":"negotiation_timeout"}}
+```
+
+Subscribe on a persistent socket with `events.subscribe` and a pane-scoped
+`media` subscription. The server validates and canonicalizes the pane ID; events
+from other panes are not delivered by this subscription:
+
+```json
+{"id":"media-events","method":"events.subscribe","params":{"subscriptions":[{"type":"media","pane_id":"w1:p1"}]}}
+```
+
+Media subscription events use the dotted `event` names below and **untagged
+`data`**: there is no `data.type`. Every data object includes `pane_id` and
+`session_id`. They are separate from the general event stream and are not
+`events.wait` match kinds.
+
+| Event | Additional required data | Meaning |
+| --- | --- | --- |
+| `media.started` | `epoch`, `helper: {version, commit, pid}`, `input_device`, `output_device` | Emitted once only after Connected **and** helper/device info are available, regardless of arrival order. `pid` is an unsigned integer; helper version/commit and device names are strings. |
+| `media.stopped` | `epoch`, `code`, `message` | One terminal close with its epoch and reason, including unanswered, abandoned, device-change, and negotiation-timeout closes. |
+| `media.error` | `code`, `message` | A runtime failure; unlike stopped, this shape has no epoch. |
+| `media.controls_applied` | `request_id`, `input_muted`, `output_suppressed`, `epoch` | Applied control acknowledgement; API controls use the outer API request ID. |
+| `media.levels` | `input_peak`, `output_peak` | Numeric audio peak telemetry, at most 10 events per second per pane. |
+
+```json
+{"event":"media.started","data":{"pane_id":"w1:p1","session_id":"session","epoch":7,"helper":{"version":"1","commit":"abc","pid":123},"input_device":"microphone","output_device":"speakers"}}
+{"event":"media.stopped","data":{"pane_id":"w1:p1","session_id":"session","epoch":7,"code":"negotiation_timeout","message":"connection deadline elapsed"}}
+{"event":"media.error","data":{"pane_id":"w1:p1","session_id":"session","code":"helper_failed","message":"helper exited"}}
+{"event":"media.controls_applied","data":{"pane_id":"w1:p1","session_id":"session","request_id":"control-1","input_muted":true,"output_suppressed":false,"epoch":7}}
+{"event":"media.levels","data":{"pane_id":"w1:p1","session_id":"session","input_peak":0.25,"output_peak":0.5}}
+```
+
+The first media subscriber for a pane requests client level reporting; the last
+subscriber leaving requests levels off, including socket disconnect and failed
+subscription setup. Subscribing before a session opens also applies to future
+sessions on that pane. A new or renewed session starts with levels off unless a
+subscriber exists. The server drops each incoming levels message immediately
+when its pane has no subscribers. If the levels-off control fails or is
+rejected, desired levels-off remains and is reconciled at the next existing
+dispatch, session-state update, or renewal event for that session; there is no
+frame polling or timer. A last-subscriber transition is a request, not a
+guarantee that the client has already stopped sending levels. Lifecycle and
+control events are not throttled by the level limit. `media.device_changed` is
+reserved and is **never emitted**; device changes are close reasons, not a sixth
+event kind. Reconnect and resubscribe after socket loss; events are live notices,
+not a durable replay log.
 
 ### Registered agent channels (unreleased)
 

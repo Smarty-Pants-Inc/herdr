@@ -232,6 +232,7 @@ impl HeadlessServer {
                 error: api::schema::ErrorBody {
                     code: "invalid_params".into(),
                     message: "notification title is empty".into(),
+                    close_code: None,
                 },
             })
             .unwrap_or_else(|_| "{}".to_string());

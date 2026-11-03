@@ -10,6 +10,7 @@ pub(crate) fn encode_error(id: String, code: &str, message: impl Into<String>) -
         ErrorBody {
             code: code.into(),
             message: message.into(),
+            close_code: None,
         },
     )
 }

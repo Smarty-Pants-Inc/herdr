@@ -3118,6 +3118,8 @@ mod tests {
                 refuse_if_exists_guard: true,
                 input_consumer: false,
                 media_open_cancel: true,
+                media_control: true,
+                media_events: true,
             }),
         };
         let missing_baseline = crate::api::RuntimeStatus {
@@ -3202,6 +3204,8 @@ mod tests {
                     guarded_live_handoff: true,
                     input_consumer: false,
                     media_open_cancel: true,
+                    media_control: true,
+                    media_events: true,
                 }),
             },
         };
@@ -3461,6 +3465,8 @@ mod tests {
                     guarded_live_handoff: true,
                     input_consumer: false,
                     media_open_cancel: true,
+                    media_control: true,
+                    media_events: true,
                 }),
             },
         };
