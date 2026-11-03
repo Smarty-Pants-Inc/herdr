@@ -114,6 +114,16 @@ Unsupported, missing, invalid, duplicated, or stale session references restore a
 
 If native agent session restore applies to a pane, Herdr resumes the agent session instead of replaying saved pane history for that pane.
 
+### Managed Pi role reconstruction
+
+The Smarty fork's Pi integration optionally reads `SMARTY_HERDR_RESTORE_PREFIX_JSON` from the launched Pi process. It must be a JSON argv array beginning with `"smarty-herdr-relaunch", "--restore"`, followed by the launcher's non-secret role reconstruction inputs. It is not shell text, and it must not contain startup session selectors such as `--session`, `--session-id`, `--resume` or `--continue`, including forwarded Pi selectors.
+
+The integration appends `--session` and the **current** session manager reference (absolute session file when available, otherwise session ID). It includes this `resume_argv` in both session updates and the state report that establishes pane ownership, using the existing Pi reporter and sequence queue. Startup, `/new`, `/resume`, `/fork`, reload and agent-start updates refresh the reference; the original command-line session selector is never reused. Without the environment value, native Pi reporting is unchanged.
+
+The complete command, including the session suffix, must fit Herdr's existing resume-command contract: at most 64 arguments and 8192 UTF-8 bytes in total, no apostrophes or control characters, and a plain executable name rather than a path. A malformed prefix or missing/invalid session reference prints a warning and omits the managed resume command. Bare Pi fallback is **not** confirmation that the role was restored.
+
+This hook records a reconstruction command; it does not implement the launcher, save the original environment, or prove that reconstruction succeeded. The restore shell must be able to find a compatible `smarty-herdr-relaunch --restore` on its PATH. Keep secrets and prompt bodies out of the prefix: Herdr persists the argv. Existing saved panes are not enrolled merely by installing the integration; they must report a valid recipe from a role-aware launch before their next restart. Verify persistence and the restored role's actual loaded context before treating a cold restore as successful.
+
 ## Live handoff
 
 Live handoff is for update and remote attach flows that need to replace a running Herdr server. It asks the old server to transfer live panes to the new server, so pane processes can keep running across the server replacement.
