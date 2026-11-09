@@ -1,5 +1,6 @@
 use crate::api::schema::{
-    AgentChannelInfoParams, AgentDraftStateParams, AgentPromptGuardedParams, Method, Request,
+    AgentChannelInfoParams, AgentDraftStateParams, AgentPromptGuardedParams, AgentPromptParams,
+    AgentStatus, AgentWaitParams, Method, PaneTarget, Request,
 };
 
 const GUARDED_USAGE: &str = "usage: herdr agent prompt-guarded <target> <text> --expected-terminal TERMINAL_ID --expected-registration-epoch EPOCH --request-id ID [--timeout-ms MS] [--allow-cross-pane] [--if-draft-empty]";
@@ -453,29 +454,149 @@ fn fresh_prompt_request_id() -> std::io::Result<String> {
     ))
 }
 
-pub(super) fn prompt_if_draft_empty(
-    target: &str,
-    text: &str,
-    allow_cross_pane: bool,
-) -> std::io::Result<i32> {
-    if target.is_empty() || text.is_empty() {
+pub(super) fn prompt_if_draft_empty(params: AgentPromptParams) -> std::io::Result<i32> {
+    if params.target.is_empty() || params.text.is_empty() {
         eprintln!("agent prompt --if-draft-empty requires a nonempty target and text");
         return Ok(2);
     }
-    let (expected_terminal, expected_registration_epoch) = match discover_draft_guard(target)? {
-        Ok(pins) => pins,
-        Err(response) => return super::super::print_response(&response),
-    };
-    send_guarded_prompt(AgentPromptGuardedParams {
-        target: target.to_owned(),
-        text: text.to_owned(),
+    // Alpha deliberately composes the prior read/check, channel delivery, and
+    // standalone wait operations. The pre-check-to-send race is accepted here:
+    // these expectations are observations, not the normal prompt's atomic
+    // writer guards. Channel pins and draft admission remain mandatory.
+    if let Err(response) = precheck_prompt_expectations(&params)? {
+        return super::super::print_response(&response);
+    }
+    let (expected_terminal, expected_registration_epoch) =
+        match discover_draft_guard(&params.target)? {
+            Ok(pins) => pins,
+            Err(response) => return super::super::print_response(&response),
+        };
+    let response = guarded_prompt_response(AgentPromptGuardedParams {
+        target: params.target.clone(),
+        text: params.text,
         expected_terminal,
         expected_registration_epoch,
         request_id: fresh_prompt_request_id()?,
         timeout_ms: None,
-        allow_cross_pane,
+        allow_cross_pane: params.allow_cross_pane,
         if_draft_empty: true,
-    })
+    })?;
+    if response.get("error").is_some() {
+        return super::super::print_response(&response);
+    }
+    if let Some(wait) = params.wait {
+        // This is intentionally standalone agent.wait, not prompt turn/activity
+        // tracking. Its timeout starts after a successful admission receipt.
+        return super::send_agent_wait(AgentWaitParams {
+            target: params.target,
+            until: wait.until,
+            timeout_ms: wait.timeout_ms,
+        });
+    }
+    super::super::print_response(&response)
+}
+
+fn prompt_expectation_error(code: &str, message: impl Into<String>) -> serde_json::Value {
+    super::cli_agent_error("cli:agent:prompt", code, message)
+}
+
+fn check_prompt_session_status(
+    params: &AgentPromptParams,
+    agent: &serde_json::Value,
+) -> Result<(), serde_json::Value> {
+    if let Some(expected) = params.expected_agent_status {
+        let actual = serde_json::from_value::<AgentStatus>(agent["agent_status"].clone())
+            .ok()
+            // API presentation calls an unseen idle agent "done". The normal
+            // expected-status guard compares detection, where it is still idle.
+            .map(|status| {
+                if status == AgentStatus::Done {
+                    AgentStatus::Idle
+                } else {
+                    status
+                }
+            });
+        match actual {
+            Some(actual) if actual == expected => {}
+            Some(actual) => {
+                return Err(prompt_expectation_error(
+                    "expected_status_mismatch",
+                    format!(
+                    "the target's detected agent status is {actual:?}, not expected {expected:?}"
+                ),
+                ))
+            }
+            None => {
+                return Err(prompt_expectation_error(
+                    "expected_status_mismatch",
+                    "the target has no detected agent status",
+                ))
+            }
+        }
+    }
+    if let Some(expected) = params.expected_agent_session_id.as_deref() {
+        match agent["agent_session_id"].as_str() {
+            Some(actual) if actual == expected => {}
+            Some(_) => {
+                return Err(prompt_expectation_error(
+                    "agent_session_mismatch",
+                    format!(
+                        "the target's reported agent session does not match expected {expected:?}"
+                    ),
+                ))
+            }
+            None => {
+                return Err(prompt_expectation_error(
+                    "agent_session_unknown",
+                    format!(
+                    "the target has no accepted current agent session ID for expected {expected:?}"
+                ),
+                ))
+            }
+        }
+    }
+    Ok(())
+}
+
+fn precheck_prompt_expectations(
+    params: &AgentPromptParams,
+) -> std::io::Result<Result<(), serde_json::Value>> {
+    if params.expected_agent_session_id.is_none()
+        && params.expected_pane_id.is_none()
+        && params.expected_agent_status.is_none()
+    {
+        return Ok(Ok(()));
+    }
+    let response = super::resolve_agent_target(&params.target, "cli:agent:prompt")?;
+    if response.get("error").is_some() {
+        return Ok(Err(response));
+    }
+    let agent = &response["result"]["agent"];
+    if let Some(expected) = params.expected_pane_id.as_deref() {
+        let matches = if agent["pane_id"].as_str() == Some(expected) {
+            true
+        } else {
+            // pane.get resolves the same legacy/public pane aliases accepted by
+            // the server's expected-pane check; string comparison alone cannot.
+            let pane = super::super::send_request(&Request {
+                id: "cli:agent:prompt:expected-pane".into(),
+                method: Method::PaneGet(PaneTarget {
+                    pane_id: expected.to_owned(),
+                }),
+            })?;
+            pane.get("error").is_none()
+                && pane["result"]["pane"]["pane_id"]
+                    .as_str()
+                    .is_some_and(|pane_id| agent["pane_id"].as_str() == Some(pane_id))
+        };
+        if !matches {
+            return Ok(Err(prompt_expectation_error(
+                "expected_pane_mismatch",
+                "the agent target no longer resolves to the expected pane",
+            )));
+        }
+    }
+    Ok(check_prompt_session_status(params, agent))
 }
 
 pub(super) fn prompt_guarded(args: &[String]) -> std::io::Result<i32> {
@@ -492,12 +613,16 @@ pub(super) fn prompt_guarded(args: &[String]) -> std::io::Result<i32> {
 }
 
 fn send_guarded_prompt(params: AgentPromptGuardedParams) -> std::io::Result<i32> {
+    super::super::print_response(&guarded_prompt_response(params)?)
+}
+
+fn guarded_prompt_response(params: AgentPromptGuardedParams) -> std::io::Result<serde_json::Value> {
     // A distinct method and pins fail closed on old/replaced servers. Never turn
     // this into agent.prompt, PTY input, or a retry after lost transport.
-    super::super::print_response(&super::super::send_request(&Request {
+    super::super::send_request(&Request {
         id: "cli:agent:prompt-guarded".into(),
         method: Method::AgentPromptGuarded(params),
-    })?)
+    })
 }
 
 #[cfg(test)]
@@ -1362,7 +1487,13 @@ mod tests {
         let mut command_args = args(&[command]);
         command_args.extend_from_slice(leaf_args);
         let exit_code = crate::cli::target::with_test_client(client, || {
-            super::super::run_agent_command(&command_args)
+            if command == "prompt" {
+                // Tests choose alpha explicitly; inherited process environment
+                // must not change the RPC sequence or leak between tests.
+                super::super::agent_prompt_with_alpha(leaf_args, true)
+            } else {
+                super::super::run_agent_command(&command_args)
+            }
         })
         .unwrap();
         let requests = server.join().unwrap();
@@ -1376,6 +1507,295 @@ mod tests {
             "terminal_id": "opaque:λ/42", "registration_epoch": "epoch=日本語",
             "ready": true, "draft_guard": true,
         }})
+    }
+
+    fn prompt_agent_snapshot() -> serde_json::Value {
+        serde_json::json!({"result": {"agent": {
+            "terminal_id": "opaque:λ/42", "pane_id": "w1:p2",
+            "agent_session_id": "session=a", "agent_status": "idle",
+        }}})
+    }
+
+    #[test]
+    fn alpha_prompt_session_status_refusals_match_normal_guard_wording() {
+        let params = super::super::parse_agent_prompt_args(&args(&[
+            "worker",
+            "hello",
+            "--expected-session=session=a",
+            "--expected-status=idle",
+        ]))
+        .unwrap();
+        let valid = prompt_agent_snapshot()["result"]["agent"].clone();
+        assert!(check_prompt_session_status(&params, &valid).is_ok());
+        let mut done = valid.clone();
+        done["agent_status"] = "done".into();
+        assert!(check_prompt_session_status(&params, &done).is_ok());
+        let mut expects_done = params.clone();
+        expects_done.expected_agent_status = Some(AgentStatus::Done);
+        assert_eq!(
+            check_prompt_session_status(&expects_done, &done).unwrap_err()["error"],
+            serde_json::json!({
+                "code": "expected_status_mismatch",
+                "message": "the target's detected agent status is Idle, not expected Done",
+            })
+        );
+        for (field, value, code, message) in [
+            (
+                "agent_status",
+                serde_json::json!("working"),
+                "expected_status_mismatch",
+                "the target's detected agent status is Working, not expected Idle",
+            ),
+            (
+                "agent_status",
+                serde_json::Value::Null,
+                "expected_status_mismatch",
+                "the target has no detected agent status",
+            ),
+            (
+                "agent_session_id",
+                serde_json::json!("other"),
+                "agent_session_mismatch",
+                "the target's reported agent session does not match expected \"session=a\"",
+            ),
+            (
+                "agent_session_id",
+                serde_json::Value::Null,
+                "agent_session_unknown",
+                "the target has no accepted current agent session ID for expected \"session=a\"",
+            ),
+        ] {
+            let mut agent = valid.clone();
+            agent[field] = value;
+            assert_eq!(
+                check_prompt_session_status(&params, &agent).unwrap_err(),
+                serde_json::json!({
+                    "id": "cli:agent:prompt", "error": {"code": code, "message": message},
+                })
+            );
+        }
+        let mut both_wrong = valid;
+        both_wrong["agent_status"] = "blocked".into();
+        both_wrong["agent_session_id"] = "other".into();
+        assert_eq!(
+            check_prompt_session_status(&params, &both_wrong).unwrap_err()["error"]["code"],
+            "expected_status_mismatch"
+        );
+    }
+
+    #[test]
+    fn alpha_prompt_prechecks_expectations_then_delivers_channel_only_then_waits() {
+        let mut snapshot = prompt_agent_snapshot();
+        snapshot["result"]["agent"]["agent_status"] = "done".into();
+        let (code, requests) = command_with_mock_replies(
+            "prompt",
+            &args(&[
+                "worker",
+                "hello",
+                "--if-draft-empty",
+                "--expected-session=session=a",
+                "--expected-pane=w1:p2",
+                "--expected-status=idle",
+                "--allow-cross-pane",
+                "--wait",
+                "--until",
+                "done",
+                "--until=blocked",
+                "--timeout",
+                "1200",
+            ]),
+            vec![
+                snapshot,
+                ready_draft_channel(),
+                serde_json::json!({"result": {"status": "accepted"}}),
+                prompt_agent_snapshot(),
+            ],
+        );
+        assert_eq!(code, 0);
+        let methods: Vec<_> = requests
+            .iter()
+            .filter_map(|request| request["method"].as_str())
+            .filter(|method| *method != "ping")
+            .collect();
+        assert_eq!(
+            methods,
+            [
+                "agent.get",
+                "agent.channel_info",
+                "agent.prompt_guarded",
+                "agent.wait"
+            ]
+        );
+        assert_eq!(
+            requests[1]["params"],
+            serde_json::json!({"target": "worker"})
+        );
+        let prompt = &requests[5]["params"];
+        assert_eq!(prompt["text"], "hello");
+        assert_eq!(prompt["expected_terminal"], "opaque:λ/42");
+        assert_eq!(prompt["expected_registration_epoch"], "epoch=日本語");
+        assert_eq!(prompt["if_draft_empty"], true);
+        assert_eq!(prompt["allow_cross_pane"], true);
+        for field in [
+            "wait",
+            "expected_agent_session_id",
+            "expected_pane_id",
+            "expected_agent_status",
+        ] {
+            assert!(
+                prompt.get(field).is_none(),
+                "published guarded shape must remain unchanged: {field}"
+            );
+        }
+        assert_eq!(
+            requests[7]["params"],
+            serde_json::json!({"target": "worker", "until": ["done", "blocked"], "timeout_ms": 1200})
+        );
+    }
+
+    #[test]
+    fn alpha_prompt_precheck_mismatches_stop_before_channel_discovery() {
+        for (options, snapshot) in [
+            (vec!["--expected-session=other"], prompt_agent_snapshot()),
+            (vec!["--expected-session=session=a"], {
+                let mut value = prompt_agent_snapshot();
+                value["result"]["agent"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("agent_session_id");
+                value
+            }),
+            (
+                vec!["--expected-session=session=a", "--expected-status=working"],
+                prompt_agent_snapshot(),
+            ),
+            (
+                vec!["--expected-session=session=a"],
+                serde_json::json!({"error": {"code": "agent_not_found", "message": "missing"}}),
+            ),
+        ] {
+            let mut input = args(&["worker", "hello", "--if-draft-empty", "--wait"]);
+            input.extend(args(&options));
+            let (code, requests) = command_with_mock_server("prompt", &input, snapshot);
+            assert_eq!(code, 1, "{options:?}");
+            assert_eq!(requests.len(), 2);
+            assert_eq!(requests[1]["method"], "agent.get");
+        }
+    }
+
+    #[test]
+    fn alpha_prompt_expected_pane_resolves_aliases_and_refuses_mismatch() {
+        for reply in [
+            serde_json::json!({"result": {"pane": {"pane_id": "w1:p3"}}}),
+            serde_json::json!({"error": {"code": "pane_not_found", "message": "missing"}}),
+            serde_json::json!({"result": {"pane": {}}}),
+        ] {
+            let (code, requests) = command_with_mock_replies(
+                "prompt",
+                &args(&[
+                    "worker",
+                    "hello",
+                    "--if-draft-empty",
+                    "--expected-pane=p_legacy",
+                    "--wait",
+                ]),
+                vec![prompt_agent_snapshot(), reply],
+            );
+            assert_eq!(code, 1);
+            assert_eq!(requests.len(), 4);
+            assert_eq!(requests[3]["method"], "pane.get");
+            assert_eq!(
+                requests[3]["params"],
+                serde_json::json!({"pane_id": "p_legacy"})
+            );
+        }
+        let (code, requests) = command_with_mock_replies(
+            "prompt",
+            &args(&[
+                "worker",
+                "hello",
+                "--if-draft-empty",
+                "--expected-pane=p_legacy",
+            ]),
+            vec![
+                prompt_agent_snapshot(),
+                serde_json::json!({"result": {"pane": {"pane_id": "w1:p2"}}}),
+                ready_draft_channel(),
+                serde_json::json!({"result": {"status": "accepted"}}),
+            ],
+        );
+        assert_eq!(code, 0);
+        assert_eq!(requests.len(), 8);
+        assert_eq!(requests[7]["method"], "agent.prompt_guarded");
+    }
+
+    #[test]
+    fn alpha_prompt_wait_reuses_standalone_defaults_and_error_exit() {
+        for wait_reply in [
+            prompt_agent_snapshot(),
+            serde_json::json!({"error": {"code": "timeout", "message": "timed out waiting for agent status"}}),
+        ] {
+            let expected_code = i32::from(wait_reply.get("error").is_some());
+            let (code, requests) = command_with_mock_replies(
+                "prompt",
+                &args(&["worker", "hello", "--if-draft-empty", "--wait"]),
+                vec![
+                    ready_draft_channel(),
+                    serde_json::json!({"result": {"status": "queued"}}),
+                    wait_reply,
+                ],
+            );
+            assert_eq!(code, expected_code);
+            assert_eq!(requests.len(), 6);
+            assert_eq!(requests[1]["method"], "agent.channel_info");
+            assert_eq!(requests[3]["method"], "agent.prompt_guarded");
+            assert_eq!(requests[5]["method"], "agent.wait");
+            assert_eq!(
+                requests[5]["params"],
+                serde_json::json!({"target": "worker"})
+            );
+        }
+    }
+
+    #[test]
+    fn alpha_prompt_never_waits_or_retries_after_channel_refusal() {
+        for reply in [
+            serde_json::json!({"error": {"code": "agent_prompt_rejected", "reason": "draft_present", "message": "draft_present"}}),
+            serde_json::json!({"error": {"code": "delivery_unknown", "message": "lost receipt"}}),
+            serde_json::json!({"error": {"code": "method_not_found", "message": "old server"}}),
+        ] {
+            let (code, requests) = command_with_mock_replies(
+                "prompt",
+                &args(&[
+                    "worker",
+                    "hello",
+                    "--if-draft-empty",
+                    "--expected-session=session=a",
+                    "--wait",
+                ]),
+                vec![prompt_agent_snapshot(), ready_draft_channel(), reply],
+            );
+            assert_eq!(code, 1);
+            assert_eq!(requests.len(), 6);
+            assert_eq!(requests[5]["method"], "agent.prompt_guarded");
+        }
+        let (code, requests) = command_with_mock_replies(
+            "prompt",
+            &args(&[
+                "worker",
+                "hello",
+                "--if-draft-empty",
+                "--expected-session=session=a",
+                "--wait",
+            ]),
+            vec![
+                prompt_agent_snapshot(),
+                serde_json::json!({"result": {"ready": false}}),
+            ],
+        );
+        assert_eq!(code, 1);
+        assert_eq!(requests.len(), 4);
+        assert_eq!(requests[3]["method"], "agent.channel_info");
     }
 
     #[test]
@@ -1544,7 +1964,10 @@ mod tests {
             let mut input = args(&["worker", "literal", "--if-draft-empty"]);
             input.extend(args(options));
             // No client/server is installed: any accidental RPC would fail this test.
-            assert_eq!(super::super::agent_prompt(&input).unwrap(), 2);
+            assert_eq!(
+                super::super::agent_prompt_with_alpha(&input, false).unwrap(),
+                2
+            );
         }
         for input in [
             &["", "literal", "--if-draft-empty"][..],
