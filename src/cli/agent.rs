@@ -549,13 +549,17 @@ fn agent_wait(args: &[String]) -> std::io::Result<i32> {
             }
         }
     }
+    send_agent_wait(AgentWaitParams {
+        target: target.clone(),
+        until,
+        timeout_ms,
+    })
+}
+
+fn send_agent_wait(params: AgentWaitParams) -> std::io::Result<i32> {
     super::print_response(&super::send_request(&Request {
         id: "cli:agent:wait".into(),
-        method: Method::AgentWait(AgentWaitParams {
-            target: target.clone(),
-            until,
-            timeout_ms,
-        }),
+        method: Method::AgentWait(params),
     })?)
 }
 
@@ -774,9 +778,24 @@ fn agent_rename(args: &[String]) -> std::io::Result<i32> {
     })?)
 }
 
-const AGENT_PROMPT_USAGE: &str = "usage: herdr agent prompt <target> <text> [--if-draft-empty | [--expected-session ID] [--expected-pane ID] [--expected-status STATUS] [--wait [--until STATUS]... [--timeout MS]]] [--allow-cross-pane]";
+const AGENT_PROMPT_USAGE: &str = "usage: herdr agent prompt <target> <text> [--if-draft-empty] [--expected-session ID] [--expected-pane ID] [--expected-status STATUS] [--wait [--until STATUS]... [--timeout MS]] [--allow-cross-pane]";
+const DRAFT_EMPTY_LEGACY_REFUSAL: &str = "agent prompt --if-draft-empty only supports --allow-cross-pane; --wait, --until, --timeout, duplicate guards, and extra arguments are refused before sending";
 
+#[derive(Debug)]
+struct ParsedAgentPrompt {
+    params: AgentPromptParams,
+    if_draft_empty: bool,
+}
+
+#[cfg(test)]
 fn parse_agent_prompt_args(args: &[String]) -> Result<AgentPromptParams, String> {
+    parse_agent_prompt_args_with_alpha(args, true).map(|parsed| parsed.params)
+}
+
+fn parse_agent_prompt_args_with_alpha(
+    args: &[String],
+    alpha: bool,
+) -> Result<ParsedAgentPrompt, String> {
     // Use the same TARGET/TEXT classification as the global extractors, while
     // retaining all session/status expectations and wait options from master.
     let argv = channel::classify_prompt_argv(args);
@@ -788,8 +807,20 @@ fn parse_agent_prompt_args(args: &[String]) -> Result<AgentPromptParams, String>
         .text
         .map(|slot| &args[slot])
         .ok_or("agent prompt requires text")?;
+    let raw_options = &args[argv.options..];
+    let guarded = raw_options.iter().any(|arg| arg == "--if-draft-empty");
+    if guarded && !alpha {
+        let mut seen_guard = false;
+        for option in raw_options {
+            match option.as_str() {
+                "--if-draft-empty" if !seen_guard => seen_guard = true,
+                "--allow-cross-pane" => {}
+                _ => return Err(DRAFT_EMPTY_LEGACY_REFUSAL.into()),
+            }
+        }
+    }
     let options = super::expand_equals_args(
-        &args[argv.options..],
+        raw_options,
         &[
             "--until",
             "--timeout",
@@ -798,6 +829,7 @@ fn parse_agent_prompt_args(args: &[String]) -> Result<AgentPromptParams, String>
             "--expected-status",
         ],
     );
+    let mut if_draft_empty = false;
     let mut wait = false;
     let mut until = Vec::new();
     let mut timeout_ms = None;
@@ -808,7 +840,17 @@ fn parse_agent_prompt_args(args: &[String]) -> Result<AgentPromptParams, String>
     let mut index = 0;
     while index < options.len() {
         match options[index].as_str() {
+            "--if-draft-empty" => {
+                if if_draft_empty {
+                    return Err("--if-draft-empty may only be specified once".into());
+                }
+                if_draft_empty = true;
+                index += 1;
+            }
             "--wait" => {
+                if guarded && wait {
+                    return Err("--wait may only be specified once".into());
+                }
                 wait = true;
                 index += 1;
             }
@@ -823,6 +865,9 @@ fn parse_agent_prompt_args(args: &[String]) -> Result<AgentPromptParams, String>
                 let value = options
                     .get(index + 1)
                     .ok_or("missing value for --timeout")?;
+                if guarded && timeout_ms.is_some() {
+                    return Err("--timeout may only be specified once".into());
+                }
                 timeout_ms =
                     Some(super::parse_u64_flag("--timeout", value).map_err(|err| err.to_string())?);
                 index += 2;
@@ -833,6 +878,15 @@ fn parse_agent_prompt_args(args: &[String]) -> Result<AgentPromptParams, String>
                     .get(index + 1)
                     .filter(|value| !value.starts_with("--"))
                     .ok_or_else(|| format!("missing value for {option}"))?;
+                let duplicate = match option {
+                    "--expected-session" => expected_agent_session_id.is_some(),
+                    "--expected-pane" => expected_pane_id.is_some(),
+                    "--expected-status" => expected_agent_status.is_some(),
+                    _ => unreachable!("matched expected guard option"),
+                };
+                if guarded && duplicate {
+                    return Err(format!("{option} may only be specified once"));
+                }
                 match option {
                     "--expected-session" => expected_agent_session_id = Some(value.clone()),
                     "--expected-pane" => expected_pane_id = Some(super::normalize_pane_id(value)),
@@ -860,61 +914,47 @@ fn parse_agent_prompt_args(args: &[String]) -> Result<AgentPromptParams, String>
     if timeout_ms.is_some() && !wait {
         return Err("--timeout requires --wait".into());
     }
-    Ok(AgentPromptParams {
-        target: target.clone(),
-        text: text.clone(),
-        expected_agent_session_id,
-        expected_pane_id,
-        expected_agent_status,
-        wait: wait.then_some(AgentPromptWaitOptions {
-            until,
-            timeout_ms,
-            submission_deadline: None,
-        }),
-        allow_cross_pane,
+    Ok(ParsedAgentPrompt {
+        if_draft_empty,
+        params: AgentPromptParams {
+            target: target.clone(),
+            text: text.clone(),
+            expected_agent_session_id,
+            expected_pane_id,
+            expected_agent_status,
+            wait: wait.then_some(AgentPromptWaitOptions {
+                until,
+                timeout_ms,
+                submission_deadline: None,
+            }),
+            allow_cross_pane,
+        },
     })
 }
 
 fn agent_prompt(args: &[String]) -> std::io::Result<i32> {
-    // TARGET, TEXT and a leading or after-target compatibility flag come from
-    // the same classification that protected them from global extraction.
-    let argv = channel::classify_prompt_argv(args);
-    let Some(target) = argv.target.map(|slot| &args[slot]) else {
-        eprintln!("{AGENT_PROMPT_USAGE}");
-        return Ok(2);
-    };
-    let Some(text) = argv.text.map(|slot| &args[slot]) else {
-        eprintln!("agent prompt requires text");
-        return Ok(2);
-    };
-    let options = &args[argv.options..];
-    // Select the guarded route before parsing any legacy wait options so it can
-    // never accidentally reach the typing path or turn-completion machinery.
-    // Session expectations are extra arguments on this route and are refused.
-    if options.iter().any(|arg| arg == "--if-draft-empty") {
-        let mut if_draft_empty = false;
-        let mut allow_cross_pane = argv.cross_pane_opt_in;
-        for option in options {
-            match option.as_str() {
-                "--if-draft-empty" if !if_draft_empty => if_draft_empty = true,
-                "--allow-cross-pane" => allow_cross_pane = true,
-                _ => {
-                    eprintln!(
-                        "agent prompt --if-draft-empty only supports --allow-cross-pane; --wait, --until, --timeout, duplicate guards, and extra arguments are refused before sending"
-                    );
-                    return Ok(2);
-                }
-            }
-        }
-        return channel::prompt_if_draft_empty(target, text, allow_cross_pane);
-    }
-    let params = match parse_agent_prompt_args(args) {
-        Ok(params) => params,
+    let alpha = alpha_enabled(std::env::var_os("SMARTY_ALPHA").as_deref());
+    agent_prompt_with_alpha(args, alpha)
+}
+
+fn alpha_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("0"))
+}
+
+fn agent_prompt_with_alpha(args: &[String], alpha: bool) -> std::io::Result<i32> {
+    let ParsedAgentPrompt {
+        params,
+        if_draft_empty,
+    } = match parse_agent_prompt_args_with_alpha(args, alpha) {
+        Ok(parsed) => parsed,
         Err(message) => {
             eprintln!("{message}");
             return Ok(2);
         }
     };
+    if if_draft_empty {
+        return channel::prompt_if_draft_empty(params);
+    }
     let response = super::send_request(&Request {
         id: "cli:agent:prompt".into(),
         method: Method::AgentPrompt(params),
@@ -1033,8 +1073,9 @@ fn print_agent_help() {
     );
     eprintln!("  herdr agent send-keys <target> [--allow-cross-pane] <key> [key ...]");
     eprintln!(
-        "  herdr agent prompt <target> <text> [--if-draft-empty | [--expected-session ID] [--expected-pane ID] [--expected-status STATUS] [--wait [--until STATUS]... [--timeout MS]]] [--allow-cross-pane]"
+        "  herdr agent prompt <target> <text> [--if-draft-empty] [--expected-session ID] [--expected-pane ID] [--expected-status STATUS] [--wait [--until STATUS]... [--timeout MS]] [--allow-cross-pane]"
     );
+    eprintln!("    alpha: --if-draft-empty accepts expectation pre-checks and standalone --wait; SMARTY_ALPHA=0 disables these combinations");
     eprintln!("  herdr agent rename <target> <name>|--clear");
     eprintln!("  herdr agent focus <target>");
     eprintln!("  herdr agent wait <target> [--until STATUS]... [--timeout MS]");
@@ -1218,6 +1259,244 @@ mod tests {
                 .unwrap();
         assert!(pane_only.expected_agent_session_id.is_none());
         assert_eq!(pane_only.expected_pane_id.as_deref(), Some("w1:p2"));
+    }
+
+    #[test]
+    fn prompt_plain_duplicate_options_preserve_final_values_with_alpha_on_and_off() {
+        let values = args(&[
+            "reviewer",
+            "hello",
+            "--wait",
+            "--timeout",
+            "1000",
+            "--expected-session",
+            "session=a",
+            "--expected-pane",
+            "w1:p1",
+            "--expected-status",
+            "working",
+            "--wait",
+            "--timeout=1200",
+            "--expected-session=session=b",
+            "--expected-pane=w1:p2",
+            "--expected-status=idle",
+        ]);
+        for alpha in [false, true] {
+            let parsed = parse_agent_prompt_args_with_alpha(&values, alpha).unwrap();
+            assert!(!parsed.if_draft_empty);
+            assert_eq!(
+                parsed.params,
+                AgentPromptParams {
+                    target: "reviewer".into(),
+                    text: "hello".into(),
+                    expected_agent_session_id: Some("session=b".into()),
+                    expected_pane_id: Some("w1:p2".into()),
+                    expected_agent_status: Some(crate::api::schema::AgentStatus::Idle),
+                    wait: Some(AgentPromptWaitOptions {
+                        until: Vec::new(),
+                        timeout_ms: Some(1200),
+                        submission_deadline: None,
+                    }),
+                    allow_cross_pane: false,
+                }
+            );
+            let request = Request {
+                id: "test:prompt".into(),
+                method: Method::AgentPrompt(parsed.params),
+            };
+            let value = serde_json::to_value(&request).unwrap();
+            assert_eq!(serde_json::from_value::<Request>(value).unwrap(), request);
+        }
+    }
+
+    #[test]
+    fn prompt_plain_duplicate_expected_status_still_requires_session() {
+        for alpha in [false, true] {
+            let values = args(&[
+                "reviewer",
+                "hello",
+                "--expected-status",
+                "working",
+                "--expected-status=idle",
+            ]);
+            assert_eq!(
+                parse_agent_prompt_args_with_alpha(&values, alpha).unwrap_err(),
+                "--expected-status requires --expected-session"
+            );
+        }
+    }
+
+    #[test]
+    fn prompt_alpha_is_disabled_only_by_exact_zero() {
+        assert!(alpha_enabled(None));
+        for value in ["", "1", "false", "00", "0\n", " 0", "0 "] {
+            assert!(
+                alpha_enabled(Some(std::ffi::OsStr::new(value))),
+                "{value:?}"
+            );
+        }
+        assert!(!alpha_enabled(Some(std::ffi::OsStr::new("0"))));
+    }
+
+    #[test]
+    fn prompt_alpha_draft_guard_carries_all_expectation_and_wait_combinations() {
+        for equals in [false, true] {
+            for mask in 0..8 {
+                for wait_options in [
+                    &[][..],
+                    &["--wait"][..],
+                    &["--wait", "--until", "idle", "--until", "done"][..],
+                    &["--wait", "--timeout=1200"][..],
+                    &["--wait", "--until=blocked", "--timeout", "1200"][..],
+                ] {
+                    let mut values = args(&[
+                        "reviewer",
+                        "hello",
+                        "--if-draft-empty",
+                        "--allow-cross-pane",
+                    ]);
+                    for (bit, option, value) in [
+                        (1, "--expected-session", "session=a"),
+                        (2, "--expected-pane", "w1:p2"),
+                        (4, "--expected-status", "idle"),
+                    ] {
+                        if mask & bit != 0 {
+                            if equals {
+                                values.push(format!("{option}={value}"));
+                            } else {
+                                values.extend(args(&[option, value]));
+                            }
+                        }
+                    }
+                    values.extend(args(wait_options));
+                    let parsed = parse_agent_prompt_args_with_alpha(&values, true);
+                    if mask & 4 != 0 && mask & 1 == 0 {
+                        assert_eq!(
+                            parsed.unwrap_err(),
+                            "--expected-status requires --expected-session"
+                        );
+                        continue;
+                    }
+                    let parsed = parsed.unwrap();
+                    assert!(parsed.if_draft_empty);
+                    let params = parsed.params;
+                    assert_eq!(params.target, "reviewer");
+                    assert_eq!(params.text, "hello");
+                    assert!(params.allow_cross_pane);
+                    assert_eq!(
+                        params.expected_agent_session_id.as_deref(),
+                        (mask & 1 != 0).then_some("session=a")
+                    );
+                    assert_eq!(
+                        params.expected_pane_id.as_deref(),
+                        (mask & 2 != 0).then_some("w1:p2")
+                    );
+                    assert_eq!(
+                        params.expected_agent_status,
+                        (mask & 4 != 0).then_some(crate::api::schema::AgentStatus::Idle)
+                    );
+                    assert_eq!(params.wait.is_some(), !wait_options.is_empty());
+                    if let Some(wait) = params.wait {
+                        assert_eq!(
+                            wait.timeout_ms,
+                            wait_options
+                                .iter()
+                                .any(|value| value.starts_with("--timeout"))
+                                .then_some(1200)
+                        );
+                        let expected_until = if wait_options.contains(&"--until=blocked") {
+                            vec![crate::api::schema::AgentStatus::Blocked]
+                        } else if wait_options.contains(&"--until") {
+                            vec![
+                                crate::api::schema::AgentStatus::Idle,
+                                crate::api::schema::AgentStatus::Done,
+                            ]
+                        } else {
+                            Vec::new()
+                        };
+                        assert_eq!(wait.until, expected_until);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn prompt_alpha_off_preserves_exact_draft_guard_refusal() {
+        for options in [
+            &["--wait"][..],
+            &["--until", "idle"][..],
+            &["--timeout=1000"][..],
+            &["--expected-session", "session=a"][..],
+            &["--expected-pane=w1:p1"][..],
+            &["--expected-status=idle", "--expected-session=session=a"][..],
+            &["--if-draft-empty"][..],
+            &["extra"][..],
+        ] {
+            let mut values = args(&["worker", "hello", "--if-draft-empty"]);
+            values.extend(args(options));
+            assert_eq!(
+                parse_agent_prompt_args_with_alpha(&values, false).unwrap_err(),
+                "agent prompt --if-draft-empty only supports --allow-cross-pane; --wait, --until, --timeout, duplicate guards, and extra arguments are refused before sending"
+            );
+            assert_eq!(agent_prompt_with_alpha(&values, false).unwrap(), 2);
+        }
+        let parsed = parse_agent_prompt_args_with_alpha(
+            &args(&["worker", "hello", "--if-draft-empty", "--allow-cross-pane"]),
+            false,
+        )
+        .unwrap();
+        assert!(parsed.if_draft_empty);
+        assert!(parsed.params.allow_cross_pane);
+        assert!(parsed.params.wait.is_none());
+        let literal = parse_agent_prompt_args_with_alpha(
+            &args(&["worker", "--if-draft-empty", "--wait"]),
+            false,
+        )
+        .unwrap();
+        assert!(!literal.if_draft_empty);
+        assert_eq!(literal.params.text, "--if-draft-empty");
+        assert!(literal.params.wait.is_some());
+    }
+
+    #[test]
+    fn prompt_alpha_draft_guard_rejects_duplicates_and_invalid_wait_options() {
+        for options in [
+            &["--if-draft-empty"][..],
+            &["--expected-session=s", "--expected-session", "s"][..],
+            &["--expected-pane", "w1:p1", "--expected-pane=w1:p1"][..],
+            &[
+                "--expected-session=s",
+                "--expected-status=idle",
+                "--expected-status",
+                "idle",
+            ][..],
+            &["--wait", "--wait"][..],
+            &["--wait", "--timeout=1", "--timeout", "1"][..],
+            &["--until=done"][..],
+            &["--timeout", "1000"][..],
+            &["--expected-session"][..],
+            &["--expected-pane"][..],
+            &["--expected-status"][..],
+            &["--expected-session=s", "--expected-status=invalid"][..],
+        ] {
+            for guard_first in [true, false] {
+                let mut values = args(&["worker", "hello"]);
+                if guard_first {
+                    values.push("--if-draft-empty".into());
+                }
+                values.extend(args(options));
+                if !guard_first {
+                    values.push("--if-draft-empty".into());
+                }
+                assert!(
+                    parse_agent_prompt_args_with_alpha(&values, true).is_err(),
+                    "{options:?}, guard_first={guard_first}"
+                );
+                // No client is installed: all of these must stop before any RPC.
+                assert_eq!(agent_prompt_with_alpha(&values, true).unwrap(), 2);
+            }
+        }
     }
 
     #[test]
