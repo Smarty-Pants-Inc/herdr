@@ -532,7 +532,10 @@ fn generated_protocol_schema_artifact_is_current() {
 
     if std::env::var_os("HERDR_UPDATE_API_SCHEMA").is_some() {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, &actual).unwrap();
+        let output = std::env::var_os("HERDR_API_SCHEMA_OUTPUT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| path.clone());
+        std::fs::write(&output, &actual).unwrap();
         return;
     }
 
@@ -1385,6 +1388,226 @@ fn media_open_and_close_schema_match_open_id_validation() {
 }
 
 #[test]
+fn media_control_request_and_applied_response_round_trip() {
+    let request_json = serde_json::json!({
+        "id": "control-1", "method": "media.control",
+        "params": {"session_id": "session", "input_muted": true,
+            "output_suppressed": false, "epoch": 7}
+    });
+    let request: Request = serde_json::from_value(request_json.clone()).unwrap();
+    assert!(matches!(&request.method, Method::MediaControl(params)
+        if params.input_muted == Some(true) && params.output_suppressed == Some(false)
+            && params.epoch == Some(7)));
+    assert_eq!(
+        crate::api::api_method_name(&request.method),
+        "media.control"
+    );
+    assert_eq!(serde_json::to_value(request).unwrap(), request_json);
+
+    let response_json = serde_json::json!({
+        "id": "control-1", "result": {"type": "media_controls_applied",
+            "session_id": "session", "request_id": "control-1",
+            "input_muted": true, "output_suppressed": false, "epoch": 7}
+    });
+    let response: SuccessResponse = serde_json::from_value(response_json.clone()).unwrap();
+    assert!(
+        matches!(&response.result, ResponseResult::MediaControlsApplied {
+        request_id, epoch: 7, input_muted: true, output_suppressed: false, ..
+    } if request_id == "control-1")
+    );
+    assert_eq!(serde_json::to_value(response).unwrap(), response_json);
+
+    let params: MediaControlParams =
+        serde_json::from_value(serde_json::json!({"session_id": "session"})).unwrap();
+    assert_eq!(params.input_muted, None);
+    assert_eq!(params.output_suppressed, None);
+    assert_eq!(params.epoch, None);
+    assert_eq!(
+        serde_json::to_value(params).unwrap(),
+        serde_json::json!({"session_id": "session"})
+    );
+}
+
+#[test]
+fn media_epoch_params_are_optional_and_preserve_explicit_values() {
+    for (method, params) in [
+        (
+            "media.answer",
+            serde_json::json!({"session_id": "session", "sdp": "v=0 answer"}),
+        ),
+        (
+            "media.control",
+            serde_json::json!({"session_id": "session", "input_muted": true}),
+        ),
+        ("media.close", serde_json::json!({"session_id": "session"})),
+        ("media.close", serde_json::json!({"open_id": "open"})),
+    ] {
+        for epoch in [None, Some(7)] {
+            let mut value = serde_json::json!({"id": "epoch", "method": method, "params": params});
+            if let Some(epoch) = epoch {
+                value["params"]["epoch"] = epoch.into();
+            }
+            let request: Request = serde_json::from_value(value.clone()).unwrap();
+            let actual = match &request.method {
+                Method::MediaAnswer(params) => params.epoch,
+                Method::MediaControl(params) => params.epoch,
+                Method::MediaClose(params) => params.epoch,
+                other => panic!("unexpected epoch method: {other:?}"),
+            };
+            assert_eq!(actual, epoch);
+            assert_eq!(serde_json::to_value(request).unwrap(), value);
+        }
+    }
+    for schema in [
+        serde_json::to_value(schemars::schema_for!(MediaAnswerParams)).unwrap(),
+        serde_json::to_value(schemars::schema_for!(MediaControlParams)).unwrap(),
+        serde_json::to_value(schemars::schema_for!(MediaCloseParams)).unwrap(),
+    ] {
+        assert_eq!(
+            schema["properties"]["epoch"]["type"],
+            serde_json::json!(["integer", "null"])
+        );
+        assert!(!schema["required"]
+            .as_array()
+            .is_some_and(|required| required.contains(&serde_json::json!("epoch"))));
+    }
+}
+
+#[test]
+fn media_subscription_events_round_trip_exact_untagged_shapes() {
+    let subscription = serde_json::json!({"type": "media", "pane_id": "w1:p1"});
+    let parsed: Subscription = serde_json::from_value(subscription.clone()).unwrap();
+    assert!(matches!(&parsed, Subscription::Media { pane_id } if pane_id == "w1:p1"));
+    assert_eq!(serde_json::to_value(parsed).unwrap(), subscription);
+
+    let cases = [
+        (
+            SubscriptionEventKind::MediaStarted,
+            serde_json::json!({"event": "media.started", "data": {
+                "pane_id": "w1:p1", "session_id": "session", "epoch": 7,
+                "helper": {"version": "1", "commit": "abc", "pid": 123},
+                "input_device": "microphone", "output_device": "speakers"}}),
+            SubscriptionEventData::MediaStarted(MediaStartedEvent {
+                pane_id: "w1:p1".into(),
+                session_id: "session".into(),
+                epoch: 7,
+                helper: MediaHelperInfo {
+                    version: "1".into(),
+                    commit: "abc".into(),
+                    pid: 123,
+                },
+                input_device: "microphone".into(),
+                output_device: "speakers".into(),
+            }),
+        ),
+        (
+            SubscriptionEventKind::MediaStopped,
+            serde_json::json!({"event": "media.stopped", "data": {
+                "pane_id": "w1:p1", "session_id": "session", "epoch": 7,
+                "code": "negotiation_timeout", "message": "connection deadline elapsed"}}),
+            SubscriptionEventData::MediaStopped(MediaStoppedEvent {
+                pane_id: "w1:p1".into(),
+                session_id: "session".into(),
+                epoch: 7,
+                code: "negotiation_timeout".into(),
+                message: "connection deadline elapsed".into(),
+            }),
+        ),
+        (
+            SubscriptionEventKind::MediaError,
+            serde_json::json!({"event": "media.error", "data": {
+                "pane_id": "w1:p1", "session_id": "session",
+                "code": "helper_failed", "message": "helper exited"}}),
+            SubscriptionEventData::MediaError(MediaErrorEvent {
+                pane_id: "w1:p1".into(),
+                session_id: "session".into(),
+                code: "helper_failed".into(),
+                message: "helper exited".into(),
+            }),
+        ),
+        (
+            SubscriptionEventKind::MediaControlsApplied,
+            serde_json::json!({"event": "media.controls_applied", "data": {
+                "pane_id": "w1:p1", "session_id": "session", "request_id": "control-1",
+                "input_muted": true, "output_suppressed": false, "epoch": 7}}),
+            SubscriptionEventData::MediaControlsApplied(MediaControlsAppliedEvent {
+                pane_id: "w1:p1".into(),
+                session_id: "session".into(),
+                request_id: "control-1".into(),
+                input_muted: true,
+                output_suppressed: false,
+                epoch: 7,
+            }),
+        ),
+        (
+            SubscriptionEventKind::MediaLevels,
+            serde_json::json!({"event": "media.levels", "data": {
+                "pane_id": "w1:p1", "session_id": "session", "input_peak": 0.25, "output_peak": 0.5}}),
+            SubscriptionEventData::MediaLevels(MediaLevelsEvent {
+                pane_id: "w1:p1".into(),
+                session_id: "session".into(),
+                input_peak: 0.25,
+                output_peak: 0.5,
+            }),
+        ),
+    ];
+    for (kind, literal, data) in cases {
+        let expected = SubscriptionEventEnvelope { event: kind, data };
+        let decoded: SubscriptionEventEnvelope = serde_json::from_value(literal.clone()).unwrap();
+        assert_eq!(decoded, expected);
+        assert!(literal["data"].get("type").is_none());
+        assert_eq!(serde_json::to_value(&decoded).unwrap(), literal);
+        let encoded = serde_json::to_string(&expected).unwrap();
+        assert_eq!(
+            serde_json::from_str::<SubscriptionEventEnvelope>(&encoded).unwrap(),
+            expected
+        );
+    }
+    assert!(
+        serde_json::from_value::<SubscriptionEventKind>(serde_json::json!("media.device_changed"))
+            .is_err()
+    );
+}
+
+#[test]
+fn media_capabilities_and_close_code_are_default_compatible() {
+    let legacy = serde_json::json!({"live_handoff": true});
+    let capabilities: ServerCapabilities = serde_json::from_value(legacy).unwrap();
+    assert!(!capabilities.media_control);
+    assert!(!capabilities.media_events);
+    assert!(serde_json::from_value::<ServerCapabilities>(serde_json::json!({})).is_err());
+    let schema = serde_json::to_value(schemars::schema_for!(ServerCapabilities)).unwrap();
+    for field in ["media_control", "media_events"] {
+        assert_eq!(schema["properties"][field]["default"], false);
+        assert!(!schema["required"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!(field)));
+        let mut value = serde_json::json!({"live_handoff": true});
+        value[field] = true.into();
+        let decoded: ServerCapabilities = serde_json::from_value(value).unwrap();
+        assert_eq!(serde_json::to_value(decoded).unwrap()[field], true);
+    }
+
+    for close_code in [None, Some("negotiation_timeout")] {
+        let mut value =
+            serde_json::json!({"code": "media_control_failed", "message": "session ended"});
+        if let Some(code) = close_code {
+            value["close_code"] = code.into();
+        }
+        let error: ErrorBody = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(error.close_code.as_deref(), close_code);
+        assert_eq!(serde_json::to_value(error).unwrap(), value);
+    }
+    let schema = serde_json::to_value(schemars::schema_for!(ErrorBody)).unwrap();
+    assert_eq!(
+        schema["properties"]["close_code"]["type"],
+        serde_json::json!(["string", "null"])
+    );
+    assert_eq!(schema["required"], serde_json::json!(["code", "message"]));
+}
+
+#[test]
 fn media_offer_decodes_legacy_epoch_absence_and_preserves_current_epochs() {
     for epoch in [None, Some(7)] {
         let mut value = serde_json::json!({
@@ -1430,6 +1653,8 @@ fn success_response_round_trips() {
                 refuse_if_exists_guard: true,
                 input_consumer: false,
                 media_open_cancel: true,
+                media_control: true,
+                media_events: true,
             }),
         },
     };
@@ -1993,6 +2218,7 @@ fn error_response_round_trips() {
         error: ErrorBody {
             code: "pane_not_found".into(),
             message: "pane p_1 not found".into(),
+            close_code: None,
         },
     };
 

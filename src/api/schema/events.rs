@@ -84,6 +84,12 @@ pub enum Subscription {
     PaneScrollChanged { pane_id: String },
     #[serde(rename = "layout.updated")]
     LayoutUpdated {},
+    /// Requires media_events capability. Receive dotted media events for one
+    /// validated pane, with untagged data (no data.type). First subscriber enables
+    /// client levels; last departure or disconnect disables them. Interest also
+    /// applies to future sessions on the pane. Levels are limited to 10 Hz.
+    #[serde(rename = "media")]
+    Media { pane_id: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -379,21 +385,94 @@ pub enum SubscriptionEventKind {
     PaneAgentSessionChanged,
     #[serde(rename = "pane.scroll_changed")]
     ScrollChanged,
+    #[serde(rename = "media.started")]
+    MediaStarted,
+    #[serde(rename = "media.stopped")]
+    MediaStopped,
+    #[serde(rename = "media.error")]
+    MediaError,
+    #[serde(rename = "media.controls_applied")]
+    MediaControlsApplied,
+    #[serde(rename = "media.levels")]
+    MediaLevels,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SubscriptionEventEnvelope {
     pub event: SubscriptionEventKind,
     pub data: SubscriptionEventData,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(untagged)]
 pub enum SubscriptionEventData {
     PaneOutputMatched(PaneOutputMatchedEvent),
     PaneAgentStatusChanged(PaneAgentStatusChangedEvent),
     ScrollChanged(PaneScrollChangedEvent),
     PaneAgentSessionChanged(PaneAgentSessionChangedEvent),
+    MediaStarted(MediaStartedEvent),
+    // Stopped contains all the error fields plus epoch; try it before error so
+    // untagged deserialization preserves the terminal close and its epoch.
+    MediaStopped(MediaStoppedEvent),
+    MediaError(MediaErrorEvent),
+    MediaControlsApplied(MediaControlsAppliedEvent),
+    MediaLevels(MediaLevelsEvent),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct MediaHelperInfo {
+    pub version: String,
+    pub commit: String,
+    pub pid: u32,
+}
+
+/// Emitted once only after Connected and helper/device info are both available.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct MediaStartedEvent {
+    pub pane_id: String,
+    pub session_id: String,
+    pub epoch: u64,
+    pub helper: MediaHelperInfo,
+    pub input_device: String,
+    pub output_device: String,
+}
+
+/// Terminal close with epoch and reason, including negotiation_timeout after the
+/// 15-second answer-to-Connected deadline. media.device_changed is reserved, never emitted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct MediaStoppedEvent {
+    pub pane_id: String,
+    pub session_id: String,
+    pub epoch: u64,
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct MediaErrorEvent {
+    pub pane_id: String,
+    pub session_id: String,
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct MediaControlsAppliedEvent {
+    pub pane_id: String,
+    pub session_id: String,
+    pub request_id: String,
+    pub input_muted: bool,
+    pub output_suppressed: bool,
+    pub epoch: u64,
+}
+
+/// Audio peaks at most 10 Hz, reported only while the pane has media subscribers.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct MediaLevelsEvent {
+    pub pane_id: String,
+    pub session_id: String,
+    pub input_peak: f32,
+    pub output_peak: f32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

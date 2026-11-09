@@ -4733,6 +4733,7 @@ fn explicit_agent_history_read_requires_idle_on_alternate_screen() {
             assert_eq!(
                 server.agent_read_not_idle_error(&request),
                 Some(api::schema::ErrorBody {
+                    close_code: None,
                     code: "agent_not_idle".into(),
                     message: format!(
                         "cannot read 200 lines while {public_pane_id} is working: its alternate-screen history can only be captured by scrolling while idle. Wait and retry, or use --source visible"
