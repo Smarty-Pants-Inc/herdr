@@ -435,14 +435,7 @@ fn agent_command() -> Command {
                     .help("Refuse unless the detected agent status matches; requires --expected-session and server support"))
                 .arg(
                     flag("if-draft-empty")
-                        .conflicts_with_all([
-                            "wait",
-                            "until",
-                            "timeout",
-                            "expected-session",
-                            "expected-pane",
-                        ])
-                        .help("Use the registered Pi channel; refuse on a draft, UI hold, or unknown state; never type"),
+                        .help("Use the registered Pi channel; refuse on a draft, UI hold, or unknown state; never type. With alpha enabled (SMARTY_ALPHA is not 0), accepts expectations and --wait"),
                 )
                 .arg(
                     flag("wait")
@@ -465,7 +458,7 @@ fn agent_command() -> Command {
                         .help("Accepted for compatibility; cross-pane agent input is allowed and logged without it"),
                 )
                 .after_help(
-                    "If the agent is already blocked, submission is rejected with agent_blocked before any input is sent. When an accepted submission starts from another non-working state, --wait requires an observed working or blocked state within 5000ms; otherwise it returns agent_prompt_stalled. A caller timeout that expires first returns timeout. It then matches idle, done, or blocked by default, or any exact --until state. It does not track turns: if the agent is already working, that active turn's completion may match.",
+                    "For normal typing prompts, if the agent is already blocked, submission is rejected with agent_blocked before any input is sent. When an accepted submission starts from another non-working state, --wait requires an observed working or blocked state within 5000ms; otherwise it returns agent_prompt_stalled. A caller timeout that expires first returns timeout. It then matches idle, done, or blocked by default, or any exact --until state. It does not track turns: if the agent is already working, that active turn's completion may match. Alpha --if-draft-empty combinations instead pre-check expectations through the read API, deliver only through the registered channel, then use standalone agent wait after admission (no activity gate; timeout starts after admission). These pre-checks are not atomic with delivery. Set SMARTY_ALPHA=0 to disable the combinations.",
                 ),
         )
         .subcommand(
@@ -1496,7 +1489,7 @@ mod tests {
     }
 
     #[test]
-    fn draft_guard_spec_excludes_legacy_wait_and_keeps_literal_payload() {
+    fn draft_guard_spec_accepts_alpha_wait_and_keeps_literal_payload() {
         let parsed = super::command()
             .try_get_matches_from([
                 "herdr",
@@ -1523,7 +1516,7 @@ mod tests {
                 "--if-draft-empty",
                 "--wait"
             ])
-            .is_err());
+            .is_ok());
         for expectation in ["--expected-session=s", "--expected-pane=p"] {
             assert!(super::command()
                 .try_get_matches_from([
@@ -1535,7 +1528,7 @@ mod tests {
                     "--if-draft-empty",
                     expectation,
                 ])
-                .is_err());
+                .is_ok());
         }
         assert!(super::command()
             .try_get_matches_from(["herdr", "agent", "draft-state", "--", "--help"])
